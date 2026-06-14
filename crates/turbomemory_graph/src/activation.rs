@@ -60,6 +60,11 @@ impl SpreadingActivation {
         self.bm25.add(id, text);
     }
 
+    pub fn remove_memory(&mut self, id: &str) {
+        self.graph.remove_memory(id);
+        self.bm25.remove(id);
+    }
+
     /// Semantic seeds are `(memory_id, normalized_similarity)` pairs from dense ANN search.
     /// Returns `None` when the Feeling-of-Knowing gate rejects the query.
     pub fn search(

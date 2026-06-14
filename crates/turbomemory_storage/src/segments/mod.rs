@@ -11,6 +11,7 @@ use crate::record::{PointOffset, Record};
 use crate::vector_store::VectorStore;
 use crate::StorageError;
 use ahash::AHashSet;
+use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 
 pub use cold::ColdSegment;
@@ -36,11 +37,15 @@ pub trait VectorSegment: Send + Sync {
     fn insert(&mut self, offset: PointOffset, record: &Record) -> Result<()>;
     /// Search the segment and return scored candidates.  Reranking with the
     /// full f32 embedding is done by the caller using `VectorStore`.
+    ///
+    /// If `allowed_offsets` is provided, only offsets contained in the bitmap
+    /// are returned.  This is used for payload-filtered ANN.
     fn search(
         &self,
         query: &[f32],
         top_k: usize,
         vectors: &VectorStore,
+        allowed_offsets: Option<&RoaringBitmap>,
     ) -> Result<Vec<ScoredPoint>>;
     fn point_count(&self) -> usize;
     fn memory_bytes(&self) -> usize;

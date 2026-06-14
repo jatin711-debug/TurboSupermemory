@@ -10,6 +10,7 @@ use crate::segments::warm::WarmSegment;
 use crate::segments::{merge_candidates, ScoredPoint, VectorSegment};
 use crate::vector_store::VectorStore;
 use parking_lot::RwLock;
+use roaring::RoaringBitmap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -110,18 +111,23 @@ impl SegmentHolder {
         query: &[f32],
         top_k: usize,
         vectors: &VectorStore,
+        allowed_offsets: Option<&RoaringBitmap>,
     ) -> crate::Result<Vec<ScoredPoint>> {
-        let pool_k = top_k.saturating_mul(4).max(top_k);
+        let pool_k = if allowed_offsets.is_some() {
+            top_k.saturating_mul(8).max(top_k)
+        } else {
+            top_k.saturating_mul(4).max(top_k)
+        };
         let mut lists = Vec::with_capacity(2 + self.sealed_hot.len() + self.warm.len() + self.cold.len());
-        lists.push(self.hot.read().search(query, pool_k, vectors)?);
+        lists.push(self.hot.read().search(query, pool_k, vectors, allowed_offsets)?);
         for sealed in &self.sealed_hot {
-            lists.push(sealed.read().search(query, pool_k, vectors)?);
+            lists.push(sealed.read().search(query, pool_k, vectors, allowed_offsets)?);
         }
         for warm in &self.warm {
-            lists.push(warm.read().search(query, pool_k, vectors)?);
+            lists.push(warm.read().search(query, pool_k, vectors, allowed_offsets)?);
         }
         for cold in &self.cold {
-            lists.push(cold.read().search(query, pool_k, vectors)?);
+            lists.push(cold.read().search(query, pool_k, vectors, allowed_offsets)?);
         }
         let candidates = merge_candidates(lists, pool_k);
 
@@ -177,6 +183,7 @@ impl SegmentHolder {
                 &vec![0.0f32; self.config.dimension],
                 hot.point_count(),
                 vectors,
+                None,
             )?
             .into_iter()
             .map(|c| c.offset)
@@ -227,6 +234,7 @@ impl SegmentHolder {
                         access_count: 0,
                         last_accessed: 0,
                         tier: Tier::Warm,
+                        payload: None,
                     })
                 })
                 .collect();
@@ -289,6 +297,7 @@ impl SegmentHolder {
                     access_count: 0,
                     last_accessed: 0,
                     tier: Tier::Warm,
+                    payload: None,
                 };
                 records.push((offset, record));
             }

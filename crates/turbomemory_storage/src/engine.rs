@@ -12,13 +12,16 @@
 
 use crate::config::StoreConfig;
 use crate::metadata_store::MetadataStore;
+use crate::payload_index::{Filter, PayloadIndex};
 use crate::record::{MetaRecord, PointOffset, Record};
+use crate::text_index::TextIndex;
 use crate::segment_holder::SegmentHolder;
 use crate::vector_store::VectorStore;
 use crate::wal::{Wal, WalOp};
 use crate::StorageError;
 use ahash::HashMap as AHashMap;
 use parking_lot::{Mutex, RwLock};
+use roaring::RoaringBitmap;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
@@ -42,6 +45,8 @@ pub struct StorageEngine {
     graph: Arc<RwLock<SpreadingActivation>>,
     ccs: Arc<Mutex<Option<CompressedCognitiveState>>>,
     id_index: Arc<RwLock<AHashMap<Arc<str>, PointOffset>>>,
+    payload_index: Arc<RwLock<PayloadIndex>>,
+    text_index: Arc<TextIndex>,
     wal: Arc<Mutex<Wal>>,
 }
 
@@ -55,6 +60,8 @@ impl Clone for StorageEngine {
             graph: self.graph.clone(),
             ccs: self.ccs.clone(),
             id_index: self.id_index.clone(),
+            payload_index: self.payload_index.clone(),
+            text_index: self.text_index.clone(),
             wal: self.wal.clone(),
         }
     }
@@ -109,6 +116,18 @@ impl StorageEngine {
         }
 
         let records = meta.records()?;
+
+        // Rebuild the payload index from the metadata snapshot.  WAL replay above
+        // already added any records that were not yet flushed.
+        let payload_index = Arc::new(RwLock::new(PayloadIndex::from_meta_records(&records)));
+
+        // Rebuild the full-text index from the metadata snapshot.
+        let text_index = Arc::new(TextIndex::open(db_path.join("text_index"))?);
+        for (offset, meta_rec) in &records {
+            text_index.add(*offset, &meta_rec.text)?;
+        }
+        text_index.commit()?;
+
         let view = vectors.read_view();
         let mut records_vec: Vec<(PointOffset, Record)> = records
             .into_iter()
@@ -205,6 +224,8 @@ impl StorageEngine {
             graph: Arc::new(RwLock::new(graph)),
             ccs: Arc::new(Mutex::new(ccs)),
             id_index: Arc::new(RwLock::new(id_index)),
+            payload_index,
+            text_index,
             wal: Arc::new(Mutex::new(wal)),
         })
     }
@@ -216,6 +237,18 @@ impl StorageEngine {
         embedding: &[f32],
         importance: f32,
         concepts: &[String],
+    ) -> crate::Result<bool> {
+        self.insert_with_payload(id, text, embedding, importance, concepts, None)
+    }
+
+    pub fn insert_with_payload(
+        &self,
+        id: &str,
+        text: &str,
+        embedding: &[f32],
+        importance: f32,
+        concepts: &[String],
+        payload: Option<String>,
     ) -> crate::Result<bool> {
         validate_dimension(embedding, self.config.dimension)?;
         if self.id_index.read().contains_key(id) {
@@ -236,6 +269,7 @@ impl StorageEngine {
             access_count: 0,
             last_accessed: 0,
             tier: crate::config::Tier::Hot,
+            payload,
         };
 
         // 1. Persist the embedding to the mmap-backed vector store first.
@@ -250,9 +284,13 @@ impl StorageEngine {
             wal.append(&WalOp::Insert { offset, seq, meta })?;
         }
 
-        // 3. Update in-memory metadata cache.
+        // 3. Update in-memory metadata cache and indexes.
         self.meta.put(offset, &record)?;
         self.id_index.write().insert(Arc::from(id), offset);
+        self.payload_index
+            .write()
+            .add(offset, record.payload.as_deref())?;
+        self.text_index.add(offset, text)?;
 
         {
             let mut graph = self.graph.write();
@@ -277,11 +315,28 @@ impl StorageEngine {
         importances: &[f32],
         concepts: &[Vec<String>],
     ) -> crate::Result<usize> {
+        self.insert_batch_with_payload(ids, texts, embeddings, importances, concepts, &[])
+    }
+
+    pub fn insert_batch_with_payload(
+        &self,
+        ids: &[String],
+        texts: &[String],
+        embeddings: &[Vec<f32>],
+        importances: &[f32],
+        concepts: &[Vec<String>],
+        payloads: &[Option<String>],
+    ) -> crate::Result<usize> {
         let n = ids.len();
         if n == 0 {
             return Ok(0);
         }
-        if texts.len() < n || embeddings.len() < n || importances.len() < n || concepts.len() < n {
+        if texts.len() < n
+            || embeddings.len() < n
+            || importances.len() < n
+            || concepts.len() < n
+            || (!payloads.is_empty() && payloads.len() < n)
+        {
             return Err(StorageError::InvalidArgument(
                 "batch arrays have mismatched lengths".into(),
             ));
@@ -289,21 +344,32 @@ impl StorageEngine {
         for emb in embeddings {
             validate_dimension(emb, self.config.dimension)?;
         }
-        {
-            let idx = self.id_index.read();
-            for id in ids {
-                if idx.contains_key(id.as_str()) {
-                    return Err(StorageError::DuplicateId(id.clone()));
-                }
-            }
-        }
 
-        let mut records: Vec<(PointOffset, Record)> = Vec::with_capacity(n);
+        // Idempotent batch insert: skip existing ids and duplicate ids within the
+        // batch.  This makes the operation safe to replay after a partial write.
+        let idx = self.id_index.read();
+        let mut seen = HashSet::with_capacity(n);
+        let mut indices: Vec<usize> = Vec::with_capacity(n);
         for i in 0..n {
+            let id = ids[i].as_str();
+            if idx.contains_key(id) || !seen.insert(id) {
+                continue;
+            }
+            indices.push(i);
+        }
+        drop(idx);
+
+        let mut records: Vec<(PointOffset, Record)> = Vec::with_capacity(indices.len());
+        for &i in &indices {
             let mut emb = embeddings[i].clone();
             normalize(&mut emb)?;
             let offset = self.meta.allocate_offset();
             let seq = self.meta.allocate_seq();
+            let payload = if payloads.is_empty() {
+                None
+            } else {
+                payloads[i].clone()
+            };
             let record = Record {
                 id: ids[i].clone(),
                 text: texts[i].clone(),
@@ -315,6 +381,7 @@ impl StorageEngine {
                 access_count: 0,
                 last_accessed: 0,
                 tier: crate::config::Tier::Hot,
+                payload,
             };
             records.push((offset, record));
         }
@@ -337,12 +404,15 @@ impl StorageEngine {
             }
         }
 
-        // 3. In-memory metadata cache.
+        // 3. In-memory metadata cache and indexes.
         self.meta.put_batch(&records)?;
         {
             let mut idx = self.id_index.write();
+            let mut pidx = self.payload_index.write();
             for (offset, rec) in &records {
                 idx.insert(Arc::from(rec.id.as_str()), *offset);
+                pidx.add(*offset, rec.payload.as_deref())?;
+                self.text_index.add(*offset, &rec.text)?;
             }
         }
 
@@ -365,7 +435,97 @@ impl StorageEngine {
             let mut segments = self.segments.write();
             segments.seal_hot(&self.vectors)?;
         }
-        Ok(n)
+        Ok(indices.len())
+    }
+
+    /// Delete the record with the given id.
+    ///
+    /// The embedding is left in place in the vector store; the offset becomes
+    /// unreachable because the metadata entry and id index are removed.  Segment
+    /// searches already filter out offsets with no metadata, so deleted points
+    /// disappear from results immediately.  Physical reclamation is deferred to
+    /// the vacuum optimizer.
+    pub fn delete_by_id(&self, id: &str) -> crate::Result<bool> {
+        let offset = {
+            let idx = self.id_index.read();
+            match idx.get(id).copied() {
+                Some(o) => o,
+                None => return Ok(false),
+            }
+        };
+
+        // 1. WAL delete entry.
+        {
+            let mut wal = self.wal.lock();
+            wal.append(&WalOp::Delete { offset })?;
+        }
+
+        // 2. Remove from payload and text indexes while we still know the old values.
+        if let Ok(Some(meta_rec)) = self.meta.get(offset) {
+            self.payload_index
+                .write()
+                .remove(offset, meta_rec.payload.as_deref());
+            self.text_index.remove(offset)?;
+        }
+
+        // 3. Remove from in-memory metadata and id index.
+        self.meta.remove(offset)?;
+        self.id_index.write().remove(id);
+
+        // 3. Remove from cognitive graph.
+        {
+            let mut graph = self.graph.write();
+            graph.remove_memory(id);
+        }
+
+        Ok(true)
+    }
+
+    /// Replace an existing record, preserving its id.
+    ///
+    /// Implemented as an atomic-in-metadata delete + insert: the old offset is
+    /// tombstoned and a new offset is allocated.  This keeps HNSW segments
+    /// correct without requiring in-place vector updates inside immutable
+    /// indexes.
+    pub fn update(
+        &self,
+        id: &str,
+        text: &str,
+        embedding: &[f32],
+        importance: f32,
+        concepts: &[String],
+    ) -> crate::Result<bool> {
+        self.update_with_payload(id, text, embedding, importance, concepts, None)
+    }
+
+    /// Return the JSON payload attached to a record, if any.
+    pub fn get_payload(&self, id: &str) -> crate::Result<Option<String>> {
+        let idx = self.id_index.read();
+        let Some(&offset) = idx.get(id) else {
+            return Ok(None);
+        };
+        drop(idx);
+        match self.meta.get(offset)? {
+            Some(meta) => Ok(meta.payload.clone()),
+            None => Ok(None),
+        }
+    }
+
+    pub fn update_with_payload(
+        &self,
+        id: &str,
+        text: &str,
+        embedding: &[f32],
+        importance: f32,
+        concepts: &[String],
+        payload: Option<String>,
+    ) -> crate::Result<bool> {
+        if !self.id_index.read().contains_key(id) {
+            return Ok(false);
+        }
+        self.delete_by_id(id)?;
+        self.insert_with_payload(id, text, embedding, importance, concepts, payload)?;
+        Ok(true)
     }
 
     pub fn search_ann(
@@ -382,16 +542,41 @@ impl StorageEngine {
         query_embedding: &[f32],
         top_k: usize,
     ) -> crate::Result<Vec<(String, f32)>> {
+        self.search_ann_candidates_filtered(query_embedding, top_k, None)
+    }
+
+    /// Filtered ANN candidate search.
+    ///
+    /// `filter` is evaluated against the payload index; the resulting offset
+    /// bitmap is intersected with tiered segment search.
+    pub fn search_ann_candidates_filtered(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+        filter: Option<&Filter>,
+    ) -> crate::Result<Vec<(String, f32)>> {
         validate_dimension(query_embedding, self.config.dimension)?;
+        let allowed_offsets = match filter {
+            Some(f) => Some(self.evaluate_filter(f)?),
+            None => None,
+        };
         if self.record_count() <= EXACT_FALLBACK_THRESHOLD {
-            let results = self.exact_top_k(query_embedding, top_k);
+            let results = match &allowed_offsets {
+                Some(bitmap) => self.exact_top_k_filtered(query_embedding, top_k, bitmap),
+                None => self.exact_top_k(query_embedding, top_k),
+            };
             for (id, _) in &results {
                 self.bump_access_by_id(id);
             }
             return Ok(results);
         }
         let segments = self.segments.read();
-        let scored = segments.search(query_embedding, top_k, &self.vectors)?;
+        let scored = segments.search(
+            query_embedding,
+            top_k,
+            &self.vectors,
+            allowed_offsets.as_ref(),
+        )?;
         drop(segments);
         let mut results = Vec::with_capacity(scored.len());
         for c in scored {
@@ -404,6 +589,15 @@ impl StorageEngine {
     }
 
     fn exact_top_k(&self, query: &[f32], top_k: usize) -> Vec<(String, f32)> {
+        self.exact_top_k_filtered(query, top_k, &RoaringBitmap::new())
+    }
+
+    fn exact_top_k_filtered(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        allowed_offsets: &RoaringBitmap,
+    ) -> Vec<(String, f32)> {
         let view = self.vectors.read_view();
         let mut all: Vec<(String, f32)> = self
             .meta
@@ -411,6 +605,9 @@ impl StorageEngine {
             .unwrap_or_default()
             .into_iter()
             .filter_map(|(offset, rec)| {
+                if !allowed_offsets.is_empty() && !allowed_offsets.contains(offset as u32) {
+                    return None;
+                }
                 view.get(offset).map(|v| {
                     let score = cosine_similarity(query, v);
                     (rec.id.clone(), score)
@@ -456,6 +653,95 @@ impl StorageEngine {
         } else {
             Ok(None)
         }
+    }
+
+    pub fn search_ann_filtered(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+        filter: &Filter,
+    ) -> crate::Result<Vec<(String, f32)>> {
+        self.search_ann_candidates_filtered(query_embedding, top_k, Some(filter))
+    }
+
+    /// Cognitive search with a payload filter.
+    pub fn search_filtered(
+        &self,
+        query_text: &str,
+        query_embedding: &[f32],
+        top_k: usize,
+        filter: &Filter,
+    ) -> crate::Result<Option<Vec<(String, f32)>>> {
+        validate_dimension(query_embedding, self.config.dimension)?;
+        let seeds =
+            self.search_ann_candidates_filtered(query_embedding, top_k.max(10), Some(filter))?;
+        let graph = self.graph.read();
+        let activated = graph.search(query_text, &seeds, top_k);
+        drop(graph);
+        if let Some(results) = activated {
+            let mut hydrated: Vec<(String, f32)> = results
+                .into_iter()
+                .filter_map(|(id, _)| {
+                    self.find_record_by_id(&id).map(|rec| {
+                        let score = cosine_similarity(query_embedding, rec.embedding_f32());
+                        (id, score)
+                    })
+                })
+                .collect();
+            hydrated.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            hydrated.truncate(top_k);
+            if hydrated.is_empty() {
+                return Ok(None);
+            }
+            for (id, _) in &hydrated {
+                self.bump_access_by_id(id);
+            }
+            Ok(Some(hydrated))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Evaluate a filter against the payload and full-text indexes.
+    fn evaluate_filter(&self, filter: &Filter) -> crate::Result<RoaringBitmap> {
+        if filter.uses_full_text() {
+            // Tantivy writes are deferred; make them visible before querying.
+            self.text_index.commit()?;
+        }
+        self.evaluate_filter_recursive(filter)
+    }
+
+    fn evaluate_filter_recursive(&self, filter: &Filter) -> crate::Result<RoaringBitmap> {
+        use crate::payload_index::Filter as F;
+        Ok(match filter {
+            F::FullText { query, .. } => self.text_index.search(query)?,
+            F::Eq { .. } | F::Range { .. } => self.payload_index.read().query(filter),
+            F::And(parts) => {
+                let mut iter = parts.iter();
+                let Some(first) = iter.next() else {
+                    return Ok(RoaringBitmap::new());
+                };
+                let mut acc = self.evaluate_filter_recursive(first)?;
+                for part in iter {
+                    if acc.is_empty() {
+                        break;
+                    }
+                    acc &= self.evaluate_filter_recursive(part)?;
+                }
+                acc
+            }
+            F::Or(parts) => {
+                let mut acc = RoaringBitmap::new();
+                for part in parts {
+                    acc |= self.evaluate_filter_recursive(part)?;
+                }
+                acc
+            }
+            F::Not(inner) => {
+                let positives = self.evaluate_filter_recursive(inner)?;
+                self.payload_index.read().all_offsets() - &positives
+            }
+        })
     }
 
     /// Hydrate a full `Record` from the metadata cache + vector store.
@@ -514,6 +800,15 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Gracefully shut down the engine.
+    ///
+    /// Flushes the WAL, vector store, metadata snapshot, and segment files.
+    /// Callers that own a background `UpdateHandler` should stop it before
+    /// calling shutdown.
+    pub fn shutdown(&self) -> crate::Result<()> {
+        self.flush()
+    }
+
     pub fn trigger_consolidation(&self) -> crate::Result<(usize, usize, usize)> {
         let mut segments = self.segments.write();
         let (sealed, compacted, promoted) = segments.trigger_consolidation(&self.meta, &self.vectors)?;
@@ -529,8 +824,9 @@ impl StorageEngine {
             wal.flush()?;
         }
 
-        // 2. Persist the vector snapshot and metadata snapshot.
+        // 2. Persist the vector snapshot, metadata snapshot, and text index.
         self.vectors.flush()?;
+        self.text_index.flush()?;
         let last_applied_seq = self.meta.next_seq().saturating_sub(1);
         self.meta.flush(last_applied_seq)?;
 
@@ -829,5 +1125,207 @@ mod tests {
         // Search still works correctly after promotion.
         let results = engine.search_ann(&q, 1).unwrap();
         assert_eq!(results[0].0, "mem_0");
+    }
+
+    #[test]
+    fn delete_removes_record_from_search_and_replay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+        for i in 0..4usize {
+            let v = make_vec(8, i);
+            engine
+                .insert(&format!("mem_{i}"), &format!("text {i}"), &v, 1.0, &[])
+                .unwrap();
+        }
+
+        assert!(engine.delete_by_id("mem_2").unwrap());
+        assert!(!engine.delete_by_id("mem_2").unwrap());
+        assert_eq!(engine.record_count(), 3);
+
+        // Searching for the deleted vector should return its nearest neighbor among
+        // the remaining records, not mem_2.
+        let q = make_vec(8, 2);
+        let results = engine.search_ann(&q, 1).unwrap();
+        assert_ne!(results[0].0, "mem_2");
+
+        // Reopen and replay: the delete should survive.
+        engine.flush_vectors().unwrap();
+        engine.flush_wal().unwrap();
+        drop(engine);
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+        assert_eq!(engine.record_count(), 3);
+        let results = engine.search_ann(&q, 1).unwrap();
+        assert_ne!(results[0].0, "mem_2");
+    }
+
+    #[test]
+    fn update_replaces_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+        engine
+            .insert("mem_0", "original text", &make_vec(8, 0), 1.0, &[])
+            .unwrap();
+
+        assert!(
+            engine
+                .update("mem_0", "updated text", &make_vec(8, 1), 2.0, &[])
+                .unwrap()
+        );
+        assert!(!engine.update("missing", "x", &make_vec(8, 1), 1.0, &[]).unwrap());
+        assert_eq!(engine.record_count(), 1);
+
+        let q = make_vec(8, 1);
+        let results = engine.search_ann(&q, 1).unwrap();
+        assert_eq!(results[0].0, "mem_0");
+
+        // The old vector should no longer be returned.
+        let q_old = make_vec(8, 0);
+        let results = engine.search_ann(&q_old, 1).unwrap();
+        assert_eq!(results[0].0, "mem_0");
+    }
+
+    #[test]
+    fn batch_insert_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+        let ids: Vec<String> = (0..4).map(|i| format!("mem_{i}")).collect();
+        let texts: Vec<String> = (0..4).map(|i| format!("text {i}")).collect();
+        let embeddings: Vec<Vec<f32>> = (0..4).map(|i| make_vec(8, i)).collect();
+        let scores = vec![1.0f32; 4];
+        let concepts: Vec<Vec<String>> = vec![vec![]; 4];
+
+        let n1 = engine
+            .insert_batch(&ids, &texts, &embeddings, &scores, &concepts)
+            .unwrap();
+        assert_eq!(n1, 4);
+
+        // Replay the same batch: existing ids should be skipped.
+        let n2 = engine
+            .insert_batch(&ids, &texts, &embeddings, &scores, &concepts)
+            .unwrap();
+        assert_eq!(n2, 0);
+        assert_eq!(engine.record_count(), 4);
+
+        // Duplicate ids within a batch should be deduplicated.
+        let dup_ids = vec!["new_1".to_string(), "new_1".to_string(), "new_2".to_string()];
+        let dup_texts = vec!["t1".to_string(), "t1".to_string(), "t2".to_string()];
+        let dup_embs = vec![make_vec(8, 5), make_vec(8, 5), make_vec(8, 6)];
+        let dup_scores = vec![1.0f32; 3];
+        let dup_concepts = vec![vec![]; 3];
+        let n3 = engine
+            .insert_batch(&dup_ids, &dup_texts, &dup_embs, &dup_scores, &dup_concepts)
+            .unwrap();
+        assert_eq!(n3, 2);
+        assert_eq!(engine.record_count(), 6);
+    }
+
+    #[test]
+    fn payload_round_trip_and_replay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+        let payload = r#"{"tags":["rust","ai"],"count":42}"#.to_string();
+        engine
+            .insert_with_payload(
+                "mem_0",
+                "text",
+                &make_vec(8, 0),
+                1.0,
+                &[],
+                Some(payload.clone()),
+            )
+            .unwrap();
+
+        assert_eq!(engine.get_payload("mem_0").unwrap().as_ref(), Some(&payload));
+
+        engine.flush_vectors().unwrap();
+        engine.flush_wal().unwrap();
+        drop(engine);
+
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+        assert_eq!(engine.get_payload("mem_0").unwrap().as_ref(), Some(&payload));
+    }
+
+    #[test]
+    fn filtered_search_by_payload() {
+        use serde_json::json;
+        use std::ops::Bound;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+        for i in 0..4usize {
+            let payload = json!({"category": if i % 2 == 0 { "even" } else { "odd" }, "score": (i as f64) * 10.0 });
+            engine
+                .insert_with_payload(
+                    &format!("mem_{i}"),
+                    &format!("text {i}"),
+                    &make_vec(8, i),
+                    1.0,
+                    &[],
+                    Some(payload.to_string()),
+                )
+                .unwrap();
+        }
+
+        // Equality filter.
+        let filter = Filter::Eq {
+            field: "category".into(),
+            value: json!("even"),
+        };
+        let results = engine.search_ann_filtered(&make_vec(8, 0), 10, &filter).unwrap();
+        let ids: Vec<_> = results.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, vec!["mem_0", "mem_2"]);
+
+        // Range filter.
+        let filter = Filter::Range {
+            field: "score".into(),
+            low: Bound::Included(15.0),
+            high: Bound::Included(35.0),
+        };
+        let results = engine.search_ann_filtered(&make_vec(8, 0), 10, &filter).unwrap();
+        let ids: Vec<_> = results.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, vec!["mem_2", "mem_3"]);
+
+        // Delete removes from index.
+        engine.delete_by_id("mem_2").unwrap();
+        let filter = Filter::Eq {
+            field: "category".into(),
+            value: json!("even"),
+        };
+        let results = engine.search_ann_filtered(&make_vec(8, 0), 10, &filter).unwrap();
+        let ids: Vec<_> = results.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, vec!["mem_0"]);
+    }
+
+    #[test]
+    fn filtered_search_survives_replay() {
+        use serde_json::json;
+
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+            for i in 0..4usize {
+                let payload = json!({"group": "a", "idx": i});
+                engine
+                    .insert_with_payload(
+                        &format!("mem_{i}"),
+                        &format!("text {i}"),
+                        &make_vec(8, i),
+                        1.0,
+                        &[],
+                        Some(payload.to_string()),
+                    )
+                    .unwrap();
+            }
+            engine.flush_vectors().unwrap();
+            engine.flush_wal().unwrap();
+        }
+
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+        let filter = Filter::Eq {
+            field: "group".into(),
+            value: json!("a"),
+        };
+        let results = engine.search_ann_filtered(&make_vec(8, 0), 10, &filter).unwrap();
+        assert_eq!(results.len(), 4);
     }
 }

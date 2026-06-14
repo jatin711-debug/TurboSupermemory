@@ -23,6 +23,10 @@ pub struct Record {
     pub access_count: u64,
     pub last_accessed: u64,
     pub tier: Tier,
+    /// Optional JSON payload (metadata / key-value) attached to the record.
+    /// Stored as a raw string so it can be serialized by non-self-describing
+    /// codecs such as bincode.
+    pub payload: Option<String>,
 }
 
 impl Record {
@@ -50,6 +54,10 @@ pub struct MetaRecord {
     pub access_count: u64,
     pub last_accessed: u64,
     pub tier: Tier,
+    /// Optional JSON payload (metadata / key-value) attached to the record.
+    /// Stored as a raw string so it can be serialized by non-self-describing
+    /// codecs such as bincode.
+    pub payload: Option<String>,
 }
 
 impl MetaRecord {
@@ -66,6 +74,7 @@ impl MetaRecord {
             access_count: self.access_count,
             last_accessed: self.last_accessed,
             tier: self.tier,
+            payload: self.payload.clone(),
         }
     }
 }
@@ -82,6 +91,25 @@ impl From<&Record> for MetaRecord {
             access_count: rec.access_count,
             last_accessed: rec.last_accessed,
             tier: rec.tier,
+            payload: rec.payload.clone(),
         }
+    }
+}
+
+impl Record {
+    /// Parse the raw payload string into a `serde_json::Value`.
+    pub fn parsed_payload(&self) -> Option<serde_json::Value> {
+        self.payload
+            .as_ref()
+            .and_then(|s| serde_json::from_str(s).ok())
+    }
+}
+
+impl MetaRecord {
+    /// Parse the raw payload string into a `serde_json::Value`.
+    pub fn parsed_payload(&self) -> Option<serde_json::Value> {
+        self.payload
+            .as_ref()
+            .and_then(|s| serde_json::from_str(s).ok())
     }
 }

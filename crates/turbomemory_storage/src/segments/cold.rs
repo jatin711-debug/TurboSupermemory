@@ -6,6 +6,7 @@ use crate::segments::mmap_array::{MmapBuffer, MmapFileWriter};
 use crate::segments::{ScoredPoint, VectorSegment};
 use crate::vector_store::VectorStore;
 use crate::StorageError;
+use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -137,6 +138,7 @@ impl VectorSegment for ColdSegment {
         query: &[f32],
         top_k: usize,
         vectors: &VectorStore,
+        allowed_offsets: Option<&RoaringBitmap>,
     ) -> crate::Result<Vec<ScoredPoint>> {
         validate_dimension(query, self.dim)?;
         let eq = self
@@ -148,14 +150,19 @@ impl VectorSegment for ColdSegment {
             .offsets
             .iter()
             .enumerate()
-            .map(|(idx, &offset)| {
+            .filter_map(|(idx, &offset)| {
+                if let Some(bitmap) = allowed_offsets {
+                    if !bitmap.contains(offset as u32) {
+                        return None;
+                    }
+                }
                 let encoded = self.encoded_vector(idx);
                 let score = eq.score(encoded);
-                ScoredPoint {
+                Some(ScoredPoint {
                     offset,
                     score,
                     tier: Tier::Cold,
-                }
+                })
             })
             .collect();
         all.sort_by(|a, b| {

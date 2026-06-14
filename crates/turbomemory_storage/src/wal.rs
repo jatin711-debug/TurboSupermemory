@@ -187,6 +187,7 @@ mod tests {
             access_count: 0,
             last_accessed: 0,
             tier: Tier::Hot,
+            payload: None,
         }
     }
 

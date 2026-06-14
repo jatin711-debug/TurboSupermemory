@@ -9,6 +9,7 @@ use crate::record::{PointOffset, Record};
 use crate::segments::{ScoredPoint, VectorSegment};
 use crate::vector_store::VectorStore;
 use crate::StorageError;
+use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use turbomemory_core::validate_dimension;
@@ -179,22 +180,35 @@ impl VectorSegment for SealedHotSegment {
         query: &[f32],
         top_k: usize,
         _vectors: &VectorStore,
+        allowed_offsets: Option<&RoaringBitmap>,
     ) -> crate::Result<Vec<ScoredPoint>> {
         validate_dimension(query, self.dim)?;
+        let fetch_k = if allowed_offsets.is_some() {
+            top_k.saturating_mul(8).max(top_k)
+        } else {
+            top_k
+        };
         let matches = self
             .index
-            .search(query, top_k)
+            .search(query, fetch_k)
             .map_err(|e| StorageError::IndexError(format!("usearch search failed: {e}")))?;
-        Ok(matches
-            .keys
-            .into_iter()
-            .zip(matches.distances)
-            .map(|(offset, distance)| ScoredPoint {
+        let mut results: Vec<ScoredPoint> = Vec::with_capacity(matches.keys.len());
+        for (offset, distance) in matches.keys.into_iter().zip(matches.distances) {
+            if let Some(bitmap) = allowed_offsets {
+                if !bitmap.contains(offset as u32) {
+                    continue;
+                }
+            }
+            results.push(ScoredPoint {
                 offset,
                 score: (1.0 - distance).clamp(-1.0, 1.0),
                 tier: Tier::Hot,
-            })
-            .collect())
+            });
+            if results.len() >= top_k {
+                break;
+            }
+        }
+        Ok(results)
     }
 
     fn point_count(&self) -> usize {

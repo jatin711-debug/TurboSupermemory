@@ -1,12 +1,13 @@
 //! gRPC service implementation.
 
 use crate::pb::{
-    memory_server::Memory, FlushRequest, FlushResponse, HealthRequest, HealthResponse,
-    InsertBatchRequest, InsertBatchResponse, InsertRequest, InsertResponse, SearchAnnRequest,
-    SearchRequest, SearchResponse, StepSessionRequest, StepSessionResponse,
-    TriggerConsolidationRequest, TriggerConsolidationResponse,
+    memory_server::Memory, DeleteRequest, DeleteResponse, FlushRequest, FlushResponse,
+    GetPayloadRequest, GetPayloadResponse, HealthRequest, HealthResponse, InsertBatchRequest,
+    InsertBatchResponse, InsertRequest, InsertResponse, SearchAnnRequest, SearchRequest,
+    SearchResponse, StepSessionRequest, StepSessionResponse, TriggerConsolidationRequest,
+    TriggerConsolidationResponse, UpdateRequest, UpdateResponse,
 };
-use crate::service::{map_results, to_pb_results, ApiError, MemoryService};
+use crate::service::{map_results, pb_filter_to_storage, to_pb_results, ApiError, MemoryService};
 use tonic::{Request, Response, Status};
 
 #[tonic::async_trait]
@@ -27,12 +28,13 @@ impl Memory for MemoryService {
         let req = request.into_inner();
         let success = self
             .engine()
-            .insert(
+            .insert_with_payload(
                 &req.id,
                 &req.text,
                 &req.embedding,
                 req.importance,
                 &req.concepts,
+                req.payload,
             )
             .map_err(ApiError::from)?;
         Ok(Response::new(InsertResponse { success }))
@@ -47,13 +49,66 @@ impl Memory for MemoryService {
         let texts = req.texts;
         let embeddings: Vec<Vec<f32>> = req.embeddings.into_iter().map(|e| e.values).collect();
         let concepts: Vec<Vec<String>> = req.concepts.into_iter().map(|c| c.values).collect();
+        let payloads: Vec<Option<String>> = if req.payloads.is_empty() {
+            Vec::new()
+        } else {
+            req.payloads.into_iter().map(Some).collect()
+        };
         let count = self
             .engine()
-            .insert_batch(&ids, &texts, &embeddings, &req.scores, &concepts)
+            .insert_batch_with_payload(&ids, &texts, &embeddings, &req.scores, &concepts, &payloads)
             .map_err(ApiError::from)?;
         Ok(Response::new(InsertBatchResponse {
             count: count as u32,
         }))
+    }
+
+    async fn delete(
+        &self,
+        request: Request<DeleteRequest>,
+    ) -> Result<Response<DeleteResponse>, Status> {
+        let req = request.into_inner();
+        let success = self
+            .engine()
+            .delete_by_id(&req.id)
+            .map_err(ApiError::from)?;
+        Ok(Response::new(DeleteResponse { success }))
+    }
+
+    async fn update(
+        &self,
+        request: Request<UpdateRequest>,
+    ) -> Result<Response<UpdateResponse>, Status> {
+        let req = request.into_inner();
+        let success = self
+            .engine()
+            .update_with_payload(
+                &req.id,
+                &req.text,
+                &req.embedding,
+                req.importance,
+                &req.concepts,
+                req.payload,
+            )
+            .map_err(ApiError::from)?;
+        Ok(Response::new(UpdateResponse { success }))
+    }
+
+    async fn get_payload(
+        &self,
+        request: Request<GetPayloadRequest>,
+    ) -> Result<Response<GetPayloadResponse>, Status> {
+        let req = request.into_inner();
+        match self.engine().get_payload(&req.id).map_err(ApiError::from)? {
+            Some(payload) => Ok(Response::new(GetPayloadResponse {
+                found: true,
+                payload,
+            })),
+            None => Ok(Response::new(GetPayloadResponse {
+                found: false,
+                payload: String::new(),
+            })),
+        }
     }
 
     async fn search(
@@ -61,10 +116,17 @@ impl Memory for MemoryService {
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         let req = request.into_inner();
-        let maybe = self
-            .engine()
-            .search(&req.query_text, &req.query_embedding, req.top_k as usize)
-            .map_err(ApiError::from)?;
+        let filter = pb_filter_to_storage(req.filter.as_ref()).map_err(ApiError::from)?;
+        let maybe = match filter {
+            Some(f) => self
+                .engine()
+                .search_filtered(&req.query_text, &req.query_embedding, req.top_k as usize, &f)
+                .map_err(ApiError::from)?,
+            None => self
+                .engine()
+                .search(&req.query_text, &req.query_embedding, req.top_k as usize)
+                .map_err(ApiError::from)?,
+        };
         if let Some(results) = maybe {
             Ok(Response::new(SearchResponse {
                 results: to_pb_results(map_results(results)),
@@ -83,10 +145,17 @@ impl Memory for MemoryService {
         request: Request<SearchAnnRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         let req = request.into_inner();
-        let results = self
-            .engine()
-            .search_ann(&req.query_embedding, req.top_k as usize)
-            .map_err(ApiError::from)?;
+        let filter = pb_filter_to_storage(req.filter.as_ref()).map_err(ApiError::from)?;
+        let results = match filter {
+            Some(f) => self
+                .engine()
+                .search_ann_filtered(&req.query_embedding, req.top_k as usize, &f)
+                .map_err(ApiError::from)?,
+            None => self
+                .engine()
+                .search_ann(&req.query_embedding, req.top_k as usize)
+                .map_err(ApiError::from)?,
+        };
         Ok(Response::new(SearchResponse {
             results: to_pb_results(map_results(results)),
             gated: false,

@@ -12,6 +12,7 @@ turbomemory_core = { path = "../turbomemory_core" }
 turbomemory_storage = { path = "../turbomemory_storage" }
 turbomemory_graph = { path = "../turbomemory_graph" }
 pyo3 = { workspace = true }
+numpy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

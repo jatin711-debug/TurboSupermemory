@@ -6,6 +6,9 @@ service Memory {
   rpc Health (HealthRequest) returns (HealthResponse);
   rpc Insert (InsertRequest) returns (InsertResponse);
   rpc InsertBatch (InsertBatchRequest) returns (InsertBatchResponse);
+  rpc Delete (DeleteRequest) returns (DeleteResponse);
+  rpc Update (UpdateRequest) returns (UpdateResponse);
+  rpc GetPayload (GetPayloadRequest) returns (GetPayloadResponse);
   rpc Search (SearchRequest) returns (SearchResponse);
   rpc SearchAnn (SearchAnnRequest) returns (SearchResponse);
   rpc StepSession (StepSessionRequest) returns (StepSessionResponse);
@@ -25,6 +28,7 @@ message InsertRequest {
   repeated float embedding = 3;
   float importance = 4;
   repeated string concepts = 5;
+  optional string payload = 6;
 }
 
 message InsertResponse {
@@ -37,6 +41,7 @@ message InsertBatchRequest {
   repeated Embedding embeddings = 3;
   repeated float scores = 4;
   repeated StringList concepts = 5;
+  repeated string payloads = 6;
 }
 
 message Embedding {
@@ -51,15 +56,80 @@ message InsertBatchResponse {
   uint32 count = 1;
 }
 
+message DeleteRequest {
+  string id = 1;
+}
+
+message DeleteResponse {
+  bool success = 1;
+}
+
+message UpdateRequest {
+  string id = 1;
+  string text = 2;
+  repeated float embedding = 3;
+  float importance = 4;
+  repeated string concepts = 5;
+  optional string payload = 6;
+}
+
+message UpdateResponse {
+  bool success = 1;
+}
+
+message GetPayloadRequest {
+  string id = 1;
+}
+
+message GetPayloadResponse {
+  bool found = 1;
+  string payload = 2;
+}
+
+message Filter {
+  oneof kind {
+    EqFilter eq = 1;
+    RangeFilter range = 2;
+    FullTextFilter full_text = 3;
+    FilterList and = 4;
+    FilterList or = 5;
+    Filter not = 6;
+  }
+}
+
+message EqFilter {
+  string field = 1;
+  string value_json = 2;
+}
+
+message RangeFilter {
+  string field = 1;
+  optional double low = 2;
+  optional double high = 3;
+  bool low_inclusive = 4;
+  bool high_inclusive = 5;
+}
+
+message FullTextFilter {
+  string field = 1;
+  string query = 2;
+}
+
+message FilterList {
+  repeated Filter filters = 1;
+}
+
 message SearchRequest {
   string query_text = 1;
   repeated float query_embedding = 2;
   uint32 top_k = 3;
+  optional Filter filter = 4;
 }
 
 message SearchAnnRequest {
   repeated float query_embedding = 1;
   uint32 top_k = 2;
+  optional Filter filter = 3;
 }
 
 message SearchResponse {
@@ -70,6 +140,7 @@ message SearchResponse {
 message ScoredMemory {
   string id = 1;
   float score = 2;
+  optional string payload = 3;
 }
 
 message StepSessionRequest {

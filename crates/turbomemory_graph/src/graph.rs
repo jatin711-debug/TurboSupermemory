@@ -112,6 +112,16 @@ impl MemoryGraph {
         self.normalize_edges();
     }
 
+    /// Remove a memory node and all edges connected to it.
+    pub fn remove_memory(&mut self, id: &str) {
+        let mem_key = NodeId::memory(id).as_str();
+        if self.nodes.remove(&mem_key).is_none() {
+            return;
+        }
+        self.edges.retain(|e| e.source.as_str() != mem_key && e.target.as_str() != mem_key);
+        self.normalize_edges();
+    }
+
     fn add_edge_internal(&mut self, source: NodeId, target: NodeId, kind: EdgeKind, weight: f32) {
         self.edges.push(Edge {
             source,

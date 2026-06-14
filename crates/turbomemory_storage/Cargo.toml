@@ -24,6 +24,9 @@ tempfile = { workspace = true }
 ahash = { workspace = true }
 smallvec = { workspace = true }
 bytemuck = { workspace = true }
+roaring = { workspace = true }
+ordered-float = { workspace = true }
+tantivy = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
