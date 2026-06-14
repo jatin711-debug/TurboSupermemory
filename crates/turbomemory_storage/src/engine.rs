@@ -2,8 +2,9 @@
 //! and the cognitive graph.
 //!
 //! Durability model:
-//!   1. WAL is the source of truth.
-//!   2. Writes append a framed WAL entry first, then update in-memory state.
+//!   1. Full embeddings are written to the mmap-backed `VectorStore` first.
+//!   2. A metadata-only WAL entry is appended; it is the source of truth for
+//!      record metadata and ordering.
 //!   3. `redb` (via `MetadataStore`) is a lazy snapshot; it is flushed only on
 //!      explicit `flush()` / background consolidation.
 //!   4. On open we replay any un-flushed WAL entries, persist a snapshot, then
@@ -11,7 +12,7 @@
 
 use crate::config::StoreConfig;
 use crate::metadata_store::MetadataStore;
-use crate::record::{PointOffset, Record};
+use crate::record::{MetaRecord, PointOffset, Record};
 use crate::segment_holder::SegmentHolder;
 use crate::vector_store::VectorStore;
 use crate::wal::{Wal, WalOp};
@@ -74,10 +75,14 @@ impl StorageEngine {
         let mut replayed = false;
         for op in wal.iter()? {
             match op? {
-                WalOp::Insert { offset, seq, record } => {
+                WalOp::Insert { offset, seq, meta: meta_rec } => {
                     if seq > last_applied {
-                        vectors.put(offset, record.embedding_f32())?;
-                        meta.put(offset, &record)?;
+                        // The embedding lives in the VectorStore mmap. If it is
+                        // missing we have a partial write; skip the metadata.
+                        if let Some(vec) = vectors.get(offset) {
+                            let record = meta_rec.with_embedding(Arc::from(Vec::from(&*vec)));
+                            meta.put(offset, &record)?;
+                        }
                         max_offset = max_offset.max(offset);
                         max_seq = max_seq.max(seq);
                         replayed = true;
@@ -104,14 +109,15 @@ impl StorageEngine {
         }
 
         let records = meta.records()?;
+        let view = vectors.read_view();
         let mut records_vec: Vec<(PointOffset, Record)> = records
             .into_iter()
             .filter_map(|(offset, meta_rec)| {
-                vectors
-                    .get(offset)
-                    .map(|v| (offset, meta_rec.with_embedding(Arc::from(Vec::from(&*v)))))
+                view.get(offset)
+                    .map(|v| (offset, meta_rec.with_embedding(Arc::from(Vec::from(v)))))
             })
             .collect();
+        drop(view);
         records_vec.sort_by(|a, b| {
             a.1.created_at
                 .cmp(&b.1.created_at)
@@ -127,10 +133,15 @@ impl StorageEngine {
             .load_meta_str("ccs")
             .and_then(|s| serde_json::from_str::<CompressedCognitiveState>(&s).ok());
 
-        // Load any sealed Hot segments that were persisted before the last flush.
+        // Load any sealed Hot, Warm, and Cold segments that were persisted before
+        // the last flush.  Their offsets are excluded from the rebuilt Hot segment.
         let mut sealed_offsets = HashSet::new();
         let mut sealed_segments = Vec::new();
-        let sealed_dir = db_path.join("segments").join(crate::segment_holder::SEALED_HOT_DIR);
+        let mut warm_segments = Vec::new();
+        let mut cold_segments = Vec::new();
+
+        let segments_dir = db_path.join("segments");
+        let sealed_dir = segments_dir.join(crate::segment_holder::SEALED_HOT_DIR);
         if sealed_dir.exists() {
             for entry in std::fs::read_dir(&sealed_dir)? {
                 let entry = entry?;
@@ -143,15 +154,47 @@ impl StorageEngine {
             }
         }
 
+        let warm_dir = segments_dir.join(crate::config::Tier::Warm.name());
+        if warm_dir.exists() {
+            for entry in std::fs::read_dir(&warm_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() && path.join("manifest.json").exists() {
+                    let seg = crate::segments::warm::WarmSegment::open(&path)?;
+                    sealed_offsets.extend(seg.offsets().iter().copied());
+                    warm_segments.push(seg);
+                }
+            }
+        }
+
+        let cold_dir = segments_dir.join(crate::config::Tier::Cold.name());
+        if cold_dir.exists() {
+            for entry in std::fs::read_dir(&cold_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() && path.join("manifest.json").exists() {
+                    let seg = crate::segments::cold::ColdSegment::open(&path)?;
+                    sealed_offsets.extend(seg.offsets().iter().copied());
+                    cold_segments.push(seg);
+                }
+            }
+        }
+
         let mut segments = SegmentHolder::from_records(
             config.clone(),
-            db_path.join("segments"),
+            segments_dir,
             &records_vec,
             &sealed_offsets,
             &vectors,
         )?;
         for seg in sealed_segments {
             segments.add_sealed_hot(seg);
+        }
+        for seg in warm_segments {
+            segments.add_warm(seg);
+        }
+        for seg in cold_segments {
+            segments.add_cold(seg);
         }
 
         Ok(Self {
@@ -195,18 +238,19 @@ impl StorageEngine {
             tier: crate::config::Tier::Hot,
         };
 
-        // 1. WAL is the source of truth.
+        // 1. Persist the embedding to the mmap-backed vector store first.
+        //    The vector store is the durable physical source of truth for
+        //    embeddings; the WAL only records the metadata operation.
+        self.vectors.put(offset, record.embedding_f32())?;
+
+        // 2. WAL metadata entry.
         {
+            let meta = MetaRecord::from(&record);
             let mut wal = self.wal.lock();
-            wal.append(&WalOp::Insert {
-                offset,
-                seq,
-                record: record.clone(),
-            })?;
+            wal.append(&WalOp::Insert { offset, seq, meta })?;
         }
 
-        // 2. Update in-memory state.
-        self.vectors.put(offset, record.embedding_f32())?;
+        // 3. Update in-memory metadata cache.
         self.meta.put(offset, &record)?;
         self.id_index.write().insert(Arc::from(id), offset);
 
@@ -214,9 +258,13 @@ impl StorageEngine {
             let mut graph = self.graph.write();
             graph.add_memory(id, text, concepts);
         }
-        {
+        let needs_seal = {
+            let segments = self.segments.read();
+            segments.insert(offset, &record, &self.vectors)?
+        };
+        if needs_seal {
             let mut segments = self.segments.write();
-            segments.insert(offset, &record, &self.vectors)?;
+            segments.seal_hot(&self.vectors)?;
         }
         Ok(true)
     }
@@ -271,22 +319,25 @@ impl StorageEngine {
             records.push((offset, record));
         }
 
-        // 1. WAL first.
+        // 1. Persist embeddings to the mmap-backed vector store first.
+        for (offset, record) in &records {
+            self.vectors.put(*offset, record.embedding_f32())?;
+        }
+
+        // 2. WAL metadata entries.
         {
             let mut wal = self.wal.lock();
             for (offset, record) in &records {
+                let meta = MetaRecord::from(record);
                 wal.append(&WalOp::Insert {
                     offset: *offset,
                     seq: record.insert_seq,
-                    record: record.clone(),
+                    meta,
                 })?;
             }
         }
 
-        // 2. In-memory state.
-        for (offset, record) in &records {
-            self.vectors.put(*offset, record.embedding_f32())?;
-        }
+        // 3. In-memory metadata cache.
         self.meta.put_batch(&records)?;
         {
             let mut idx = self.id_index.write();
@@ -301,11 +352,18 @@ impl StorageEngine {
                 graph.add_memory(&rec.id, &rec.text, &rec.concepts);
             }
         }
+        let mut needs_seal = false;
         {
-            let mut segments = self.segments.write();
+            let segments = self.segments.read();
             for (offset, record) in &records {
-                segments.insert(*offset, record, &self.vectors)?;
+                if segments.insert(*offset, record, &self.vectors)? {
+                    needs_seal = true;
+                }
             }
+        }
+        if needs_seal {
+            let mut segments = self.segments.write();
+            segments.seal_hot(&self.vectors)?;
         }
         Ok(n)
     }
@@ -346,14 +404,15 @@ impl StorageEngine {
     }
 
     fn exact_top_k(&self, query: &[f32], top_k: usize) -> Vec<(String, f32)> {
+        let view = self.vectors.read_view();
         let mut all: Vec<(String, f32)> = self
             .meta
             .records()
             .unwrap_or_default()
             .into_iter()
             .filter_map(|(offset, rec)| {
-                self.vectors.get(offset).map(|v| {
-                    let score = cosine_similarity(query, &v);
+                view.get(offset).map(|v| {
+                    let score = cosine_similarity(query, v);
                     (rec.id.clone(), score)
                 })
             })
@@ -402,8 +461,9 @@ impl StorageEngine {
     /// Hydrate a full `Record` from the metadata cache + vector store.
     fn get_record(&self, offset: PointOffset) -> Option<Record> {
         let meta = self.meta.get(offset).ok().flatten()?;
-        let vec = self.vectors.get(offset)?;
-        Some(meta.with_embedding(Arc::from(Vec::from(&*vec))))
+        let view = self.vectors.read_view();
+        let vec = view.get(offset)?;
+        Some(meta.with_embedding(Arc::from(Vec::from(vec))))
     }
 
     fn find_record_by_id(&self, id: &str) -> Option<Record> {
@@ -498,6 +558,23 @@ impl StorageEngine {
 
     pub fn config(&self) -> &StoreConfig {
         &self.config
+    }
+
+    /// Flush only the vector store to disk.
+    ///
+    /// This is exposed primarily for crash-recovery tests that need embeddings
+    /// to be durable while leaving the WAL un-snapshoted.
+    pub fn flush_vectors(&self) -> crate::Result<()> {
+        self.vectors.flush()
+    }
+
+    /// Flush only the WAL to disk.
+    ///
+    /// Exposed for crash-recovery tests that need the WAL durable without
+    /// snapshoting metadata.
+    pub fn flush_wal(&self) -> crate::Result<()> {
+        let mut wal = self.wal.lock();
+        wal.flush()
     }
 }
 
@@ -619,6 +696,103 @@ mod tests {
             let q = make_vec(8, 2);
             let results = engine.search_ann(&q, 1).unwrap();
             assert_eq!(results[0].0, "mem_2");
+        }
+    }
+
+    #[test]
+    fn wal_truncation_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+            for i in 0..5usize {
+                let v = make_vec(8, i);
+                engine
+                    .insert(&format!("mem_{i}"), &format!("text {i}"), &v, 1.0, &[])
+                    .unwrap();
+            }
+            // Make embeddings and WAL durable but do not snapshot metadata / clear WAL.
+            engine.flush_vectors().unwrap();
+            engine.flush_wal().unwrap();
+        }
+
+        // Simulate a torn write by truncating the last 4 bytes (the CRC of the
+        // final WAL record).  The iterator should detect the CRC mismatch and
+        // stop replay, recovering all preceding records.
+        let wal_path = tmp.path().join("wal").join(crate::wal::WAL_FILE);
+        let bytes = std::fs::read(&wal_path).unwrap();
+        // Walk the WAL to find the byte offset of the final record's CRC.
+        let mut pos = crate::wal::WAL_HEADER_SIZE;
+        let mut last_record_crc_end = pos;
+        while pos + 4 <= bytes.len() {
+            let len = u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                as usize;
+            if pos + 4 + len + 4 > bytes.len() {
+                break;
+            }
+            last_record_crc_end = pos + 4 + len + 4;
+            pos = last_record_crc_end;
+        }
+        // Truncate only the CRC of the last complete record.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal_path)
+            .unwrap();
+        file.set_len((last_record_crc_end - 4) as u64).unwrap();
+        drop(file);
+
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+        assert_eq!(engine.record_count(), 4);
+        for i in 0..4usize {
+            let q = make_vec(8, i);
+            let results = engine.search_ann(&q, 1).unwrap();
+            assert_eq!(results[0].0, format!("mem_{i}"));
+        }
+    }
+
+    #[test]
+    fn wal_replay_without_flush() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+            for i in 0..5usize {
+                let v = make_vec(8, i);
+                engine
+                    .insert(&format!("mem_{i}"), &format!("text {i}"), &v, 1.0, &[])
+                    .unwrap();
+            }
+            engine.flush_vectors().unwrap();
+            engine.flush_wal().unwrap();
+        }
+
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+        assert_eq!(engine.record_count(), 5);
+    }
+
+    #[test]
+    fn hot_warm_cold_persist_and_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+            for i in 0..8usize {
+                let v = make_vec(8, i);
+                engine
+                    .insert(&format!("mem_{i}"), &format!("text {i}"), &v, 1.0, &[])
+                    .unwrap();
+            }
+            // First seal -> SealedHot, second seal -> Warm.
+            engine.trigger_consolidation().unwrap();
+            engine.flush().unwrap();
+        }
+        {
+            let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+            assert_eq!(engine.record_count(), 8);
+            // Each query should be correct regardless of which tier the data
+            // currently lives in.
+            for i in 0..8usize {
+                let q = make_vec(8, i);
+                let results = engine.search_ann(&q, 1).unwrap();
+                assert_eq!(results[0].0, format!("mem_{i}"));
+            }
         }
     }
 

@@ -146,6 +146,14 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     1.0 - cosine_similarity(a, b)
 }
 
+/// Batched cosine similarity between one query and many vectors.
+///
+/// All slices must have the same length.  Returns a vector of scores in
+/// `[-1, 1]` parallel to `vectors`.
+pub fn cosine_similarity_batch(query: &[f32], vectors: &[&[f32]]) -> Vec<f32> {
+    vectors.iter().map(|v| cosine_similarity(query, v)).collect()
+}
+
 fn dot_product_scalar(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }

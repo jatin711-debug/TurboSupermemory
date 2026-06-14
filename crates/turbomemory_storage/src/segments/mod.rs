@@ -45,6 +45,11 @@ pub trait VectorSegment: Send + Sync {
     fn point_count(&self) -> usize;
     fn memory_bytes(&self) -> usize;
     fn flusher(&self) -> Flusher;
+    /// Offsets stored in this segment.  Hot segments return an empty slice
+    /// because they do not track a stable offset list.
+    fn offsets(&self) -> &[PointOffset] {
+        &[]
+    }
 }
 
 /// Merge candidate lists from multiple segments, preserving the highest scores.

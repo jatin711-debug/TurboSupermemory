@@ -10,6 +10,8 @@ pub mod update_handler;
 pub mod vector_store;
 pub mod wal;
 
+pub use engine::StorageEngine;
+
 pub type Result<T> = std::result::Result<T, StorageError>;
 
 #[derive(Debug, thiserror::Error)]

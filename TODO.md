@@ -10,9 +10,9 @@ Status key: **Done** | **In Progress** | **Pending**
 |---|---|---|---|---|
 | 1.1 | Replace `vector-index` with `hnswlib-rs`, `usearch`, or a custom C++ HNSW | `crates/turbomemory_storage/src/segments/hot.rs` | Done | Replaced with `usearch` v2.25; all tests pass |
 | 1.2 | Make the HNSW backend swappable behind a trait | New: `crates/turbomemory_storage/src/index/` | Pending | Lets you benchmark CPU vs GPU backends later |
-| 1.3 | Add bulk insert / bulk build path for sealed segments | `crates/turbomemory_storage/src/segments/hot.rs` | Pending | Qdrant/Chroma build HNSW in bulk, not one-by-one |
+| 1.3 | Add bulk insert / bulk build path for sealed segments | `crates/turbomemory_storage/src/segments/sealed_hot.rs` | Done | `from_vectors` reads from `VectorStore` mmap without `Record` clones; still one-by-one `usearch` adds |
 | 1.4 | Add `VisitedPool` to reuse visited bitsets across searches | `crates/turbomemory_storage/src/index/visited_pool.rs` | Pending | Avoids per-search allocation |
-| 1.5 | Support index save/load/mmap for sealed segments | `crates/turbomemory_storage/src/segments/hot.rs` | Pending | Needed for segment lifecycle |
+| 1.5 | Support index save/load/mmap for sealed segments | `crates/turbomemory_storage/src/segments/sealed_hot.rs`, `warm.rs`, `cold.rs` | Done | SealedHot + Warm + Cold segments persist and reload via manifest + mmap data file |
 | 1.6 | Add deletion / tombstone support in HNSW | `crates/turbomemory_storage/src/segments/hot.rs`, graph layer | Pending | Currently no real delete path |
 | 1.7 | Tune `M`, `ef_construct`, `ef_search` per dimension and dataset size | `crates/turbomemory_storage/src/segments/hot.rs`, config | Pending | `D=8` and `D=1024` need different params |
 | 1.8 | Add `full_scan_threshold` fallback like Qdrant | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Brute force is fine for tiny segments |
@@ -29,8 +29,8 @@ Status key: **Done** | **In Progress** | **Pending**
 | 2.3 | Implement SSE f32 kernels | `crates/turbomemory_core/src/metrics.rs` | Done | SSE dot, L2, dot+norms |
 | 2.4 | Implement AArch64 NEON kernels | `crates/turbomemory_core/src/metrics.rs` | Done | NEON dot, L2, dot+norms |
 | 2.5 | Add runtime CPU feature detection | `crates/turbomemory_core/src/metrics.rs` | Done | `is_x86_feature_detected!` + aarch64 NEON |
-| 2.6 | Add quantized distance kernels (u8, binary, i8 RaBitQ) | `crates/turbomemory_core/src/metrics_quantized.rs` | Pending | Needed for Warm/Cold search |
-| 2.7 | Add batched distance computation for re-ranking | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Helps exact re-ranking throughput |
+| 2.6 | Add quantized distance kernels (u8, binary, i8 RaBitQ) | `crates/turbomemory_core/src/metrics_quantized.rs` | Done | AVX2 u8 scalar + 1-bit sign dot-product kernels; i8/PQ future |
+| 2.7 | Add batched distance computation for re-ranking | `crates/turbomemory_core/src/metrics.rs`, `segment_holder.rs` | Done | `cosine_similarity_batch` + chunked rerank in `SegmentHolder::search` |
 | 2.8 | (Future) cuBLAS / CUDA batched dot-product path | New: `crates/turbomemory_gpu/` | Pending | Only after CPU path is competitive |
 
 ---
@@ -39,8 +39,8 @@ Status key: **Done** | **In Progress** | **Pending**
 
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
-| 3.1 | Make WAL the primary durability source of truth | `crates/turbomemory_storage/src/wal.rs`, `engine.rs` | Done | Engine appends WAL first; `redb` is snapshot |
-| 3.2 | Append to WAL first, then update in-memory state | `crates/turbomemory_storage/src/engine.rs` | Done | `insert`/`insert_batch` write WAL before cache/segments |
+| 3.1 | Make WAL the primary durability source of truth | `crates/turbomemory_storage/src/wal.rs`, `engine.rs` | Done | Embeddings now durable in `VectorStore`; WAL is metadata-only |
+| 3.2 | Append to WAL first, then update in-memory state | `crates/turbomemory_storage/src/engine.rs` | Done | `VectorStore.put` first, then metadata WAL, then metadata cache/segments |
 | 3.3 | Stop committing `redb` on every insert | `crates/turbomemory_storage/src/engine.rs` | Done | `meta.put` only updates cache; redb flushed lazily |
 | 3.4 | Use `redb` only for metadata / ID maps, or replace it | `crates/turbomemory_storage/src/engine.rs` | Done | `redb` is now metadata snapshot + sequences |
 | 3.5 | Add atomic segment swap during optimization | `crates/turbomemory_storage/src/segment_holder.rs` | Done | `seal_hot` swaps via `std::mem::replace` under write lock |
@@ -58,7 +58,7 @@ Status key: **Done** | **In Progress** | **Pending**
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
 | 4.1 | Define sealed/immutable segment type | `crates/turbomemory_storage/src/segments/` | Pending | Hot is appendable; Warm/Cold should be immutable |
-| 4.2 | Implement Hot → Warm sealing when Hot hits size threshold | `crates/turbomemory_storage/src/segment_holder.rs` | In Progress | Manual consolidation exists; make threshold-driven |
+| 4.2 | Implement Hot → Warm sealing when Hot hits size threshold | `crates/turbomemory_storage/src/segment_holder.rs` | Done | First seal → SealedHot; subsequent seals → Warm; Warm → Cold when over capacity |
 | 4.3 | Implement Warm → Cold demotion | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Use access scoring |
 | 4.4 | Add indexing optimizer: build HNSW once segment is large enough | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Avoids indexing tiny segments |
 | 4.5 | Add merge optimizer to reduce segment count | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Too many segments hurts search |
@@ -72,14 +72,14 @@ Status key: **Done** | **In Progress** | **Pending**
 
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
-| 5.1 | Actually route vectors to Warm/Cold tiers by access frequency | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Currently everything stays Hot |
+| 5.1 | Actually route vectors to Warm/Cold tiers by access frequency | `crates/turbomemory_storage/src/segment_holder.rs` | Done | Hot → SealedHot → Warm → Cold lifecycle now active; promotion back to Hot by access score |
 | 5.2 | Add access scoring / recency tracking per record | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Needed for promotion/demotion |
 | 5.3 | Implement scalar quantization with per-segment calibration | `crates/turbomemory_storage/src/segments/warm.rs` | Done | Exists; ensure it is used |
 | 5.4 | Implement product quantization (PQ) option | `crates/turbomemory_storage/src/segments/warm.rs` | Pending | Better recall/compression than scalar |
 | 5.5 | Implement binary / 1-bit quantization for Cold tier | `crates/turbomemory_storage/src/segments/cold.rs` | Done | Exists; ensure it is used |
 | 5.6 | Precompute query LUT for quantized scoring | `crates/turbomemory_storage/src/segments/warm.rs` | In Progress | Exists; verify SIMD/fast path |
-| 5.7 | Add mmap-backed quantized vector storage | `crates/turbomemory_storage/src/segments/{warm,cold}.rs` | In Progress | Chunked mmap exists for Warm |
-| 5.8 | Add promotion from Warm/Cold back to Hot on access | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Cognitive / ANN hot data should stay fast |
+| 5.7 | Add mmap-backed quantized vector storage | `crates/turbomemory_storage/src/segments/{warm,cold}.rs` | Done | Warm/Cold segments write manifest + mmap data file and reload on open |
+| 5.8 | Add promotion from Warm/Cold back to Hot on access | `crates/turbomemory_storage/src/segment_holder.rs` | Done | `promote_hot` uses access score; now reachable because Warm/Cold tiers are populated |
 | 5.9 | Hot/Warm/Cold segment scaffolding | `crates/turbomemory_storage/src/segments/` | Done | Architecture in place |
 
 ---
@@ -88,10 +88,10 @@ Status key: **Done** | **In Progress** | **Pending**
 
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
-| 6.1 | Replace `Vec<f32>` clones with mmap-backed storage | `crates/turbomemory_storage/src/vector_store.rs` | Done | `VectorStore` mmap-backed dense f32 file keyed by `PointOffset` |
+| 6.1 | Replace `Vec<f32>` clones with mmap-backed storage | `crates/turbomemory_storage/src/vector_store.rs` | Done | `VectorStore` mmap-backed dense f32 file keyed by `PointOffset`; header CRC + `VectorReadView` for lock-free reads |
 | 6.2 | Use `bytemuck` for zero-copy `&[f32]`/`&[u8]` views | `crates/turbomemory_storage/src/segments/mmap_array.rs` | Done | Added `as_typed_slice<T>` / `as_typed_slice_mut<T>` |
 | 6.3 | Introduce `CowVector` / `BorrowedVector` abstractions | `crates/turbomemory_core/src/` | Pending | Defer until dense vector store refactor |
-| 6.4 | Store vectors in contiguous aligned arrays | `crates/turbomemory_storage/src/vector_store.rs` | Done | `VectorStore` uses contiguous `f32` array |
+| 6.4 | Store vectors in contiguous aligned arrays | `crates/turbomemory_storage/src/vector_store.rs` | Done | `VectorStore` uses contiguous `f32` array; search/rerank use `read_view` to avoid per-get locks |
 | 6.5 | Avoid `String` clones in `id_index`; use `Arc<str>` or string pool | `crates/turbomemory_storage/src/engine.rs` | Done | `id_index` is now `ahash::HashMap<Arc<str>, PointOffset>` |
 | 6.6 | Use `smallvec` for short candidate / link lists | `crates/turbomemory_storage/src/segments/mod.rs` | Done | `merge_candidates` uses `SmallVec<[ScoredPoint; 64]>` |
 | 6.7 | Use `ahash` for `id_index` and graph maps | `crates/turbomemory_storage/src/engine.rs` | Done | `id_index` uses `ahash` |
@@ -105,10 +105,10 @@ Status key: **Done** | **In Progress** | **Pending**
 |---|---|---|---|---|
 | 7.1 | Remove `Mutex<StorageEngine>` from Python binding | `crates/turbomemory_python/src/lib.rs` | Done | `PyMemoryEngine` holds `Arc<StorageEngine>` directly |
 | 7.2 | Use `Arc<StorageEngine>` + `RwLock` for segment holder | `crates/turbomemory_storage/src/engine.rs` | Done | StorageEngine already uses `Arc<RwLock>` |
-| 7.3 | Add `parking_lot::upgradable_read` for segment mutation | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Better than plain RwLock |
-| 7.4 | Separate read/write locks per segment | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Fine-grained concurrency |
+| 7.3 | Add `parking_lot::upgradable_read` for segment mutation | `crates/turbomemory_storage/src/segment_holder.rs` | Done | `insert` uses holder read lock + per-segment write lock; seal takes holder write lock only when needed |
+| 7.4 | Separate read/write locks per segment | `crates/turbomemory_storage/src/segment_holder.rs` | Done | Each segment is `Arc<RwLock<dyn VectorSegment>>`; searches lock per-segment |
 | 7.5 | Use lock-free object pools where possible | Search / visited lists | Pending | Reduces contention |
-| 7.6 | Ensure background optimizer doesn't block readers | `crates/turbomemory_storage/src/update_handler.rs` | Pending | Copy-on-write segment swap |
+| 7.6 | Ensure background optimizer doesn't block readers | `crates/turbomemory_storage/src/update_handler.rs` | Done | Sealing builds the new segment under holder write lock briefly; readers use per-segment locks |
 | 7.7 | Add graceful shutdown: stop workers, flush WAL, close mmap | `crates/turbomemory_storage/src/engine.rs`, `main.rs` | Pending | Prevents corruption |
 
 ---

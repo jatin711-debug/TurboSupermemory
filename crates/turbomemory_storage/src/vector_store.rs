@@ -13,7 +13,7 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 4] = b"TMDV";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const HEADER_SIZE: usize = std::mem::size_of::<Header>();
 
 #[repr(C)]
@@ -23,10 +23,44 @@ struct Header {
     version: u32,
     dimension: u32,
     count: u64,
+    header_crc: u32,
+    reserved0: u32,
+    reserved1: u32,
+    reserved2: u32,
 }
 
 unsafe impl Zeroable for Header {}
 unsafe impl Pod for Header {}
+
+fn compute_header_crc(header: &Header) -> u32 {
+    let mut copy = *header;
+    copy.header_crc = 0;
+    crc32fast::hash(bytemuck::bytes_of(&copy))
+}
+
+fn validate_header(header: &Header, expected_dim: usize) -> crate::Result<()> {
+    if header.magic != *MAGIC {
+        return Err(StorageError::InvalidArgument(
+            "vector store has invalid magic".into(),
+        ));
+    }
+    if header.version != VERSION {
+        return Err(StorageError::InvalidArgument(format!(
+            "vector store version {} not supported",
+            header.version
+        )));
+    }
+    if header.dimension as usize != expected_dim {
+        return Err(StorageError::DimensionMismatch);
+    }
+    let computed = compute_header_crc(header);
+    if computed != header.header_crc {
+        return Err(StorageError::InvalidArgument(
+            "vector store header CRC mismatch".into(),
+        ));
+    }
+    Ok(())
+}
 
 struct Inner {
     file: File,
@@ -80,7 +114,13 @@ impl VectorStore {
             version: VERSION,
             dimension: dim as u32,
             count: 0,
+            header_crc: 0,
+            reserved0: 0,
+            reserved1: 0,
+            reserved2: 0,
         };
+        let crc = compute_header_crc(&header);
+        let header = Header { header_crc: crc, ..header };
         write_header(&mut mmap, header);
 
         Ok(Self {
@@ -110,20 +150,7 @@ impl VectorStore {
             ));
         }
         let header: Header = *bytemuck::from_bytes(&mmap[..HEADER_SIZE]);
-        if header.magic != *MAGIC {
-            return Err(StorageError::InvalidArgument(
-                "vector store has invalid magic".into(),
-            ));
-        }
-        if header.version != VERSION {
-            return Err(StorageError::InvalidArgument(format!(
-                "vector store version {} not supported",
-                header.version
-            )));
-        }
-        if header.dimension as usize != dim {
-            return Err(StorageError::DimensionMismatch);
-        }
+        validate_header(&header, dim)?;
         let file_len = mmap.len();
         let slots = file_len
             .saturating_sub(HEADER_SIZE)
@@ -174,6 +201,17 @@ impl VectorStore {
         }))
     }
 
+    /// Return a stable read view of the vector store.
+    ///
+    /// The view holds a single read lock for its lifetime, so all reads through
+    /// it are lock-free and see a consistent mmap snapshot.  This is the
+    /// preferred API for search and reranking.
+    pub fn read_view(&self) -> VectorReadView<'_> {
+        VectorReadView {
+            inner: self.inner.read(),
+        }
+    }
+
     /// Return the number of populated slots (max offset + 1).
     pub fn count(&self) -> usize {
         self.inner.read().count
@@ -196,9 +234,40 @@ impl VectorStore {
         let mmap = inner.mmap.as_mut().unwrap();
         let mut header: Header = *bytemuck::from_bytes(&mmap[..HEADER_SIZE]);
         header.count = count as u64;
+        let crc = compute_header_crc(&header);
+        header.header_crc = crc;
         write_header(mmap, header);
         mmap.flush()?;
         Ok(())
+    }
+}
+
+/// Stable read view into a `VectorStore`.
+pub struct VectorReadView<'a> {
+    inner: RwLockReadGuard<'a, Inner>,
+}
+
+impl VectorReadView<'_> {
+    /// Read the vector at `offset` without taking an additional lock.
+    pub fn get(&self, offset: PointOffset) -> Option<&[f32]> {
+        let idx = offset as usize;
+        if idx >= self.inner.count {
+            return None;
+        }
+        let mmap = self.inner.mmap.as_ref().unwrap();
+        let start = HEADER_SIZE + idx * self.inner.dim * 4;
+        let end = start + self.inner.dim * 4;
+        Some(bytemuck::cast_slice(&mmap[start..end]))
+    }
+
+    /// Return the number of populated slots in this view.
+    pub fn count(&self) -> usize {
+        self.inner.count
+    }
+
+    /// Return the vector dimension.
+    pub fn dimension(&self) -> usize {
+        self.inner.dim
     }
 }
 
@@ -236,7 +305,13 @@ fn grow_inner(inner: &mut Inner, min_idx: usize) -> crate::Result<()> {
         version: VERSION,
         dimension: inner.dim as u32,
         count: inner.count as u64,
+        header_crc: 0,
+        reserved0: 0,
+        reserved1: 0,
+        reserved2: 0,
     };
+    let crc = compute_header_crc(&header);
+    let header = Header { header_crc: crc, ..header };
     write_header(&mut mmap, header);
     inner.mmap = Some(mmap);
     inner.slots = new_slots;

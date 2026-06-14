@@ -4,12 +4,13 @@
 //! building blocks (FWHT, Lloyd-Max tables, scalar/sign quantization).
 
 pub mod metrics;
+pub mod metrics_quantized;
 pub mod quantization;
 pub mod quantized_search;
 
 pub use metrics::{
-    cosine_distance, cosine_similarity, dot_and_norms, dot_product, l2_distance_sq, CosineMetric,
-    DotProductMetric, EuclideanMetric, Metric,
+    cosine_distance, cosine_similarity, cosine_similarity_batch, dot_and_norms, dot_product,
+    l2_distance_sq, CosineMetric, DotProductMetric, EuclideanMetric, Metric,
 };
 pub use quantization::{LloydMaxTable, Quantizer, ScalarQuantizer, SignQuantizer};
 pub use quantized_search::{EncodedQuery, QuantizedStore};

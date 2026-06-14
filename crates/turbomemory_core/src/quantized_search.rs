@@ -1,4 +1,4 @@
-//! Quantized distance computation via lookup tables.
+//! Quantized distance computation via lookup tables and SIMD kernels.
 
 use crate::quantization::{ScalarQuantizer, SignQuantizer};
 use crate::Result;
@@ -8,71 +8,62 @@ pub trait EncodedQuery: Send + Sync {
     fn score(&self, encoded: &[u8]) -> f32;
 }
 
-/// Lookup-table encoded query for [`ScalarQuantizer`].
-///
-/// For each dimension `i` and each possible code `c`, `lut[i * 256 + c]` stores
-/// `query_i * dequantized(c)`.  The score is the sum over dimensions.
+/// SIMD-accelerated encoded query for [`ScalarQuantizer`].
 pub struct ScalarEncodedQuery {
     dim: usize,
-    lut: Vec<f32>,
+    query: Vec<f32>,
+    min: f32,
+    scale: f32,
 }
 
 impl ScalarEncodedQuery {
     pub fn new(query: &[f32], quantizer: &ScalarQuantizer) -> Result<Self> {
         crate::validate_dimension(query, quantizer.dim)?;
-        let dim = quantizer.dim;
-        let mut lut = vec![0.0f32; dim * 256];
-        for (i, &qi) in query.iter().enumerate() {
-            let base = i * 256;
-            for c in 0..256u32 {
-                let value = quantizer.decode_coordinate(c as u8);
-                lut[base + c as usize] = qi * value;
-            }
-        }
-        Ok(Self { dim, lut })
+        let levels = quantizer.levels();
+        let scale = if levels < f32::EPSILON {
+            0.0
+        } else {
+            (quantizer.max - quantizer.min) / levels
+        };
+        Ok(Self {
+            dim: quantizer.dim,
+            query: query.to_vec(),
+            min: quantizer.min,
+            scale,
+        })
     }
 }
 
 impl EncodedQuery for ScalarEncodedQuery {
     fn score(&self, encoded: &[u8]) -> f32 {
-        let mut sum = 0.0f32;
-        for (i, &code) in encoded.iter().enumerate().take(self.dim) {
-            sum += self.lut[i * 256 + code as usize];
-        }
-        sum
+        crate::metrics_quantized::scalar_quantized_dot(
+            &self.query,
+            &encoded[..self.dim],
+            self.min,
+            self.scale,
+        )
     }
 }
 
-/// Encoded query for [`SignQuantizer`].
+/// SIMD-accelerated encoded query for [`SignQuantizer`].
 pub struct SignEncodedQuery {
     dim: usize,
-    pos: Vec<f32>,
-    neg: Vec<f32>,
+    query: Vec<f32>,
 }
 
 impl SignEncodedQuery {
     pub fn new(query: &[f32], quantizer: &SignQuantizer) -> Result<Self> {
         crate::validate_dimension(query, quantizer.dim)?;
-        let dim = quantizer.dim;
-        let mut pos = Vec::with_capacity(dim);
-        let mut neg = Vec::with_capacity(dim);
-        for &q in query {
-            pos.push(q);
-            neg.push(-q);
-        }
-        Ok(Self { dim, pos, neg })
+        Ok(Self {
+            dim: quantizer.dim,
+            query: query.to_vec(),
+        })
     }
 }
 
 impl EncodedQuery for SignEncodedQuery {
     fn score(&self, encoded: &[u8]) -> f32 {
-        let mut sum = 0.0f32;
-        for i in 0..self.dim {
-            let byte = encoded[i / 8];
-            let bit = byte & (1 << (i % 8)) != 0;
-            sum += if bit { self.pos[i] } else { self.neg[i] };
-        }
-        sum
+        crate::metrics_quantized::sign_quantized_dot(&self.query, &encoded[..self.dim.div_ceil(8)])
     }
 }
 

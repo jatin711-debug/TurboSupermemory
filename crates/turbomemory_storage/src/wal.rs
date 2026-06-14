@@ -1,17 +1,33 @@
 //! A simple append-only write-ahead log with CRC32-C framed records.
 //!
 //! Format:
+//!   [magic: 4 bytes "TMSW"] [version: u32 BE]
 //!   [length: u32 BE] [payload: length bytes] [crc: u32 BE]
 //!
-//! This mirrors Qdrant's WAL framing but is intentionally minimal.
+//! The WAL stores metadata operations only; full embeddings live in the
+//! `VectorStore` mmap.  This removes the largest in-memory duplicate.
 
-use crate::record::{PointOffset, Record};
+use crate::record::{MetaRecord, PointOffset};
+use bytemuck::{Pod, Zeroable};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-const WAL_FILE: &str = "wal.bin";
+pub const WAL_FILE: &str = "wal_meta.bin";
+const WAL_MAGIC: &[u8; 4] = b"TMSW";
+const WAL_VERSION: u32 = 1;
+pub const WAL_HEADER_SIZE: usize = std::mem::size_of::<WalHeader>();
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WalHeader {
+    magic: [u8; 4],
+    version: u32,
+}
+
+unsafe impl Zeroable for WalHeader {}
+unsafe impl Pod for WalHeader {}
 
 /// A record in the WAL.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -19,7 +35,7 @@ pub enum WalOp {
     Insert {
         offset: PointOffset,
         seq: u64,
-        record: Record,
+        meta: MetaRecord,
     },
     Delete {
         offset: PointOffset,
@@ -40,11 +56,39 @@ impl Wal {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
         let path = dir.join(WAL_FILE);
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
             .open(&path)?;
+
+        let metadata = file.metadata()?;
+        if metadata.len() == 0 {
+            // New file: write header.
+            let header = WalHeader {
+                magic: *WAL_MAGIC,
+                version: WAL_VERSION,
+            };
+            file.write_all(bytemuck::bytes_of(&header))?;
+            file.sync_data()?;
+        } else {
+            // Verify existing header.
+            let mut header_bytes = [0u8; WAL_HEADER_SIZE];
+            file.read_exact(&mut header_bytes)?;
+            let header: WalHeader = *bytemuck::from_bytes(&header_bytes);
+            if header.magic != *WAL_MAGIC {
+                return Err(crate::StorageError::InvalidArgument(
+                    "WAL has invalid magic".into(),
+                ));
+            }
+            if header.version != WAL_VERSION {
+                return Err(crate::StorageError::InvalidArgument(format!(
+                    "WAL version {} not supported",
+                    header.version
+                )));
+            }
+        }
+
         Ok(Self { path, file })
     }
 
@@ -67,7 +111,8 @@ impl Wal {
     }
 
     pub fn iter(&self) -> crate::Result<WalIter> {
-        let file = File::open(&self.path)?;
+        let mut file = File::open(&self.path)?;
+        file.seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))?;
         Ok(WalIter {
             reader: BufReader::new(file),
         })
@@ -80,6 +125,12 @@ impl Wal {
             .append(true)
             .read(true)
             .open(&self.path)?;
+        let header = WalHeader {
+            magic: *WAL_MAGIC,
+            version: WAL_VERSION,
+        };
+        self.file.write_all(bytemuck::bytes_of(&header))?;
+        self.file.sync_data()?;
         Ok(())
     }
 }
@@ -100,10 +151,14 @@ impl Iterator for WalIter {
         };
         let mut payload = vec![0u8; len];
         if let Err(e) = self.reader.read_exact(&mut payload) {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                return None;
+            }
             return Some(Err(e.into()));
         }
         let stored_crc = match self.reader.read_u32::<BigEndian>() {
             Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
             Err(e) => return Some(Err(e.into())),
         };
         let computed_crc = crc32fast::hash(&payload);
@@ -119,20 +174,19 @@ impl Iterator for WalIter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use crate::config::Tier;
 
-    fn dummy_record(id: &str) -> Record {
-        Record {
+    fn dummy_meta(id: &str) -> MetaRecord {
+        MetaRecord {
             id: id.to_string(),
             text: "text".to_string(),
-            embedding: Arc::from(vec![1.0f32, 0.0, 0.0]),
             importance: 1.0,
             concepts: vec![],
             created_at: 0,
             insert_seq: 0,
             access_count: 0,
             last_accessed: 0,
-            tier: crate::config::Tier::Hot,
+            tier: Tier::Hot,
         }
     }
 
@@ -143,13 +197,13 @@ mod tests {
         wal.append(&WalOp::Insert {
             offset: 1,
             seq: 10,
-            record: dummy_record("a"),
+            meta: dummy_meta("a"),
         })
         .unwrap();
         wal.append(&WalOp::Insert {
             offset: 2,
             seq: 11,
-            record: dummy_record("b"),
+            meta: dummy_meta("b"),
         })
         .unwrap();
         wal.flush().unwrap();

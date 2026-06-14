@@ -27,3 +27,9 @@ bytemuck = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = { workspace = true }
+
+[[bench]]
+name = "vector_search"
+harness = false

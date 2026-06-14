@@ -53,7 +53,23 @@ impl SealedHotSegment {
         config: &StoreConfig,
         records: &[(PointOffset, Record)],
     ) -> crate::Result<Self> {
-        if records.is_empty() {
+        let vectors: Vec<(PointOffset, &[f32])> = records
+            .iter()
+            .map(|(offset, rec)| (*offset, rec.embedding_f32()))
+            .collect();
+        Self::from_vectors(path, config, &vectors)
+    }
+
+    /// Bulk-build a sealed segment from `(offset, vector)` pairs.
+    ///
+    /// This avoids allocating temporary `Record`s; vectors are read directly
+    /// from the `VectorStore` mmap and added one-by-one to the `usearch` index.
+    pub fn from_vectors(
+        path: impl AsRef<Path>,
+        config: &StoreConfig,
+        vectors: &[(PointOffset, &[f32])],
+    ) -> crate::Result<Self> {
+        if vectors.is_empty() {
             return Err(StorageError::InvalidArgument(
                 "cannot seal an empty hot segment".into(),
             ));
@@ -65,12 +81,12 @@ impl SealedHotSegment {
         let index = Index::new(&options)
             .map_err(|e| StorageError::IndexError(format!("usearch index creation failed: {e}")))?;
         index
-            .reserve(records.len().max(1))
+            .reserve(vectors.len().max(1))
             .map_err(|e| StorageError::IndexError(format!("usearch reserve failed: {e}")))?;
 
-        for (offset, rec) in records {
+        for (offset, vector) in vectors {
             index
-                .add(*offset, rec.embedding_f32())
+                .add(*offset, vector)
                 .map_err(|e| StorageError::IndexError(format!("usearch add failed: {e}")))?;
         }
 
@@ -82,7 +98,7 @@ impl SealedHotSegment {
             .save(index_path_str)
             .map_err(|e| StorageError::IndexError(format!("usearch save failed: {e}")))?;
 
-        let offsets: Vec<PointOffset> = records.iter().map(|(offset, _)| *offset).collect();
+        let offsets: Vec<PointOffset> = vectors.iter().map(|(offset, _)| *offset).collect();
         let manifest = Manifest {
             version: 1,
             dimension: config.dimension,
@@ -183,6 +199,10 @@ impl VectorSegment for SealedHotSegment {
 
     fn point_count(&self) -> usize {
         self.point_count()
+    }
+
+    fn offsets(&self) -> &[PointOffset] {
+        &self.offsets
     }
 
     fn memory_bytes(&self) -> usize {

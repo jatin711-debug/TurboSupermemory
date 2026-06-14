@@ -6,10 +6,23 @@ use crate::segments::mmap_array::{MmapBuffer, MmapFileWriter};
 use crate::segments::{ScoredPoint, VectorSegment};
 use crate::vector_store::VectorStore;
 use crate::StorageError;
+use serde::{Deserialize, Serialize};
+use std::fs;
 use std::path::{Path, PathBuf};
 use turbomemory_core::quantization::{Quantizer, SignQuantizer};
 use turbomemory_core::quantized_search::{EncodedQuery, QuantizedStore};
 use turbomemory_core::{cosine_similarity, validate_dimension};
+
+const DATA_FILE: &str = "data.bin";
+const MANIFEST_FILE: &str = "manifest.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Manifest {
+    version: u32,
+    dimension: usize,
+    quantizer: SignQuantizer,
+    offsets: Vec<PointOffset>,
+}
 
 /// Immutable Cold segment.
 pub struct ColdSegment {
@@ -37,8 +50,10 @@ impl ColdSegment {
         let dim = records[0].1.embedding_f32().len();
         let quantizer = SignQuantizer::new(dim);
         let path = path.as_ref().to_path_buf();
+        fs::create_dir_all(&path)?;
 
-        let mut writer = MmapFileWriter::new(&path);
+        let data_path = path.join(DATA_FILE);
+        let mut writer = MmapFileWriter::new(&data_path);
         let mut offsets = Vec::with_capacity(records.len());
         for (offset, rec) in records {
             let encoded = quantizer
@@ -48,6 +63,17 @@ impl ColdSegment {
             offsets.push(*offset);
         }
         let buffer = writer.finish()?;
+
+        let manifest = Manifest {
+            version: 1,
+            dimension: dim,
+            quantizer: quantizer.clone(),
+            offsets: offsets.clone(),
+        };
+        let manifest_json = serde_json::to_string_pretty(&manifest)
+            .map_err(|e| StorageError::Serialize(Box::new(bincode::ErrorKind::Custom(e.to_string()))))?;
+        fs::write(path.join(MANIFEST_FILE), manifest_json)?;
+
         Ok(Self {
             dim,
             quantizer,
@@ -57,10 +83,35 @@ impl ColdSegment {
         })
     }
 
-    pub fn open(_path: impl AsRef<Path>) -> crate::Result<Self> {
-        Err(StorageError::InvalidArgument(
-            "ColdSegment::open is not implemented".into(),
-        ))
+    pub fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let manifest: Manifest = {
+            let bytes = fs::read(path.join(MANIFEST_FILE))?;
+            serde_json::from_slice(&bytes)
+                .map_err(|e| StorageError::InvalidArgument(format!("bad cold manifest: {e}")))?
+        };
+
+        let data_path = path.join(DATA_FILE);
+        let buffer = MmapBuffer::open(&data_path)?;
+
+        let expected_bytes = manifest
+            .offsets
+            .len()
+            .checked_mul(manifest.quantizer.encoded_bytes_per_vector())
+            .ok_or_else(|| StorageError::InvalidArgument("cold segment size overflow".into()))?;
+        if buffer.len() < expected_bytes {
+            return Err(StorageError::InvalidArgument(
+                "cold segment data file is too small".into(),
+            ));
+        }
+
+        Ok(Self {
+            dim: manifest.dimension,
+            quantizer: manifest.quantizer,
+            offsets: manifest.offsets,
+            buffer,
+            path,
+        })
     }
 
     fn encoded_vector(&self, idx: usize) -> &[u8] {
@@ -114,12 +165,13 @@ impl VectorSegment for ColdSegment {
         });
         let candidates: Vec<_> = all.into_iter().take(top_k).collect();
 
+        let view = vectors.read_view();
         let mut reranked: Vec<ScoredPoint> = candidates
             .into_iter()
             .filter_map(|c| {
-                vectors.get(c.offset).map(|v| ScoredPoint {
+                view.get(c.offset).map(|v| ScoredPoint {
                     offset: c.offset,
-                    score: cosine_similarity(query, &v),
+                    score: cosine_similarity(query, v),
                     tier: Tier::Cold,
                 })
             })
@@ -137,6 +189,10 @@ impl VectorSegment for ColdSegment {
         self.offsets.len()
     }
 
+    fn offsets(&self) -> &[PointOffset] {
+        &self.offsets
+    }
+
     fn memory_bytes(&self) -> usize {
         self.buffer.len()
     }
@@ -144,7 +200,7 @@ impl VectorSegment for ColdSegment {
     fn flusher(&self) -> Flusher {
         let path = self.path.clone();
         Box::new(move || {
-            if std::fs::metadata(&path).is_ok() {
+            if fs::metadata(&path).is_ok() {
                 Ok(())
             } else {
                 Err(StorageError::InvalidArgument(

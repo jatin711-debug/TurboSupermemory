@@ -205,8 +205,8 @@ def run_verification(db_path_arg):
 
     # 4. Test Consolidation Merge
     logger.info("Step 4: Testing Dynamic Consolidation (StreamingMerge)...")
-    ops, dels = engine.trigger_consolidation()
-    logger.info(f"Consolidation complete: ops={ops} tier transitions, dels={dels} index updates.")
+    sealed, compacted, promoted = engine.trigger_consolidation()
+    logger.info(f"Consolidation complete: sealed={sealed}, compacted={compacted}, promoted={promoted}.")
     logger.info("Consolidation merge test passed.")
 
     logger.info("=========================================================================")

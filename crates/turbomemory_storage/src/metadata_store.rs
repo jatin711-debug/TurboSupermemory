@@ -45,7 +45,7 @@ impl MetadataStore {
                     .values()
                     .map(|r| r.insert_seq + 1)
                     .max()
-                    .unwrap_or(0)
+                    .unwrap_or(1)
             });
         Ok(Self {
             db,
