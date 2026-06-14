@@ -3,9 +3,14 @@
 //! Provides vector math, distance functions, and compression/quantization
 //! building blocks (FWHT, Lloyd-Max tables, scalar/sign quantization).
 
+pub mod metrics;
 pub mod quantization;
 pub mod quantized_search;
 
+pub use metrics::{
+    cosine_distance, cosine_similarity, dot_and_norms, dot_product, l2_distance_sq, CosineMetric,
+    DotProductMetric, EuclideanMetric, Metric,
+};
 pub use quantization::{LloydMaxTable, Quantizer, ScalarQuantizer, SignQuantizer};
 pub use quantized_search::{EncodedQuery, QuantizedStore};
 
@@ -37,35 +42,6 @@ pub fn validate_dimension(vec: &[f32], dim: usize) -> Result<()> {
         })
     } else {
         Ok(())
-    }
-}
-
-/// Squared Euclidean distance.
-pub fn l2_distance_sq(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| {
-            let d = x - y;
-            d * d
-        })
-        .sum()
-}
-
-/// Cosine similarity in [-1, 1]. Inputs should be normalized for dot-product retrieval.
-pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let mut dot = 0.0f32;
-    let mut na = 0.0f32;
-    let mut nb = 0.0f32;
-    for (x, y) in a.iter().zip(b) {
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-    }
-    let denom = na.sqrt() * nb.sqrt();
-    if denom == 0.0 {
-        0.0
-    } else {
-        (dot / denom).clamp(-1.0, 1.0)
     }
 }
 

@@ -1,10 +1,15 @@
-//! Durable metadata store backed by redb.
+//! Durable metadata store backed by redb with an in-memory cache.
+//!
+//! `redb` is now a lazy snapshot, not the primary durability log.  Writes land
+//! in the WAL first; `MetadataStore` caches records in memory and flushes
+//! dirty entries to `redb` when asked.
 
 use crate::config::Flusher;
 use crate::record::{PointOffset, Record};
 use crate::StorageError;
+use parking_lot::{Mutex, RwLock};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -15,6 +20,8 @@ const META_TABLE: TableDefinition<&str, &str> = TableDefinition::new("meta");
 pub struct MetadataStore {
     db: Database,
     db_path: PathBuf,
+    records: RwLock<HashMap<PointOffset, Record>>,
+    dirty: Mutex<HashSet<PointOffset>>,
     next_offset: AtomicU64,
     next_seq: AtomicU64,
 }
@@ -41,6 +48,8 @@ impl MetadataStore {
         Ok(Self {
             db,
             db_path,
+            records: RwLock::new(records),
+            dirty: Mutex::new(HashSet::new()),
             next_offset: AtomicU64::new(next_offset),
             next_seq: AtomicU64::new(next_seq),
         })
@@ -70,52 +79,81 @@ impl MetadataStore {
         table.get(key).ok()??.value().to_string().into()
     }
 
+    /// Return a snapshot of all cached records.
     pub fn records(&self) -> crate::Result<HashMap<PointOffset, Record>> {
-        Self::load_records(&self.db)
+        Ok(self.records.read().clone())
     }
 
+    /// Look up a record from the in-memory cache.
     pub fn get(&self, offset: PointOffset) -> crate::Result<Option<Record>> {
-        let txn = redb(self.db.begin_read())?;
-        if let Ok(table) = txn.open_table(RECORDS_TABLE) {
-            if let Some(v) = redb(table.get(offset))? {
-                return Ok(Some(bincode::deserialize(v.value())?));
-            }
-        }
-        Ok(None)
+        Ok(self.records.read().get(&offset).cloned())
     }
 
+    /// Insert or update a record in the cache and mark it dirty for the next flush.
     pub fn put(&self, offset: PointOffset, record: &Record) -> crate::Result<()> {
-        let txn = redb(self.db.begin_write())?;
-        {
-            let mut table = redb(txn.open_table(RECORDS_TABLE))?;
-            let bytes = bincode::serialize(record)?;
-            redb(table.insert(offset, bytes.as_slice()))?;
-        }
-        redb(txn.commit())?;
+        let mut records = self.records.write();
+        records.insert(offset, record.clone());
+        drop(records);
+        self.dirty.lock().insert(offset);
         Ok(())
     }
 
+    /// Batch insert/update records in the cache.
     pub fn put_batch(&self, records: &[(PointOffset, Record)]) -> crate::Result<()> {
         if records.is_empty() {
             return Ok(());
         }
-        let txn = redb(self.db.begin_write())?;
-        {
-            let mut table = redb(txn.open_table(RECORDS_TABLE))?;
-            for (offset, rec) in records {
-                let bytes = bincode::serialize(rec)?;
-                redb(table.insert(*offset, bytes.as_slice()))?;
-            }
+        let mut cache = self.records.write();
+        let mut dirty = self.dirty.lock();
+        for (offset, rec) in records {
+            cache.insert(*offset, rec.clone());
+            dirty.insert(*offset);
         }
-        redb(txn.commit())?;
         Ok(())
     }
 
+    /// Remove a record from the cache and mark the slot dirty.
     pub fn remove(&self, offset: PointOffset) -> crate::Result<()> {
+        let mut records = self.records.write();
+        records.remove(&offset);
+        drop(records);
+        self.dirty.lock().insert(offset);
+        Ok(())
+    }
+
+    /// Persist dirty records, sequence counters, and the last applied WAL seq
+    /// to `redb` in a single transaction.
+    pub fn flush(&self, last_applied_seq: u64) -> crate::Result<()> {
+        let dirty: HashSet<PointOffset> = std::mem::take(&mut *self.dirty.lock());
+        if dirty.is_empty()
+            && self.last_applied_seq() == Some(last_applied_seq)
+            && self.records.read().is_empty()
+        {
+            // Nothing to do and snapshot already matches.
+            return Ok(());
+        }
+
+        let records = self.records.read();
         let txn = redb(self.db.begin_write())?;
         {
             let mut table = redb(txn.open_table(RECORDS_TABLE))?;
-            redb(table.remove(offset))?;
+            for offset in &dirty {
+                if let Some(rec) = records.get(offset) {
+                    let bytes = bincode::serialize(rec)?;
+                    redb(table.insert(*offset, bytes.as_slice()))?;
+                } else {
+                    redb(table.remove(*offset))?;
+                }
+            }
+        }
+        {
+            let mut meta = redb(txn.open_table(META_TABLE))?;
+            let next_offset_str = self.next_offset.load(Ordering::SeqCst).to_string();
+            redb(meta.insert("next_offset", next_offset_str.as_str()))?;
+            let next_seq_str = self.next_seq.load(Ordering::SeqCst).to_string();
+            redb(meta.insert("next_seq", next_seq_str.as_str()))?;
+            let last_applied_str = last_applied_seq.to_string();
+            redb(meta.insert("last_applied_seq", last_applied_str.as_str()))?;
         }
         redb(txn.commit())?;
         Ok(())
@@ -151,6 +189,20 @@ impl MetadataStore {
         self.next_seq.load(Ordering::SeqCst)
     }
 
+    /// Ensure the next offset counter is at least `offset + 1`.
+    pub fn advance_offset_past(&self, offset: PointOffset) {
+        self.next_offset.fetch_max(offset + 1, Ordering::SeqCst);
+    }
+
+    /// Ensure the next sequence counter is at least `seq + 1`.
+    pub fn advance_seq_past(&self, seq: u64) {
+        self.next_seq.fetch_max(seq + 1, Ordering::SeqCst);
+    }
+
+    pub fn last_applied_seq(&self) -> Option<u64> {
+        Self::load_meta(&self.db, "last_applied_seq").and_then(|s| s.parse().ok())
+    }
+
     pub fn save_sequences(&self) -> crate::Result<()> {
         self.save_meta(
             "next_offset",
@@ -160,11 +212,6 @@ impl MetadataStore {
             "next_seq",
             &self.next_seq.load(Ordering::SeqCst).to_string(),
         )?;
-        Ok(())
-    }
-
-    pub fn flush(&self) -> crate::Result<()> {
-        self.save_sequences()?;
         Ok(())
     }
 

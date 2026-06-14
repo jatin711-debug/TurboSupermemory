@@ -13,7 +13,7 @@ anyhow = { workspace = true }
 log = { workspace = true }
 parking_lot = { workspace = true }
 redb = { workspace = true }
-vector-index = { workspace = true }
+usearch = { workspace = true }
 byteorder = { workspace = true }
 bincode = { workspace = true }
 memmap2 = { workspace = true }

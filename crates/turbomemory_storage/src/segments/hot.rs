@@ -1,49 +1,44 @@
 //! Hot tier: full-precision f32 vectors indexed by HNSW.
+//!
+//! The HNSW implementation is provided by `usearch`, a C++ HNSW library with
+//! Rust bindings and built-in SIMD distance kernels.
 
 use crate::config::{Flusher, Tier};
 use crate::metadata_store::MetadataStore;
 use crate::record::{PointOffset, Record};
 use crate::segments::{ScoredPoint, VectorSegment};
 use crate::StorageError;
-use turbomemory_core::{cosine_similarity, validate_dimension};
-use vector_index::{HnswConfig, HnswIndex, Metric, Neighbor};
+use turbomemory_core::validate_dimension;
+use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
-/// Cosine distance metric for the HNSW index.
-#[derive(Clone, Default)]
-pub struct CosineMetric;
-
-impl Metric for CosineMetric {
-    type Point = Vec<f32>;
-
-    fn distance(&self, a: &Self::Point, b: &Self::Point) -> f32 {
-        let sim = cosine_similarity(a, b);
-        (1.0 - sim).max(0.0)
-    }
-
-    fn dim(&self, point: &Self::Point) -> usize {
-        point.len()
-    }
-}
-
-/// Appendable Hot segment backed by an in-memory HNSW index.
+/// Appendable Hot segment backed by a `usearch` HNSW index.
 pub struct HotSegment {
     dim: usize,
-    index: HnswIndex<Vec<f32>, CosineMetric>,
+    index: Index,
     count: usize,
     config: crate::config::StoreConfig,
 }
 
 impl HotSegment {
+    fn index_options(dim: usize, config: &crate::config::StoreConfig) -> IndexOptions {
+        IndexOptions {
+            dimensions: dim,
+            metric: MetricKind::Cos,
+            quantization: ScalarKind::F32,
+            connectivity: config.max_edges,
+            expansion_add: config.ef_construction(),
+            expansion_search: config.search_list_size,
+            multi: false,
+        }
+    }
+
     pub fn new(config: &crate::config::StoreConfig) -> crate::Result<Self> {
-        let hnsw_cfg = HnswConfig {
-            m: config.max_edges,
-            m_max0: config.max_edges * 2,
-            ef_construction: config.ef_construction(),
-            ef_search: config.search_list_size,
-            level_lambda: 1.0 / (config.max_edges as f32).ln(),
-        };
-        let index = HnswIndex::new(hnsw_cfg, CosineMetric)
-            .map_err(|e| StorageError::IndexError(e.to_string()))?;
+        let options = Self::index_options(config.dimension, config);
+        let index = Index::new(&options)
+            .map_err(|e| StorageError::IndexError(format!("usearch index creation failed: {e}")))?;
+        index
+            .reserve(config.tier.hot_capacity.max(1))
+            .map_err(|e| StorageError::IndexError(format!("usearch reserve failed: {e}")))?;
         Ok(Self {
             dim: config.dimension,
             index,
@@ -82,8 +77,8 @@ impl VectorSegment for HotSegment {
     fn insert(&mut self, offset: PointOffset, record: &Record) -> crate::Result<()> {
         validate_dimension(record.embedding_f32(), self.dim)?;
         self.index
-            .insert(offset, record.embedding_f32().to_vec())
-            .map_err(|e| StorageError::IndexError(e.to_string()))?;
+            .add(offset, record.embedding_f32())
+            .map_err(|e| StorageError::IndexError(format!("usearch insert failed: {e}")))?;
         self.count += 1;
         Ok(())
     }
@@ -95,13 +90,19 @@ impl VectorSegment for HotSegment {
         _records: &MetadataStore,
     ) -> crate::Result<Vec<ScoredPoint>> {
         validate_dimension(query, self.dim)?;
-        let q = query.to_vec();
-        let neighbors: Vec<Neighbor> = self.index.search(&q, top_k);
-        Ok(neighbors
+        // `usearch` returns cosine *distance* (1 - similarity).  Convert back
+        // to the similarity score used by the rest of the engine.
+        let matches = self
+            .index
+            .search(query, top_k)
+            .map_err(|e| StorageError::IndexError(format!("usearch search failed: {e}")))?;
+        Ok(matches
+            .keys
             .into_iter()
-            .map(|n| ScoredPoint {
-                offset: n.id,
-                score: (1.0 - n.distance).clamp(-1.0, 1.0),
+            .zip(matches.distances)
+            .map(|(offset, distance)| ScoredPoint {
+                offset,
+                score: (1.0 - distance).clamp(-1.0, 1.0),
                 tier: Tier::Hot,
             })
             .collect())
@@ -112,8 +113,7 @@ impl VectorSegment for HotSegment {
     }
 
     fn memory_bytes(&self) -> usize {
-        // HNSW graph overhead dominates; this is a rough lower bound.
-        self.count * self.dim * std::mem::size_of::<f32>() * 2
+        self.index.memory_usage()
     }
 
     fn flusher(&self) -> Flusher {

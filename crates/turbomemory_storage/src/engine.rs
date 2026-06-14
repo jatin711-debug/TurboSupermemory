@@ -1,10 +1,19 @@
 //! Top-level storage engine combining durable metadata, tiered vector segments,
 //! and the cognitive graph.
+//!
+//! Durability model:
+//!   1. WAL is the source of truth.
+//!   2. Writes append a framed WAL entry first, then update in-memory state.
+//!   3. `redb` (via `MetadataStore`) is a lazy snapshot; it is flushed only on
+//!      explicit `flush()` / background consolidation.
+//!   4. On open we replay any un-flushed WAL entries, persist a snapshot, then
+//!      rebuild the id index, graph, and tiered segments from the snapshot.
 
 use crate::config::StoreConfig;
 use crate::metadata_store::MetadataStore;
 use crate::record::{PointOffset, Record};
 use crate::segment_holder::SegmentHolder;
+use crate::wal::{Wal, WalOp};
 use crate::StorageError;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
@@ -19,6 +28,8 @@ use turbomemory_graph::{
 /// a lightly-configured HNSW index.
 const EXACT_FALLBACK_THRESHOLD: usize = 4096;
 
+const WAL_DIR: &str = "wal";
+
 /// The main storage engine.
 pub struct StorageEngine {
     config: Arc<StoreConfig>,
@@ -27,6 +38,7 @@ pub struct StorageEngine {
     graph: Arc<RwLock<SpreadingActivation>>,
     ccs: Arc<Mutex<Option<CompressedCognitiveState>>>,
     id_index: Arc<RwLock<HashMap<String, PointOffset>>>,
+    wal: Arc<Mutex<Wal>>,
 }
 
 impl Clone for StorageEngine {
@@ -38,6 +50,7 @@ impl Clone for StorageEngine {
             graph: self.graph.clone(),
             ccs: self.ccs.clone(),
             id_index: self.id_index.clone(),
+            wal: self.wal.clone(),
         }
     }
 }
@@ -46,6 +59,41 @@ impl StorageEngine {
     pub fn open(db_path: impl AsRef<Path>, config: StoreConfig) -> crate::Result<Self> {
         let db_path = db_path.as_ref();
         let meta = MetadataStore::open(db_path)?;
+        let wal_path = db_path.join(WAL_DIR);
+        let mut wal = Wal::open(&wal_path)?;
+
+        // Replay any un-flushed WAL entries into the metadata cache.
+        let last_applied = meta.last_applied_seq().unwrap_or(0);
+        let mut max_seq = last_applied;
+        let mut max_offset = 0u64;
+        let mut replayed = false;
+        for op in wal.iter()? {
+            match op? {
+                WalOp::Insert { offset, seq, record } => {
+                    if seq > last_applied {
+                        meta.put(offset, &record)?;
+                        max_offset = max_offset.max(offset);
+                        max_seq = max_seq.max(seq);
+                        replayed = true;
+                    }
+                }
+                WalOp::Delete { offset } => {
+                    meta.remove(offset)?;
+                    replayed = true;
+                }
+                WalOp::Flush { .. } => {}
+            }
+        }
+
+        if replayed {
+            meta.advance_offset_past(max_offset);
+            meta.advance_seq_past(max_seq);
+            // Persist the recovered snapshot and discard the now-redundant WAL.
+            meta.flush(max_seq)?;
+            wal.flush()?;
+            wal.clear()?;
+        }
+
         let records = meta.records()?;
         let mut records_vec: Vec<(PointOffset, Record)> = records.into_iter().collect();
         records_vec.sort_by(|a, b| {
@@ -77,6 +125,7 @@ impl StorageEngine {
             graph: Arc::new(RwLock::new(graph)),
             ccs: Arc::new(Mutex::new(ccs)),
             id_index: Arc::new(RwLock::new(id_index)),
+            wal: Arc::new(Mutex::new(wal)),
         })
     }
 
@@ -107,6 +156,18 @@ impl StorageEngine {
             access_count: 0,
             tier: crate::config::Tier::Hot,
         };
+
+        // 1. WAL is the source of truth.
+        {
+            let mut wal = self.wal.lock();
+            wal.append(&WalOp::Insert {
+                offset,
+                seq,
+                record: record.clone(),
+            })?;
+        }
+
+        // 2. Update in-memory state.
         self.meta.put(offset, &record)?;
         self.id_index.write().insert(id.to_string(), offset);
 
@@ -170,12 +231,20 @@ impl StorageEngine {
             records.push((offset, record));
         }
 
-        // Persist metadata first.
-        let persist: Vec<_> = records
-            .iter()
-            .map(|(off, rec)| (*off, rec.clone()))
-            .collect();
-        self.meta.put_batch(&persist)?;
+        // 1. WAL first.
+        {
+            let mut wal = self.wal.lock();
+            for (offset, record) in &records {
+                wal.append(&WalOp::Insert {
+                    offset: *offset,
+                    seq: record.insert_seq,
+                    record: record.clone(),
+                })?;
+            }
+        }
+
+        // 2. In-memory state.
+        self.meta.put_batch(&records)?;
         {
             let mut idx = self.id_index.write();
             for (offset, rec) in &records {
@@ -332,12 +401,31 @@ impl StorageEngine {
     }
 
     pub fn flush(&self) -> crate::Result<()> {
+        // 1. Durably sync the WAL.
+        {
+            let mut wal = self.wal.lock();
+            wal.flush()?;
+        }
+
+        // 2. Persist a snapshot of dirty records + sequence counters to redb.
+        let last_applied_seq = self.meta.next_seq().saturating_sub(1);
+        self.meta.flush(last_applied_seq)?;
+
+        // 3. Flush tiered segment files.
         let segments = self.segments.read();
         segments.flush()?;
         drop(segments);
+
+        // 4. Persist graph / CCS metadata.
         self.save_graph()?;
         self.save_ccs()?;
-        self.meta.flush()?;
+
+        // 5. WAL is now fully captured by the redb snapshot; truncate it.
+        {
+            let mut wal = self.wal.lock();
+            wal.clear()?;
+        }
+
         Ok(())
     }
 

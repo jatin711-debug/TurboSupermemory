@@ -5,6 +5,7 @@
 //!
 //! This mirrors Qdrant's WAL framing but is intentionally minimal.
 
+use crate::record::{PointOffset, Record};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
@@ -15,9 +16,17 @@ const WAL_FILE: &str = "wal.bin";
 /// A record in the WAL.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum WalOp {
-    Insert { offset: u64, id: String },
-    Delete { offset: u64 },
-    Flush { offset: u64 },
+    Insert {
+        offset: PointOffset,
+        seq: u64,
+        record: Record,
+    },
+    Delete {
+        offset: PointOffset,
+    },
+    Flush {
+        offset: PointOffset,
+    },
 }
 
 /// Append-only WAL.
@@ -39,12 +48,20 @@ impl Wal {
         Ok(Self { path, file })
     }
 
+    /// Append an operation to the WAL.
+    ///
+    /// The write is buffered; call [`Wal::flush`] to durably sync it to disk.
     pub fn append(&mut self, op: &WalOp) -> crate::Result<()> {
         let payload = bincode::serialize(op)?;
         let crc = crc32fast::hash(&payload);
         self.file.write_u32::<BigEndian>(payload.len() as u32)?;
         self.file.write_all(&payload)?;
         self.file.write_u32::<BigEndian>(crc)?;
+        Ok(())
+    }
+
+    /// Durably sync the WAL to disk.
+    pub fn flush(&mut self) -> crate::Result<()> {
         self.file.sync_data()?;
         Ok(())
     }
@@ -102,6 +119,21 @@ impl Iterator for WalIter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    fn dummy_record(id: &str) -> Record {
+        Record {
+            id: id.to_string(),
+            text: "text".to_string(),
+            embedding: Arc::from(vec![1.0f32, 0.0, 0.0]),
+            importance: 1.0,
+            concepts: vec![],
+            created_at: 0,
+            insert_seq: 0,
+            access_count: 0,
+            tier: crate::config::Tier::Hot,
+        }
+    }
 
     #[test]
     fn wal_append_and_iter() {
@@ -109,14 +141,17 @@ mod tests {
         let mut wal = Wal::open(tmp.path()).unwrap();
         wal.append(&WalOp::Insert {
             offset: 1,
-            id: "a".into(),
+            seq: 10,
+            record: dummy_record("a"),
         })
         .unwrap();
         wal.append(&WalOp::Insert {
             offset: 2,
-            id: "b".into(),
+            seq: 11,
+            record: dummy_record("b"),
         })
         .unwrap();
+        wal.flush().unwrap();
         let ops: Vec<_> = wal.iter().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(ops.len(), 2);
     }
@@ -126,6 +161,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut wal = Wal::open(tmp.path()).unwrap();
         wal.append(&WalOp::Flush { offset: 0 }).unwrap();
+        wal.flush().unwrap();
         wal.clear().unwrap();
         let ops: Vec<_> = wal.iter().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         assert!(ops.is_empty());
