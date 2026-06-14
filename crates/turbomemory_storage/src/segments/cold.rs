@@ -1,10 +1,10 @@
 //! Cold tier: 1-bit sign-quantized vectors stored in a memory-mapped file.
 
 use crate::config::{Flusher, Tier};
-use crate::metadata_store::MetadataStore;
 use crate::record::{PointOffset, Record};
 use crate::segments::mmap_array::{MmapBuffer, MmapFileWriter};
 use crate::segments::{ScoredPoint, VectorSegment};
+use crate::vector_store::VectorStore;
 use crate::StorageError;
 use std::path::{Path, PathBuf};
 use turbomemory_core::quantization::{Quantizer, SignQuantizer};
@@ -85,7 +85,7 @@ impl VectorSegment for ColdSegment {
         &self,
         query: &[f32],
         top_k: usize,
-        records: &MetadataStore,
+        vectors: &VectorStore,
     ) -> crate::Result<Vec<ScoredPoint>> {
         validate_dimension(query, self.dim)?;
         let eq = self
@@ -117,9 +117,9 @@ impl VectorSegment for ColdSegment {
         let mut reranked: Vec<ScoredPoint> = candidates
             .into_iter()
             .filter_map(|c| {
-                records.get(c.offset).ok().flatten().map(|rec| ScoredPoint {
+                vectors.get(c.offset).map(|v| ScoredPoint {
                     offset: c.offset,
-                    score: cosine_similarity(query, rec.embedding_f32()),
+                    score: cosine_similarity(query, &v),
                     tier: Tier::Cold,
                 })
             })

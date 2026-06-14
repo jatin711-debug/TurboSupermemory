@@ -158,7 +158,7 @@ impl PyMemoryEngine {
         })
     }
 
-    fn trigger_consolidation(&self, py: Python<'_>) -> PyResult<(usize, usize)> {
+    fn trigger_consolidation(&self, py: Python<'_>) -> PyResult<(usize, usize, usize)> {
         py.allow_threads(|| self.inner.trigger_consolidation().map_err(storage_err))
     }
 

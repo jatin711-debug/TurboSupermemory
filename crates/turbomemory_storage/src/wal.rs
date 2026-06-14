@@ -131,6 +131,7 @@ mod tests {
             created_at: 0,
             insert_seq: 0,
             access_count: 0,
+            last_accessed: 0,
             tier: crate::config::Tier::Hot,
         }
     }

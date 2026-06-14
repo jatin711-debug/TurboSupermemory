@@ -109,7 +109,7 @@ impl Memory for MemoryService {
         &self,
         _request: Request<TriggerConsolidationRequest>,
     ) -> Result<Response<TriggerConsolidationResponse>, Status> {
-        let (sealed, compacted) = self
+        let (sealed, compacted, _promoted) = self
             .engine()
             .trigger_consolidation()
             .map_err(ApiError::from)?;

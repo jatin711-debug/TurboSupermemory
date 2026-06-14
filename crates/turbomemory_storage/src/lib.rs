@@ -7,6 +7,7 @@ pub mod record;
 pub mod segment_holder;
 pub mod segments;
 pub mod update_handler;
+pub mod vector_store;
 pub mod wal;
 
 pub type Result<T> = std::result::Result<T, StorageError>;

@@ -3,17 +3,20 @@
 pub mod cold;
 pub mod hot;
 pub mod mmap_array;
+pub mod sealed_hot;
 pub mod warm;
 
 use crate::config::{Flusher, Tier};
-use crate::metadata_store::MetadataStore;
 use crate::record::{PointOffset, Record};
+use crate::vector_store::VectorStore;
 use crate::StorageError;
+use ahash::AHashSet;
 use smallvec::SmallVec;
 
 pub use cold::ColdSegment;
 pub use hot::HotSegment;
 pub use mmap_array::MmapBuffer;
+pub use sealed_hot::SealedHotSegment;
 pub use warm::WarmSegment;
 
 pub type Result<T> = std::result::Result<T, StorageError>;
@@ -32,12 +35,12 @@ pub trait VectorSegment: Send + Sync {
     /// Insert a record.  Only the Hot segment is appendable in this design.
     fn insert(&mut self, offset: PointOffset, record: &Record) -> Result<()>;
     /// Search the segment and return scored candidates.  Reranking with the
-    /// full f32 embedding is done by the caller using `MetadataStore`.
+    /// full f32 embedding is done by the caller using `VectorStore`.
     fn search(
         &self,
         query: &[f32],
         top_k: usize,
-        records: &MetadataStore,
+        vectors: &VectorStore,
     ) -> Result<Vec<ScoredPoint>>;
     fn point_count(&self) -> usize;
     fn memory_bytes(&self) -> usize;
@@ -45,6 +48,8 @@ pub trait VectorSegment: Send + Sync {
 }
 
 /// Merge candidate lists from multiple segments, preserving the highest scores.
+/// If the same offset appears in multiple lists (e.g. after promotion), keep
+/// the highest score and drop the duplicates.
 pub fn merge_candidates(lists: Vec<Vec<ScoredPoint>>, top_k: usize) -> Vec<ScoredPoint> {
     let mut merged: SmallVec<[ScoredPoint; 64]> = SmallVec::with_capacity(top_k * lists.len());
     for list in lists {
@@ -55,6 +60,17 @@ pub fn merge_candidates(lists: Vec<Vec<ScoredPoint>>, top_k: usize) -> Vec<Score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    merged.truncate(top_k);
-    merged.into_vec()
+
+    // Deduplicate by offset, keeping the first (highest-scoring) occurrence.
+    let mut seen = AHashSet::with_capacity(merged.len());
+    let mut deduped: SmallVec<[ScoredPoint; 64]> = SmallVec::with_capacity(top_k);
+    for candidate in merged {
+        if seen.insert(candidate.offset) {
+            deduped.push(candidate);
+            if deduped.len() >= top_k {
+                break;
+            }
+        }
+    }
+    deduped.into_vec()
 }

@@ -161,7 +161,7 @@ async fn step_session(
 async fn trigger_consolidation(
     State(service): State<MemoryService>,
 ) -> Result<Json<ConsolidationResp>, ApiError> {
-    let (sealed, compacted) = service.engine().trigger_consolidation()?;
+    let (sealed, compacted, _promoted) = service.engine().trigger_consolidation()?;
     Ok(Json(ConsolidationResp { sealed, compacted }))
 }
 

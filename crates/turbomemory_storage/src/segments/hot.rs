@@ -4,9 +4,9 @@
 //! Rust bindings and built-in SIMD distance kernels.
 
 use crate::config::{Flusher, Tier};
-use crate::metadata_store::MetadataStore;
 use crate::record::{PointOffset, Record};
 use crate::segments::{ScoredPoint, VectorSegment};
+use crate::vector_store::VectorStore;
 use crate::StorageError;
 use turbomemory_core::validate_dimension;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
@@ -87,7 +87,7 @@ impl VectorSegment for HotSegment {
         &self,
         query: &[f32],
         top_k: usize,
-        _records: &MetadataStore,
+        _vectors: &VectorStore,
     ) -> crate::Result<Vec<ScoredPoint>> {
         validate_dimension(query, self.dim)?;
         // `usearch` returns cosine *distance* (1 - similarity).  Convert back

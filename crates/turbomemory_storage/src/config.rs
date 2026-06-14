@@ -23,7 +23,7 @@ impl Tier {
 /// Per-tier sizing and quantization policy.
 #[derive(Debug, Clone)]
 pub struct TierConfig {
-    /// Number of records before the Hot segment is demoted to Warm.
+    /// Number of records before the Hot segment is sealed.
     pub hot_capacity: usize,
     /// Number of records before the Warm segment is demoted to Cold.
     pub warm_capacity: usize,
@@ -33,6 +33,12 @@ pub struct TierConfig {
     pub warm_chunk_bytes: usize,
     /// True if the Cold tier uses 1-bit sign quantization.
     pub cold_sign: bool,
+    /// Access-score threshold above which a record is promoted back to Hot.
+    pub hot_promote_threshold: f64,
+    /// Access-score threshold below which a record in Hot is demoted.
+    pub warm_demote_threshold: f64,
+    /// Recency half-life in seconds for access scoring.
+    pub recency_half_life_secs: u64,
 }
 
 impl Default for TierConfig {
@@ -43,6 +49,9 @@ impl Default for TierConfig {
             warm_bits: 8,
             warm_chunk_bytes: 16 * 1024 * 1024, // 16 MiB
             cold_sign: true,
+            hot_promote_threshold: 2.0,
+            warm_demote_threshold: 0.5,
+            recency_half_life_secs: 3600,
         }
     }
 }

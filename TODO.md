@@ -88,10 +88,10 @@ Status key: **Done** | **In Progress** | **Pending**
 
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
-| 6.1 | Replace `Vec<f32>` clones with mmap-backed storage | `crates/turbomemory_storage/src/segments/hot.rs` | Pending | Needs custom mmap vector store around usearch / dense storage |
+| 6.1 | Replace `Vec<f32>` clones with mmap-backed storage | `crates/turbomemory_storage/src/vector_store.rs` | Done | `VectorStore` mmap-backed dense f32 file keyed by `PointOffset` |
 | 6.2 | Use `bytemuck` for zero-copy `&[f32]`/`&[u8]` views | `crates/turbomemory_storage/src/segments/mmap_array.rs` | Done | Added `as_typed_slice<T>` / `as_typed_slice_mut<T>` |
 | 6.3 | Introduce `CowVector` / `BorrowedVector` abstractions | `crates/turbomemory_core/src/` | Pending | Defer until dense vector store refactor |
-| 6.4 | Store vectors in contiguous aligned arrays | `crates/turbomemory_storage/src/segments/hot.rs` | Pending | Depends on 6.1 mmap vector store |
+| 6.4 | Store vectors in contiguous aligned arrays | `crates/turbomemory_storage/src/vector_store.rs` | Done | `VectorStore` uses contiguous `f32` array |
 | 6.5 | Avoid `String` clones in `id_index`; use `Arc<str>` or string pool | `crates/turbomemory_storage/src/engine.rs` | Done | `id_index` is now `ahash::HashMap<Arc<str>, PointOffset>` |
 | 6.6 | Use `smallvec` for short candidate / link lists | `crates/turbomemory_storage/src/segments/mod.rs` | Done | `merge_candidates` uses `SmallVec<[ScoredPoint; 64]>` |
 | 6.7 | Use `ahash` for `id_index` and graph maps | `crates/turbomemory_storage/src/engine.rs` | Done | `id_index` uses `ahash` |

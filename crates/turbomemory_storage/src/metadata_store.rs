@@ -1,11 +1,12 @@
 //! Durable metadata store backed by redb with an in-memory cache.
 //!
 //! `redb` is now a lazy snapshot, not the primary durability log.  Writes land
-//! in the WAL first; `MetadataStore` caches records in memory and flushes
-//! dirty entries to `redb` when asked.
+//! in the WAL first; `MetadataStore` caches metadata records in memory and
+//! flushes dirty entries to `redb` when asked.  Full embeddings live in the
+//! separate `VectorStore`, so the metadata cache no longer duplicates vectors.
 
 use crate::config::Flusher;
-use crate::record::{PointOffset, Record};
+use crate::record::{MetaRecord, PointOffset, Record};
 use crate::StorageError;
 use parking_lot::{Mutex, RwLock};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -16,11 +17,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const RECORDS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("records");
 const META_TABLE: TableDefinition<&str, &str> = TableDefinition::new("meta");
 
-/// Owns the durable metadata: records, cognitive graph, CCS, and sequence counters.
+/// Owns the durable metadata: records (without embeddings), cognitive graph,
+/// CCS, and sequence counters.
 pub struct MetadataStore {
     db: Database,
     db_path: PathBuf,
-    records: RwLock<HashMap<PointOffset, Record>>,
+    records: RwLock<HashMap<PointOffset, MetaRecord>>,
     dirty: Mutex<HashSet<PointOffset>>,
     next_offset: AtomicU64,
     next_seq: AtomicU64,
@@ -59,14 +61,14 @@ impl MetadataStore {
         &self.db_path
     }
 
-    fn load_records(db: &Database) -> crate::Result<HashMap<PointOffset, Record>> {
+    fn load_records(db: &Database) -> crate::Result<HashMap<PointOffset, MetaRecord>> {
         let txn = redb(db.begin_read())?;
         let mut map = HashMap::new();
         if let Ok(table) = txn.open_table(RECORDS_TABLE) {
             for item in table.iter()? {
                 let (k, v) = item?;
                 let offset: u64 = k.value();
-                let rec: Record = bincode::deserialize(v.value())?;
+                let rec: MetaRecord = bincode::deserialize(v.value())?;
                 map.insert(offset, rec);
             }
         }
@@ -79,26 +81,32 @@ impl MetadataStore {
         table.get(key).ok()??.value().to_string().into()
     }
 
-    /// Return a snapshot of all cached records.
-    pub fn records(&self) -> crate::Result<HashMap<PointOffset, Record>> {
+    /// Return a snapshot of all cached metadata records.
+    pub fn records(&self) -> crate::Result<HashMap<PointOffset, MetaRecord>> {
         Ok(self.records.read().clone())
     }
 
-    /// Look up a record from the in-memory cache.
-    pub fn get(&self, offset: PointOffset) -> crate::Result<Option<Record>> {
+    /// Look up a metadata record from the in-memory cache.
+    pub fn get(&self, offset: PointOffset) -> crate::Result<Option<MetaRecord>> {
         Ok(self.records.read().get(&offset).cloned())
     }
 
-    /// Insert or update a record in the cache and mark it dirty for the next flush.
+    /// Insert or update metadata from a full `Record`.  The embedding is *not*
+    /// kept here; callers must write it to the `VectorStore` separately.
     pub fn put(&self, offset: PointOffset, record: &Record) -> crate::Result<()> {
+        self.put_meta(offset, &MetaRecord::from(record))
+    }
+
+    /// Insert or update a metadata record directly.
+    pub fn put_meta(&self, offset: PointOffset, meta: &MetaRecord) -> crate::Result<()> {
         let mut records = self.records.write();
-        records.insert(offset, record.clone());
+        records.insert(offset, meta.clone());
         drop(records);
         self.dirty.lock().insert(offset);
         Ok(())
     }
 
-    /// Batch insert/update records in the cache.
+    /// Batch insert/update metadata records.
     pub fn put_batch(&self, records: &[(PointOffset, Record)]) -> crate::Result<()> {
         if records.is_empty() {
             return Ok(());
@@ -106,7 +114,7 @@ impl MetadataStore {
         let mut cache = self.records.write();
         let mut dirty = self.dirty.lock();
         for (offset, rec) in records {
-            cache.insert(*offset, rec.clone());
+            cache.insert(*offset, MetaRecord::from(rec));
             dirty.insert(*offset);
         }
         Ok(())
