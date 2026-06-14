@@ -207,9 +207,9 @@ Status key: **Done** | **In Progress** | **Pending**
 
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
-| 15.1 | Add recall vs latency benchmarks across dimensions | `benchmark.py` / `benches/` | Pending | Prove improvements |
+| 15.1 | Add recall vs latency benchmarks across dimensions | `benchmark.py` / `benches/` | In Progress | `benches/vector_search.rs` covers exact/HNSW/Warm/Cold at D=128 |
 | 15.2 | Add ingest throughput benchmark with concurrent writers | `benchmark.py` / `benches/` | Pending | Catch Mutex regressions |
-| 15.3 | Add crash-recovery tests (kill -9, replay WAL) | `crates/turbomemory_storage/tests/` | Pending | Durability correctness |
+| 15.3 | Add crash-recovery tests (kill -9, replay WAL) | `crates/turbomemory_storage/tests/` | Done | `tests/crash_recovery.rs` covers WAL replay, tier reload, truncated WAL |
 | 15.4 | Add property-based tests for segment lifecycle | `crates/turbomemory_storage/tests/` | Pending | Seal/merge correctness |
 | 15.5 | Add comparison harness vs Qdrant/Chroma | `benchmark.py` | In Progress | Exists; needs to be run regularly |
 | 15.6 | Add continuous benchmark tracking | CI / `benches/` | Pending | Detect regressions |
