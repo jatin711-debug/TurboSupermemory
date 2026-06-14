@@ -3,7 +3,6 @@
 //! Exposes a single `MemoryEngine` class with the exact API expected by
 //! `verify.py` and `benchmark.py`.
 
-use parking_lot::Mutex;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use std::sync::Arc;
@@ -46,9 +45,9 @@ fn extract_f32_matrix(obj: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<f32>>> {
 
 #[pyclass(name = "MemoryEngine")]
 pub struct PyMemoryEngine {
-    inner: Arc<Mutex<StorageEngine>>,
+    inner: Arc<StorageEngine>,
     #[allow(dead_code)]
-    handler: Mutex<Option<UpdateHandler>>,
+    handler: Option<UpdateHandler>,
 }
 
 #[pymethods]
@@ -71,20 +70,17 @@ impl PyMemoryEngine {
             tier: turbomemory_storage::config::TierConfig::default(),
             auto_consolidation_interval: Some(Duration::from_secs(60)),
         };
-        let engine = Arc::new(StorageEngine::open(db_path, config).map_err(storage_err)?);
-        let handler = engine
+        let inner = Arc::new(StorageEngine::open(db_path, config).map_err(storage_err)?);
+        let handler = inner
             .config()
             .auto_consolidation_interval
-            .map(|interval| UpdateHandler::new(engine.clone(), interval));
-        let inner = Arc::new(Mutex::new((*engine).clone()));
-        Ok(Self {
-            inner,
-            handler: Mutex::new(handler),
-        })
+            .map(|interval| UpdateHandler::new(inner.clone(), interval));
+        Ok(Self { inner, handler })
     }
 
     fn insert(
-        &mut self,
+        &self,
+        py: Python<'_>,
         id: &str,
         text: &str,
         embedding: &Bound<'_, PyAny>,
@@ -92,15 +88,17 @@ impl PyMemoryEngine {
         concepts: Vec<String>,
     ) -> PyResult<bool> {
         let emb = extract_f32_vec(embedding)?;
-        self.inner
-            .lock()
-            .insert(id, text, &emb, importance_score, &concepts)
-            .map_err(storage_err)
+        py.allow_threads(|| {
+            self.inner
+                .insert(id, text, &emb, importance_score, &concepts)
+                .map_err(storage_err)
+        })
     }
 
     #[pyo3(signature = (ids, texts, embeddings, scores, concepts))]
     fn insert_batch(
-        &mut self,
+        &self,
+        py: Python<'_>,
         ids: Vec<String>,
         texts: Vec<String>,
         embeddings: &Bound<'_, PyAny>,
@@ -108,63 +106,64 @@ impl PyMemoryEngine {
         concepts: Vec<Vec<String>>,
     ) -> PyResult<usize> {
         let matrix = extract_f32_matrix(embeddings)?;
-        self.inner
-            .lock()
-            .insert_batch(&ids, &texts, &matrix, &scores, &concepts)
-            .map_err(storage_err)
+        py.allow_threads(|| {
+            self.inner
+                .insert_batch(&ids, &texts, &matrix, &scores, &concepts)
+                .map_err(storage_err)
+        })
     }
 
     fn search_ann(
         &self,
+        py: Python<'_>,
         query_embedding: &Bound<'_, PyAny>,
         top_k: usize,
     ) -> PyResult<Vec<(String, f32)>> {
         let q = extract_f32_vec(query_embedding)?;
-        self.inner.lock().search_ann(&q, top_k).map_err(storage_err)
+        py.allow_threads(|| self.inner.search_ann(&q, top_k).map_err(storage_err))
     }
 
     fn search_ann_candidates(
         &self,
+        py: Python<'_>,
         query_embedding: &Bound<'_, PyAny>,
         top_k: usize,
     ) -> PyResult<Vec<(String, f32)>> {
         let q = extract_f32_vec(query_embedding)?;
-        self.inner
-            .lock()
-            .search_ann_candidates(&q, top_k)
-            .map_err(storage_err)
+        py.allow_threads(|| self.inner.search_ann_candidates(&q, top_k).map_err(storage_err))
     }
 
     #[pyo3(signature = (query_text, query_embedding, top_k))]
     fn search(
-        &mut self,
+        &self,
+        py: Python<'_>,
         query_text: &str,
         query_embedding: &Bound<'_, PyAny>,
         top_k: usize,
     ) -> PyResult<Option<Vec<(String, f32)>>> {
         let q = extract_f32_vec(query_embedding)?;
-        self.inner
-            .lock()
-            .search(query_text, &q, top_k)
-            .map_err(storage_err)
+        py.allow_threads(|| self.inner.search(query_text, &q, top_k).map_err(storage_err))
     }
 
-    fn step_session(&mut self, user_input: &str, assistant_response: &str) -> PyResult<String> {
-        self.inner
-            .lock()
-            .step_session(user_input, assistant_response)
-            .map_err(storage_err)
+    fn step_session(
+        &self,
+        py: Python<'_>,
+        user_input: &str,
+        assistant_response: &str,
+    ) -> PyResult<String> {
+        py.allow_threads(|| {
+            self.inner
+                .step_session(user_input, assistant_response)
+                .map_err(storage_err)
+        })
     }
 
-    fn trigger_consolidation(&mut self) -> PyResult<(usize, usize)> {
-        self.inner
-            .lock()
-            .trigger_consolidation()
-            .map_err(storage_err)
+    fn trigger_consolidation(&self, py: Python<'_>) -> PyResult<(usize, usize)> {
+        py.allow_threads(|| self.inner.trigger_consolidation().map_err(storage_err))
     }
 
-    fn flush(&self) -> PyResult<()> {
-        self.inner.lock().flush().map_err(storage_err)
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.inner.flush().map_err(storage_err))
     }
 }
 

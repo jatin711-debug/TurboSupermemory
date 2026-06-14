@@ -21,6 +21,9 @@ crc32fast = { workspace = true }
 crossbeam-channel = { workspace = true }
 arc-swap = { workspace = true }
 tempfile = { workspace = true }
+ahash = { workspace = true }
+smallvec = { workspace = true }
+bytemuck = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

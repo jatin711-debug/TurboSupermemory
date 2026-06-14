@@ -9,6 +9,7 @@ use crate::config::{Flusher, Tier};
 use crate::metadata_store::MetadataStore;
 use crate::record::{PointOffset, Record};
 use crate::StorageError;
+use smallvec::SmallVec;
 
 pub use cold::ColdSegment;
 pub use hot::HotSegment;
@@ -45,7 +46,7 @@ pub trait VectorSegment: Send + Sync {
 
 /// Merge candidate lists from multiple segments, preserving the highest scores.
 pub fn merge_candidates(lists: Vec<Vec<ScoredPoint>>, top_k: usize) -> Vec<ScoredPoint> {
-    let mut merged: Vec<ScoredPoint> = Vec::with_capacity(top_k * lists.len());
+    let mut merged: SmallVec<[ScoredPoint; 64]> = SmallVec::with_capacity(top_k * lists.len());
     for list in lists {
         merged.extend(list);
     }
@@ -55,5 +56,5 @@ pub fn merge_candidates(lists: Vec<Vec<ScoredPoint>>, top_k: usize) -> Vec<Score
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     merged.truncate(top_k);
-    merged
+    merged.into_vec()
 }

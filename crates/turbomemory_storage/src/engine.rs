@@ -15,8 +15,8 @@ use crate::record::{PointOffset, Record};
 use crate::segment_holder::SegmentHolder;
 use crate::wal::{Wal, WalOp};
 use crate::StorageError;
+use ahash::HashMap as AHashMap;
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use turbomemory_core::{cosine_similarity, normalize, validate_dimension};
@@ -37,7 +37,7 @@ pub struct StorageEngine {
     segments: Arc<RwLock<SegmentHolder>>,
     graph: Arc<RwLock<SpreadingActivation>>,
     ccs: Arc<Mutex<Option<CompressedCognitiveState>>>,
-    id_index: Arc<RwLock<HashMap<String, PointOffset>>>,
+    id_index: Arc<RwLock<AHashMap<Arc<str>, PointOffset>>>,
     wal: Arc<Mutex<Wal>>,
 }
 
@@ -102,9 +102,9 @@ impl StorageEngine {
                 .then(a.1.insert_seq.cmp(&b.1.insert_seq))
         });
 
-        let id_index: HashMap<String, PointOffset> = records_vec
+        let id_index: AHashMap<Arc<str>, PointOffset> = records_vec
             .iter()
-            .map(|(offset, rec)| (rec.id.clone(), *offset))
+            .map(|(offset, rec)| (Arc::from(rec.id.as_str()), *offset))
             .collect();
         let graph = build_graph(&records_vec);
         let ccs = meta
@@ -169,7 +169,7 @@ impl StorageEngine {
 
         // 2. Update in-memory state.
         self.meta.put(offset, &record)?;
-        self.id_index.write().insert(id.to_string(), offset);
+        self.id_index.write().insert(Arc::from(id), offset);
 
         {
             let mut graph = self.graph.write();
@@ -205,7 +205,7 @@ impl StorageEngine {
         {
             let idx = self.id_index.read();
             for id in ids {
-                if idx.contains_key(id) {
+                if idx.contains_key(id.as_str()) {
                     return Err(StorageError::DuplicateId(id.clone()));
                 }
             }
@@ -248,7 +248,7 @@ impl StorageEngine {
         {
             let mut idx = self.id_index.write();
             for (offset, rec) in &records {
-                idx.insert(rec.id.clone(), *offset);
+                idx.insert(Arc::from(rec.id.as_str()), *offset);
             }
         }
 

@@ -88,13 +88,13 @@ Status key: **Done** | **In Progress** | **Pending**
 
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
-| 6.1 | Replace `Vec<f32>` clones with mmap-backed storage | `crates/turbomemory_storage/src/segments/hot.rs` | Pending | Current HNSW owns copies |
-| 6.2 | Use `bytemuck` for zero-copy `&[f32]`/`&[u8]` views | All segment files | Pending | Avoids reallocation |
-| 6.3 | Introduce `CowVector` / `BorrowedVector` abstractions | `crates/turbomemory_core/src/` | Pending | Qdrant-style borrowed views |
-| 6.4 | Store vectors in contiguous aligned arrays | `crates/turbomemory_storage/src/segments/hot.rs` | Pending | SIMD prefers aligned data |
-| 6.5 | Avoid `String` clones in `id_index`; use `Arc<str>` or string pool | `crates/turbomemory_storage/src/engine.rs` | Pending | Metadata maps can be huge |
-| 6.6 | Use `smallvec` for short candidate / link lists | Search hot paths | Pending | Reduces heap churn |
-| 6.7 | Use `ahash` for `id_index` and graph maps | `crates/turbomemory_storage/src/engine.rs` | Pending | Faster hashing than default |
+| 6.1 | Replace `Vec<f32>` clones with mmap-backed storage | `crates/turbomemory_storage/src/segments/hot.rs` | Pending | Needs custom mmap vector store around usearch / dense storage |
+| 6.2 | Use `bytemuck` for zero-copy `&[f32]`/`&[u8]` views | `crates/turbomemory_storage/src/segments/mmap_array.rs` | Done | Added `as_typed_slice<T>` / `as_typed_slice_mut<T>` |
+| 6.3 | Introduce `CowVector` / `BorrowedVector` abstractions | `crates/turbomemory_core/src/` | Pending | Defer until dense vector store refactor |
+| 6.4 | Store vectors in contiguous aligned arrays | `crates/turbomemory_storage/src/segments/hot.rs` | Pending | Depends on 6.1 mmap vector store |
+| 6.5 | Avoid `String` clones in `id_index`; use `Arc<str>` or string pool | `crates/turbomemory_storage/src/engine.rs` | Done | `id_index` is now `ahash::HashMap<Arc<str>, PointOffset>` |
+| 6.6 | Use `smallvec` for short candidate / link lists | `crates/turbomemory_storage/src/segments/mod.rs` | Done | `merge_candidates` uses `SmallVec<[ScoredPoint; 64]>` |
+| 6.7 | Use `ahash` for `id_index` and graph maps | `crates/turbomemory_storage/src/engine.rs` | Done | `id_index` uses `ahash` |
 | 6.8 | O(1) duplicate-ID index | `crates/turbomemory_storage/src/engine.rs` | Done | Recently added |
 
 ---
@@ -103,7 +103,7 @@ Status key: **Done** | **In Progress** | **Pending**
 
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
-| 7.1 | Remove `Mutex<StorageEngine>` from Python binding | `crates/turbomemory_python/src/lib.rs` | Pending | Serializes reads and writes |
+| 7.1 | Remove `Mutex<StorageEngine>` from Python binding | `crates/turbomemory_python/src/lib.rs` | Done | `PyMemoryEngine` holds `Arc<StorageEngine>` directly |
 | 7.2 | Use `Arc<StorageEngine>` + `RwLock` for segment holder | `crates/turbomemory_storage/src/engine.rs` | Done | StorageEngine already uses `Arc<RwLock>` |
 | 7.3 | Add `parking_lot::upgradable_read` for segment mutation | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Better than plain RwLock |
 | 7.4 | Separate read/write locks per segment | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Fine-grained concurrency |

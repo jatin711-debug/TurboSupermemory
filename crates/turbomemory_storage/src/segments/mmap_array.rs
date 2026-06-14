@@ -1,6 +1,7 @@
 //! A small owned-or-mmap byte buffer used by quantized segments.
 
 use crate::segments::Result;
+use bytemuck::Pod;
 use memmap2::Mmap;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -46,6 +47,26 @@ impl MmapBuffer {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// View the buffer as a typed slice, if alignment and length allow.
+    pub fn as_typed_slice<T: Pod>(&self) -> Option<&[T]> {
+        let bytes = self.as_bytes();
+        let align = bytes.as_ptr().align_offset(std::mem::align_of::<T>());
+        if align != 0 || !bytes.len().is_multiple_of(std::mem::size_of::<T>()) {
+            return None;
+        }
+        Some(bytemuck::cast_slice(bytes))
+    }
+
+    /// Mutable typed view for owned buffers.
+    pub fn as_typed_slice_mut<T: Pod>(&mut self) -> Option<&mut [T]> {
+        let bytes = self.as_bytes_mut()?;
+        let align = bytes.as_ptr().align_offset(std::mem::align_of::<T>());
+        if align != 0 || !bytes.len().is_multiple_of(std::mem::size_of::<T>()) {
+            return None;
+        }
+        Some(bytemuck::cast_slice_mut(bytes))
     }
 
     /// Write the owned buffer to disk and reopen as a read-only mmap.
