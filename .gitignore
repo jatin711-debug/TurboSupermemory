@@ -1,0 +1,44 @@
+# --- Rust/Cargo ---
+/target/
+**/*.rs.bk
+Cargo.lock.back
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.py.class
+.ipynb_checkpoints/
+.venv/
+env/
+venv/
+ENV/
+
+# --- Project Specific State ---
+/test_db/
+/turbomemory.pyd
+/ResearchPapers/
+/turbomemory.so
+/libturbomemory.so
+/libturbomemory.dylib
+
+# --- IDEs / Editors ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- OS Specific ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.research*
+mem0
+qdrant
+chroma
+ResearchPapers

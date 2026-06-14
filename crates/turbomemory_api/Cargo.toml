@@ -1,0 +1,25 @@
+[package]
+name = "turbomemory_api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+turbomemory_core = { path = "../turbomemory_core" }
+turbomemory_storage = { path = "../turbomemory_storage" }
+turbomemory_graph = { path = "../turbomemory_graph" }
+tokio = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[[bin]]
+name = "turbomemory-server"
+path = "src/main.rs"
