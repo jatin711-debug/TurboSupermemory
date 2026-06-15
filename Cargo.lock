@@ -2463,6 +2463,7 @@ dependencies = [
  "ordered-float",
  "parking_lot",
  "rand",
+ "rayon",
  "redb",
  "roaring",
  "serde",

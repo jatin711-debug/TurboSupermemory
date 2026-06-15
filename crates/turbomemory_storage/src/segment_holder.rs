@@ -10,6 +10,7 @@ use crate::segments::warm::WarmSegment;
 use crate::segments::{merge_candidates, ScoredPoint, VectorSegment};
 use crate::vector_store::VectorStore;
 use parking_lot::RwLock;
+use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -21,6 +22,10 @@ pub const SEALED_HOT_DIR: &str = "sealed_hot";
 pub struct SegmentHolder {
     config: StoreConfig,
     hot: Arc<RwLock<HotSegment>>,
+    /// Plain segments that have been swapped out of the Hot tier and are waiting
+    /// for the background optimizer to build their HNSW replacements. They remain
+    /// searchable as exact segments until the build completes.
+    sealing_plain: Vec<Arc<RwLock<HotSegment>>>,
     sealed_hot: Vec<Arc<RwLock<dyn VectorSegment>>>,
     warm: Vec<Arc<RwLock<dyn VectorSegment>>>,
     cold: Vec<Arc<RwLock<dyn VectorSegment>>>,
@@ -34,6 +39,7 @@ impl SegmentHolder {
         std::fs::create_dir_all(&base_path)?;
         Ok(Self {
             hot: Arc::new(RwLock::new(HotSegment::new(&config)?)),
+            sealing_plain: Vec::new(),
             sealed_hot: Vec::new(),
             warm: Vec::new(),
             cold: Vec::new(),
@@ -61,7 +67,7 @@ impl SegmentHolder {
         Ok(holder)
     }
 
-    fn segment_path(&mut self, tier: Tier) -> PathBuf {
+    pub(crate) fn segment_path(&mut self, tier: Tier) -> PathBuf {
         let id = self.next_segment_id;
         self.next_segment_id += 1;
         self.base_path
@@ -69,10 +75,34 @@ impl SegmentHolder {
             .join(format!("segment_{id}"))
     }
 
-    fn sealed_hot_path(&mut self) -> PathBuf {
+    pub(crate) fn sealed_hot_path(&mut self) -> PathBuf {
         let id = self.next_segment_id;
         self.next_segment_id += 1;
         self.base_path.join(SEALED_HOT_DIR).join(format!("segment_{id}"))
+    }
+
+    pub(crate) fn sealed_hot_is_empty(&self) -> bool {
+        self.sealed_hot.is_empty()
+    }
+
+    pub(crate) fn pop_sealing_plain(&mut self) -> Option<Arc<RwLock<HotSegment>>> {
+        self.sealing_plain.pop()
+    }
+
+    pub(crate) fn push_sealing_plain(&mut self, plain: Arc<RwLock<HotSegment>>) {
+        self.sealing_plain.push(plain);
+    }
+
+    pub(crate) fn remove_sealing_plain(&mut self, target: &Arc<RwLock<HotSegment>>) {
+        self.sealing_plain.retain(|p| !Arc::ptr_eq(p, target));
+    }
+
+    pub(crate) fn push_sealed_hot(&mut self, segment: SealedHotSegment) {
+        self.add_sealed_hot(segment);
+    }
+
+    pub(crate) fn push_warm(&mut self, segment: WarmSegment) {
+        self.add_warm(segment);
     }
 
     pub fn add_sealed_hot(&mut self, segment: SealedHotSegment) {
@@ -113,22 +143,41 @@ impl SegmentHolder {
         vectors: &VectorStore,
         allowed_offsets: Option<&RoaringBitmap>,
     ) -> crate::Result<Vec<ScoredPoint>> {
-        let pool_k = if allowed_offsets.is_some() {
-            top_k.saturating_mul(8).max(top_k)
-        } else {
-            top_k.saturating_mul(4).max(top_k)
-        };
-        let mut lists = Vec::with_capacity(2 + self.sealed_hot.len() + self.warm.len() + self.cold.len());
-        lists.push(self.hot.read().search(query, pool_k, vectors, allowed_offsets)?);
+        // Use Qdrant-style ef semantics: floor the per-segment candidate pool at
+        // the configured search list size (`ef`), then apply the usual over-fetch
+        // multiplier for filtered queries.
+        let multiplier = if allowed_offsets.is_some() { 8 } else { 4 };
+        let pool_k = top_k.saturating_mul(multiplier).max(self.config.search_list_size);
+        // Collect all searchable segments and query them in parallel.
+        let mut segments: Vec<Arc<RwLock<dyn VectorSegment>>> =
+            Vec::with_capacity(2 + self.sealing_plain.len() + self.sealed_hot.len() + self.warm.len() + self.cold.len());
+        segments.push(self.hot.clone());
+        for plain in &self.sealing_plain {
+            segments.push(plain.clone());
+        }
         for sealed in &self.sealed_hot {
-            lists.push(sealed.read().search(query, pool_k, vectors, allowed_offsets)?);
+            segments.push(sealed.clone());
         }
         for warm in &self.warm {
-            lists.push(warm.read().search(query, pool_k, vectors, allowed_offsets)?);
+            segments.push(warm.clone());
         }
         for cold in &self.cold {
-            lists.push(cold.read().search(query, pool_k, vectors, allowed_offsets)?);
+            segments.push(cold.clone());
         }
+
+        let lists: Vec<Vec<ScoredPoint>> = if segments.len() <= 1 {
+            // Avoid Rayon's thread-pool overhead when there is only one segment
+            // (the common small-collection case).
+            segments
+                .into_iter()
+                .map(|seg| seg.read().search(query, pool_k, vectors, allowed_offsets))
+                .collect::<crate::Result<Vec<_>>>()?
+        } else {
+            segments
+                .into_par_iter()
+                .map(|seg| seg.read().search(query, pool_k, vectors, allowed_offsets))
+                .collect::<crate::Result<Vec<_>>>()?
+        };
         let candidates = merge_candidates(lists, pool_k);
 
         // Final rerank with full f32 embeddings from the vector store.
@@ -164,9 +213,10 @@ impl SegmentHolder {
         Ok(reranked)
     }
 
-    /// Move the current Hot segment into a persisted SealedHot/Warm segment and
-    /// create a fresh Hot segment.
-    pub fn seal_hot(&mut self, vectors: &VectorStore) -> crate::Result<()> {
+    /// Move the current Hot segment into the `sealing_plain` queue and create a
+    /// fresh Hot segment. The actual HNSW build happens later in the background
+    /// optimizer, so this method is fast enough to run on the insert hot path.
+    pub fn seal_hot(&mut self, _vectors: &VectorStore) -> crate::Result<()> {
         // Re-check capacity: another thread may have sealed while we waited for
         // the holder write lock.
         {
@@ -176,81 +226,39 @@ impl SegmentHolder {
             }
         }
 
-        // Collect the offsets currently in the Hot segment.
-        let offsets: Vec<PointOffset> = {
-            let hot = self.hot.read();
-            hot.search(
-                &vec![0.0f32; self.config.dimension],
-                hot.point_count(),
-                vectors,
-                None,
-            )?
-            .into_iter()
-            .map(|c| c.offset)
-            .collect()
+        // Fast swap: capture the full plain Hot segment and replace it with a
+        // fresh one. No HNSW construction happens here.
+        let old_hot = {
+            let mut hot = self.hot.write();
+            if hot.point_count() < self.config.tier.hot_capacity {
+                return Ok(());
+            }
+            std::mem::replace(&mut *hot, HotSegment::new(&self.config)?)
         };
-        if offsets.is_empty() {
-            return Ok(());
-        }
+        self.sealing_plain.push(Arc::new(RwLock::new(old_hot)));
+        Ok(())
+    }
 
-        // Bulk-read vectors from the mmap store without cloning into `Record`s.
+    /// Read full vectors for a list of offsets. Used by the background optimizer
+    /// to build persisted segments while NOT holding the segment holder write lock.
+    pub fn read_vectors_for_offsets(
+        &self,
+        offsets: &[PointOffset],
+        vectors: &VectorStore,
+    ) -> Vec<(PointOffset, Vec<f32>)> {
         let view = vectors.read_view();
-        let mut vectors_for_build: Vec<(PointOffset, Vec<f32>)> =
-            Vec::with_capacity(offsets.len());
-        for &offset in &offsets {
+        let mut out: Vec<(PointOffset, Vec<f32>)> = Vec::with_capacity(offsets.len());
+        for &offset in offsets {
             if let Some(v) = view.get(offset) {
-                vectors_for_build.push((offset, Vec::from(v)));
+                out.push((offset, Vec::from(v)));
             }
         }
-        drop(view);
-        if vectors_for_build.is_empty() {
-            return Ok(());
-        }
-        let borrowed: Vec<(PointOffset, &[f32])> = vectors_for_build
-            .iter()
-            .map(|(offset, v)| (*offset, v.as_slice()))
-            .collect();
-
-        if self.sealed_hot.is_empty() {
-            // First seal: keep as fast HNSW (SealedHot).
-            let path = self.sealed_hot_path();
-            let sealed = SealedHotSegment::from_vectors(&path, &self.config, &borrowed)?;
-            self.sealed_hot
-                .push(Arc::new(RwLock::new(sealed)) as Arc<RwLock<dyn VectorSegment>>);
-        } else {
-            // Subsequent seals: quantize to Warm to save memory.
-            let path = self.segment_path(Tier::Warm);
-            let records: Vec<(PointOffset, Record)> = vectors_for_build
-                .iter()
-                .map(|(offset, v)| {
-                    (*offset, Record {
-                        id: String::new(),
-                        text: String::new(),
-                        embedding: Arc::from(v.clone()),
-                        importance: 0.0,
-                        concepts: Vec::new(),
-                        created_at: 0,
-                        insert_seq: 0,
-                        access_count: 0,
-                        last_accessed: 0,
-                        tier: Tier::Warm,
-                        payload: None,
-                    })
-                })
-                .collect();
-            let warm = WarmSegment::from_records(&path, &records, self.config.tier.warm_bits)?;
-            self.warm
-                .push(Arc::new(RwLock::new(warm)) as Arc<RwLock<dyn VectorSegment>>);
-        }
-        *self.hot.write() = HotSegment::new(&self.config)?;
-        // Roll warm to cold if over capacity.
-        self.compact_warm(vectors)?;
-        Ok(())
+        out
     }
 
     /// If total warm records exceed the warm capacity, merge all warm segments
     /// into a single Cold segment.
-    fn compact_warm(&mut self, vectors: &VectorStore) -> crate::Result<()> {
+    pub(crate) fn compact_warm(&mut self, vectors: &VectorStore) -> crate::Result<()> {
         let total_warm: usize = self.warm.iter().map(|s| s.read().point_count()).sum();
         if total_warm <= self.config.tier.warm_capacity || self.warm.is_empty() {
             return Ok(());
@@ -307,6 +315,7 @@ impl SegmentHolder {
 
     pub fn point_count(&self) -> usize {
         self.hot.read().point_count()
+            + self.sealing_plain.iter().map(|s| s.read().point_count()).sum::<usize>()
             + self.sealed_hot.iter().map(|s| s.read().point_count()).sum::<usize>()
             + self.warm.iter().map(|s| s.read().point_count()).sum::<usize>()
             + self.cold.iter().map(|s| s.read().point_count()).sum::<usize>()
@@ -314,6 +323,7 @@ impl SegmentHolder {
 
     pub fn memory_bytes(&self) -> usize {
         self.hot.read().memory_bytes()
+            + self.sealing_plain.iter().map(|s| s.read().memory_bytes()).sum::<usize>()
             + self.sealed_hot.iter().map(|s| s.read().memory_bytes()).sum::<usize>()
             + self.warm.iter().map(|s| s.read().memory_bytes()).sum::<usize>()
             + self.cold.iter().map(|s| s.read().memory_bytes()).sum::<usize>()
@@ -321,6 +331,9 @@ impl SegmentHolder {
 
     pub fn flush(&self) -> crate::Result<()> {
         (self.hot.read().flusher())()?;
+        for plain in &self.sealing_plain {
+            (plain.read().flusher())()?;
+        }
         for sealed in &self.sealed_hot {
             (sealed.read().flusher())()?;
         }
@@ -365,6 +378,11 @@ impl SegmentHolder {
         let half_life = self.config.tier.recency_half_life_secs.max(1);
 
         let mut candidate_offsets = Vec::new();
+        for plain in &self.sealing_plain {
+            for &offset in plain.read().offsets() {
+                candidate_offsets.push(offset);
+            }
+        }
         for sealed in &self.sealed_hot {
             for &offset in sealed.read().offsets() {
                 candidate_offsets.push(offset);

@@ -12,7 +12,7 @@ use crate::StorageError;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use turbomemory_core::validate_dimension;
+use turbomemory_core::{cosine_similarity_batch, validate_dimension};
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
 const MANIFEST_FILE: &str = "manifest.json";
@@ -30,6 +30,7 @@ struct Manifest {
 /// Immutable sealed Hot segment backed by a persisted `usearch` HNSW index.
 pub struct SealedHotSegment {
     dim: usize,
+    search_list_size: usize,
     index: Index,
     path: PathBuf,
     offsets: Vec<PointOffset>,
@@ -113,6 +114,7 @@ impl SealedHotSegment {
 
         Ok(Self {
             dim: config.dimension,
+            search_list_size: config.search_list_size,
             index,
             path,
             offsets,
@@ -149,6 +151,7 @@ impl SealedHotSegment {
 
         Ok(Self {
             dim: config.dimension,
+            search_list_size: manifest.search_list_size,
             index,
             path,
             offsets: manifest.offsets,
@@ -161,6 +164,44 @@ impl SealedHotSegment {
 
     pub fn point_count(&self) -> usize {
         self.offsets.len()
+    }
+
+    /// Exact brute-force search over a specific set of offsets.
+    fn search_exact(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        vectors: &VectorStore,
+        offsets: &[PointOffset],
+    ) -> crate::Result<Vec<ScoredPoint>> {
+        let view = vectors.read_view();
+        const CHUNK: usize = 64;
+        let mut scored: Vec<ScoredPoint> = Vec::with_capacity(offsets.len());
+        for chunk in offsets.chunks(CHUNK) {
+            let mut pairs = Vec::with_capacity(chunk.len());
+            for &offset in chunk {
+                if let Some(v) = view.get(offset) {
+                    pairs.push((offset, v));
+                }
+            }
+            let refs: Vec<&[f32]> = pairs.iter().map(|(_, v)| *v).collect();
+            let scores = cosine_similarity_batch(query, &refs);
+            for ((offset, _), score) in pairs.into_iter().zip(scores) {
+                scored.push(ScoredPoint {
+                    offset,
+                    score,
+                    tier: Tier::Hot,
+                });
+            }
+        }
+        drop(view);
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored.truncate(top_k);
+        Ok(scored)
     }
 }
 
@@ -179,18 +220,32 @@ impl VectorSegment for SealedHotSegment {
         &self,
         query: &[f32],
         top_k: usize,
-        _vectors: &VectorStore,
+        vectors: &VectorStore,
         allowed_offsets: Option<&RoaringBitmap>,
     ) -> crate::Result<Vec<ScoredPoint>> {
         validate_dimension(query, self.dim)?;
-        let fetch_k = if allowed_offsets.is_some() {
-            top_k.saturating_mul(8).max(top_k)
-        } else {
-            top_k
-        };
+
+        // For very selective filters, an exact scan over the allowed offsets in
+        // this segment is more reliable than HNSW with post-filtering. This
+        // approximates Qdrant's plain-index fallback for selective filters.
+        if let Some(bitmap) = allowed_offsets {
+            let threshold = self.search_list_size.max(100);
+            let allowed_in_segment: Vec<PointOffset> = self
+                .offsets
+                .iter()
+                .copied()
+                .filter(|o| bitmap.contains(*o as u32))
+                .collect();
+            if allowed_in_segment.len() <= threshold {
+                return self.search_exact(query, top_k, vectors, &allowed_in_segment);
+            }
+        }
+
+        // The caller (SegmentHolder) already applies the ef/over-fetch multiplier,
+        // so we use `top_k` directly here.
         let matches = self
             .index
-            .search(query, fetch_k)
+            .search(query, top_k)
             .map_err(|e| StorageError::IndexError(format!("usearch search failed: {e}")))?;
         let mut results: Vec<ScoredPoint> = Vec::with_capacity(matches.keys.len());
         for (offset, distance) in matches.keys.into_iter().zip(matches.distances) {

@@ -3,12 +3,12 @@
 pub mod config;
 pub mod engine;
 pub mod metadata_store;
+pub mod optimizer;
 pub mod payload_index;
 pub mod record;
 pub mod text_index;
 pub mod segment_holder;
 pub mod segments;
-pub mod update_handler;
 pub mod vector_store;
 pub mod wal;
 

@@ -215,7 +215,7 @@ if HAS_QDRANT:
         def search(self, query_embedding, top_k):
             search_result = self.client.search(
                 collection_name="benchmark",
-                query_vector=embedding.tolist(),
+                query_vector=query_embedding.tolist(),
                 limit=top_k
             )
             return [(hit.payload["id"], hit.score) for hit in search_result]

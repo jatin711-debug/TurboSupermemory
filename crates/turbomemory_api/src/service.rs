@@ -79,9 +79,7 @@ impl MemoryService {
             auto_consolidation_interval: None,
         };
         let engine = StorageEngine::open(db_path, config)?;
-        Ok(Self {
-            engine: Arc::new(engine),
-        })
+        Ok(Self { engine })
     }
 
     pub fn engine(&self) -> &Arc<StorageEngine> {

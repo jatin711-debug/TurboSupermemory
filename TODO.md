@@ -217,20 +217,62 @@ Status key: **Done** | **In Progress** | **Pending**
 
 ---
 
+## 16. Imported Architecture Optimizations (Qdrant + Chroma)
+
+Lessons from `docs/qdrant_architecture.md` and `docs/chroma_architecture.md` that are now queued for TSM implementation.
+
+### 16.1 Ingestion speed
+
+| # | Fix | Location(s) | Status | Notes |
+|---|---|---|---|---|
+| 16.1.1 | Add appendable plain / brute-force segment for hot writes | `crates/turbomemory_storage/src/segments/hot.rs` | Done | `HotSegment` is now a plain offset list; HNSW built offline by optimizer |
+| 16.1.2 | Add in-memory write buffer + periodic batch flush to HNSW | `crates/turbomemory_storage/src/segments/hot.rs`, `engine.rs` | Pending | Chroma-style fallback: buffer ≤100 items, flush asynchronously (deferred; plain segment already removes HNSW insert cost) |
+| 16.1.3 | Move Hot-seal / HNSW rebuild / compaction to background optimizer | `crates/turbomemory_storage/src/optimizer.rs` (new), `segment_holder.rs` | Done | `BackgroundOptimizer` builds `SealedHot`/`Warm` from `sealing_plain`; `flush()` drains pending seals |
+| 16.1.4 | Batch WAL appends and make flush policy configurable | `crates/turbomemory_storage/src/wal.rs`, `engine.rs` | Pending | `EveryWrite` / `EveryBatch` / `Periodic`; Qdrant/Chroma both amortize fsync |
+| 16.1.5 | Move Tantivy text-index commit out of query path | `crates/turbomemory_storage/src/text_index.rs`, `engine.rs` | Done | `TextIndex` tracks pending docs; `commit_if_pending()` in `evaluate_filter`; periodic flush commits |
+| 16.1.6 | Apply metadata / payload / text updates in log-compaction batches | `crates/turbomemory_storage/src/metadata_store.rs`, `payload_index.rs`, `text_index.rs` | Pending | Chroma-style: batch-apply a chunk of WAL records |
+
+### 16.2 Search speed
+
+| # | Fix | Location(s) | Status | Notes |
+|---|---|---|---|---|
+| 16.2.1 | Use `ef = max(search_list_size, top_k)` at query time | `crates/turbomemory_storage/src/segment_holder.rs`, `segments/hot.rs`, `segments/sealed_hot.rs` | Done | `pool_k = max(search_list_size, top_k * multiplier)`; segment search uses caller's `pool_k` directly |
+| 16.2.2 | Query segments in parallel with Rayon / thread pool | `crates/turbomemory_storage/src/segment_holder.rs` | Done | `rayon` added; segments searched in parallel; sequential fallback for single segment |
+| 16.2.3 | Push payload bitmap into HNSW traversal as `FilteredScorer` | `crates/turbomemory_storage/src/segments/sealed_hot.rs` | Done | Selective-filter fallback to exact scan per `SealedHotSegment`; post-filter path uses larger `pool_k` |
+| 16.2.4 | Add small-segment exact / brute-force fallback threshold | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Qdrant `full_scan_threshold`; currently engine falls back at 4,096 total records only |
+| 16.2.5 | Accelerate Warm/Cold scans with SIMD + early-exit top-k | `crates/turbomemory_core/src/metrics_quantized.rs`, `segments/warm.rs`, `segments/cold.rs` | Pending | Scalar u8 and 1-bit sign distance already implemented; wire into scans |
+
+### 16.3 Recall
+
+| # | Fix | Location(s) | Status | Notes |
+|---|---|---|---|---|
+| 16.3.1 | Expose `ef` / `search_list_size` in Python `search_ann` API | `crates/turbomemory_python/src/lib.rs`, `crates/turbomemory_api/` | Pending | Lets callers trade latency for recall |
+| 16.3.2 | Floor filtered-search candidate pool at `ef` | `crates/turbomemory_storage/src/segment_holder.rs` | Done | `pool_k = max(search_list_size, top_k * 8)` for filtered queries |
+| 16.3.3 | Add recall audit auto-tune: sample + raise `ef` if below target | `audit_recall.py`, `crates/turbomemory_storage/src/engine.rs` | Pending | Chroma/Qdrant both keep recall high via ef tuning |
+
+---
+
 ## Suggested Execution Order
 
 ### Phase A — Production correctness ✅
 1. **12.1–12.7** — Dimension validation, duplicate-ID semantics, idempotent batch, out-of-disk handling, deletion/tombstones, corruption detection, observable consolidation.
 2. **7.7** — Graceful shutdown (stop workers, flush WAL/vectors/segments, close mmap).
 
-### Phase B — Core DB features for users (current)
+### Phase B — Core DB features for users ✅
 3. **11.1–11.4** — Payload storage, payload index (Roaring bitmaps), filtered ANN, full-text index.
 4. **8.1–8.4** — Python binding hardening (async batch handle, zero-copy numpy, GIL release, exception mapping).
 5. **9.1–9.2** — Batch insert and delete/update REST/gRPC endpoints.
 
-### Phase C — Scalability / optimizer hardening
-6. **4.1–4.7 + 5.2 + 5.4** — Immutable segments, access scoring, background builders, merge/vacuum/config-mismatch optimizers, product quantization.
-7. **1.4 + 1.7 + 1.8 + 3.6 + 3.10** — VisitedPool, HNSW tuning, full-scan threshold, segment versioning, sync thresholds.
+### Phase C — Scalability / optimizer hardening (current)
+6. **16.1–16.3** — Imported architecture optimizations (done):
+   - **16.2.1** ✅ Query-time `ef` fix (recall@5 now 100% at N=5k D=128/768).
+   - **16.1.5** ✅ Batch Tantivy commits / remove commit-on-query.
+   - **16.1.1** ✅ Appendable plain segment for hot writes.
+   - **16.1.3** ✅ Background optimizer for seal/merge/compaction.
+   - **16.2.2 + 16.2.3** ✅ Parallel segment search + filtered HNSW traversal.
+7. **Remaining Phase C items** — `16.1.2`, `16.1.4`, `16.1.6`, `16.2.4`, `16.2.5`, `16.3.1`, `16.3.3`, plus the original `4.x`, `5.x`, `1.x`, `3.x` backlog.
+7. **4.1–4.7 + 5.2 + 5.4** — Immutable segments, access scoring, background builders, merge/vacuum/config-mismatch optimizers, product quantization.
+8. **1.4 + 1.7 + 1.8 + 3.6 + 3.10** — VisitedPool, HNSW tuning, full-scan threshold, segment versioning, sync thresholds.
 
 ### Phase D — Operations / deployment
 8. **13.1–13.4** — `tracing` + `metrics` + structured logging.

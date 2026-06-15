@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use turbomemory_storage::config::StoreConfig;
 use turbomemory_storage::engine::StorageEngine;
-use turbomemory_storage::update_handler::UpdateHandler;
 
 /// Map storage errors to specific Python exception types.
 fn storage_err(e: turbomemory_storage::StorageError) -> PyErr {
@@ -86,8 +85,6 @@ fn parse_payload(payload: Option<String>) -> PyResult<Option<String>> {
 #[pyclass(name = "MemoryEngine")]
 pub struct PyMemoryEngine {
     inner: Arc<StorageEngine>,
-    #[allow(dead_code)]
-    handler: Option<UpdateHandler>,
 }
 
 #[pymethods]
@@ -110,12 +107,8 @@ impl PyMemoryEngine {
             tier: turbomemory_storage::config::TierConfig::default(),
             auto_consolidation_interval: Some(Duration::from_secs(60)),
         };
-        let inner = Arc::new(StorageEngine::open(db_path, config).map_err(storage_err)?);
-        let handler = inner
-            .config()
-            .auto_consolidation_interval
-            .map(|interval| UpdateHandler::new(inner.clone(), interval));
-        Ok(Self { inner, handler })
+        let inner = StorageEngine::open(db_path, config).map_err(storage_err)?;
+        Ok(Self { inner })
     }
 
     #[pyo3(signature = (id, text, embedding, importance_score, concepts, payload=None))]
@@ -241,11 +234,9 @@ impl PyMemoryEngine {
         })
     }
 
-    /// Stop the background worker and flush all durable state.
+    /// Flush all durable state. The engine's built-in background optimizer is
+    /// stopped automatically when the engine is dropped.
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
-        if let Some(mut handler) = self.handler.take() {
-            py.allow_threads(|| handler.stop());
-        }
         py.allow_threads(|| self.inner.shutdown().map_err(storage_err))
     }
 

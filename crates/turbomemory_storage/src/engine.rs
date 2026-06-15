@@ -14,6 +14,7 @@ use crate::config::StoreConfig;
 use crate::metadata_store::MetadataStore;
 use crate::payload_index::{Filter, PayloadIndex};
 use crate::record::{MetaRecord, PointOffset, Record};
+use crate::optimizer::BackgroundOptimizer;
 use crate::text_index::TextIndex;
 use crate::segment_holder::SegmentHolder;
 use crate::vector_store::VectorStore;
@@ -25,6 +26,7 @@ use roaring::RoaringBitmap;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use turbomemory_core::{cosine_similarity, normalize, validate_dimension};
 use turbomemory_graph::{
     step_session, CompressedCognitiveState, MemoryGraph, SpreadingActivation, SpreadingConfig,
@@ -40,14 +42,15 @@ const WAL_DIR: &str = "wal";
 pub struct StorageEngine {
     config: Arc<StoreConfig>,
     meta: Arc<MetadataStore>,
-    vectors: Arc<VectorStore>,
-    segments: Arc<RwLock<SegmentHolder>>,
+    pub(crate) vectors: Arc<VectorStore>,
+    pub(crate) segments: Arc<RwLock<SegmentHolder>>,
     graph: Arc<RwLock<SpreadingActivation>>,
     ccs: Arc<Mutex<Option<CompressedCognitiveState>>>,
     id_index: Arc<RwLock<AHashMap<Arc<str>, PointOffset>>>,
     payload_index: Arc<RwLock<PayloadIndex>>,
     text_index: Arc<TextIndex>,
     wal: Arc<Mutex<Wal>>,
+    optimizer: Arc<BackgroundOptimizer>,
 }
 
 impl Clone for StorageEngine {
@@ -63,12 +66,13 @@ impl Clone for StorageEngine {
             payload_index: self.payload_index.clone(),
             text_index: self.text_index.clone(),
             wal: self.wal.clone(),
+            optimizer: self.optimizer.clone(),
         }
     }
 }
 
 impl StorageEngine {
-    pub fn open(db_path: impl AsRef<Path>, config: StoreConfig) -> crate::Result<Self> {
+    pub fn open(db_path: impl AsRef<Path>, config: StoreConfig) -> crate::Result<Arc<Self>> {
         let db_path = db_path.as_ref();
         let meta = MetadataStore::open(db_path)?;
         let vectors = VectorStore::open(db_path.join("vectors.bin"), config.dimension)?;
@@ -216,18 +220,26 @@ impl StorageEngine {
             segments.add_cold(seg);
         }
 
-        Ok(Self {
-            config: Arc::new(config),
-            meta: Arc::new(meta),
-            vectors: Arc::new(vectors),
-            segments: Arc::new(RwLock::new(segments)),
-            graph: Arc::new(RwLock::new(graph)),
-            ccs: Arc::new(Mutex::new(ccs)),
-            id_index: Arc::new(RwLock::new(id_index)),
-            payload_index,
-            text_index,
-            wal: Arc::new(Mutex::new(wal)),
-        })
+        let interval = config
+            .auto_consolidation_interval
+            .unwrap_or_else(|| Duration::from_secs(60));
+
+        Ok(Arc::new_cyclic(move |weak| {
+            let optimizer = BackgroundOptimizer::new(weak.clone(), interval);
+            Self {
+                config: Arc::new(config),
+                meta: Arc::new(meta),
+                vectors: Arc::new(vectors),
+                segments: Arc::new(RwLock::new(segments)),
+                graph: Arc::new(RwLock::new(graph)),
+                ccs: Arc::new(Mutex::new(ccs)),
+                id_index: Arc::new(RwLock::new(id_index)),
+                payload_index,
+                text_index,
+                wal: Arc::new(Mutex::new(wal)),
+                optimizer: Arc::new(optimizer),
+            }
+        }))
     }
 
     pub fn insert(
@@ -705,8 +717,9 @@ impl StorageEngine {
     /// Evaluate a filter against the payload and full-text indexes.
     fn evaluate_filter(&self, filter: &Filter) -> crate::Result<RoaringBitmap> {
         if filter.uses_full_text() {
-            // Tantivy writes are deferred; make them visible before querying.
-            self.text_index.commit()?;
+            // Tantivy writes are deferred; make them visible before querying,
+            // but only if there are actually pending documents.
+            self.text_index.commit_if_pending()?;
         }
         self.evaluate_filter_recursive(filter)
     }
@@ -818,13 +831,18 @@ impl StorageEngine {
     }
 
     pub fn flush(&self) -> crate::Result<()> {
-        // 1. Durably sync the WAL.
+        // 1. Build any pending plain segments so the durable snapshot captures
+        //    them as persisted HNSW / quantized segments rather than in-memory
+        //    plain indexes.
+        while crate::optimizer::BackgroundOptimizer::process_one_seal(self).unwrap_or(false) {}
+
+        // 2. Durably sync the WAL.
         {
             let mut wal = self.wal.lock();
             wal.flush()?;
         }
 
-        // 2. Persist the vector snapshot, metadata snapshot, and text index.
+        // 3. Persist the vector snapshot, metadata snapshot, and text index.
         self.vectors.flush()?;
         self.text_index.flush()?;
         let last_applied_seq = self.meta.next_seq().saturating_sub(1);
@@ -1282,7 +1300,8 @@ mod tests {
             high: Bound::Included(35.0),
         };
         let results = engine.search_ann_filtered(&make_vec(8, 0), 10, &filter).unwrap();
-        let ids: Vec<_> = results.into_iter().map(|(id, _)| id).collect();
+        let mut ids: Vec<_> = results.into_iter().map(|(id, _)| id).collect();
+        ids.sort();
         assert_eq!(ids, vec!["mem_2", "mem_3"]);
 
         // Delete removes from index.

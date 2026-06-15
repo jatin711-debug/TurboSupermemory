@@ -9,6 +9,7 @@ use crate::StorageError;
 use parking_lot::Mutex;
 use roaring::RoaringBitmap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::{Field, Schema, Value as TantivyValue, INDEXED, STORED, FAST, TEXT};
@@ -25,6 +26,9 @@ pub struct TextIndex {
     text_field: Field,
     offset_field: Field,
     path: PathBuf,
+    /// Number of documents added/removed since the last commit. Used to avoid
+    /// paying a Tantivy commit on every full-text query.
+    pending: AtomicU64,
 }
 
 impl TextIndex {
@@ -64,6 +68,7 @@ impl TextIndex {
             text_field,
             offset_field,
             path,
+            pending: AtomicU64::new(0),
         })
     }
 
@@ -73,16 +78,18 @@ impl TextIndex {
         writer
             .add_document(doc!(
                 self.text_field => text,
-                self.offset_field => offset as u64,
+                self.offset_field => offset,
             ))
             .map_err(|e| StorageError::IndexError(format!("tantivy add: {e}")))?;
+        self.pending.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
     /// Remove a record from the index.
     pub fn remove(&self, offset: PointOffset) -> crate::Result<()> {
         let writer = self.writer.lock();
-        writer.delete_term(Term::from_field_u64(self.offset_field, offset as u64));
+        writer.delete_term(Term::from_field_u64(self.offset_field, offset));
+        self.pending.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -96,7 +103,18 @@ impl TextIndex {
         self.reader
             .reload()
             .map_err(|e| StorageError::IndexError(format!("tantivy reload: {e}")))?;
+        self.pending.store(0, Ordering::Release);
         Ok(())
+    }
+
+    /// Commit only if there are pending writes. This removes the per-query
+    /// commit stall when the text index is up to date.
+    pub fn commit_if_pending(&self) -> crate::Result<()> {
+        if self.pending.load(Ordering::Acquire) > 0 {
+            self.commit()
+        } else {
+            Ok(())
+        }
     }
 
     /// Search the full-text index and return all matching offsets.
