@@ -116,7 +116,7 @@ impl Memory for MemoryService {
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         let req = request.into_inner();
-        let filter = pb_filter_to_storage(req.filter.as_ref()).map_err(ApiError::from)?;
+        let filter = pb_filter_to_storage(req.filter.as_ref())?;
         let maybe = match filter {
             Some(f) => self
                 .engine()
@@ -145,7 +145,7 @@ impl Memory for MemoryService {
         request: Request<SearchAnnRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         let req = request.into_inner();
-        let filter = pb_filter_to_storage(req.filter.as_ref()).map_err(ApiError::from)?;
+        let filter = pb_filter_to_storage(req.filter.as_ref())?;
         let results = match filter {
             Some(f) => self
                 .engine()

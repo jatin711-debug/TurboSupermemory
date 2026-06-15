@@ -362,8 +362,8 @@ impl StorageEngine {
         let idx = self.id_index.read();
         let mut seen = HashSet::with_capacity(n);
         let mut indices: Vec<usize> = Vec::with_capacity(n);
-        for i in 0..n {
-            let id = ids[i].as_str();
+        for (i, raw_id) in ids.iter().enumerate().take(n) {
+            let id = raw_id.as_str();
             if idx.contains_key(id) || !seen.insert(id) {
                 continue;
             }
