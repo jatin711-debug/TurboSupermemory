@@ -15,6 +15,7 @@ fn bench_config(dim: usize, hot_capacity: usize, warm_capacity: usize) -> StoreC
             warm_capacity,
             warm_bits: 8,
             warm_chunk_bytes: 16 * 1024 * 1024,
+            hnsw_threshold: 1000,
             cold_sign: true,
             hot_promote_threshold: 2.0,
             warm_demote_threshold: 0.5,

@@ -70,10 +70,19 @@ impl PayloadIndex {
 
     /// Build an index from a snapshot of metadata records.
     pub fn from_meta_records(records: &HashMap<PointOffset, crate::record::MetaRecord>) -> Self {
+        Self::from_meta_records_iter(records.iter().map(|(o, m)| (*o, m)))
+    }
+
+    /// Build an index from an iterator of `(offset, record)` pairs.
+    ///
+    /// Avoids cloning the whole metadata map during engine open.
+    pub fn from_meta_records_iter<'a>(
+        records: impl Iterator<Item = (PointOffset, &'a crate::record::MetaRecord)>,
+    ) -> Self {
         let mut idx = Self::new();
         for (offset, meta) in records {
             // Best-effort indexing; malformed payloads are ignored.
-            let _ = idx.add(*offset, meta.payload.as_deref());
+            let _ = idx.add(offset, meta.payload.as_deref());
         }
         idx
     }

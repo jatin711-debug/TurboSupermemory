@@ -41,4 +41,6 @@ Thumbs.db
 mem0
 qdrant
 chroma
+vespa
+faiss
 ResearchPapers

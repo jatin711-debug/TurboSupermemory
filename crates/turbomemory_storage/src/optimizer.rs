@@ -4,8 +4,7 @@
 //!   1. Performs fast Hot-seal swaps when the Hot segment is full.
 //!   2. Builds HNSW / quantized segments from `sealing_plain` segments off the
 //!      caller thread, then atomically installs them.
-//!   3. Runs periodic consolidation + flush (replacing the external
-//!      `UpdateHandler`).
+//!   3. Runs periodic consolidation + flush.
 
 use crate::config::Tier;
 use crate::engine::StorageEngine;
@@ -109,8 +108,8 @@ impl BackgroundOptimizer {
             if offsets.is_empty() {
                 return Ok(true);
             }
-            let is_first_sealed = segments.sealed_hot_is_empty();
-            let path = if is_first_sealed {
+            let use_hnsw = offsets.len() >= engine.config().tier.hnsw_threshold;
+            let path = if use_hnsw {
                 segments.sealed_hot_path()
             } else {
                 segments.segment_path(Tier::Warm)
@@ -118,7 +117,7 @@ impl BackgroundOptimizer {
             Job {
                 plain,
                 offsets,
-                is_first_sealed,
+                use_hnsw,
                 path,
             }
         };
@@ -182,7 +181,7 @@ impl Drop for BackgroundOptimizer {
 struct Job {
     plain: Arc<RwLock<HotSegment>>,
     offsets: Vec<PointOffset>,
-    is_first_sealed: bool,
+    use_hnsw: bool,
     path: PathBuf,
 }
 
@@ -208,7 +207,7 @@ fn build_segment(engine: &StorageEngine, job: &Job) -> crate::Result<BuiltSegmen
         .map(|(offset, v)| (*offset, v.as_slice()))
         .collect();
 
-    if job.is_first_sealed {
+    if job.use_hnsw {
         let sealed = SealedHotSegment::from_vectors(&job.path, engine.config(), &borrowed)?;
         Ok(BuiltSegment::Sealed(sealed))
     } else {

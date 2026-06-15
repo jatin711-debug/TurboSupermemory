@@ -157,6 +157,7 @@ mod tests {
                 warm_capacity: 1000,
                 warm_bits: 8,
                 warm_chunk_bytes: 4096,
+                hnsw_threshold: 1000,
                 cold_sign: true,
                 hot_promote_threshold: 2.0,
                 warm_demote_threshold: 0.5,

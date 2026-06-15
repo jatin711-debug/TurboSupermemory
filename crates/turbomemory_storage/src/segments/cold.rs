@@ -146,11 +146,8 @@ impl VectorSegment for ColdSegment {
             .encode_query(query)
             .map_err(StorageError::Core)?;
 
-        let mut all: Vec<ScoredPoint> = self
-            .offsets
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, &offset)| {
+        let candidates = crate::segments::top_k_minheap(
+            self.offsets.iter().enumerate().filter_map(|(idx, &offset)| {
                 if let Some(bitmap) = allowed_offsets {
                     if !bitmap.contains(offset as u32) {
                         return None;
@@ -163,14 +160,9 @@ impl VectorSegment for ColdSegment {
                     score,
                     tier: Tier::Cold,
                 })
-            })
-            .collect();
-        all.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let candidates: Vec<_> = all.into_iter().take(top_k).collect();
+            }),
+            top_k,
+        );
 
         let view = vectors.read_view();
         let mut reranked: Vec<ScoredPoint> = candidates

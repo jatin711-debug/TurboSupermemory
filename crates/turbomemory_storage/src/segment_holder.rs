@@ -81,10 +81,6 @@ impl SegmentHolder {
         self.base_path.join(SEALED_HOT_DIR).join(format!("segment_{id}"))
     }
 
-    pub(crate) fn sealed_hot_is_empty(&self) -> bool {
-        self.sealed_hot.is_empty()
-    }
-
     pub(crate) fn pop_sealing_plain(&mut self) -> Option<Arc<RwLock<HotSegment>>> {
         self.sealing_plain.pop()
     }

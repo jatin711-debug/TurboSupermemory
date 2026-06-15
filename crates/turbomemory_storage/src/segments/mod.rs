@@ -57,6 +57,68 @@ pub trait VectorSegment: Send + Sync {
     }
 }
 
+/// Wrapper that makes [`ScoredPoint`] usable in a binary heap.
+///
+/// Ordering is by score descending; combined with [`std::cmp::Reverse`] this
+/// yields a min-heap over scores, i.e. the heap always keeps the top-k highest
+/// scoring points.
+#[derive(Debug, Clone, Copy)]
+struct HeapScored(ScoredPoint);
+
+impl PartialEq for HeapScored {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.score.to_bits() == other.0.score.to_bits()
+    }
+}
+
+impl Eq for HeapScored {}
+
+impl PartialOrd for HeapScored {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapScored {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .score
+            .partial_cmp(&other.0.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+/// Collect the top-k highest-scoring points from an iterator without sorting
+/// the whole set. This turns the O(N log N) Warm/Cold scans into O(N log k).
+pub fn top_k_minheap(
+    scored: impl Iterator<Item = ScoredPoint>,
+    k: usize,
+) -> Vec<ScoredPoint> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    if k == 0 {
+        return Vec::new();
+    }
+
+    let mut heap: BinaryHeap<Reverse<HeapScored>> = BinaryHeap::with_capacity(k);
+    for point in scored {
+        if heap.len() < k {
+            heap.push(Reverse(HeapScored(point)));
+        } else if let Some(Reverse(min)) = heap.peek() {
+            if point.score > min.0.score {
+                heap.pop();
+                heap.push(Reverse(HeapScored(point)));
+            }
+        }
+    }
+
+    let mut out: Vec<ScoredPoint> = heap.into_sorted_vec().into_iter().map(|r| r.0.0).collect();
+    // `into_sorted_vec` produces ascending order; reverse to get highest first.
+    out.reverse();
+    out
+}
+
 /// Merge candidate lists from multiple segments, preserving the highest scores.
 /// If the same offset appears in multiple lists (e.g. after promotion), keep
 /// the highest score and drop the duplicates.

@@ -26,6 +26,9 @@ pub struct MetadataStore {
     dirty: Mutex<HashSet<PointOffset>>,
     next_offset: AtomicU64,
     next_seq: AtomicU64,
+    /// Number of live metadata records. Maintained incrementally so callers
+    /// never need to clone the map just to know its size.
+    record_count: AtomicU64,
 }
 
 impl MetadataStore {
@@ -35,6 +38,7 @@ impl MetadataStore {
         let db_file = db_path.join("memory.redb");
         let db = redb(Database::create(db_file))?;
         let records = Self::load_records(&db)?;
+        let record_count = AtomicU64::new(records.len() as u64);
         let next_offset = Self::load_meta(&db, "next_offset")
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| records.keys().copied().max().map(|m| m + 1).unwrap_or(0));
@@ -54,6 +58,7 @@ impl MetadataStore {
             dirty: Mutex::new(HashSet::new()),
             next_offset: AtomicU64::new(next_offset),
             next_seq: AtomicU64::new(next_seq),
+            record_count,
         })
     }
 
@@ -82,8 +87,28 @@ impl MetadataStore {
     }
 
     /// Return a snapshot of all cached metadata records.
+    ///
+    /// Prefer [`for_each_record`](Self::for_each_record) or
+    /// [`record_count`](Self::record_count) for hot paths; this clones the map.
     pub fn records(&self) -> crate::Result<HashMap<PointOffset, MetaRecord>> {
         Ok(self.records.read().clone())
+    }
+
+    /// Iterate over all live metadata records without cloning the map.
+    pub fn for_each_record<F>(&self, mut f: F) -> crate::Result<()>
+    where
+        F: FnMut(PointOffset, &MetaRecord),
+    {
+        let guard = self.records.read();
+        for (offset, rec) in guard.iter() {
+            f(*offset, rec);
+        }
+        Ok(())
+    }
+
+    /// Return the number of live metadata records in O(1).
+    pub fn record_count(&self) -> usize {
+        self.record_count.load(Ordering::Relaxed) as usize
     }
 
     /// Look up a metadata record from the in-memory cache.
@@ -100,8 +125,12 @@ impl MetadataStore {
     /// Insert or update a metadata record directly.
     pub fn put_meta(&self, offset: PointOffset, meta: &MetaRecord) -> crate::Result<()> {
         let mut records = self.records.write();
+        let is_new = !records.contains_key(&offset);
         records.insert(offset, meta.clone());
         drop(records);
+        if is_new {
+            self.record_count.fetch_add(1, Ordering::Relaxed);
+        }
         self.dirty.lock().insert(offset);
         Ok(())
     }
@@ -113,9 +142,17 @@ impl MetadataStore {
         }
         let mut cache = self.records.write();
         let mut dirty = self.dirty.lock();
+        let mut added: u64 = 0;
         for (offset, rec) in records {
+            if !cache.contains_key(offset) {
+                added += 1;
+            }
             cache.insert(*offset, MetaRecord::from(rec));
             dirty.insert(*offset);
+        }
+        drop(cache);
+        if added > 0 {
+            self.record_count.fetch_add(added, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -123,8 +160,11 @@ impl MetadataStore {
     /// Remove a record from the cache and mark the slot dirty.
     pub fn remove(&self, offset: PointOffset) -> crate::Result<()> {
         let mut records = self.records.write();
-        records.remove(&offset);
+        let existed = records.remove(&offset).is_some();
         drop(records);
+        if existed {
+            self.record_count.fetch_sub(1, Ordering::Relaxed);
+        }
         self.dirty.lock().insert(offset);
         Ok(())
     }

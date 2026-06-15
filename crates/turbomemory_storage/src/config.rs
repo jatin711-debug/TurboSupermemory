@@ -31,6 +31,9 @@ pub struct TierConfig {
     pub warm_bits: u8,
     /// Byte size of a single Warm tier mmap chunk.
     pub warm_chunk_bytes: usize,
+    /// Minimum number of records in a sealed segment before building an HNSW
+    /// index. Smaller segments stay quantized/plain for efficiency.
+    pub hnsw_threshold: usize,
     /// True if the Cold tier uses 1-bit sign quantization.
     pub cold_sign: bool,
     /// Access-score threshold above which a record is promoted back to Hot.
@@ -48,6 +51,7 @@ impl Default for TierConfig {
             warm_capacity: 100_000,
             warm_bits: 8,
             warm_chunk_bytes: 16 * 1024 * 1024, // 16 MiB
+            hnsw_threshold: 1000,
             cold_sign: true,
             hot_promote_threshold: 2.0,
             warm_demote_threshold: 0.5,

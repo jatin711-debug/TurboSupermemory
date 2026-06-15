@@ -155,11 +155,8 @@ impl VectorSegment for WarmSegment {
             .encode_query(query)
             .map_err(StorageError::Core)?;
 
-        let mut all: Vec<ScoredPoint> = self
-            .offsets
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, &offset)| {
+        let candidates = crate::segments::top_k_minheap(
+            self.offsets.iter().enumerate().filter_map(|(idx, &offset)| {
                 if let Some(bitmap) = allowed_offsets {
                     if !bitmap.contains(offset as u32) {
                         return None;
@@ -172,14 +169,9 @@ impl VectorSegment for WarmSegment {
                     score,
                     tier: Tier::Warm,
                 })
-            })
-            .collect();
-        all.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let candidates: Vec<_> = all.into_iter().take(top_k).collect();
+            }),
+            top_k,
+        );
 
         // Rerank with full f32 embeddings from the vector store.
         let view = vectors.read_view();

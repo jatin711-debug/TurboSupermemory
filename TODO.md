@@ -14,8 +14,8 @@ Status key: **Done** | **In Progress** | **Pending**
 | 1.4 | Add `VisitedPool` to reuse visited bitsets across searches | `crates/turbomemory_storage/src/index/visited_pool.rs` | Pending | Avoids per-search allocation (Phase C) |
 | 1.5 | Support index save/load/mmap for sealed segments | `crates/turbomemory_storage/src/segments/sealed_hot.rs`, `warm.rs`, `cold.rs` | Done | SealedHot + Warm + Cold segments persist and reload via manifest + mmap data file |
 | 1.6 | Add deletion / tombstone support in HNSW | `crates/turbomemory_storage/src/segments/hot.rs`, graph layer | In Progress | Currently no real delete path (Phase A: implement delete/update API and tombstones) (Phase A: delete implemented; tombstone cleanup in vacuum) |
-| 1.7 | Tune `M`, `ef_construct`, `ef_search` per dimension and dataset size | `crates/turbomemory_storage/src/segments/hot.rs`, config | Pending | `D=8` and `D=1024` need different params (Phase C) |
-| 1.8 | Add `full_scan_threshold` fallback like Qdrant | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Brute force is fine for tiny segments (Phase C) |
+| 1.7 | Tune `M`, `ef_construct`, `ef_search` per dimension and dataset size | `crates/turbomemory_storage/src/segments/hot.rs`, config | In Progress | Added `hnsw_threshold`; still need dimension-aware `M`/`ef` defaults (Phase C) |
+| 1.8 | Add `full_scan_threshold` fallback like Qdrant | `crates/turbomemory_storage/src/segment_holder.rs` | Done | `hnsw_threshold` routes small segments to quantized/plain scan; engine exact fallback remains at 4,096 records |
 | 1.9 | Current Hot HNSW based on `vector-index` crate | `crates/turbomemory_storage/src/segments/hot.rs` | Done | Replaced by `usearch` |
 
 ---
@@ -60,7 +60,7 @@ Status key: **Done** | **In Progress** | **Pending**
 | 4.1 | Define sealed/immutable segment type | `crates/turbomemory_storage/src/segments/` | Pending | Hot is appendable; Warm/Cold should be immutable (Phase C) |
 | 4.2 | Implement Hot → Warm sealing when Hot hits size threshold | `crates/turbomemory_storage/src/segment_holder.rs` | Done | First seal → SealedHot; subsequent seals → Warm; Warm → Cold when over capacity |
 | 4.3 | Implement Warm → Cold demotion | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Use access scoring (Phase C) |
-| 4.4 | Add indexing optimizer: build HNSW once segment is large enough | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Avoids indexing tiny segments (Phase C) |
+| 4.4 | Add indexing optimizer: build HNSW once segment is large enough | `crates/turbomemory_storage/src/optimizer.rs` | Done | `hnsw_threshold` in `TierConfig`; optimizer builds `SealedHotSegment` for large seals and `WarmSegment` for small ones |
 | 4.5 | Add merge optimizer to reduce segment count | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Too many segments hurts search (Phase C) |
 | 4.6 | Add vacuum optimizer to reclaim deleted points | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Tombstones accumulate over time (Phase A/B: vacuum deleted points) |
 | 4.7 | Add config-mismatch optimizer | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Rebuilds segments when config changes (Phase C) |
@@ -96,6 +96,7 @@ Status key: **Done** | **In Progress** | **Pending**
 | 6.6 | Use `smallvec` for short candidate / link lists | `crates/turbomemory_storage/src/segments/mod.rs` | Done | `merge_candidates` uses `SmallVec<[ScoredPoint; 64]>` |
 | 6.7 | Use `ahash` for `id_index` and graph maps | `crates/turbomemory_storage/src/engine.rs` | Done | `id_index` uses `ahash` |
 | 6.8 | O(1) duplicate-ID index | `crates/turbomemory_storage/src/engine.rs` | Done | Recently added |
+| 6.9 | O(1) `record_count` and avoid metadata `HashMap` clone on hot paths | `crates/turbomemory_storage/src/metadata_store.rs`, `engine.rs` | Done | `record_count` maintained atomically; `exact_top_k` and engine open iterate without cloning the map |
 
 ---
 
@@ -239,8 +240,8 @@ Lessons from `docs/qdrant_architecture.md` and `docs/chroma_architecture.md` tha
 | 16.2.1 | Use `ef = max(search_list_size, top_k)` at query time | `crates/turbomemory_storage/src/segment_holder.rs`, `segments/hot.rs`, `segments/sealed_hot.rs` | Done | `pool_k = max(search_list_size, top_k * multiplier)`; segment search uses caller's `pool_k` directly |
 | 16.2.2 | Query segments in parallel with Rayon / thread pool | `crates/turbomemory_storage/src/segment_holder.rs` | Done | `rayon` added; segments searched in parallel; sequential fallback for single segment |
 | 16.2.3 | Push payload bitmap into HNSW traversal as `FilteredScorer` | `crates/turbomemory_storage/src/segments/sealed_hot.rs` | Done | Selective-filter fallback to exact scan per `SealedHotSegment`; post-filter path uses larger `pool_k` |
-| 16.2.4 | Add small-segment exact / brute-force fallback threshold | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Qdrant `full_scan_threshold`; currently engine falls back at 4,096 total records only |
-| 16.2.5 | Accelerate Warm/Cold scans with SIMD + early-exit top-k | `crates/turbomemory_core/src/metrics_quantized.rs`, `segments/warm.rs`, `segments/cold.rs` | Pending | Scalar u8 and 1-bit sign distance already implemented; wire into scans |
+| 16.2.4 | Add small-segment exact / brute-force fallback threshold | `crates/turbomemory_storage/src/segment_holder.rs` | Done | `hnsw_threshold` decides HNSW vs quantized/plain per segment; engine still exact-falls-back below 4,096 records |
+| 16.2.5 | Accelerate Warm/Cold scans with SIMD + early-exit top-k | `crates/turbomemory_core/src/metrics_quantized.rs`, `segments/warm.rs`, `segments/cold.rs` | In Progress | Min-heap top-k implemented; SIMD sign dot and wider scalar SSE/NEON paths still pending |
 
 ### 16.3 Recall
 
@@ -270,7 +271,7 @@ Lessons from `docs/qdrant_architecture.md` and `docs/chroma_architecture.md` tha
    - **16.1.1** ✅ Appendable plain segment for hot writes.
    - **16.1.3** ✅ Background optimizer for seal/merge/compaction.
    - **16.2.2 + 16.2.3** ✅ Parallel segment search + filtered HNSW traversal.
-7. **Remaining Phase C items** — `16.1.2`, `16.1.4`, `16.1.6`, `16.2.4`, `16.2.5`, `16.3.1`, `16.3.3`, plus the original `4.x`, `5.x`, `1.x`, `3.x` backlog.
+7. **Remaining Phase C items** — `16.1.2`, `16.1.4`, `16.1.6`, `16.2.5` (SIMD part), `16.3.1`, `16.3.3`, plus the original `4.5`, `4.6`, `5.x`, `1.7`, `3.x` backlog.
 7. **4.1–4.7 + 5.2 + 5.4** — Immutable segments, access scoring, background builders, merge/vacuum/config-mismatch optimizers, product quantization.
 8. **1.4 + 1.7 + 1.8 + 3.6 + 3.10** — VisitedPool, HNSW tuning, full-scan threshold, segment versioning, sync thresholds.
 

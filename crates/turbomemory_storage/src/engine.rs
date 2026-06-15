@@ -119,21 +119,32 @@ impl StorageEngine {
             wal.clear()?;
         }
 
-        let records = meta.records()?;
+        // Collect metadata records once (no full HashMap clone) and rebuild
+        // derived indexes from that collection.
+        let mut records_meta: Vec<(PointOffset, MetaRecord)> =
+            Vec::with_capacity(meta.record_count());
+        meta.for_each_record(|offset, rec| records_meta.push((offset, rec.clone())))?;
 
-        // Rebuild the payload index from the metadata snapshot.  WAL replay above
-        // already added any records that were not yet flushed.
-        let payload_index = Arc::new(RwLock::new(PayloadIndex::from_meta_records(&records)));
+        // Rebuild the payload index from the metadata snapshot.
+        let payload_index = Arc::new(RwLock::new(PayloadIndex::from_meta_records_iter(
+            records_meta.iter().map(|(o, m)| (*o, m)),
+        )));
 
         // Rebuild the full-text index from the metadata snapshot.
         let text_index = Arc::new(TextIndex::open(db_path.join("text_index"))?);
-        for (offset, meta_rec) in &records {
+        for (offset, meta_rec) in &records_meta {
             text_index.add(*offset, &meta_rec.text)?;
         }
         text_index.commit()?;
 
+        records_meta.sort_by(|a, b| {
+            a.1.created_at
+                .cmp(&b.1.created_at)
+                .then(a.1.insert_seq.cmp(&b.1.insert_seq))
+        });
+
         let view = vectors.read_view();
-        let mut records_vec: Vec<(PointOffset, Record)> = records
+        let records_vec: Vec<(PointOffset, Record)> = records_meta
             .into_iter()
             .filter_map(|(offset, meta_rec)| {
                 view.get(offset)
@@ -141,11 +152,6 @@ impl StorageEngine {
             })
             .collect();
         drop(view);
-        records_vec.sort_by(|a, b| {
-            a.1.created_at
-                .cmp(&b.1.created_at)
-                .then(a.1.insert_seq.cmp(&b.1.insert_seq))
-        });
 
         let id_index: AHashMap<Arc<str>, PointOffset> = records_vec
             .iter()
@@ -611,21 +617,16 @@ impl StorageEngine {
         allowed_offsets: &RoaringBitmap,
     ) -> Vec<(String, f32)> {
         let view = self.vectors.read_view();
-        let mut all: Vec<(String, f32)> = self
-            .meta
-            .records()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|(offset, rec)| {
-                if !allowed_offsets.is_empty() && !allowed_offsets.contains(offset as u32) {
-                    return None;
-                }
-                view.get(offset).map(|v| {
-                    let score = cosine_similarity(query, v);
-                    (rec.id.clone(), score)
-                })
-            })
-            .collect();
+        let mut all: Vec<(String, f32)> = Vec::new();
+        let _ = self.meta.for_each_record(|offset, rec| {
+            if !allowed_offsets.is_empty() && !allowed_offsets.contains(offset as u32) {
+                return;
+            }
+            if let Some(v) = view.get(offset) {
+                let score = cosine_similarity(query, v);
+                all.push((rec.id.clone(), score));
+            }
+        });
         all.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         all.truncate(top_k);
         all
@@ -816,8 +817,8 @@ impl StorageEngine {
     /// Gracefully shut down the engine.
     ///
     /// Flushes the WAL, vector store, metadata snapshot, and segment files.
-    /// Callers that own a background `UpdateHandler` should stop it before
-    /// calling shutdown.
+    /// The background optimizer is stopped automatically when the engine is
+    /// dropped.
     pub fn shutdown(&self) -> crate::Result<()> {
         self.flush()
     }
@@ -867,7 +868,7 @@ impl StorageEngine {
     }
 
     pub fn record_count(&self) -> usize {
-        self.meta.records().map(|m| m.len()).unwrap_or(0)
+        self.meta.record_count()
     }
 
     pub fn config(&self) -> &StoreConfig {
@@ -924,6 +925,7 @@ mod tests {
                 warm_capacity: 6,
                 warm_bits: 4,
                 warm_chunk_bytes: 4096,
+                hnsw_threshold: 1000,
                 cold_sign: true,
                 hot_promote_threshold: 2.0,
                 warm_demote_threshold: 0.5,
