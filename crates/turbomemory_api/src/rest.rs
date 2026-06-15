@@ -215,9 +215,12 @@ async fn search(
 ) -> Result<Json<SearchResp>, ApiError> {
     let filter = json_filter_to_storage(req.filter)?;
     let maybe = match filter {
-        Some(f) => service
-            .engine()
-            .search_filtered(&req.query_text, &req.query_embedding, req.top_k, &f)?,
+        Some(f) => service.engine().search_filtered(
+            &req.query_text,
+            &req.query_embedding,
+            req.top_k,
+            &f,
+        )?,
         None => service
             .engine()
             .search(&req.query_text, &req.query_embedding, req.top_k)?,
@@ -244,7 +247,9 @@ async fn search_ann(
         Some(f) => service
             .engine()
             .search_ann_filtered(&req.query_embedding, req.top_k, &f)?,
-        None => service.engine().search_ann(&req.query_embedding, req.top_k)?,
+        None => service
+            .engine()
+            .search_ann(&req.query_embedding, req.top_k)?,
     };
     Ok(Json(SearchResp {
         results: map_results(results),

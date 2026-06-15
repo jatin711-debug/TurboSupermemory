@@ -82,6 +82,19 @@ pub struct VectorStore {
 impl VectorStore {
     /// Create a new vector store at `path` for vectors of dimension `dim`.
     pub fn new(path: impl AsRef<Path>, dim: usize) -> crate::Result<Self> {
+        Self::new_with_capacity(path, dim, 1024)
+    }
+
+    /// Create a new vector store with a requested initial slot count.
+    ///
+    /// The file is sized to hold at least `max(1024, initial_slots)` vectors,
+    /// avoiding repeated remaps for workloads where the expected record count is
+    /// known up front.
+    pub fn new_with_capacity(
+        path: impl AsRef<Path>,
+        dim: usize,
+        initial_slots: usize,
+    ) -> crate::Result<Self> {
         let path = path.as_ref().to_path_buf();
         if dim == 0 {
             return Err(StorageError::InvalidArgument(
@@ -98,11 +111,12 @@ impl VectorStore {
             .truncate(true)
             .open(&path)?;
 
-        let initial_slots = 1024usize;
-        let data_bytes = initial_slots.checked_mul(dim).and_then(|n| n.checked_mul(4));
-        let data_bytes = data_bytes.ok_or_else(|| {
-            StorageError::InvalidArgument("vector store size overflow".into())
-        })?;
+        let initial_slots = initial_slots.max(1024);
+        let data_bytes = initial_slots
+            .checked_mul(dim)
+            .and_then(|n| n.checked_mul(4));
+        let data_bytes = data_bytes
+            .ok_or_else(|| StorageError::InvalidArgument("vector store size overflow".into()))?;
         let len = HEADER_SIZE
             .checked_add(data_bytes)
             .ok_or_else(|| StorageError::InvalidArgument("vector store size overflow".into()))?;
@@ -120,7 +134,10 @@ impl VectorStore {
             reserved2: 0,
         };
         let crc = compute_header_crc(&header);
-        let header = Header { header_crc: crc, ..header };
+        let header = Header {
+            header_crc: crc,
+            ..header
+        };
         write_header(&mut mmap, header);
 
         Ok(Self {
@@ -137,10 +154,13 @@ impl VectorStore {
     }
 
     /// Open an existing vector store and validate its header.
-    pub fn open(path: impl AsRef<Path>, dim: usize) -> crate::Result<Self> {
+    ///
+    /// If the file does not exist, it is created with room for at least
+    /// `max(1024, initial_slots)` vectors.
+    pub fn open(path: impl AsRef<Path>, dim: usize, initial_slots: usize) -> crate::Result<Self> {
         let path = path.as_ref().to_path_buf();
         if !path.exists() {
-            return Self::new(&path, dim);
+            return Self::new_with_capacity(&path, dim, initial_slots);
         }
         let file = OpenOptions::new().read(true).write(true).open(&path)?;
         let mmap = unsafe { MmapMut::map_mut(&file)? };
@@ -152,9 +172,7 @@ impl VectorStore {
         let header: Header = *bytemuck::from_bytes(&mmap[..HEADER_SIZE]);
         validate_header(&header, dim)?;
         let file_len = mmap.len();
-        let slots = file_len
-            .saturating_sub(HEADER_SIZE)
-            .saturating_div(dim * 4);
+        let slots = file_len.saturating_sub(HEADER_SIZE).saturating_div(dim * 4);
         let count = (header.count as usize).min(slots);
         Ok(Self {
             inner: RwLock::new(Inner {
@@ -285,9 +303,7 @@ fn write_vector(mmap: &mut MmapMut, dim: usize, idx: usize, vector: &[f32]) {
 }
 
 fn grow_inner(inner: &mut Inner, min_idx: usize) -> crate::Result<()> {
-    let new_slots = (min_idx + 1)
-        .max(inner.slots.saturating_mul(2))
-        .max(1024);
+    let new_slots = (min_idx + 1).max(inner.slots.saturating_mul(2)).max(1024);
     let data_bytes = new_slots
         .checked_mul(inner.dim)
         .and_then(|n| n.checked_mul(4))
@@ -311,7 +327,10 @@ fn grow_inner(inner: &mut Inner, min_idx: usize) -> crate::Result<()> {
         reserved2: 0,
     };
     let crc = compute_header_crc(&header);
-    let header = Header { header_crc: crc, ..header };
+    let header = Header {
+        header_crc: crc,
+        ..header
+    };
     write_header(&mut mmap, header);
     inner.mmap = Some(mmap);
     inner.slots = new_slots;
@@ -349,12 +368,35 @@ mod tests {
             store.put(1, &[4.0, 5.0, 6.0]).unwrap();
             store.flush().unwrap();
         }
-        let store = VectorStore::open(&path, 3).unwrap();
+        let store = VectorStore::open(&path, 3, 0).unwrap();
         assert_eq!(store.count(), 2);
         let got = store.get(0).unwrap();
         assert_eq!(&*got, &[1.0f32, 2.0, 3.0]);
         let got = store.get(1).unwrap();
         assert_eq!(&*got, &[4.0f32, 5.0, 6.0]);
         assert!(store.get(2).is_none());
+    }
+
+    #[test]
+    fn pre_sized_open_allocates_expected_slots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("vectors.bin");
+        let dim = 128;
+        let expected = 50_000;
+        let store = VectorStore::open(&path, dim, expected).unwrap();
+        assert!(path.exists());
+        let min_len = HEADER_SIZE + expected * dim * 4;
+        let meta = std::fs::metadata(&path).unwrap();
+        assert!(
+            meta.len() as usize >= min_len,
+            "expected file size at least {}, got {}",
+            min_len,
+            meta.len()
+        );
+        // The store should still work normally.
+        let vec: Vec<f32> = (0..dim).map(|i| if i == 0 { 1.0 } else { 0.0 }).collect();
+        let last_offset = (expected - 1) as u64;
+        store.put(last_offset, &vec).unwrap();
+        assert!(store.get(last_offset).is_some());
     }
 }

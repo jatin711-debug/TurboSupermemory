@@ -1,10 +1,10 @@
 //! Shared service layer used by both the gRPC and REST frontends.
 
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
-use std::ops::Bound;
 use thiserror::Error;
-use turbomemory_storage::config::{StoreConfig, TierConfig};
+use turbomemory_storage::config::StoreConfig;
 use turbomemory_storage::engine::StorageEngine;
 use turbomemory_storage::payload_index::Filter as StorageFilter;
 
@@ -51,9 +51,7 @@ impl axum::response::IntoResponse for ApiError {
                 | turbomemory_storage::StorageError::InvalidArgument(_) => {
                     axum::http::StatusCode::BAD_REQUEST
                 }
-                turbomemory_storage::StorageError::NotFound(_) => {
-                    axum::http::StatusCode::NOT_FOUND
-                }
+                turbomemory_storage::StorageError::NotFound(_) => axum::http::StatusCode::NOT_FOUND,
                 _ => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             },
         };
@@ -69,15 +67,10 @@ pub struct MemoryService {
 
 impl MemoryService {
     pub fn open(db_path: impl AsRef<Path>, dimension: usize) -> Result<Self, ApiError> {
-        let config = StoreConfig {
-            dimension,
-            max_edges: 16,
-            search_list_size: 100,
-            outlier_count: 0,
-            initial_capacity: 1024,
-            tier: TierConfig::default(),
-            auto_consolidation_interval: None,
-        };
+        let mut config = StoreConfig::default_for_dimension(dimension);
+        config.max_edges = 16;
+        config.search_list_size = 100;
+        config.auto_consolidation_interval = None;
         let engine = StorageEngine::open(db_path, config)?;
         Ok(Self { engine })
     }
@@ -113,23 +106,43 @@ pub fn to_pb_results(results: Vec<ScoredMemory>) -> Vec<super::pb::ScoredMemory>
 }
 
 /// Convert a gRPC `Filter` into the storage-engine filter AST.
-pub fn pb_filter_to_storage(filter: Option<&super::pb::Filter>) -> Result<Option<StorageFilter>, ApiError> {
+pub fn pb_filter_to_storage(
+    filter: Option<&super::pb::Filter>,
+) -> Result<Option<StorageFilter>, ApiError> {
     let Some(f) = filter else { return Ok(None) };
     Ok(Some(convert_pb_filter(f)?))
 }
 
 fn convert_pb_filter(filter: &super::pb::Filter) -> Result<StorageFilter, ApiError> {
     use super::pb::filter::Kind;
-    let kind = filter.kind.as_ref().ok_or_else(|| ApiError::InvalidFilter("empty filter".into()))?;
+    let kind = filter
+        .kind
+        .as_ref()
+        .ok_or_else(|| ApiError::InvalidFilter("empty filter".into()))?;
     Ok(match kind {
         Kind::Eq(eq) => {
             let value: serde_json::Value = serde_json::from_str(&eq.value_json)
                 .map_err(|e| ApiError::InvalidFilter(format!("eq value_json: {e}")))?;
-            StorageFilter::Eq { field: eq.field.clone(), value }
+            StorageFilter::Eq {
+                field: eq.field.clone(),
+                value,
+            }
         }
         Kind::Range(r) => {
-            let low = r.low.map(|v| if r.low_inclusive { Bound::Included(v) } else { Bound::Excluded(v) });
-            let high = r.high.map(|v| if r.high_inclusive { Bound::Included(v) } else { Bound::Excluded(v) });
+            let low = r.low.map(|v| {
+                if r.low_inclusive {
+                    Bound::Included(v)
+                } else {
+                    Bound::Excluded(v)
+                }
+            });
+            let high = r.high.map(|v| {
+                if r.high_inclusive {
+                    Bound::Included(v)
+                } else {
+                    Bound::Excluded(v)
+                }
+            });
             StorageFilter::Range {
                 field: r.field.clone(),
                 low: low.unwrap_or(Bound::Unbounded),
@@ -141,10 +154,16 @@ fn convert_pb_filter(filter: &super::pb::Filter) -> Result<StorageFilter, ApiErr
             query: ft.query.clone(),
         },
         Kind::And(list) => StorageFilter::And(
-            list.filters.iter().map(convert_pb_filter).collect::<Result<Vec<_>, _>>()?
+            list.filters
+                .iter()
+                .map(convert_pb_filter)
+                .collect::<Result<Vec<_>, _>>()?,
         ),
         Kind::Or(list) => StorageFilter::Or(
-            list.filters.iter().map(convert_pb_filter).collect::<Result<Vec<_>, _>>()?
+            list.filters
+                .iter()
+                .map(convert_pb_filter)
+                .collect::<Result<Vec<_>, _>>()?,
         ),
         Kind::Not(inner) => StorageFilter::Not(Box::new(convert_pb_filter(inner)?)),
     })
@@ -166,41 +185,105 @@ pub fn json_filter_to_storage(value: serde_json::Value) -> Result<Option<Storage
 }
 
 fn convert_json_filter(value: serde_json::Value) -> Result<StorageFilter, ApiError> {
-    let obj = value.as_object().ok_or_else(|| ApiError::InvalidFilter("filter must be a JSON object".into()))?;
-    let op = obj.get("op").and_then(|v| v.as_str()).ok_or_else(|| ApiError::InvalidFilter("filter missing op".into()))?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| ApiError::InvalidFilter("filter must be a JSON object".into()))?;
+    let op = obj
+        .get("op")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::InvalidFilter("filter missing op".into()))?;
     Ok(match op {
         "eq" => {
-            let field = obj.get("field").and_then(|v| v.as_str()).ok_or_else(|| ApiError::InvalidFilter("eq missing field".into()))?;
+            let field = obj
+                .get("field")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ApiError::InvalidFilter("eq missing field".into()))?;
             let val = obj.get("value").cloned().unwrap_or(serde_json::Value::Null);
-            StorageFilter::Eq { field: field.into(), value: val }
+            StorageFilter::Eq {
+                field: field.into(),
+                value: val,
+            }
         }
         "range" => {
-            let field = obj.get("field").and_then(|v| v.as_str()).ok_or_else(|| ApiError::InvalidFilter("range missing field".into()))?;
+            let field = obj
+                .get("field")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ApiError::InvalidFilter("range missing field".into()))?;
             let low = obj.get("low").and_then(|v| v.as_f64());
             let high = obj.get("high").and_then(|v| v.as_f64());
-            let low_inclusive = obj.get("low_inclusive").and_then(|v| v.as_bool()).unwrap_or(true);
-            let high_inclusive = obj.get("high_inclusive").and_then(|v| v.as_bool()).unwrap_or(true);
+            let low_inclusive = obj
+                .get("low_inclusive")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let high_inclusive = obj
+                .get("high_inclusive")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
             StorageFilter::Range {
                 field: field.into(),
-                low: low.map(|v| if low_inclusive { Bound::Included(v) } else { Bound::Excluded(v) }).unwrap_or(Bound::Unbounded),
-                high: high.map(|v| if high_inclusive { Bound::Included(v) } else { Bound::Excluded(v) }).unwrap_or(Bound::Unbounded),
+                low: low
+                    .map(|v| {
+                        if low_inclusive {
+                            Bound::Included(v)
+                        } else {
+                            Bound::Excluded(v)
+                        }
+                    })
+                    .unwrap_or(Bound::Unbounded),
+                high: high
+                    .map(|v| {
+                        if high_inclusive {
+                            Bound::Included(v)
+                        } else {
+                            Bound::Excluded(v)
+                        }
+                    })
+                    .unwrap_or(Bound::Unbounded),
             }
         }
         "full_text" => {
-            let field = obj.get("field").and_then(|v| v.as_str()).ok_or_else(|| ApiError::InvalidFilter("full_text missing field".into()))?;
-            let query = obj.get("query").and_then(|v| v.as_str()).ok_or_else(|| ApiError::InvalidFilter("full_text missing query".into()))?;
-            StorageFilter::FullText { field: field.into(), query: query.into() }
+            let field = obj
+                .get("field")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ApiError::InvalidFilter("full_text missing field".into()))?;
+            let query = obj
+                .get("query")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ApiError::InvalidFilter("full_text missing query".into()))?;
+            StorageFilter::FullText {
+                field: field.into(),
+                query: query.into(),
+            }
         }
         "and" => {
-            let arr = obj.get("filters").and_then(|v| v.as_array()).ok_or_else(|| ApiError::InvalidFilter("and missing filters".into()))?;
-            StorageFilter::And(arr.iter().cloned().map(convert_json_filter).collect::<Result<Vec<_>, _>>()?)
+            let arr = obj
+                .get("filters")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| ApiError::InvalidFilter("and missing filters".into()))?;
+            StorageFilter::And(
+                arr.iter()
+                    .cloned()
+                    .map(convert_json_filter)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
         }
         "or" => {
-            let arr = obj.get("filters").and_then(|v| v.as_array()).ok_or_else(|| ApiError::InvalidFilter("or missing filters".into()))?;
-            StorageFilter::Or(arr.iter().cloned().map(convert_json_filter).collect::<Result<Vec<_>, _>>()?)
+            let arr = obj
+                .get("filters")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| ApiError::InvalidFilter("or missing filters".into()))?;
+            StorageFilter::Or(
+                arr.iter()
+                    .cloned()
+                    .map(convert_json_filter)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
         }
         "not" => {
-            let inner = obj.get("filter").cloned().ok_or_else(|| ApiError::InvalidFilter("not missing filter".into()))?;
+            let inner = obj
+                .get("filter")
+                .cloned()
+                .ok_or_else(|| ApiError::InvalidFilter("not missing filter".into()))?;
             StorageFilter::Not(Box::new(convert_json_filter(inner)?))
         }
         other => return Err(ApiError::InvalidFilter(format!("unknown op: {other}"))),

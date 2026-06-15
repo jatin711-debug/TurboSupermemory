@@ -1,14 +1,16 @@
 //! Tiered storage engine for TurboSuperMemory.
 
+pub mod access_counters;
 pub mod config;
 pub mod engine;
 pub mod metadata_store;
 pub mod optimizer;
 pub mod payload_index;
 pub mod record;
-pub mod text_index;
 pub mod segment_holder;
 pub mod segments;
+pub mod text_index;
+pub mod update_worker;
 pub mod vector_store;
 pub mod wal;
 

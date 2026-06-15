@@ -54,6 +54,7 @@ def run_audit(num_items, dimension, num_queries=50, top_k=5):
         max_edges=5,
         search_list_size=10,
         outlier_count=0,
+        initial_capacity=num_items,
     )
 
     t0 = time.perf_counter()
@@ -138,6 +139,7 @@ def run_audit(num_items, dimension, num_queries=50, top_k=5):
         max_edges=5,
         search_list_size=10,
         outlier_count=0,
+        initial_capacity=num_items,
     )
     ann_after = engine2.search_ann(queries[0], top_k)
     cognitive_after = engine2.search("memory", queries[0], top_k)
@@ -164,8 +166,9 @@ def run_audit(num_items, dimension, num_queries=50, top_k=5):
     print(f"  Cognitive ranking identical: {cognitive_same_ids}")
     print(f"  Cognitive scores identical (within 1e-6): {cognitive_same_scores}")
 
+    engine2.close()
     if os.path.exists(db_dir):
-        shutil.rmtree(db_dir)
+        shutil.rmtree(db_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

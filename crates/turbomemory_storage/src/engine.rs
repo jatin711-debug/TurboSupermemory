@@ -10,13 +10,15 @@
 //!   4. On open we replay any un-flushed WAL entries, persist a snapshot, then
 //!      rebuild the id index, graph, and tiered segments from the snapshot.
 
+use crate::access_counters::AccessCounters;
 use crate::config::StoreConfig;
 use crate::metadata_store::MetadataStore;
+use crate::optimizer::BackgroundOptimizer;
 use crate::payload_index::{Filter, PayloadIndex};
 use crate::record::{MetaRecord, PointOffset, Record};
-use crate::optimizer::BackgroundOptimizer;
-use crate::text_index::TextIndex;
 use crate::segment_holder::SegmentHolder;
+use crate::text_index::TextIndex;
+use crate::update_worker::UpdateWorker;
 use crate::vector_store::VectorStore;
 use crate::wal::{Wal, WalOp};
 use crate::StorageError;
@@ -51,6 +53,8 @@ pub struct StorageEngine {
     text_index: Arc<TextIndex>,
     wal: Arc<Mutex<Wal>>,
     optimizer: Arc<BackgroundOptimizer>,
+    update_worker: Arc<UpdateWorker>,
+    access_counters: Arc<AccessCounters>,
 }
 
 impl Clone for StorageEngine {
@@ -67,6 +71,8 @@ impl Clone for StorageEngine {
             text_index: self.text_index.clone(),
             wal: self.wal.clone(),
             optimizer: self.optimizer.clone(),
+            update_worker: self.update_worker.clone(),
+            access_counters: self.access_counters.clone(),
         }
     }
 }
@@ -75,7 +81,11 @@ impl StorageEngine {
     pub fn open(db_path: impl AsRef<Path>, config: StoreConfig) -> crate::Result<Arc<Self>> {
         let db_path = db_path.as_ref();
         let meta = MetadataStore::open(db_path)?;
-        let vectors = VectorStore::open(db_path.join("vectors.bin"), config.dimension)?;
+        let vectors = VectorStore::open(
+            db_path.join("vectors.bin"),
+            config.dimension,
+            config.initial_capacity,
+        )?;
         let wal_path = db_path.join(WAL_DIR);
         let mut wal = Wal::open(&wal_path)?;
 
@@ -86,7 +96,11 @@ impl StorageEngine {
         let mut replayed = false;
         for op in wal.iter()? {
             match op? {
-                WalOp::Insert { offset, seq, meta: meta_rec } => {
+                WalOp::Insert {
+                    offset,
+                    seq,
+                    meta: meta_rec,
+                } => {
                     if seq > last_applied {
                         // The embedding lives in the VectorStore mmap. If it is
                         // missing we have a partial write; skip the metadata.
@@ -230,20 +244,42 @@ impl StorageEngine {
             .auto_consolidation_interval
             .unwrap_or_else(|| Duration::from_secs(60));
 
+        let meta = Arc::new(meta);
+        let vectors = Arc::new(vectors);
+        let segments = Arc::new(RwLock::new(segments));
+        let graph = Arc::new(RwLock::new(graph));
+        let id_index = Arc::new(RwLock::new(id_index));
+        let budget = Arc::new(crate::optimizer::ResourceBudget::new(
+            config.optimizer_budget.clone(),
+        ));
+        let access_counters = Arc::new(AccessCounters::new());
+
         Ok(Arc::new_cyclic(move |weak| {
-            let optimizer = BackgroundOptimizer::new(weak.clone(), interval);
+            let optimizer = BackgroundOptimizer::new(weak.clone(), interval, budget);
+            let applier = Arc::new(crate::update_worker::IndexApplier {
+                meta: meta.clone(),
+                vectors: vectors.clone(),
+                segments: segments.clone(),
+                graph: graph.clone(),
+                id_index: id_index.clone(),
+                payload_index: payload_index.clone(),
+                text_index: text_index.clone(),
+            });
+            let update_worker = UpdateWorker::new(applier, 1024);
             Self {
                 config: Arc::new(config),
-                meta: Arc::new(meta),
-                vectors: Arc::new(vectors),
-                segments: Arc::new(RwLock::new(segments)),
-                graph: Arc::new(RwLock::new(graph)),
+                meta,
+                vectors,
+                segments,
+                graph,
                 ccs: Arc::new(Mutex::new(ccs)),
-                id_index: Arc::new(RwLock::new(id_index)),
+                id_index,
                 payload_index,
                 text_index,
                 wal: Arc::new(Mutex::new(wal)),
                 optimizer: Arc::new(optimizer),
+                update_worker: Arc::new(update_worker),
+                access_counters,
             }
         }))
     }
@@ -302,26 +338,8 @@ impl StorageEngine {
             wal.append(&WalOp::Insert { offset, seq, meta })?;
         }
 
-        // 3. Update in-memory metadata cache and indexes.
-        self.meta.put(offset, &record)?;
-        self.id_index.write().insert(Arc::from(id), offset);
-        self.payload_index
-            .write()
-            .add(offset, record.payload.as_deref())?;
-        self.text_index.add(offset, text)?;
-
-        {
-            let mut graph = self.graph.write();
-            graph.add_memory(id, text, concepts);
-        }
-        let needs_seal = {
-            let segments = self.segments.read();
-            segments.insert(offset, &record, &self.vectors)?
-        };
-        if needs_seal {
-            let mut segments = self.segments.write();
-            segments.seal_hot(&self.vectors)?;
-        }
+        // 3. Submit the index update to the serialized worker.
+        self.update_worker.submit_and_wait(vec![(offset, record)])?;
         Ok(true)
     }
 
@@ -409,50 +427,25 @@ impl StorageEngine {
             self.vectors.put(*offset, record.embedding_f32())?;
         }
 
-        // 2. WAL metadata entries.
+        // 2. WAL metadata entries (batched under a single lock).
         {
             let mut wal = self.wal.lock();
-            for (offset, record) in &records {
-                let meta = MetaRecord::from(record);
-                wal.append(&WalOp::Insert {
-                    offset: *offset,
-                    seq: record.insert_seq,
-                    meta,
-                })?;
-            }
+            let ops: Vec<WalOp> = records
+                .iter()
+                .map(|(offset, record)| {
+                    let meta = MetaRecord::from(record);
+                    WalOp::Insert {
+                        offset: *offset,
+                        seq: record.insert_seq,
+                        meta,
+                    }
+                })
+                .collect();
+            wal.append_batch(&ops)?;
         }
 
-        // 3. In-memory metadata cache and indexes.
-        self.meta.put_batch(&records)?;
-        {
-            let mut idx = self.id_index.write();
-            let mut pidx = self.payload_index.write();
-            for (offset, rec) in &records {
-                idx.insert(Arc::from(rec.id.as_str()), *offset);
-                pidx.add(*offset, rec.payload.as_deref())?;
-                self.text_index.add(*offset, &rec.text)?;
-            }
-        }
-
-        {
-            let mut graph = self.graph.write();
-            for (_, rec) in &records {
-                graph.add_memory(&rec.id, &rec.text, &rec.concepts);
-            }
-        }
-        let mut needs_seal = false;
-        {
-            let segments = self.segments.read();
-            for (offset, record) in &records {
-                if segments.insert(*offset, record, &self.vectors)? {
-                    needs_seal = true;
-                }
-            }
-        }
-        if needs_seal {
-            let mut segments = self.segments.write();
-            segments.seal_hot(&self.vectors)?;
-        }
+        // 3. Submit the index updates to the serialized worker.
+        self.update_worker.submit_and_wait(records)?;
         Ok(indices.len())
     }
 
@@ -551,7 +544,16 @@ impl StorageEngine {
         query_embedding: &[f32],
         top_k: usize,
     ) -> crate::Result<Vec<(String, f32)>> {
-        let candidates = self.search_ann_candidates(query_embedding, top_k)?;
+        self.search_ann_with_ef(query_embedding, top_k, None)
+    }
+
+    pub fn search_ann_with_ef(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+        ef: Option<usize>,
+    ) -> crate::Result<Vec<(String, f32)>> {
+        let candidates = self.search_ann_candidates_with_ef(query_embedding, top_k, ef)?;
         Ok(candidates)
     }
 
@@ -563,6 +565,15 @@ impl StorageEngine {
         self.search_ann_candidates_filtered(query_embedding, top_k, None)
     }
 
+    pub fn search_ann_candidates_with_ef(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+        ef: Option<usize>,
+    ) -> crate::Result<Vec<(String, f32)>> {
+        self.search_ann_candidates_filtered_with_ef(query_embedding, top_k, None, ef)
+    }
+
     /// Filtered ANN candidate search.
     ///
     /// `filter` is evaluated against the payload index; the resulting offset
@@ -572,6 +583,16 @@ impl StorageEngine {
         query_embedding: &[f32],
         top_k: usize,
         filter: Option<&Filter>,
+    ) -> crate::Result<Vec<(String, f32)>> {
+        self.search_ann_candidates_filtered_with_ef(query_embedding, top_k, filter, None)
+    }
+
+    pub fn search_ann_candidates_filtered_with_ef(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+        filter: Option<&Filter>,
+        ef: Option<usize>,
     ) -> crate::Result<Vec<(String, f32)>> {
         validate_dimension(query_embedding, self.config.dimension)?;
         let allowed_offsets = match filter {
@@ -592,6 +613,7 @@ impl StorageEngine {
         let scored = segments.search(
             query_embedding,
             top_k,
+            ef,
             &self.vectors,
             allowed_offsets.as_ref(),
         )?;
@@ -638,8 +660,19 @@ impl StorageEngine {
         query_embedding: &[f32],
         top_k: usize,
     ) -> crate::Result<Option<Vec<(String, f32)>>> {
+        self.search_with_ef(query_text, query_embedding, top_k, None)
+    }
+
+    pub fn search_with_ef(
+        &self,
+        query_text: &str,
+        query_embedding: &[f32],
+        top_k: usize,
+        ef: Option<usize>,
+    ) -> crate::Result<Option<Vec<(String, f32)>>> {
         validate_dimension(query_embedding, self.config.dimension)?;
-        let seeds = self.search_ann_candidates(query_embedding, top_k.max(10))?;
+        let seeds =
+            self.search_ann_candidates_with_ef(query_embedding, top_k.max(10), ef)?;
         let graph = self.graph.read();
         let activated = graph.search(query_text, &seeds, top_k);
         drop(graph);
@@ -685,9 +718,24 @@ impl StorageEngine {
         top_k: usize,
         filter: &Filter,
     ) -> crate::Result<Option<Vec<(String, f32)>>> {
+        self.search_filtered_with_ef(query_text, query_embedding, top_k, filter, None)
+    }
+
+    pub fn search_filtered_with_ef(
+        &self,
+        query_text: &str,
+        query_embedding: &[f32],
+        top_k: usize,
+        filter: &Filter,
+        ef: Option<usize>,
+    ) -> crate::Result<Option<Vec<(String, f32)>>> {
         validate_dimension(query_embedding, self.config.dimension)?;
-        let seeds =
-            self.search_ann_candidates_filtered(query_embedding, top_k.max(10), Some(filter))?;
+        let seeds = self.search_ann_candidates_filtered_with_ef(
+            query_embedding,
+            top_k.max(10),
+            Some(filter),
+            ef,
+        )?;
         let graph = self.graph.read();
         let activated = graph.search(query_text, &seeds, top_k);
         drop(graph);
@@ -768,17 +816,17 @@ impl StorageEngine {
 
     fn find_record_by_id(&self, id: &str) -> Option<Record> {
         let idx = self.id_index.read();
-        idx.get(id).copied().and_then(|offset| self.get_record(offset))
+        idx.get(id)
+            .copied()
+            .and_then(|offset| self.get_record(offset))
     }
 
     /// Bump the access score for the record with the given offset.
+    ///
+    /// Writes go to the fast in-memory `AccessCounters` instead of the metadata
+    /// cache so that searches do not contend on the metadata write lock.
     fn bump_access(&self, offset: PointOffset) {
-        let Some(mut meta_rec) = self.meta.get(offset).ok().flatten() else {
-            return;
-        };
-        meta_rec.access_count += 1;
-        meta_rec.last_accessed = now_secs();
-        let _ = self.meta.put_meta(offset, &meta_rec);
+        self.access_counters.bump(offset, now_secs());
     }
 
     fn bump_access_by_id(&self, id: &str) {
@@ -824,8 +872,11 @@ impl StorageEngine {
     }
 
     pub fn trigger_consolidation(&self) -> crate::Result<(usize, usize, usize)> {
+        // Make sure recent access counts are visible to the promotion scorer.
+        self.access_counters.drain_into(&self.meta)?;
         let mut segments = self.segments.write();
-        let (sealed, compacted, promoted) = segments.trigger_consolidation(&self.meta, &self.vectors)?;
+        let (sealed, compacted, promoted) =
+            segments.trigger_consolidation(&self.meta, &self.vectors)?;
         drop(segments);
         self.save_graph()?;
         Ok((sealed, compacted, promoted))
@@ -835,30 +886,33 @@ impl StorageEngine {
         // 1. Build any pending plain segments so the durable snapshot captures
         //    them as persisted HNSW / quantized segments rather than in-memory
         //    plain indexes.
-        while crate::optimizer::BackgroundOptimizer::process_one_seal(self).unwrap_or(false) {}
+        while self.optimizer.process_one_seal(self).unwrap_or(false) {}
 
-        // 2. Durably sync the WAL.
+        // 2. Drain access counters into the metadata cache before snapshotting it.
+        self.access_counters.drain_into(&self.meta)?;
+
+        // 3. Durably sync the WAL.
         {
             let mut wal = self.wal.lock();
             wal.flush()?;
         }
 
-        // 3. Persist the vector snapshot, metadata snapshot, and text index.
+        // 4. Persist the vector snapshot, metadata snapshot, and text index.
         self.vectors.flush()?;
         self.text_index.flush()?;
         let last_applied_seq = self.meta.next_seq().saturating_sub(1);
         self.meta.flush(last_applied_seq)?;
 
-        // 3. Flush tiered segment files.
+        // 5. Flush tiered segment files.
         let segments = self.segments.read();
         segments.flush()?;
         drop(segments);
 
-        // 4. Persist graph / CCS metadata.
+        // 6. Persist graph / CCS metadata.
         self.save_graph()?;
         self.save_ccs()?;
 
-        // 5. WAL is now fully captured by the redb snapshot; truncate it.
+        // 7. WAL is now fully captured by the redb snapshot; truncate it.
         {
             let mut wal = self.wal.lock();
             wal.clear()?;
@@ -926,11 +980,14 @@ mod tests {
                 warm_bits: 4,
                 warm_chunk_bytes: 4096,
                 hnsw_threshold: 1000,
+                merge_threshold_segments: 2,
+                merge_max_records: 200_000,
                 cold_sign: true,
                 hot_promote_threshold: 2.0,
                 warm_demote_threshold: 0.5,
                 recency_half_life_secs: 60,
             },
+            optimizer_budget: crate::config::OptimizerBudget::default(),
             auto_consolidation_interval: None,
         }
     }
@@ -939,6 +996,31 @@ mod tests {
         let mut v = vec![0.0f32; dim];
         v[idx % dim] = 1.0;
         v
+    }
+
+    fn hnsw_test_config(dim: usize) -> StoreConfig {
+        StoreConfig {
+            dimension: dim,
+            max_edges: 8,
+            search_list_size: 10,
+            outlier_count: 0,
+            initial_capacity: 4096,
+            tier: TierConfig {
+                hot_capacity: 100,
+                warm_capacity: 10_000,
+                warm_bits: 8,
+                warm_chunk_bytes: 4096,
+                hnsw_threshold: 10,
+                merge_threshold_segments: 2,
+                merge_max_records: 10_000,
+                cold_sign: true,
+                hot_promote_threshold: 2.0,
+                warm_demote_threshold: 0.5,
+                recency_half_life_secs: 60,
+            },
+            optimizer_budget: crate::config::OptimizerBudget::default(),
+            auto_consolidation_interval: None,
+        }
     }
 
     #[test]
@@ -1040,8 +1122,9 @@ mod tests {
         let mut pos = crate::wal::WAL_HEADER_SIZE;
         let mut last_record_crc_end = pos;
         while pos + 4 <= bytes.len() {
-            let len = u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
-                as usize;
+            let len =
+                u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                    as usize;
             if pos + 4 + len + 4 > bytes.len() {
                 break;
             }
@@ -1186,12 +1269,12 @@ mod tests {
             .insert("mem_0", "original text", &make_vec(8, 0), 1.0, &[])
             .unwrap();
 
-        assert!(
-            engine
-                .update("mem_0", "updated text", &make_vec(8, 1), 2.0, &[])
-                .unwrap()
-        );
-        assert!(!engine.update("missing", "x", &make_vec(8, 1), 1.0, &[]).unwrap());
+        assert!(engine
+            .update("mem_0", "updated text", &make_vec(8, 1), 2.0, &[])
+            .unwrap());
+        assert!(!engine
+            .update("missing", "x", &make_vec(8, 1), 1.0, &[])
+            .unwrap());
         assert_eq!(engine.record_count(), 1);
 
         let q = make_vec(8, 1);
@@ -1227,7 +1310,11 @@ mod tests {
         assert_eq!(engine.record_count(), 4);
 
         // Duplicate ids within a batch should be deduplicated.
-        let dup_ids = vec!["new_1".to_string(), "new_1".to_string(), "new_2".to_string()];
+        let dup_ids = vec![
+            "new_1".to_string(),
+            "new_1".to_string(),
+            "new_2".to_string(),
+        ];
         let dup_texts = vec!["t1".to_string(), "t1".to_string(), "t2".to_string()];
         let dup_embs = vec![make_vec(8, 5), make_vec(8, 5), make_vec(8, 6)];
         let dup_scores = vec![1.0f32; 3];
@@ -1255,14 +1342,20 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(engine.get_payload("mem_0").unwrap().as_ref(), Some(&payload));
+        assert_eq!(
+            engine.get_payload("mem_0").unwrap().as_ref(),
+            Some(&payload)
+        );
 
         engine.flush_vectors().unwrap();
         engine.flush_wal().unwrap();
         drop(engine);
 
         let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
-        assert_eq!(engine.get_payload("mem_0").unwrap().as_ref(), Some(&payload));
+        assert_eq!(
+            engine.get_payload("mem_0").unwrap().as_ref(),
+            Some(&payload)
+        );
     }
 
     #[test]
@@ -1291,7 +1384,9 @@ mod tests {
             field: "category".into(),
             value: json!("even"),
         };
-        let results = engine.search_ann_filtered(&make_vec(8, 0), 10, &filter).unwrap();
+        let results = engine
+            .search_ann_filtered(&make_vec(8, 0), 10, &filter)
+            .unwrap();
         let ids: Vec<_> = results.into_iter().map(|(id, _)| id).collect();
         assert_eq!(ids, vec!["mem_0", "mem_2"]);
 
@@ -1301,7 +1396,9 @@ mod tests {
             low: Bound::Included(15.0),
             high: Bound::Included(35.0),
         };
-        let results = engine.search_ann_filtered(&make_vec(8, 0), 10, &filter).unwrap();
+        let results = engine
+            .search_ann_filtered(&make_vec(8, 0), 10, &filter)
+            .unwrap();
         let mut ids: Vec<_> = results.into_iter().map(|(id, _)| id).collect();
         ids.sort();
         assert_eq!(ids, vec!["mem_2", "mem_3"]);
@@ -1312,7 +1409,9 @@ mod tests {
             field: "category".into(),
             value: json!("even"),
         };
-        let results = engine.search_ann_filtered(&make_vec(8, 0), 10, &filter).unwrap();
+        let results = engine
+            .search_ann_filtered(&make_vec(8, 0), 10, &filter)
+            .unwrap();
         let ids: Vec<_> = results.into_iter().map(|(id, _)| id).collect();
         assert_eq!(ids, vec!["mem_0"]);
     }
@@ -1346,7 +1445,116 @@ mod tests {
             field: "group".into(),
             value: json!("a"),
         };
-        let results = engine.search_ann_filtered(&make_vec(8, 0), 10, &filter).unwrap();
+        let results = engine
+            .search_ann_filtered(&make_vec(8, 0), 10, &filter)
+            .unwrap();
         assert_eq!(results.len(), 4);
+    }
+
+    #[test]
+    fn merge_optimizer_combines_sealed_segments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::open(tmp.path(), hnsw_test_config(32)).unwrap();
+        let n = 600usize;
+        for i in 0..n {
+            engine
+                .insert(
+                    &format!("mem_{i}"),
+                    &format!("text {i}"),
+                    &make_vec(32, i),
+                    1.0,
+                    &[],
+                )
+                .unwrap();
+        }
+        engine.trigger_consolidation().unwrap();
+        engine.flush().unwrap();
+        // The merge optimizer runs in the background; wait for it to reduce the
+        // sealed segment count.
+        let mut sealed_count = engine.segments.read().sealed_hot_count();
+        for _ in 0..60 {
+            if sealed_count <= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            sealed_count = engine.segments.read().sealed_hot_count();
+        }
+        assert!(
+            sealed_count <= 2,
+            "expected at most 2 sealed segments, got {}",
+            sealed_count
+        );
+        // Search should still return results.
+        let results = engine.search_ann(&make_vec(32, 0), 5).unwrap();
+        assert_eq!(results.len(), 5);
+        // mem_0 and mem_32 are identical one-hot vectors; the approximate index may
+        // return either of them. Just verify the top result is a perfect cosine match.
+        assert!(results[0].1 > 0.9999, "top result should be an exact match");
+        assert!(results[0].0.starts_with("mem_"));
+    }
+
+    #[test]
+    fn search_ann_with_ef_can_improve_recall() {
+        use rand::Rng;
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::open(tmp.path(), hnsw_test_config(32)).unwrap();
+        let dim = 32;
+        let n = 600;
+        let mut rng = rand::thread_rng();
+        let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>() - 0.5).collect();
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter_mut().for_each(|x| *x /= norm.max(1e-8));
+            embeddings.push(v.clone());
+            engine
+                .insert(&format!("mem_{i}"), &format!("text {i}"), &v, 1.0, &[])
+                .unwrap();
+        }
+        engine.trigger_consolidation().unwrap();
+
+        // Compute flat ground truth for a few queries.
+        let queries: Vec<Vec<f32>> = (0..10)
+            .map(|_| {
+                let mut v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>() - 0.5).collect();
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                v.iter_mut().for_each(|x| *x /= norm.max(1e-8));
+                v
+            })
+            .collect();
+
+        let mut low_recall = 0.0f32;
+        let mut high_recall = 0.0f32;
+        for q in &queries {
+            let gt = {
+                let mut scored: Vec<(String, f32)> = embeddings
+                    .iter()
+                    .enumerate()
+                    .map(|(i, emb)| {
+                        let score = turbomemory_core::cosine_similarity(q, emb);
+                        (format!("mem_{i}"), score)
+                    })
+                    .collect();
+                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                scored.truncate(5);
+                scored.into_iter().map(|(id, _)| id).collect::<std::collections::HashSet<_>>()
+            };
+            let low = engine.search_ann_with_ef(q, 5, None).unwrap();
+            let high = engine.search_ann_with_ef(q, 5, Some(200)).unwrap();
+            let low_ids: std::collections::HashSet<_> =
+                low.into_iter().map(|(id, _)| id).collect();
+            let high_ids: std::collections::HashSet<_> =
+                high.into_iter().map(|(id, _)| id).collect();
+            low_recall += low_ids.intersection(&gt).count() as f32 / 5.0;
+            high_recall += high_ids.intersection(&gt).count() as f32 / 5.0;
+        }
+        low_recall /= queries.len() as f32;
+        high_recall /= queries.len() as f32;
+        assert!(
+            high_recall >= low_recall,
+            "higher ef should not reduce recall: low={}, high={}",
+            low_recall,
+            high_recall
+        );
     }
 }

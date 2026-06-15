@@ -1,286 +1,306 @@
-# TurboSuperMemory — Engineering TODO
+# TurboSuperMemory — Million-Scale Optimization Roadmap
 
-Status key: **Done** | **In Progress** | **Pending**
-
----
-
-## 1. HNSW / Vector Index Engine
-
-| # | Fix | Location(s) | Status | Notes |
-|---|---|---|---|---|
-| 1.1 | Replace `vector-index` with `hnswlib-rs`, `usearch`, or a custom C++ HNSW | `crates/turbomemory_storage/src/segments/hot.rs` | Done | Replaced with `usearch` v2.25; all tests pass |
-| 1.2 | Make the HNSW backend swappable behind a trait | New: `crates/turbomemory_storage/src/index/` | Pending | Lets you benchmark CPU vs GPU backends later (Deferred to Phase E; `usearch` is sufficient for now) |
-| 1.3 | Add bulk insert / bulk build path for sealed segments | `crates/turbomemory_storage/src/segments/sealed_hot.rs` | Done | `from_vectors` reads from `VectorStore` mmap without `Record` clones; still one-by-one `usearch` adds |
-| 1.4 | Add `VisitedPool` to reuse visited bitsets across searches | `crates/turbomemory_storage/src/index/visited_pool.rs` | Pending | Avoids per-search allocation (Phase C) |
-| 1.5 | Support index save/load/mmap for sealed segments | `crates/turbomemory_storage/src/segments/sealed_hot.rs`, `warm.rs`, `cold.rs` | Done | SealedHot + Warm + Cold segments persist and reload via manifest + mmap data file |
-| 1.6 | Add deletion / tombstone support in HNSW | `crates/turbomemory_storage/src/segments/hot.rs`, graph layer | In Progress | Currently no real delete path (Phase A: implement delete/update API and tombstones) (Phase A: delete implemented; tombstone cleanup in vacuum) |
-| 1.7 | Tune `M`, `ef_construct`, `ef_search` per dimension and dataset size | `crates/turbomemory_storage/src/segments/hot.rs`, config | In Progress | Added `hnsw_threshold`; still need dimension-aware `M`/`ef` defaults (Phase C) |
-| 1.8 | Add `full_scan_threshold` fallback like Qdrant | `crates/turbomemory_storage/src/segment_holder.rs` | Done | `hnsw_threshold` routes small segments to quantized/plain scan; engine exact fallback remains at 4,096 records |
-| 1.9 | Current Hot HNSW based on `vector-index` crate | `crates/turbomemory_storage/src/segments/hot.rs` | Done | Replaced by `usearch` |
+> Target: **1M+ vectors at 512–4096 dimensions**, sustained ingest, and sub-10 ms P99 search latency on capable hardware.
+> Reference: Qdrant v1.18.2 (`D:/personal-projects/TurboSuperMemory/qdrant`), Chroma, Faiss, cuVS/RAFT.
+> Status key: **Done** | **In Progress** | **Pending** | **Blocked**
 
 ---
 
-## 2. Distance Metrics & SIMD
+## Executive Summary — Are We Ready for 1M × 4k?
 
-| # | Fix | Location(s) | Status | Notes |
-|---|---|---|---|---|
-| 2.1 | Introduce a `Metric<T>` trait with `similarity`, `query_similarity`, `preprocess` | `crates/turbomemory_core/src/metrics.rs` (new) | Done | Added `Metric`, `CosineMetric`, `DotProductMetric`, `EuclideanMetric` |
-| 2.2 | Implement AVX2/FMA f32 dot/cosine/euclidean kernels | `crates/turbomemory_core/src/metrics.rs` | Done | AVX2/FMA dot, L2, dot+norms |
-| 2.3 | Implement SSE f32 kernels | `crates/turbomemory_core/src/metrics.rs` | Done | SSE dot, L2, dot+norms |
-| 2.4 | Implement AArch64 NEON kernels | `crates/turbomemory_core/src/metrics.rs` | Done | NEON dot, L2, dot+norms |
-| 2.5 | Add runtime CPU feature detection | `crates/turbomemory_core/src/metrics.rs` | Done | `is_x86_feature_detected!` + aarch64 NEON |
-| 2.6 | Add quantized distance kernels (u8, binary, i8 RaBitQ) | `crates/turbomemory_core/src/metrics_quantized.rs` | Done | AVX2 u8 scalar + 1-bit sign dot-product kernels; i8/PQ future |
-| 2.7 | Add batched distance computation for re-ranking | `crates/turbomemory_core/src/metrics.rs`, `segment_holder.rs` | Done | `cosine_similarity_batch` + chunked rerank in `SegmentHolder::search` |
-| 2.8 | (Future) cuBLAS / CUDA batched dot-product path | New: `crates/turbomemory_gpu/` | Pending | Only after CPU path is competitive (Future / Phase E) |
+**No.** The codebase is solid for 100k × 128, but 1M+ vectors at high dimension introduces bottlenecks that are structural, not incremental:
 
----
+1. **Single-node / single-shard design** — one `VectorStore`, one `SegmentHolder`, one `MetadataStore`, one graph.
+2. **Single-threaded update worker** — all writes serialize through one channel/worker.
+3. **Global `RwLock<SegmentHolder>`** — searches and segment mutations contend on one lock.
+4. **In-memory metadata cache** — every record's metadata lives in a `HashMap`; won't fit RAM at 1M+ text records.
+5. **No vacuum / physical deletion** — deleted vectors and old segments are never reclaimed.
+6. **Single-threaded HNSW builds** with a 512 MiB default budget — sealing 1M × 4k would take hours.
+7. **1-bit Cold tier collapse at 4k** — sign-only quantization is too coarse for high-dimensional recall.
+8. **No visited-set pool, no adaptive filtering, no segment-level parallelism**, and heavy per-query allocation.
+9. **No GPU acceleration** — CPU-only HNSW build and distance compute.
 
-## 3. Storage Architecture & Durability
-
-| # | Fix | Location(s) | Status | Notes |
-|---|---|---|---|---|
-| 3.1 | Make WAL the primary durability source of truth | `crates/turbomemory_storage/src/wal.rs`, `engine.rs` | Done | Embeddings now durable in `VectorStore`; WAL is metadata-only |
-| 3.2 | Append to WAL first, then update in-memory state | `crates/turbomemory_storage/src/engine.rs` | Done | `VectorStore.put` first, then metadata WAL, then metadata cache/segments |
-| 3.3 | Stop committing `redb` on every insert | `crates/turbomemory_storage/src/engine.rs` | Done | `meta.put` only updates cache; redb flushed lazily |
-| 3.4 | Use `redb` only for metadata / ID maps, or replace it | `crates/turbomemory_storage/src/engine.rs` | Done | `redb` is now metadata snapshot + sequences |
-| 3.5 | Add atomic segment swap during optimization | `crates/turbomemory_storage/src/segment_holder.rs` | Done | `seal_hot` swaps via `std::mem::replace` under write lock |
-| 3.6 | Implement segment versioning / sequence numbers | `crates/turbomemory_storage/src/segment_holder.rs` | In Progress | WAL seq used; per-segment version not yet added (In Progress; finalize in Phase C) |
-| 3.7 | Add `Flusher` closure pattern per component | All `*Segment`, `MetadataStore`, `Wal` | Done | Segment flusher pattern already in place |
-| 3.8 | Add async flush worker | `crates/turbomemory_storage/src/update_handler.rs` | In Progress | Periodic fsync without blocking queries (In Progress; finalize in Phase D) |
-| 3.9 | Implement crash recovery: replay WAL into segments | `crates/turbomemory_storage/src/engine.rs` | Done | `StorageEngine::open` replays WAL, snapshots, clears |
-| 3.10 | Add `sync_threshold` / auto-persist for sealed indices | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Depends on sealed segment persistence (Phase C) |
-| 3.11 | Framed append-only WAL with CRC32-C | `crates/turbomemory_storage/src/wal.rs` | Done | Foundation for 3.1 |
+This roadmap is the complete set of optimizations needed to reach 1M+ nodes × high dimensions. Items are grouped by phase, with Qdrant-derived defaults and concrete file targets.
 
 ---
 
-## 4. Segment Lifecycle & Optimizers
+## Phase 0 — Structural Foundations for Million-Scale
+
+These are prerequisites. Without them, later optimizations are local fixes.
 
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
-| 4.1 | Define sealed/immutable segment type | `crates/turbomemory_storage/src/segments/` | Pending | Hot is appendable; Warm/Cold should be immutable (Phase C) |
-| 4.2 | Implement Hot → Warm sealing when Hot hits size threshold | `crates/turbomemory_storage/src/segment_holder.rs` | Done | First seal → SealedHot; subsequent seals → Warm; Warm → Cold when over capacity |
-| 4.3 | Implement Warm → Cold demotion | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Use access scoring (Phase C) |
-| 4.4 | Add indexing optimizer: build HNSW once segment is large enough | `crates/turbomemory_storage/src/optimizer.rs` | Done | `hnsw_threshold` in `TierConfig`; optimizer builds `SealedHotSegment` for large seals and `WarmSegment` for small ones |
-| 4.5 | Add merge optimizer to reduce segment count | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Too many segments hurts search (Phase C) |
-| 4.6 | Add vacuum optimizer to reclaim deleted points | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Tombstones accumulate over time (Phase A/B: vacuum deleted points) |
-| 4.7 | Add config-mismatch optimizer | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Rebuilds segments when config changes (Phase C) |
-| 4.8 | Add optimizer scheduling / backpressure | `crates/turbomemory_storage/src/update_handler.rs` | Pending | Don't optimize while queries are heavy (Phase D) |
+| 0.1 | **Shard the collection** into N independent `Shard` instances | `crates/turbomemory_storage/src/shard.rs` (new) | Pending | Each shard owns its own `VectorStore`, `SegmentHolder`, `MetadataStore`, WAL, optimizers, graph shard. Default `num_shards = clamp(num_cpus / 4, 2, 16)`. Route by `id` hash or explicit partition key. Qdrant model: `lib/collection/src/shards/`. |
+| 0.2 | **Replace global `RwLock<SegmentHolder>` with lock-free segment list** | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Use `arc-swap` / `ArcSwap<Vec<Arc<Segment>>>` so searches never block on seal/merge swap. Segment mutations publish a new `Arc`. Qdrant uses `LockedSegmentHolder` + `updates_mutex`; we can do better for single-node. |
+| 0.3 | **Add collection abstraction above `StorageEngine`** | `crates/turbomemory_storage/src/collection.rs` (new) | Pending | One `Collection` = many `Shard`s. Python `MemoryEngine` opens a collection directory. Required for sharding and config per collection. |
+| 0.4 | **Move metadata out of single in-memory `HashMap`** | `crates/turbomemory_storage/src/metadata_store.rs` | Pending | Use per-segment metadata files (Qdrant: `segment.json` + mmap id_tracker) or a paged metadata store. Keep hot cache, spill cold records to mmap. Target: < 20% of working set in RAM. |
+| 0.5 | **Introduce per-shard update worker pool** | `crates/turbomemory_storage/src/update_worker.rs` | Pending | One update worker per shard, not one global worker. Use `tokio::sync::mpsc` or crossbeam channels. Bound per-shard queue length. |
+| 0.6 | **Separate read / write / optimize / flush thread pools** | `crates/turbomemory_storage/src/runtime.rs` (new) | Pending | CPU-bound search pool, IO-bound pool, optimizer pool, flush pool. Adaptive switching when CPU > 90% (Qdrant `AdaptiveSearchHandle`). |
+| 0.7 | **Add NUMA / huge-page awareness stubs** | `crates/turbomemory_storage/src/memory_policy.rs` (new) | Pending | Pin optimizer threads, advise `MEM_LARGE_PAGES` on Windows, `madvise(MADV_HUGEPAGE)` on Linux for vector mmap. |
 
 ---
 
-## 5. Tiered Storage (Hot / Warm / Cold)
+## Phase 1 — Ingestion Pipeline (WAL + Update Workers)
+
+Qdrant's ingestion is fast because inserts are **appends to plain segments + WAL**, not HNSW graph mutations. Copy that model exactly.
 
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
-| 5.1 | Actually route vectors to Warm/Cold tiers by access frequency | `crates/turbomemory_storage/src/segment_holder.rs` | Done | Hot → SealedHot → Warm → Cold lifecycle now active; promotion back to Hot by access score |
-| 5.2 | Add access scoring / recency tracking per record | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Needed for promotion/demotion (Phase C) |
-| 5.3 | Implement scalar quantization with per-segment calibration | `crates/turbomemory_storage/src/segments/warm.rs` | Done | Exists; ensure it is used |
-| 5.4 | Implement product quantization (PQ) option | `crates/turbomemory_storage/src/segments/warm.rs` | Pending | Better recall/compression than scalar (Phase C) |
-| 5.5 | Implement binary / 1-bit quantization for Cold tier | `crates/turbomemory_storage/src/segments/cold.rs` | Done | Exists; ensure it is used |
-| 5.6 | Precompute query LUT for quantized scoring | `crates/turbomemory_storage/src/segments/warm.rs` | In Progress | Exists; verify SIMD/fast path (In Progress; finalize in Phase C) |
-| 5.7 | Add mmap-backed quantized vector storage | `crates/turbomemory_storage/src/segments/{warm,cold}.rs` | Done | Warm/Cold segments write manifest + mmap data file and reload on open |
-| 5.8 | Add promotion from Warm/Cold back to Hot on access | `crates/turbomemory_storage/src/segment_holder.rs` | Done | `promote_hot` uses access score; now reachable because Warm/Cold tiers are populated |
-| 5.9 | Hot/Warm/Cold segment scaffolding | `crates/turbomemory_storage/src/segments/` | Done | Architecture in place |
+| 1.1 | **Make mutable Hot segment plain / brute-force only** | `crates/turbomemory_storage/src/segments/hot.rs` | Pending | Never mutate HNSW on insert. Hot segment = append-only offset list + optional exact index. Qdrant: `lib/segment/src/segment_constructor/segment_constructor_base.rs:160`. |
+| 1.2 | **Chunk upserts into 32-point batches** | `crates/turbomemory_storage/src/update_worker.rs`, `engine.rs` | Pending | Qdrant `UPDATE_OP_CHUNK_SIZE = 32` (`lib/shard/src/update.rs:176`). Prevents long write locks. Deletions batch to 512 (`lib/shard/src/update.rs:342`). |
+| 1.3 | **WAL segment size = 32 MiB with CRC32-C framing** | `crates/turbomemory_storage/src/wal.rs` | Pending | Qdrant default (`lib/wal/src/lib.rs:40`). Current TSM WAL is single-file; split into rotating 32 MB segments. |
+| 1.4 | **Add `first-index` / acknowledged-offset file** | `crates/turbomemory_storage/src/wal.rs` | Pending | Qdrant `lib/shard/src/wal.rs:28`. Bounded replay on restart; prefix-truncate old segments after flush. |
+| 1.5 | **Configurable flush policy: EveryWrite / EveryBatch / Periodic / None** | `crates/turbomemory_storage/src/wal.rs`, `config.rs` | Pending | Default Periodic 5 s (Qdrant `flush_interval_sec = 5`). `wait=true` requests force flush. |
+| 1.6 | **Group commit / async WAL fsync** | `crates/turbomemory_storage/src/wal.rs` | Pending | Batch multiple in-flight inserts into one fsync. Separate committer thread. |
+| 1.7 | **Smallest-appendable-segment selection** | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | If multiple Hot segments exist, write to the one with most free capacity. Qdrant: `lib/shard/src/segment_holder/mod.rs:313`. |
+| 1.8 | **Batch payload / text / graph updates** | `crates/turbomemory_storage/src/update_worker.rs` | Pending | Apply metadata, payload index, text index, and graph edges in chunks, not per-point. Qdrant chunks payload ops at 32 (`lib/shard/src/update.rs:714`). |
+| 1.9 | **Zero-copy Python ingest** | `crates/turbomemory_python/src/lib.rs` | Pending | Remove `slice.to_vec()` / `row.to_vec()` in `extract_f32_vec` / `extract_f32_matrix`. Borrow `numpy` arrays directly; copy only when non-contiguous or wrong dtype. |
+| 1.10 | **Streaming bulk insert API** | `crates/turbomemory_python/src/lib.rs` | Pending | Accept iterator/reader or chunked callback API for datasets larger than RAM. |
+| 1.11 | **Pipeline insert: validate → WAL append → segment append → ack** | `crates/turbomemory_storage/src/engine.rs` | Pending | Decouple durability ack from index visibility. Qdrant acks after WAL write; segment update is async. |
 
 ---
 
-## 6. Memory Layout & Zero-Copy
+## Phase 2 — Segment Lifecycle & Optimizers
+
+Qdrant uses four optimizers: **Indexing**, **Merge**, **Vacuum**, **ConfigMismatch**. We need all four, plus tier-aware versions.
 
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
-| 6.1 | Replace `Vec<f32>` clones with mmap-backed storage | `crates/turbomemory_storage/src/vector_store.rs` | Done | `VectorStore` mmap-backed dense f32 file keyed by `PointOffset`; header CRC + `VectorReadView` for lock-free reads |
-| 6.2 | Use `bytemuck` for zero-copy `&[f32]`/`&[u8]` views | `crates/turbomemory_storage/src/segments/mmap_array.rs` | Done | Added `as_typed_slice<T>` / `as_typed_slice_mut<T>` |
-| 6.3 | Introduce `CowVector` / `BorrowedVector` abstractions | `crates/turbomemory_core/src/` | Pending | Defer until dense vector store refactor (Deferred; mmap + VectorReadView already zero-copy) |
-| 6.4 | Store vectors in contiguous aligned arrays | `crates/turbomemory_storage/src/vector_store.rs` | Done | `VectorStore` uses contiguous `f32` array; search/rerank use `read_view` to avoid per-get locks |
-| 6.5 | Avoid `String` clones in `id_index`; use `Arc<str>` or string pool | `crates/turbomemory_storage/src/engine.rs` | Done | `id_index` is now `ahash::HashMap<Arc<str>, PointOffset>` |
-| 6.6 | Use `smallvec` for short candidate / link lists | `crates/turbomemory_storage/src/segments/mod.rs` | Done | `merge_candidates` uses `SmallVec<[ScoredPoint; 64]>` |
-| 6.7 | Use `ahash` for `id_index` and graph maps | `crates/turbomemory_storage/src/engine.rs` | Done | `id_index` uses `ahash` |
-| 6.8 | O(1) duplicate-ID index | `crates/turbomemory_storage/src/engine.rs` | Done | Recently added |
-| 6.9 | O(1) `record_count` and avoid metadata `HashMap` clone on hot paths | `crates/turbomemory_storage/src/metadata_store.rs`, `engine.rs` | Done | `record_count` maintained atomically; `exact_top_k` and engine open iterate without cloning the map |
+| 2.1 | **Byte-threshold sealing: indexing_threshold_kb = 10,000 KB** | `crates/turbomemory_storage/src/config.rs`, `segment_holder.rs` | Pending | Seal Hot → SealedHot when vector storage reaches 10 MB. Convert to point count at runtime: `threshold_kb * 1024 / (dim * 4)`. Qdrant: `lib/shard/src/optimizers/config.rs:15`. |
+| 2.2 | **Max segment size: 256,000 KB per indexing thread** | `crates/turbomemory_storage/src/config.rs` | Pending | Cap segment size to avoid giant unmanageable segments. `max_segment_size_kb = num_indexing_threads * 256_000`. Qdrant: `lib/collection/src/optimizers_builder.rs:184`. |
+| 2.3 | **Target segment count: clamp(num_cpus / 2, 2, 8)** | `crates/turbomemory_storage/src/optimizer.rs`, `config.rs` | Pending | Merge optimizer tries to converge to this count. Qdrant: `lib/collection/src/optimizers_builder.rs:155`. |
+| 2.4 | **IndexingOptimizer: build HNSW only when segment crosses threshold** | `crates/turbomemory_storage/src/optimizer.rs` | Pending | Background build from plain segment to SealedHot. Do not build HNSW for segments below `full_scan_threshold`. |
+| 2.5 | **MergeOptimizer: merge small segments up to max size** | `crates/turbomemory_storage/src/optimizer.rs` | Pending | Greedily merge smallest segments. Require ≥3 segments in first batch or two batches of ≥2 to guarantee count reduction. Qdrant: `lib/shard/src/optimizers/merge_optimizer.rs`. |
+| 2.6 | **VacuumOptimizer: reclaim deleted vectors at 20% / 1,000 vectors** | `crates/turbomemory_storage/src/optimizer.rs` | Pending | Trigger rebuild when deleted_ratio > 0.2 and deleted_count ≥ 1,000. Qdrant: `lib/shard/src/optimizers/config.rs:16-17`. |
+| 2.7 | **ConfigMismatchOptimizer: rebuild when HNSW/quantization/tier config changes** | `crates/turbomemory_storage/src/optimizer.rs` | Pending | Detect desired vs actual segment config and rebuild. Qdrant: `lib/shard/src/optimizers/config_mismatch_optimizer.rs`. |
+| 2.8 | **Build new segments in temp directory + atomic rename** | `crates/turbomemory_storage/src/optimizer.rs`, `segment_builder.rs` (new) | Pending | Qdrant `temp_segments/` → atomic rename into `segments/` (`lib/segment/src/segment_constructor/segment_builder.rs:761`). Current TSM builds in-place under lock; fix. |
+| 2.9 | **Disk-space guard before optimization** | `crates/turbomemory_storage/src/optimizer.rs` | Pending | Require ≥2× source segment size free in temp path. Qdrant: `lib/shard/src/optimize.rs:601`. |
+| 2.10 | **Resource budget: IO permit → CPU permit** | `crates/turbomemory_storage/src/optimizer.rs`, `resource_budget.rs` | Pending | Acquire IO permit for data copying, replace with CPU permit for HNSW indexing. Qdrant: `lib/shard/src/optimize.rs:330`. |
+| 2.11 | **Multi-threaded HNSW construction** | `crates/turbomemory_storage/src/segments/sealed_hot.rs`, `usearch_index.rs` | Pending | First 256 points single-threaded, then parallel insertion. Default build threads: `clamp(num_cpus, 1, 16)` (Qdrant: `lib/common/common/src/defaults.rs:79`). |
+| 2.12 | **Old-index reuse / heal on merge** | `crates/turbomemory_storage/src/segments/sealed_hot.rs` | Pending | When merging already-indexed segments, reuse/heal existing HNSW graph instead of rebuilding from scratch. Qdrant: `OldIndexCandidate` in `lib/segment/src/index/hnsw_index/hnsw/build.rs:150`. |
+| 2.13 | **Cache hygiene: prefault before build, drop after build** | `crates/turbomemory_storage/src/optimizer.rs` | Pending | `populate()` vectors before HNSW build; `clear_cache()` after sealing to avoid page-cache pollution. Qdrant: `lib/segment/src/segment_constructor/segment_builder.rs:834`, `:675-733`. |
+| 2.14 | **Deferred points / `prevent_unoptimized`** | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Hide new writes in over-capacity segments until optimization completes, preventing unbounded exact-scan segments. Qdrant pattern. |
 
 ---
 
-## 7. Concurrency & Locking
+## Phase 3 — Search Architecture
+
+Search at 1M × 4k is dominated by HNSW traversal, multi-segment aggregation, and filtering. These are the highest-ROI CPU wins.
 
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
-| 7.1 | Remove `Mutex<StorageEngine>` from Python binding | `crates/turbomemory_python/src/lib.rs` | Done | `PyMemoryEngine` holds `Arc<StorageEngine>` directly |
-| 7.2 | Use `Arc<StorageEngine>` + `RwLock` for segment holder | `crates/turbomemory_storage/src/engine.rs` | Done | StorageEngine already uses `Arc<RwLock>` |
-| 7.3 | Add `parking_lot::upgradable_read` for segment mutation | `crates/turbomemory_storage/src/segment_holder.rs` | Done | `insert` uses holder read lock + per-segment write lock; seal takes holder write lock only when needed |
-| 7.4 | Separate read/write locks per segment | `crates/turbomemory_storage/src/segment_holder.rs` | Done | Each segment is `Arc<RwLock<dyn VectorSegment>>`; searches lock per-segment |
-| 7.5 | Use lock-free object pools where possible | Search / visited lists | Pending | Reduces contention (Phase C) |
-| 7.6 | Ensure background optimizer doesn't block readers | `crates/turbomemory_storage/src/update_handler.rs` | Done | Sealing builds the new segment under holder write lock briefly; readers use per-segment locks |
-| 7.7 | Add graceful shutdown: stop workers, flush WAL, close mmap | `crates/turbomemory_storage/src/engine.rs`, `main.rs` | Done | Prevents corruption (Phase A: stop workers, flush WAL/vectors/segments, close mmap) (Phase A: `StorageEngine::shutdown` + Python context manager) |
+| 3.1 | **Visited-set pool** | `crates/turbomemory_storage/src/visited_pool.rs` (new) | Pending | Replace per-search allocation with `Vec<u8>` token arrays. Pool size = `num_cpus.clamp(16, 128)`. Token wraps to 0 → refill vector. Qdrant: `lib/segment/src/index/hnsw_index/visited_pool.rs`. |
+| 3.2 | **HNSW defaults aligned with Qdrant** | `crates/turbomemory_storage/src/config.rs` | Pending | `M = 16`, `M0 = 32`, `ef_construct = 100`, `ef_search = max(ef, top_k)`, `full_scan_threshold = 10_000` KB converted to vector count. |
+| 3.3 | **Compressed / inline-vector graph links for sealed segments** | `crates/turbomemory_storage/src/segments/sealed_hot.rs` | Pending | Reduce random seeks by inlining quantized vectors or packing neighbor lists. Qdrant graph formats: `Plain`, `Compressed`, `CompressedWithVectors`. |
+| 3.4 | **Heuristic neighbor selection (HNSW)** | `crates/turbomemory_storage/src/segments/sealed_hot.rs` | Pending | Use diverse neighbor heuristic during build, not just top-M by distance. |
+| 3.5 | **Parallel search across segments with result aggregation** | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Spawn per-segment search on thread pool; merge with k-way top-k. Use `BatchResultAggregator`. Cancel slow/abandoned tasks on drop. Qdrant: `lib/collection/src/collection_manager/segments_searcher.rs:211`. |
+| 3.6 | **Probabilistic sampling for multi-segment search** | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Poisson-derived per-segment limit; rerun if boundary crosses global top-k. Qdrant: `lib/collection/src/collection_manager/segments_searcher.rs:571`. |
+| 3.7 | **Cardinality-aware filter routing** | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Estimate `{min, exp, max}` cardinality. `max < full_scan_threshold` → plain; `min > threshold` → HNSW; else sample ≤1,000 points with Agresti-Coull confidence interval. Qdrant: `lib/segment/src/index/hnsw_index/hnsw/vector_index_impl.rs:55-173`. |
+| 3.8 | **ACORN-1 adaptive filtered search** | `crates/turbomemory_storage/src/segments/sealed_hot.rs` | Pending | When selectivity ≤ 0.4, expand 1-hop and conditional 2-hop neighbors during HNSW traversal. Use two pooled visited lists. Qdrant: `lib/segment/src/index/hnsw_index/hnsw/search.rs:36-85`. |
+| 3.9 | **Plain search with SIMD + early-exit top-k** | `crates/turbomemory_storage/src/segments/hot.rs` | Pending | Hot segment exact scan must be competitive. Use batched SIMD distance + min-heap top-k. |
+| 3.10 | **Per-query latency budget / adaptive `ef`** | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Allow caller to specify `ef`; optionally auto-raise `ef` if recall audit is below target. |
+| 3.11 | **Exact reranking after quantization** | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Rescore top-k approximate results with full f32 vectors. Default on for binary/TurboQuant, off for scalar/PQ. Qdrant: `lib/segment/src/index/vector_index_search_common.rs:48-87`. |
+| 3.12 | **Abort-on-drop for long searches** | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Wrap blocking search tasks so dropping the request cancels the thread work. Qdrant: `AbortOnDropHandle`. |
 
 ---
 
-## 8. Python Bindings
+## Phase 4 — Quantization & Distance Compute (CPU)
+
+At 4k dimensions, distance compute is the bottleneck. We need SIMD, batched kernels, and richer quantizers.
 
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
-| 8.1 | Expose batch insert returning async future / background handle | `crates/turbomemory_python/src/lib.rs` | Done | GIL released; zero-copy numpy; async handle deferred to Phase D if needed (Phase B: async batch insert handle) |
-| 8.2 | Accept numpy arrays without copying where possible | `crates/turbomemory_python/src/lib.rs` | Done | `numpy::PyReadonlyArray1/2` zero-copy views (Phase B: zero-copy numpy extraction) |
-| 8.3 | Release the GIL during Rust search/indexing | `crates/turbomemory_python/src/lib.rs` | Done | `py.allow_threads` on all heavy calls (Phase B: release GIL during search/indexing) |
-| 8.4 | Add proper Python exceptions mapping | `crates/turbomemory_python/src/lib.rs` | Done | `DuplicateId`/`DimensionMismatch`/`InvalidArgument` -> `ValueError`; `NotFound` -> `KeyError`; rest -> `RuntimeError` (Phase B: map StorageError to Python exceptions) |
-| 8.5 | Add `__del__` / context manager for clean engine shutdown | `crates/turbomemory_python/src/lib.rs` | Done | Resource cleanup (Phase A/B: `close()` + context manager) (Phase A: close() + context manager) |
-| 8.6 | PyO3 bindings with original Python API preserved | `crates/turbomemory_python/src/lib.rs` | Done | Existing baseline |
+| 4.1 | **Batched SIMD distance kernel (matrix × query)** | `crates/turbomemory_core/src/metrics.rs` | Pending | Replace per-vector `cosine_similarity` with blocked AVX2/FMA matrix multiply. Four-accumulator unroll. Threshold: AVX for `dim >= 32`, SSE/NEON for `dim >= 16`. Qdrant: `lib/segment/src/spaces/`. |
+| 4.2 | **Pre-normalize cosine vectors** | `crates/turbomemory_core/src/metrics.rs` | Pending | Store normalized vectors so cosine = dot. Query normalized once. |
+| 4.3 | **Scalar int8 quantizer** | `crates/turbomemory_core/src/quantization/` (new) | Pending | `alpha=(max-min)/127`, offset=min, per-metric multiplier, vector offset prefix. SIMD i8 dot/L1. Qdrant: `lib/quantization/src/encoded_vectors_u8.rs`. |
+| 4.4 | **Product Quantization (PQ)** | `crates/turbomemory_core/src/quantization/` (new) | Pending | 256 centroids/subspace, kmeans sample 10k, max 100 iter, tol 1e-5. Query builds LUT; SIMD LUT gather. Qdrant: `lib/quantization/src/encoded_vectors_pq.rs`. |
+| 4.5 | **Binary / 1-bit + 1.5-bit / 2-bit quantizers** | `crates/turbomemory_core/src/quantization/` (new) | Pending | XOR-popcount via SSE4.2/AVX-512/NEON; optional scalar query encoding. Default rescoring=true. Qdrant: `lib/quantization/src/encoded_vectors_binary.rs`. |
+| 4.6 | **TurboQuant-style 1/2/4-bit quantizer** | `crates/turbomemory_core/src/quantization/` (new) | Pending | FWHT rotation + length rescale + Lloyd-Max + per-coordinate shift/scale error correction. Asymmetric scoring. |
+| 4.7 | **OPQ / learned rotation before PQ** | `crates/turbomemory_core/src/quantization/` (new) | Pending | Reduce PQ distortion for high-dimensional embeddings. |
+| 4.8 | **Quantization auto-selection by dimension and recall target** | `crates/turbomemory_storage/src/config.rs` | Pending | Warm tier picks scalar/PQ/TurboQuant based on dim and target recall. Cold tier avoids 1-bit sign-only at dim ≥ 1024. |
+| 4.9 | **Zero-copy quantized scans** | `crates/turbomemory_storage/src/segments/warm.rs`, `cold.rs` | Pending | Read mmap slices directly; remove `chunk_bytes.extend_from_slice` copies. |
+| 4.10 | **Query LUT precomputation for quantized tiers** | `crates/turbomemory_storage/src/segments/warm.rs`, `cold.rs` | Pending | Build lookup table once per query, reuse across chunks. |
+| 4.11 | **Distance compute thread pool with work stealing** | `crates/turbomemory_storage/src/runtime.rs` | Pending | Use `rayon` or custom pool for batch distance jobs; separate from search threads. |
 
 ---
 
-## 9. API / gRPC / REST
+## Phase 5 — Memory, Storage & I/O
+
+1M × 4k = ~16 GB of vectors alone. We must be mmap-first, shard-first, and I/O-aware.
 
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
-| 9.1 | Add batch insert endpoint to gRPC/REST | `crates/turbomemory_api/src/grpc.rs`, `rest.rs` | Done | Batch insert supports payloads; `/insert_batch` and `InsertBatch` RPC updated (Phase B: batch insert gRPC/REST endpoint) |
-| 9.2 | Add delete / update endpoints | `crates/turbomemory_api/src/grpc.rs`, `rest.rs` | Done | `/delete`, `/update`, `Delete`, `Update`, plus `/get_payload` and `GetPayload` (Phase B: delete/update gRPC/REST endpoints) |
-| 9.3 | Add health metrics endpoint (beyond `/health`) | `crates/turbomemory_api/src/rest.rs` | Pending | Prometheus-style metrics (Phase D) |
-| 9.4 | Add request timeouts and payload size limits | `crates/turbomemory_api/src/main.rs` | Pending | Production hardening (Phase D) |
-| 9.5 | Add CORS / auth middleware stubs | `crates/turbomemory_api/src/rest.rs` | Pending | Deployment readiness (Phase D) |
-| 9.6 | gRPC + REST server scaffold | `crates/turbomemory_api/src/` | Done | Existing baseline |
+| 5.1 | **Shard `VectorStore` by point-offset range** | `crates/turbomemory_storage/src/vector_store.rs` | Pending | Split vectors into multiple `vectors-*.bin` files (e.g., per shard or per 256k offsets). Avoid 16 GB+ single file remap. |
+| 5.2 | **Recycle deleted vector slots** | `crates/turbomemory_storage/src/vector_store.rs` | Pending | Maintain a free-list of deleted offsets; new inserts reuse slots instead of always appending. |
+| 5.3 | **Async / prefetch mmap I/O** | `crates/turbomemory_storage/src/vector_store.rs`, `segments/warm.rs`, `cold.rs` | Pending | `madvise` / `PrefetchVirtualMemory` (Windows) for cold-start and sequential build reads. Add `MmapOptions::populate()` option. |
+| 5.4 | **Separate hot and cold mmap policies** | `crates/turbomemory_storage/src/vector_store.rs` | Pending | Hot vectors locked/prefaulted; Warm/Cold left for OS cache. |
+| 5.5 | **Paged metadata store with cache eviction** | `crates/turbomemory_storage/src/metadata_store.rs` | Pending | Replace single `HashMap` with LRU cache + mmap-backed pages. Critical for 1M+ text records. |
+| 5.6 | **Per-segment metadata files** | `crates/turbomemory_storage/src/segments/` | Pending | Each segment owns its id→offset map and payload indexes, not a global redb. Qdrant: `segment.json` + mmap id_tracker. |
+| 5.7 | **Replace redb with per-segment metadata + WAL** | `crates/turbomemory_storage/src/metadata_store.rs` | Pending | redb becomes a bottleneck at high metadata throughput. Use append-only segment manifests + WAL replay. |
+| 5.8 | **Offset-mapped payload storage (mmap)** | `crates/turbomemory_storage/src/payload_storage.rs` (new) | Pending | Store payloads in per-segment mmap files keyed by local offset, like Qdrant `MmapPayloadStorage`. |
+| 5.9 | **Bitmap payload indexes with mmap backing** | `crates/turbomemory_storage/src/payload_index.rs` | Pending | Keyword/int/range indexes as Roaring bitmaps persisted to mmap; not fully in-memory. |
+| 5.10 | **Text index segmentation and batch commits** | `crates/turbomemory_storage/src/text_index.rs` | Pending | Separate text index per segment; periodic commit; avoid `TopDocs::with_limit(num_docs)` full materialization. |
+| 5.11 | **Write-ahead snapshot / checkpointing** | `crates/turbomemory_storage/src/engine.rs` | Pending | Take periodic checkpoints (segments + manifest) without blocking foreground; truncate WAL after checkpoint. |
+| 5.12 | **mmap growth strategy: pre-allocate in power-of-two chunks** | `crates/turbomemory_storage/src/vector_store.rs` | Pending | Avoid full-file remap on every growth; double capacity and zero-fill lazily. |
+| 5.13 | **DiskANN / SPANN-style on-disk ANN index option** | `crates/turbomemory_storage/src/index/diskann.rs` (new) | Pending | For >RAM collections, provide disk-based approximate index as alternative to in-RAM HNSW. |
 
 ---
 
-## 10. Cognitive Graph Layer
+## Phase 6 — Concurrency & Scheduling
 
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
-| 10.1 | Persist graph edges durably | `crates/turbomemory_graph/src/` | Pending | Currently rebuilt from metadata (Phase E / Future) |
-| 10.2 | Use quantized or sparse edge weights | `crates/turbomemory_graph/src/` | Pending | Memory blowup with dense graph (Phase E / Future) |
-| 10.3 | Add access-time decay to edge weights | `crates/turbomemory_graph/src/` | Pending | Forgetting / recency (Phase E / Future) |
-| 10.4 | Make spreading activation concurrent-safe | `crates/turbomemory_graph/src/` | Pending | Currently behind RwLock (Phase E / Future) |
-| 10.5 | Add graph pruning / consolidation | `crates/turbomemory_graph/src/` | Pending | Remove stale edges (Phase E / Future) |
-| 10.6 | Deterministic sorted graph edges | `crates/turbomemory_graph/src/` | Done | Existing baseline |
+| 6.1 | **Per-shard RwLock-free segment list** | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | See 0.2. Publish `Arc<Vec<Arc<Segment>>>` on mutation; readers snapshot cheaply. |
+| 6.2 | **Lock-free access counters** | `crates/turbomemory_storage/src/access_counters.rs` | Pending | Current `Mutex<AHashMap>` contends. Use sharded atomic counters or thread-local buffers with periodic drain. |
+| 6.3 | **parking_lot everywhere** | Whole workspace | Pending | Replace `std::sync::{Mutex,RwLock}` with `parking_lot` variants for lower overhead. |
+| 6.4 | **Per-point link locks during mutable HNSW build** | `crates/turbomemory_storage/src/segments/sealed_hot.rs` | Pending | If we ever support incremental HNSW, use `Vec<RwLock<LinksContainer>>` per point (Qdrant pattern). For now, avoid incremental build. |
+| 6.5 | **Resource isolation: search vs ingest vs optimize** | `crates/turbomemory_storage/src/resource_budget.rs` | Pending | CPU/IO/memory permits per operation class. Background optimizer throttled when foreground CPU > threshold. |
+| 6.6 | **Adaptive search thread pool** | `crates/turbomemory_storage/src/runtime.rs` | Pending | Switch between HighIo and HighCpu pools based on process CPU ratio (Qdrant `AdaptiveSearchHandle`). |
+| 6.7 | **Cancel slow/abandoned queries** | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | See 3.12. |
+| 6.8 | **Concurrent graph search / spreading activation** | `crates/turbomemory_graph/src/` | Pending | Remove single `RwLock<SpreadingActivation>`; shard graph or use RCU. |
+| 6.9 | **Batch cognitive search rehydration** | `crates/turbomemory_storage/src/engine.rs` | Pending | Load result payloads in batches, not one-by-one. |
 
 ---
 
-## 11. Payload, Filtering & Metadata
+## Phase 7 — GPU / CUDA / cuBLAS / Vulkan Acceleration
+
+GPU is **not a magic bullet**. Qdrant uses GPU only for HNSW **build**, not search, via Vulkan compute. Distance compute can be GPU-accelerated for batch queries. We should support both CUDA (NVIDIA) and Vulkan (portable) paths behind feature flags.
 
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
-| 11.1 | Add payload storage (JSON / key-value) per record | `crates/turbomemory_storage/src/` | Done | `Record`/`MetaRecord` carry `payload: Option<String>`; WAL replay is bincode-safe because the JSON is stored as raw text rather than `serde_json::Value` |
-| 11.2 | Add payload index (roaring bitmaps) | `crates/turbomemory_storage/src/` | Done | `PayloadIndex` with keyword + numeric range; filtered ANN via bitmap post-filter/over-fetch (Phase B: Roaring bitmap indexes for keyword/int/range filters) |
-| 11.3 | Integrate filtered scorer with HNSW search | `crates/turbomemory_storage/src/segments/hot.rs` | Done | `VectorSegment::search` accepts `allowed_offsets`; Hot/SealedHot over-fetch + post-filter; Warm/Cold intersect bitmap (Phase B: pre-filter candidates before HNSW search) |
-| 11.4 | Add full-text index for `text` field | `crates/turbomemory_storage/src/` | Done | `TextIndex` backed by `tantivy`; `Filter::FullText` supported in filtered ANN/cognitive search (Phase B: integrate tantivy or trigram full-text index) |
-| 11.5 | Support sparse vectors | `crates/turbomemory_core/src/` | Pending | Nice-to-have later (Future / Phase E) |
+| 7.1 | **Add `turbomemory_gpu` crate with backend trait** | `crates/turbomemory_gpu/` (new) | Pending | `GpuBackend` trait: `init()`, `upload_vectors()`, `upload_query_batch()`, `batch_dot()`, `build_hnsw_approx()`, `shutdown()`. Implementations: `CudaBackend`, `VulkanBackend`. |
+| 7.2 | **cuBLAS batched distance compute** | `crates/turbomemory_gpu/src/cuda/dot.rs` | Pending | For batch queries (e.g., 64 queries × 1M vectors × 4k), cuBLAS `S GEMM` or custom CUDA kernel is much faster than CPU. Use for exact/rerank batches. |
+| 7.3 | **CUDA kernel for top-k reduction** | `crates/turbomemory_gpu/src/cuda/topk.rs` | Pending | Fuse distance + top-k on GPU to avoid host↔device round trips. NVIDIA cuVS / RAFT provide `cuvs::neighbors::cagra` and `raft::spatial::knn`. |
+| 7.4 | **CUDA HNSW build path** | `crates/turbomemory_gpu/src/cuda/hnsw_build.rs` | Pending | Parallel level-by-level HNSW insertion on GPU. Fallback to CPU on OOM/error. Only for sealed segments, not incremental. |
+| 7.5 | **Vulkan compute HNSW build path (Qdrant model)** | `crates/turbomemory_gpu/src/vulkan/` | Pending | Use `ash` + compute shaders. Default 512 parallel insertion groups. Cross-platform, no NVIDIA dependency. Qdrant: `lib/segment/src/index/hnsw_index/gpu/`. |
+| 7.6 | **GPU device manager** | `crates/turbomemory_gpu/src/device_manager.rs` | Pending | Global manager with per-optimization device lock. Select discrete > integrated; allow explicit device filter. Qdrant: `GPU_DEVICES_MANAGER` in `lib/segment/src/index/hnsw_index/gpu/mod.rs:23`. |
+| 7.7 | **Feature flags: `cuda`, `vulkan`, `gpu`** | `Cargo.toml`, `crates/turbomemory_gpu/Cargo.toml` | Pending | `gpu` enables whichever backend is available; `cuda`/`vulkan` force specific path. |
+| 7.8 | **cuVS / RAFT CAGRA index integration** | `crates/turbomemory_gpu/src/cuda/cagra.rs` | Pending | NVIDIA CAGRA is currently fastest GPU ANN for batch search. Use as alternative HNSW backend for sealed segments. |
+| 7.9 | **GPU quantization scoring kernels** | `crates/turbomemory_gpu/src/cuda/quantized.rs` | Pending | PQ LUT lookup, binary popcount, scalar i8 dot on GPU for Warm/Cold tiers when batch is large enough to amortize upload. |
+| 7.10 | **Host↔device memory pool** | `crates/turbomemory_gpu/src/memory_pool.rs` | Pending | Avoid `cudaMalloc` per query; keep pinned host buffers and device arenas. |
+| 7.11 | **CUDA/C++ build.rs with `cc` crate** | `crates/turbomemory_gpu/build.rs` | Pending | Compile `.cu` files with `nvcc`; fallback to prebuilt stubs if CUDA unavailable. |
+| 7.12 | **Benchmark GPU vs CPU per operation** | `benchmark.py`, `benches/` | Pending | Auto-select backend based on batch size, dimension, and measured latency. |
+
+### GPU Strategy Notes
+
+- **Search**: keep CPU HNSW as default. GPU search wins only for large batch queries; single-query latency is usually worse due to upload overhead.
+- **Build**: GPU HNSW/CAGRA build is a clear win for 1M × 4k segments.
+- **Distance**: cuBLAS batch GEMM for exact reranking is a clear win for batch search.
+- **Fallback**: every GPU path must silently fall back to CPU on error (OOM, driver issue, no device).
 
 ---
 
-## 12. Correctness & Edge Cases
+## Phase 8 — Python Bindings & API
 
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
-| 12.1 | Validate embedding dimension matches config on every insert | `crates/turbomemory_storage/src/engine.rs` | Done | Silent corruption risk (Phase A: `validate_dimension` on insert and batch insert) |
-| 12.2 | Handle duplicate IDs deterministically (update vs reject) | `crates/turbomemory_storage/src/engine.rs` | Done | O(1) check exists; semantics need docs/tests (Phase A: insert rejects duplicates, update replaces existing) |
-| 12.3 | Add idempotent batch insert | `crates/turbomemory_storage/src/engine.rs` | Done | Replay safety (Phase A: skip existing/duplicate ids in batch insert) |
-| 12.4 | Handle out-of-disk and mmap failures gracefully | All storage files | Done | Currently likely panics (Phase A: io errors from file set_len/mmap propagate as StorageError) |
-| 12.5 | Add deletion semantics and tombstone cleanup | `crates/turbomemory_storage/src/engine.rs` | In Progress | Needed for production (Phase A: delete/update API implemented; vacuum cleanup pending) (Phase B/C: vacuum cleanup after delete/update) |
-| 12.6 | Add corruption detection on WAL replay / segment load | `crates/turbomemory_storage/src/wal.rs` | Done | CRC is there, but verify all paths (Phase A: WAL CRC check, vector store header magic/version/CRC validation) |
-| 12.7 | Make `trigger_consolidation` idempotent and observable | `crates/turbomemory_storage/src/engine.rs` | Done | Return work done / errors clearly (Phase A: returns sealed/compacted/promoted tuple) |
+| 8.1 | **Zero-copy numpy ingest** | `crates/turbomemory_python/src/lib.rs` | Pending | See 1.9. |
+| 8.2 | **Streaming / chunked bulk insert** | `crates/turbomemory_python/src/lib.rs` | Pending | See 1.10. |
+| 8.3 | **Async Python API (`asyncio`)** | `crates/turbomemory_python/src/lib.rs` | Pending | Return awaitable futures for insert/search; release GIL. |
+| 8.4 | **Collection / shard config in Python** | `crates/turbomemory_python/src/lib.rs` | Pending | Expose `num_shards`, `indexing_threshold_kb`, `max_segment_size_kb`, quantization config. |
+| 8.5 | **Batch search API** | `crates/turbomemory_python/src/lib.rs` | Pending | Accept matrix of queries; return list of result lists. Enables GPU batching. |
+| 8.6 | **Progress callbacks for build/optimize** | `crates/turbomemory_python/src/lib.rs` | Pending | Long seals/merges report progress. |
+| 8.7 | **Recall audit auto-tune helper** | `audit_recall.py` | Pending | Python helper to sample, measure recall, and raise `ef` until target is met. |
 
 ---
 
-## 13. Observability & Tooling
+## Phase 9 — Observability & Operations
 
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
-| 13.1 | Replace `println!` / ad-hoc logging with `tracing` spans | Whole workspace | Pending | Needed for production debugging (Phase D) |
-| 13.2 | Add metrics: ingest latency, search latency, segment sizes, tier counts | `crates/turbomemory_storage/src/engine.rs` | Pending | Use `metrics` crate (Phase D) |
-| 13.3 | Add WAL lag / optimizer queue depth metrics | `crates/turbomemory_storage/src/update_handler.rs` | Pending | Operational visibility (Phase D) |
-| 13.4 | Add structured logging configuration | `crates/turbomemory_api/src/main.rs` | Pending | Env-filter etc. (Phase D) |
+| 9.1 | **Replace `println!` with `tracing` spans** | Whole workspace | Pending | Structured, level-filtered logging. |
+| 9.2 | **Metrics: ingest latency, search latency, segment sizes, tier counts** | `crates/turbomemory_storage/src/metrics.rs` (new) | Pending | Use `metrics` crate with Prometheus exporter in API server. |
+| 9.3 | **WAL lag / optimizer queue depth metrics** | `crates/turbomemory_storage/src/update_worker.rs`, `optimizer.rs` | Pending | Operational visibility. |
+| 9.4 | **Health metrics endpoint** | `crates/turbomemory_api/src/rest.rs` | Pending | Prometheus `/metrics`. |
+| 9.5 | **Request timeouts, payload size limits, CORS, auth** | `crates/turbomemory_api/src/main.rs`, `rest.rs` | Pending | Production hardening. |
+| 9.6 | **Docker / container build** | `deployments/docker/` (new) | Pending | Multi-stage build with optional CUDA base image. |
+| 9.7 | **Cross-platform build support** | `Cargo.toml`, `.cargo/config.toml` | Pending | Windows MSVC, Linux, macOS; target-cpu=native optional. |
+| 9.8 | **Release profile with LTO + codegen-units=1** | `Cargo.toml` | Done | Already configured. |
 
 ---
 
-## 14. Build, C++ / CUDA Integration & Deployment
+## Phase 10 — Testing & Benchmarking at Million-Scale
 
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
-| 14.1 | Add `build.rs` for C++ HNSW backend | New crate `crates/turbomemory_hnsw_cpp/` | Pending | If going custom C++ (Future / Phase E) |
-| 14.2 | Use `cxx` or `bindgen` for safe C++ interop | `crates/turbomemory_hnsw_cpp/` | Pending | Avoid raw FFI (Future / Phase E) |
-| 14.3 | Add CUDA/cuBLAS feature flag and crate | `crates/turbomemory_gpu/` | Pending | Future path (Future / Phase E) |
-| 14.4 | Cross-platform build support (Windows MSVC, Linux, macOS) | `Cargo.toml`, build scripts | Pending | SIMD detection differs (Phase D) |
-| 14.5 | Add `.cargo/config.toml` for target-specific flags | `.cargo/config.toml` | Pending | e.g., `-C target-cpu=native` (Phase D) |
-| 14.6 | Add container / Docker build for the server | `deployments/` or new `docker/` | Pending | Deployment readiness (Phase D) |
-| 14.7 | Release profile with LTO + codegen-units = 1 | `Cargo.toml` | Done | Already configured |
+| 10.1 | **Add 1M × 4k synthetic benchmark** | `benchmark.py`, `benches/` | Pending | Measure ingest time, search P50/P99, recall@10, peak RSS, disk usage. |
+| 10.2 | **Add concurrent ingest + search benchmark** | `benchmark.py` | Pending | Catch lock contention and tail latency. |
+| 10.3 | **Add crash-recovery tests for sharded WAL** | `crates/turbomemory_storage/tests/` | Pending | Kill mid-seal, verify no data loss. |
+| 10.4 | **Add property-based tests for segment lifecycle** | `crates/turbomemory_storage/tests/` | Pending | Seal/merge/vacuum correctness. |
+| 10.5 | **Add comparison harness vs Qdrant/Chroma/Faiss** | `benchmark.py` | Pending | Same dataset, same recall target. |
+| 10.6 | **Continuous benchmark tracking** | CI / `benches/` | Pending | Detect regressions on PRs. |
+| 10.7 | **GPU correctness tests** | `crates/turbomemory_gpu/tests/` | Pending | Compare GPU exact top-k vs CPU brute force bit-exact. |
 
 ---
 
-## 15. Testing & Benchmarking
+## Qdrant Default Cheat Sheet (Reference)
 
-| # | Fix | Location(s) | Status | Notes |
-|---|---|---|---|---|
-| 15.1 | Add recall vs latency benchmarks across dimensions | `benchmark.py` / `benches/` | In Progress | `benches/vector_search.rs` covers exact/HNSW/Warm/Cold at D=128 |
-| 15.2 | Add ingest throughput benchmark with concurrent writers | `benchmark.py` / `benches/` | Pending | Catch Mutex regressions (Phase B/C) |
-| 15.3 | Add crash-recovery tests (kill -9, replay WAL) | `crates/turbomemory_storage/tests/` | Done | `tests/crash_recovery.rs` covers WAL replay, tier reload, truncated WAL |
-| 15.4 | Add property-based tests for segment lifecycle | `crates/turbomemory_storage/tests/` | Pending | Seal/merge correctness (Phase B/C) |
-| 15.5 | Add comparison harness vs Qdrant/Chroma | `benchmark.py` | In Progress | Exists; needs to be run regularly |
-| 15.6 | Add continuous benchmark tracking | CI / `benches/` | Pending | Detect regressions (Future) |
-| 15.7 | `cargo test --workspace`, `make verify`, `make audit`, `make benchmark --tsm-only`, `cargo clippy -D warnings` all pass | Workspace | Done | Existing baseline |
-
----
-
-## 16. Imported Architecture Optimizations (Qdrant + Chroma)
-
-Lessons from `docs/qdrant_architecture.md` and `docs/chroma_architecture.md` that are now queued for TSM implementation.
-
-### 16.1 Ingestion speed
-
-| # | Fix | Location(s) | Status | Notes |
-|---|---|---|---|---|
-| 16.1.1 | Add appendable plain / brute-force segment for hot writes | `crates/turbomemory_storage/src/segments/hot.rs` | Done | `HotSegment` is now a plain offset list; HNSW built offline by optimizer |
-| 16.1.2 | Add in-memory write buffer + periodic batch flush to HNSW | `crates/turbomemory_storage/src/segments/hot.rs`, `engine.rs` | Pending | Chroma-style fallback: buffer ≤100 items, flush asynchronously (deferred; plain segment already removes HNSW insert cost) |
-| 16.1.3 | Move Hot-seal / HNSW rebuild / compaction to background optimizer | `crates/turbomemory_storage/src/optimizer.rs` (new), `segment_holder.rs` | Done | `BackgroundOptimizer` builds `SealedHot`/`Warm` from `sealing_plain`; `flush()` drains pending seals |
-| 16.1.4 | Batch WAL appends and make flush policy configurable | `crates/turbomemory_storage/src/wal.rs`, `engine.rs` | Pending | `EveryWrite` / `EveryBatch` / `Periodic`; Qdrant/Chroma both amortize fsync |
-| 16.1.5 | Move Tantivy text-index commit out of query path | `crates/turbomemory_storage/src/text_index.rs`, `engine.rs` | Done | `TextIndex` tracks pending docs; `commit_if_pending()` in `evaluate_filter`; periodic flush commits |
-| 16.1.6 | Apply metadata / payload / text updates in log-compaction batches | `crates/turbomemory_storage/src/metadata_store.rs`, `payload_index.rs`, `text_index.rs` | Pending | Chroma-style: batch-apply a chunk of WAL records |
-
-### 16.2 Search speed
-
-| # | Fix | Location(s) | Status | Notes |
-|---|---|---|---|---|
-| 16.2.1 | Use `ef = max(search_list_size, top_k)` at query time | `crates/turbomemory_storage/src/segment_holder.rs`, `segments/hot.rs`, `segments/sealed_hot.rs` | Done | `pool_k = max(search_list_size, top_k * multiplier)`; segment search uses caller's `pool_k` directly |
-| 16.2.2 | Query segments in parallel with Rayon / thread pool | `crates/turbomemory_storage/src/segment_holder.rs` | Done | `rayon` added; segments searched in parallel; sequential fallback for single segment |
-| 16.2.3 | Push payload bitmap into HNSW traversal as `FilteredScorer` | `crates/turbomemory_storage/src/segments/sealed_hot.rs` | Done | Selective-filter fallback to exact scan per `SealedHotSegment`; post-filter path uses larger `pool_k` |
-| 16.2.4 | Add small-segment exact / brute-force fallback threshold | `crates/turbomemory_storage/src/segment_holder.rs` | Done | `hnsw_threshold` decides HNSW vs quantized/plain per segment; engine still exact-falls-back below 4,096 records |
-| 16.2.5 | Accelerate Warm/Cold scans with SIMD + early-exit top-k | `crates/turbomemory_core/src/metrics_quantized.rs`, `segments/warm.rs`, `segments/cold.rs` | In Progress | Min-heap top-k implemented; SIMD sign dot and wider scalar SSE/NEON paths still pending |
-
-### 16.3 Recall
-
-| # | Fix | Location(s) | Status | Notes |
-|---|---|---|---|---|
-| 16.3.1 | Expose `ef` / `search_list_size` in Python `search_ann` API | `crates/turbomemory_python/src/lib.rs`, `crates/turbomemory_api/` | Pending | Lets callers trade latency for recall |
-| 16.3.2 | Floor filtered-search candidate pool at `ef` | `crates/turbomemory_storage/src/segment_holder.rs` | Done | `pool_k = max(search_list_size, top_k * 8)` for filtered queries |
-| 16.3.3 | Add recall audit auto-tune: sample + raise `ef` if below target | `audit_recall.py`, `crates/turbomemory_storage/src/engine.rs` | Pending | Chroma/Qdrant both keep recall high via ef tuning |
+| Parameter | Qdrant Default | TSM Target |
+|---|---|---|
+| HNSW `m` | 16 | 16 |
+| HNSW `m0` | 32 | 32 |
+| `ef_construct` | 100 | 100 |
+| `ef` search | `max(ef, top_k)` | `max(ef, top_k)` |
+| `full_scan_threshold` | 10,000 KB → vector count | 10,000 KB → vector count |
+| `indexing_threshold_kb` | 10,000 | 10,000 |
+| `max_segment_size_kb` | 256,000 × indexing_threads | 256,000 × indexing_threads |
+| Target segment count | `clamp(num_cpus/2, 2, 8)` | `clamp(num_cpus/2, 2, 8)` |
+| Deleted threshold | 0.2 | 0.2 |
+| Vacuum min vectors | 1,000 | 1,000 |
+| HNSW build threads | `clamp(num_cpus, 1, 16)` | `clamp(num_cpus, 1, 16)` |
+| Single-threaded HNSW prefix | 256 points | 256 points |
+| Upsert chunk size | 32 | 32 |
+| Deletion batch size | 512 | 512 |
+| WAL segment size | 32 MiB | 32 MiB |
+| Flush interval | 5 s | 5 s |
+| Visited pool size | `clamp(num_cpus, 16, 128)` | `clamp(num_cpus, 16, 128)` |
+| GPU groups (Vulkan) | 512 | 512 |
 
 ---
 
 ## Suggested Execution Order
 
-### Phase A — Production correctness ✅
-1. **12.1–12.7** — Dimension validation, duplicate-ID semantics, idempotent batch, out-of-disk handling, deletion/tombstones, corruption detection, observable consolidation.
-2. **7.7** — Graceful shutdown (stop workers, flush WAL/vectors/segments, close mmap).
+### Stage 1 — Unlock 1M × 4k structurally (P0)
+1. **0.1–0.3** — Shard collection, collection abstraction, lock-free segment list.
+2. **0.4–0.5** — Paged metadata store, per-shard update worker.
+3. **1.1–1.3** — Plain Hot segment, 32-point chunks, 32 MiB WAL segments.
+4. **2.1–2.2, 2.4–2.6** — Byte-threshold sealing, max segment size, Indexing/Merge/Vacuum optimizers.
+5. **5.1–5.3** — Sharded VectorStore, slot recycling, prefetch.
 
-### Phase B — Core DB features for users ✅
-3. **11.1–11.4** — Payload storage, payload index (Roaring bitmaps), filtered ANN, full-text index.
-4. **8.1–8.4** — Python binding hardening (async batch handle, zero-copy numpy, GIL release, exception mapping).
-5. **9.1–9.2** — Batch insert and delete/update REST/gRPC endpoints.
+### Stage 2 — Make search fast at high dimension
+6. **3.1, 3.5, 3.7** — Visited pool, parallel multi-segment search, cardinality-aware filtering.
+7. **4.1–4.3** — Batched SIMD distance, scalar int8 quantizer, cosine pre-normalization.
+8. **3.2, 3.11** — Qdrant-aligned HNSW defaults, exact reranking.
 
-### Phase C — Scalability / optimizer hardening (current)
-6. **16.1–16.3** — Imported architecture optimizations (done):
-   - **16.2.1** ✅ Query-time `ef` fix (recall@5 now 100% at N=5k D=128/768).
-   - **16.1.5** ✅ Batch Tantivy commits / remove commit-on-query.
-   - **16.1.1** ✅ Appendable plain segment for hot writes.
-   - **16.1.3** ✅ Background optimizer for seal/merge/compaction.
-   - **16.2.2 + 16.2.3** ✅ Parallel segment search + filtered HNSW traversal.
-7. **Remaining Phase C items** — `16.1.2`, `16.1.4`, `16.1.6`, `16.2.5` (SIMD part), `16.3.1`, `16.3.3`, plus the original `4.5`, `4.6`, `5.x`, `1.7`, `3.x` backlog.
-7. **4.1–4.7 + 5.2 + 5.4** — Immutable segments, access scoring, background builders, merge/vacuum/config-mismatch optimizers, product quantization.
-8. **1.4 + 1.7 + 1.8 + 3.6 + 3.10** — VisitedPool, HNSW tuning, full-scan threshold, segment versioning, sync thresholds.
+### Stage 3 — GPU acceleration
+9. **7.1–7.4, 7.6** — `turbomemory_gpu` crate, cuBLAS batch distance, CUDA HNSW build, device manager.
+10. **7.5, 7.8** — Vulkan compute build path, CAGRA integration.
 
-### Phase D — Operations / deployment
-8. **13.1–13.4** — `tracing` + `metrics` + structured logging.
-9. **9.3–9.5 + 14.4–14.6** — Health metrics, timeouts/limits, CORS/auth, cross-platform builds, Docker.
-10. **3.8** — Async flush worker hardening.
+### Stage 4 — Operations & polish
+11. **9.1–9.7** — Tracing, metrics, Docker, cross-platform builds.
+12. **10.1–10.7** — Million-scale benchmarks, comparison harness, continuous tracking.
 
-### Phase E — Future / research
-11. **10.1–10.5** — Durable graph persistence, then decay/pruning/consolidation.
-12. **1.2 + 11.5 + 14.1–14.3** — Swappable HNSW trait, sparse vectors, optional custom C++/CUDA backends only after CPU path is benchmarked at million-scale.
-13. **15.6** — Continuous benchmark tracking / CI.
+---
+
+## Legacy Items (from previous TODO.md)
+
+All previously tracked items are subsumed above. The following remain relevant but are now lower priority until Stage 1 is complete:
+
+- Cognitive graph durable persistence (graph shard per collection shard).
+- Sparse vectors.
+- Multi-agent scoping / distributed shards.
+- Advanced full-text index tuning beyond per-segment Tantivy.
+
+---
+
+## Final Note
+
+Scaling to **1M+ nodes × 4k dimensions** is a multi-month project, not a few quick fixes. The order matters:
+
+1. **Sharding and lock-free segment list** remove the single-node ceiling.
+2. **Plain Hot segments + background indexing** remove per-insert HNSW cost.
+3. **Multi-threaded HNSW build + byte-threshold sealing** make large segments feasible.
+4. **SIMD batched distance + scalar/PQ quantization** make high-dimension search fast.
+5. **GPU/cuBLAS/CAGRA** provide the final throughput multiplier for batch workloads.
+
+Do not start with GPU. A GPU-accelerated bad architecture is still a bad architecture.

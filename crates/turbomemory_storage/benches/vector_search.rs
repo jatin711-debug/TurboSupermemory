@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::time::Duration;
-use turbomemory_storage::config::{StoreConfig, TierConfig};
+use turbomemory_storage::config::{OptimizerBudget, StoreConfig, TierConfig};
 use turbomemory_storage::StorageEngine;
 
 fn bench_config(dim: usize, hot_capacity: usize, warm_capacity: usize) -> StoreConfig {
@@ -16,11 +16,14 @@ fn bench_config(dim: usize, hot_capacity: usize, warm_capacity: usize) -> StoreC
             warm_bits: 8,
             warm_chunk_bytes: 16 * 1024 * 1024,
             hnsw_threshold: 1000,
+            merge_threshold_segments: 4,
+            merge_max_records: 200_000,
             cold_sign: true,
             hot_promote_threshold: 2.0,
             warm_demote_threshold: 0.5,
             recency_half_life_secs: 3600,
         },
+        optimizer_budget: OptimizerBudget::default(),
         auto_consolidation_interval: None,
     }
 }
@@ -42,13 +45,7 @@ fn insert_records(engine: &StorageEngine, dim: usize, n: usize) {
     for i in 0..n {
         let v = random_vec(dim, i);
         engine
-            .insert(
-                &format!("mem_{i}"),
-                &format!("text {i}"),
-                &v,
-                1.0,
-                &[],
-            )
+            .insert(&format!("mem_{i}"), &format!("text {i}"), &v, 1.0, &[])
             .unwrap();
     }
 }

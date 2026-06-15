@@ -96,11 +96,42 @@ impl Wal {
     ///
     /// The write is buffered; call [`Wal::flush`] to durably sync it to disk.
     pub fn append(&mut self, op: &WalOp) -> crate::Result<()> {
+        Self::write_op(&mut self.file, op)
+    }
+
+    /// Append a batch of operations under a single lock.
+    ///
+    /// This amortizes the mutex and serialization overhead for batch inserts by
+    /// serializing all records into a temporary buffer and issuing a single
+    /// write syscall.
+    pub fn append_batch(&mut self, ops: &[WalOp]) -> crate::Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        // Pre-serialize to size the buffer reasonably; each op is small metadata.
+        let mut buf = Vec::with_capacity(ops.len() * 256);
+        for op in ops {
+            Self::write_op_to_buffer(&mut buf, op)?;
+        }
+        self.file.write_all(&buf)?;
+        Ok(())
+    }
+
+    fn write_op(file: &mut File, op: &WalOp) -> crate::Result<()> {
         let payload = bincode::serialize(op)?;
         let crc = crc32fast::hash(&payload);
-        self.file.write_u32::<BigEndian>(payload.len() as u32)?;
-        self.file.write_all(&payload)?;
-        self.file.write_u32::<BigEndian>(crc)?;
+        file.write_u32::<BigEndian>(payload.len() as u32)?;
+        file.write_all(&payload)?;
+        file.write_u32::<BigEndian>(crc)?;
+        Ok(())
+    }
+
+    fn write_op_to_buffer(buf: &mut Vec<u8>, op: &WalOp) -> crate::Result<()> {
+        let payload = bincode::serialize(op)?;
+        let crc = crc32fast::hash(&payload);
+        buf.write_u32::<BigEndian>(payload.len() as u32)?;
+        buf.write_all(&payload)?;
+        buf.write_u32::<BigEndian>(crc)?;
         Ok(())
     }
 

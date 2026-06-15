@@ -78,7 +78,9 @@ impl SegmentHolder {
     pub(crate) fn sealed_hot_path(&mut self) -> PathBuf {
         let id = self.next_segment_id;
         self.next_segment_id += 1;
-        self.base_path.join(SEALED_HOT_DIR).join(format!("segment_{id}"))
+        self.base_path
+            .join(SEALED_HOT_DIR)
+            .join(format!("segment_{id}"))
     }
 
     pub(crate) fn pop_sealing_plain(&mut self) -> Option<Arc<RwLock<HotSegment>>> {
@@ -116,6 +118,66 @@ impl SegmentHolder {
             .push(Arc::new(RwLock::new(segment)) as Arc<RwLock<dyn VectorSegment>>);
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn sealed_hot_count(&self) -> usize {
+        self.sealed_hot.len()
+    }
+
+    /// Choose a group of sealed HNSW segments to merge.
+    ///
+    /// Returns clones of the segment Arcs (oldest first) while keeping the total
+    /// point count under `max_records`. The caller builds a replacement segment
+    /// outside the holder lock, then uses [`remove_sealed_hot_segments`] to swap
+    /// it in.
+    pub(crate) fn sealed_hot_merge_candidates(
+        &self,
+        threshold: usize,
+        max_records: usize,
+    ) -> Option<Vec<Arc<RwLock<dyn VectorSegment>>>> {
+        if self.sealed_hot.len() < threshold {
+            return None;
+        }
+        let mut candidates = Vec::with_capacity(self.sealed_hot.len());
+        let mut total = 0usize;
+        for seg in &self.sealed_hot {
+            let count = seg.read().point_count();
+            if total > 0 && total.saturating_add(count) > max_records {
+                break;
+            }
+            candidates.push(Arc::clone(seg));
+            total += count;
+            if candidates.len() >= threshold && total >= self.config.tier.hot_capacity {
+                // At least merge `threshold` segments, but keep going until we
+                // would exceed the record budget.
+            }
+        }
+        if candidates.len() >= threshold {
+            Some(candidates)
+        } else {
+            None
+        }
+    }
+
+    /// Remove sealed hot segments whose `Arc` pointer matches one of `targets`.
+    ///
+    /// Returns the number of segments removed. Paths of removed segments should
+    /// be collected by the caller for later deletion.
+    pub(crate) fn remove_sealed_hot_segments(
+        &mut self,
+        targets: &[Arc<RwLock<dyn VectorSegment>>],
+    ) -> usize {
+        let mut removed = 0usize;
+        self.sealed_hot.retain(|seg| {
+            if targets.iter().any(|t| Arc::ptr_eq(t, seg)) {
+                removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+        removed
+    }
+
     /// Insert a record into the mutable Hot segment.
     ///
     /// Returns `true` if the Hot segment reached capacity and should be sealed.
@@ -136,17 +198,49 @@ impl SegmentHolder {
         &self,
         query: &[f32],
         top_k: usize,
+        ef: Option<usize>,
         vectors: &VectorStore,
         allowed_offsets: Option<&RoaringBitmap>,
     ) -> crate::Result<Vec<ScoredPoint>> {
         // Use Qdrant-style ef semantics: floor the per-segment candidate pool at
-        // the configured search list size (`ef`), then apply the usual over-fetch
-        // multiplier for filtered queries.
-        let multiplier = if allowed_offsets.is_some() { 8 } else { 4 };
-        let pool_k = top_k.saturating_mul(multiplier).max(self.config.search_list_size);
+        // the caller-provided `ef` (or the configured search list size), then
+        // apply an over-fetch multiplier that grows with filter strictness and
+        // the number of segments.
+        let base_ef = ef.unwrap_or(self.config.search_list_size);
+        let base_multiplier = if allowed_offsets.is_some() { 8 } else { 4 };
+        let segment_count = 1
+            + self.sealing_plain.len()
+            + self.sealed_hot.len()
+            + self.warm.len()
+            + self.cold.len();
+        let selectivity = allowed_offsets
+            .map(|b| {
+                let total = self.point_count().max(1);
+                let allowed = b.len() as usize;
+                (allowed as f32) / (total as f32)
+            })
+            .unwrap_or(1.0f32);
+        let multiplier = if selectivity < 0.01 {
+            // Very selective filters rely on the exact fallback in each segment.
+            base_multiplier
+        } else {
+            let selectivity_factor = (1.0f32 / selectivity.sqrt()).clamp(1.0f32, 16.0f32);
+            let segment_factor =
+                (1.0f32 + (segment_count.saturating_sub(1)) as f32 * 0.5f32).clamp(1.0f32, 4.0f32);
+            (base_multiplier as f32 * selectivity_factor * segment_factor) as usize
+        };
+        let pool_k = top_k
+            .saturating_mul(multiplier)
+            .max(base_ef)
+            .min(top_k.saturating_mul(64));
+
         // Collect all searchable segments and query them in parallel.
-        let mut segments: Vec<Arc<RwLock<dyn VectorSegment>>> =
-            Vec::with_capacity(2 + self.sealing_plain.len() + self.sealed_hot.len() + self.warm.len() + self.cold.len());
+        let mut segments: Vec<Arc<RwLock<dyn VectorSegment>>> = Vec::with_capacity(
+            2 + self.sealing_plain.len()
+                + self.sealed_hot.len()
+                + self.warm.len()
+                + self.cold.len(),
+        );
         segments.push(self.hot.clone());
         for plain in &self.sealing_plain {
             segments.push(plain.clone());
@@ -311,18 +405,50 @@ impl SegmentHolder {
 
     pub fn point_count(&self) -> usize {
         self.hot.read().point_count()
-            + self.sealing_plain.iter().map(|s| s.read().point_count()).sum::<usize>()
-            + self.sealed_hot.iter().map(|s| s.read().point_count()).sum::<usize>()
-            + self.warm.iter().map(|s| s.read().point_count()).sum::<usize>()
-            + self.cold.iter().map(|s| s.read().point_count()).sum::<usize>()
+            + self
+                .sealing_plain
+                .iter()
+                .map(|s| s.read().point_count())
+                .sum::<usize>()
+            + self
+                .sealed_hot
+                .iter()
+                .map(|s| s.read().point_count())
+                .sum::<usize>()
+            + self
+                .warm
+                .iter()
+                .map(|s| s.read().point_count())
+                .sum::<usize>()
+            + self
+                .cold
+                .iter()
+                .map(|s| s.read().point_count())
+                .sum::<usize>()
     }
 
     pub fn memory_bytes(&self) -> usize {
         self.hot.read().memory_bytes()
-            + self.sealing_plain.iter().map(|s| s.read().memory_bytes()).sum::<usize>()
-            + self.sealed_hot.iter().map(|s| s.read().memory_bytes()).sum::<usize>()
-            + self.warm.iter().map(|s| s.read().memory_bytes()).sum::<usize>()
-            + self.cold.iter().map(|s| s.read().memory_bytes()).sum::<usize>()
+            + self
+                .sealing_plain
+                .iter()
+                .map(|s| s.read().memory_bytes())
+                .sum::<usize>()
+            + self
+                .sealed_hot
+                .iter()
+                .map(|s| s.read().memory_bytes())
+                .sum::<usize>()
+            + self
+                .warm
+                .iter()
+                .map(|s| s.read().memory_bytes())
+                .sum::<usize>()
+            + self
+                .cold
+                .iter()
+                .map(|s| s.read().memory_bytes())
+                .sum::<usize>()
     }
 
     pub fn flush(&self) -> crate::Result<()> {
@@ -397,17 +523,19 @@ impl SegmentHolder {
 
         let mut promoted = 0usize;
         for offset in candidate_offsets {
-            let Some(meta_rec) = meta.get(offset)? else { continue };
+            let Some(meta_rec) = meta.get(offset)? else {
+                continue;
+            };
             if access_score(&meta_rec, now, half_life) < threshold {
                 continue;
             }
             let view = vectors.read_view();
-            let Some(vec) = view.get(offset) else { continue };
+            let Some(vec) = view.get(offset) else {
+                continue;
+            };
             let embedding = Arc::from(Vec::from(vec));
             drop(view);
-            let record = meta_rec
-                .with_embedding(embedding)
-                .with_tier(Tier::Hot);
+            let record = meta_rec.with_embedding(embedding).with_tier(Tier::Hot);
             // Persist the tier change in metadata.
             meta.put(offset, &record)?;
             {

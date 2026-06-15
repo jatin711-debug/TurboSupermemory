@@ -141,7 +141,7 @@ impl VectorSegment for HotSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{StoreConfig, TierConfig};
+    use crate::config::{OptimizerBudget, StoreConfig, TierConfig};
     use crate::record::Record;
     use std::sync::Arc;
 
@@ -158,11 +158,14 @@ mod tests {
                 warm_bits: 8,
                 warm_chunk_bytes: 4096,
                 hnsw_threshold: 1000,
+                merge_threshold_segments: 4,
+                merge_max_records: 200_000,
                 cold_sign: true,
                 hot_promote_threshold: 2.0,
                 warm_demote_threshold: 0.5,
                 recency_half_life_secs: 60,
             },
+            optimizer_budget: OptimizerBudget::default(),
             auto_consolidation_interval: None,
         }
     }
@@ -202,7 +205,9 @@ mod tests {
             seg.insert(i as u64, &rec).unwrap();
         }
 
-        let results = seg.search(&[1.0f32, 0.0, 0.0, 0.0], 2, &vectors, None).unwrap();
+        let results = seg
+            .search(&[1.0f32, 0.0, 0.0, 0.0], 2, &vectors, None)
+            .unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].offset, 0);
         assert_eq!(results[1].offset, 1);

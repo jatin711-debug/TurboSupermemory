@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
-use tantivy::schema::{Field, Schema, Value as TantivyValue, INDEXED, STORED, FAST, TEXT};
+use tantivy::schema::{Field, Schema, Value as TantivyValue, FAST, INDEXED, STORED, TEXT};
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, Term};
 
 const TEXT_FIELD: &str = "text";
@@ -38,10 +38,7 @@ impl TextIndex {
 
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field(TEXT_FIELD, TEXT);
-        let offset_field = schema_builder.add_u64_field(
-            OFFSET_FIELD,
-            INDEXED | FAST | STORED,
-        );
+        let offset_field = schema_builder.add_u64_field(OFFSET_FIELD, INDEXED | FAST | STORED);
         let schema = schema_builder.build();
 
         let index = if path.join("meta.json").exists() {
@@ -74,14 +71,27 @@ impl TextIndex {
 
     /// Add a record's text to the index.
     pub fn add(&self, offset: PointOffset, text: &str) -> crate::Result<()> {
+        self.add_batch(&[(offset, text)])
+    }
+
+    /// Add a batch of texts under a single writer lock acquisition.
+    ///
+    /// This amortizes Tantivy lock contention and small-write overhead for
+    /// batch ingestion.
+    pub fn add_batch(&self, docs: &[(PointOffset, &str)]) -> crate::Result<()> {
+        if docs.is_empty() {
+            return Ok(());
+        }
         let writer = self.writer.lock();
-        writer
-            .add_document(doc!(
-                self.text_field => text,
-                self.offset_field => offset,
-            ))
-            .map_err(|e| StorageError::IndexError(format!("tantivy add: {e}")))?;
-        self.pending.fetch_add(1, Ordering::Release);
+        for (offset, text) in docs {
+            writer
+                .add_document(doc!(
+                    self.text_field => *text,
+                    self.offset_field => *offset,
+                ))
+                .map_err(|e| StorageError::IndexError(format!("tantivy add: {e}")))?;
+        }
+        self.pending.fetch_add(docs.len() as u64, Ordering::Release);
         Ok(())
     }
 
@@ -138,7 +148,10 @@ impl TextIndex {
             let doc: tantivy::TantivyDocument = searcher
                 .doc(doc_address)
                 .map_err(|e| StorageError::IndexError(format!("tantivy fetch doc: {e}")))?;
-            if let Some(value) = doc.get_first(self.offset_field).and_then(|v| TantivyValue::as_u64(&v)) {
+            if let Some(value) = doc
+                .get_first(self.offset_field)
+                .and_then(|v| TantivyValue::as_u64(&v))
+            {
                 bitmap.insert(value as u32);
             }
         }

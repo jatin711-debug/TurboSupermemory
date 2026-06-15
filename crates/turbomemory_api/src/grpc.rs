@@ -120,7 +120,12 @@ impl Memory for MemoryService {
         let maybe = match filter {
             Some(f) => self
                 .engine()
-                .search_filtered(&req.query_text, &req.query_embedding, req.top_k as usize, &f)
+                .search_filtered(
+                    &req.query_text,
+                    &req.query_embedding,
+                    req.top_k as usize,
+                    &f,
+                )
                 .map_err(ApiError::from)?,
             None => self
                 .engine()

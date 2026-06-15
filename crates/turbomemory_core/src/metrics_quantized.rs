@@ -112,6 +112,87 @@ pub fn sign_quantized_dot(query: &[f32], encoded: &[u8]) -> f32 {
     sum_pos - 2.0 * sum_diff_abs
 }
 
+/// Score a contiguous block of `N` scalar-quantized vectors against `query`.
+///
+/// `encoded` must contain `N * query.len()` bytes. The per-vector SIMD kernel
+/// is reused internally, but the batch interface removes iterator/closure
+/// overhead from the caller.
+pub fn scalar_quantized_dot_batch(query: &[f32], encoded: &[u8], min: f32, scale: f32) -> Vec<f32> {
+    let dim = query.len();
+    assert_eq!(
+        encoded.len() % dim,
+        0,
+        "encoded length must be a multiple of query dimension"
+    );
+    let n = encoded.len() / dim;
+    let mut scores = Vec::with_capacity(n);
+    for vector in encoded.chunks_exact(dim) {
+        scores.push(scalar_quantized_dot(query, vector, min, scale));
+    }
+    scores
+}
+
+/// Score a contiguous block of `N` 1-bit sign-quantized vectors using a
+/// precomputed query sign mask and per-byte weight table.
+///
+/// `encoded` must contain `N * mask.len()` bytes. This is the fast path used by
+/// [`SignEncodedQuery`](crate::quantized_search::SignEncodedQuery).
+pub fn sign_quantized_score_batch(
+    mask: &[u8],
+    weights: &[[f32; 256]],
+    encoded: &[u8],
+    sum_abs: f32,
+) -> Vec<f32> {
+    let bytes_per_vec = mask.len();
+    assert_eq!(
+        encoded.len() % bytes_per_vec,
+        0,
+        "encoded length must be a multiple of bytes-per-vector"
+    );
+    let n = encoded.len() / bytes_per_vec;
+    let mut scores = Vec::with_capacity(n);
+    for vector in encoded.chunks_exact(bytes_per_vec) {
+        let mut sum_diff = 0.0f32;
+        for (b, &encoded_byte) in vector.iter().enumerate() {
+            let xor = mask[b] ^ encoded_byte;
+            sum_diff += weights[b][xor as usize];
+        }
+        scores.push(sum_abs - 2.0 * sum_diff);
+    }
+    scores
+}
+
+/// Score a contiguous block of `N` 1-bit sign-quantized vectors against `query`.
+///
+/// `encoded` must contain `N * query.len().div_ceil(8)` bytes. This is faster
+/// than calling [`sign_quantized_dot`] in a loop because the query sign mask
+/// and per-byte absolute weights are computed once.
+pub fn sign_quantized_dot_batch(query: &[f32], encoded: &[u8]) -> Vec<f32> {
+    let dim = query.len();
+    let bytes_per_vec = dim.div_ceil(8);
+
+    // Build query sign mask and per-byte absolute weights.
+    let mut query_mask = vec![0u8; bytes_per_vec];
+    let mut abs_weights = vec![[0.0f32; 256]; bytes_per_vec];
+    let mut sum_abs = 0.0f32;
+    for (i, &q) in query.iter().enumerate() {
+        let abs_q = q.abs();
+        sum_abs += abs_q;
+        let byte = i / 8;
+        let bit = i % 8;
+        if q >= 0.0 {
+            query_mask[byte] |= 1 << bit;
+        }
+        for (pattern, cell) in abs_weights[byte].iter_mut().enumerate() {
+            if (pattern & (1 << bit)) != 0 {
+                *cell += abs_q;
+            }
+        }
+    }
+
+    sign_quantized_score_batch(&query_mask, &abs_weights, encoded, sum_abs)
+}
+
 /// Batched cosine similarity between a query and a slice of full-precision
 /// vectors.  All vectors must be the same length as `query`.
 pub fn batched_cosine_similarity(query: &[f32], vectors: &[&[f32]]) -> Vec<f32> {
@@ -154,5 +235,42 @@ mod tests {
         let expected: f32 = query.iter().zip(&decoded).map(|(a, b)| a * b).sum();
         let actual = sign_quantized_dot(&query, &encoded);
         assert!((actual - expected).abs() < 1e-4, "{actual} vs {expected}");
+    }
+
+    #[test]
+    fn scalar_quantized_dot_batch_matches_per_vector() {
+        let dim = 17;
+        let query: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.1 - 0.8).collect();
+        let encoded: Vec<u8> = (0..(dim * 5)).map(|i| ((i * 13) % 256) as u8).collect();
+        let min = -1.0f32;
+        let scale = 2.0f32 / 255.0;
+
+        let actual = scalar_quantized_dot_batch(&query, &encoded, min, scale);
+        let expected: Vec<f32> = encoded
+            .chunks_exact(dim)
+            .map(|v| scalar_quantized_dot_scalar(&query, v, min, scale))
+            .collect();
+        assert_eq!(actual.len(), expected.len());
+        for (a, e) in actual.iter().zip(&expected) {
+            assert!((a - e).abs() < 1e-4, "{a} vs {e}");
+        }
+    }
+
+    #[test]
+    fn sign_quantized_dot_batch_matches_per_vector() {
+        let dim: usize = 13;
+        let query: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.2 - 1.2).collect();
+        let bytes_per_vec = dim.div_ceil(8);
+        let encoded: Vec<u8> = (0..(bytes_per_vec * 7)).map(|i| (i % 256) as u8).collect();
+
+        let actual = sign_quantized_dot_batch(&query, &encoded);
+        let expected: Vec<f32> = encoded
+            .chunks_exact(bytes_per_vec)
+            .map(|v| sign_quantized_dot(&query, v))
+            .collect();
+        assert_eq!(actual.len(), expected.len());
+        for (a, e) in actual.iter().zip(&expected) {
+            assert!((a - e).abs() < 1e-4, "{a} vs {e}");
+        }
     }
 }

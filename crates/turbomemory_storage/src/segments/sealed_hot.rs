@@ -1,54 +1,29 @@
-//! Sealed Hot segment: an immutable, disk-persisted `usearch` HNSW index.
+//! Sealed Hot segment: an immutable segment that delegates search to a
+//! pluggable [`VectorIndex`] implementation.
 //!
-//! When the mutable Hot segment reaches capacity it is rebuilt as a sealed
-//! segment, persisted to disk, and reopened on subsequent engine starts.  This
-//! removes the expensive "rebuild HNSW from metadata on every open" path.
+//! Today the only implementation is `UsearchIndex`; the segment itself is
+//! index-agnostic so future indexes can be swapped in without changing the
+//! optimizer or segment holder.
 
 use crate::config::{Flusher, StoreConfig, Tier};
 use crate::record::{PointOffset, Record};
+use crate::segments::vector_index::{VectorIndex, VectorIndexManifest};
 use crate::segments::{ScoredPoint, VectorSegment};
 use crate::vector_store::VectorStore;
 use crate::StorageError;
 use roaring::RoaringBitmap;
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use turbomemory_core::{cosine_similarity_batch, validate_dimension};
-use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
 const MANIFEST_FILE: &str = "manifest.json";
-const INDEX_FILE: &str = "index.usearch";
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Manifest {
-    version: u32,
-    dimension: usize,
-    max_edges: usize,
-    search_list_size: usize,
-    offsets: Vec<PointOffset>,
-}
-
-/// Immutable sealed Hot segment backed by a persisted `usearch` HNSW index.
+/// Immutable sealed Hot segment backed by a persisted [`VectorIndex`].
 pub struct SealedHotSegment {
-    dim: usize,
-    search_list_size: usize,
-    index: Index,
+    index: Box<dyn VectorIndex>,
     path: PathBuf,
     offsets: Vec<PointOffset>,
 }
 
 impl SealedHotSegment {
-    fn index_options(dim: usize, config: &StoreConfig) -> IndexOptions {
-        IndexOptions {
-            dimensions: dim,
-            metric: MetricKind::Cos,
-            quantization: ScalarKind::F32,
-            connectivity: config.max_edges,
-            expansion_add: config.ef_construction(),
-            expansion_search: config.search_list_size,
-            multi: false,
-        }
-    }
-
     /// Build a sealed segment from records and persist it to disk.
     pub fn from_records(
         path: impl AsRef<Path>,
@@ -63,9 +38,6 @@ impl SealedHotSegment {
     }
 
     /// Bulk-build a sealed segment from `(offset, vector)` pairs.
-    ///
-    /// This avoids allocating temporary `Record`s; vectors are read directly
-    /// from the `VectorStore` mmap and added one-by-one to the `usearch` index.
     pub fn from_vectors(
         path: impl AsRef<Path>,
         config: &StoreConfig,
@@ -77,84 +49,45 @@ impl SealedHotSegment {
             ));
         }
         let path = path.as_ref().to_path_buf();
-        std::fs::create_dir_all(&path)?;
-
-        let options = Self::index_options(config.dimension, config);
-        let index = Index::new(&options)
-            .map_err(|e| StorageError::IndexError(format!("usearch index creation failed: {e}")))?;
-        index
-            .reserve(vectors.len().max(1))
-            .map_err(|e| StorageError::IndexError(format!("usearch reserve failed: {e}")))?;
-
-        for (offset, vector) in vectors {
-            index
-                .add(*offset, vector)
-                .map_err(|e| StorageError::IndexError(format!("usearch add failed: {e}")))?;
-        }
-
-        let index_path = path.join(INDEX_FILE);
-        let index_path_str = index_path
-            .to_str()
-            .ok_or_else(|| StorageError::InvalidArgument("invalid sealed hot path".into()))?;
-        index
-            .save(index_path_str)
-            .map_err(|e| StorageError::IndexError(format!("usearch save failed: {e}")))?;
-
-        let offsets: Vec<PointOffset> = vectors.iter().map(|(offset, _)| *offset).collect();
-        let manifest = Manifest {
-            version: 1,
-            dimension: config.dimension,
-            max_edges: config.max_edges,
-            search_list_size: config.search_list_size,
-            offsets: offsets.clone(),
-        };
-        let manifest_json = serde_json::to_string_pretty(&manifest)
-            .map_err(|e| StorageError::Serialize(Box::new(bincode::ErrorKind::Custom(e.to_string()))))?;
-        std::fs::write(path.join(MANIFEST_FILE), manifest_json)?;
+        let index = Box::new(crate::segments::UsearchIndex::build(
+            &path, config, vectors,
+        )?);
+        let offsets = index.offsets().to_vec();
 
         Ok(Self {
-            dim: config.dimension,
-            search_list_size: config.search_list_size,
             index,
             path,
             offsets,
         })
     }
 
-    /// Open a previously sealed segment.  Prefer `view` (mmap) and fall back to
-    /// `load` if the platform doesn't support it.
+    /// Open a previously sealed segment from disk.
     pub fn open(path: impl AsRef<Path>, config: &StoreConfig) -> crate::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let manifest: Manifest = {
+        let manifest: VectorIndexManifest = {
             let bytes = std::fs::read(path.join(MANIFEST_FILE))?;
-            serde_json::from_slice(&bytes)
-                .map_err(|e| StorageError::InvalidArgument(format!("bad sealed hot manifest: {e}")))?
+            serde_json::from_slice(&bytes).map_err(|e| {
+                StorageError::InvalidArgument(format!("bad sealed hot manifest: {e}"))
+            })?
         };
         if manifest.dimension != config.dimension {
             return Err(StorageError::DimensionMismatch);
         }
 
-        let index_path = path.join(INDEX_FILE);
-        let index_path_str = index_path
-            .to_str()
-            .ok_or_else(|| StorageError::InvalidArgument("invalid sealed hot path".into()))?;
-
-        let options = Self::index_options(config.dimension, config);
-        let index = Index::new(&options)
-            .map_err(|e| StorageError::IndexError(format!("usearch index creation failed: {e}")))?;
-
-        if index.view(index_path_str).is_err() {
-            index
-                .load(index_path_str)
-                .map_err(|e| StorageError::IndexError(format!("usearch load failed: {e}")))?;
-        }
+        let index: Box<dyn VectorIndex> = match manifest.index_type.as_str() {
+            "usearch" => Box::new(crate::segments::UsearchIndex::open(&path, config)?),
+            other => {
+                return Err(StorageError::InvalidArgument(format!(
+                    "unsupported sealed hot index type: {other}"
+                )))
+            }
+        };
+        let offsets = index.offsets().to_vec();
 
         Ok(Self {
-            dim: config.dimension,
-            search_list_size: manifest.search_list_size,
             index,
             path,
-            offsets: manifest.offsets,
+            offsets,
         })
     }
 
@@ -164,44 +97,6 @@ impl SealedHotSegment {
 
     pub fn point_count(&self) -> usize {
         self.offsets.len()
-    }
-
-    /// Exact brute-force search over a specific set of offsets.
-    fn search_exact(
-        &self,
-        query: &[f32],
-        top_k: usize,
-        vectors: &VectorStore,
-        offsets: &[PointOffset],
-    ) -> crate::Result<Vec<ScoredPoint>> {
-        let view = vectors.read_view();
-        const CHUNK: usize = 64;
-        let mut scored: Vec<ScoredPoint> = Vec::with_capacity(offsets.len());
-        for chunk in offsets.chunks(CHUNK) {
-            let mut pairs = Vec::with_capacity(chunk.len());
-            for &offset in chunk {
-                if let Some(v) = view.get(offset) {
-                    pairs.push((offset, v));
-                }
-            }
-            let refs: Vec<&[f32]> = pairs.iter().map(|(_, v)| *v).collect();
-            let scores = cosine_similarity_batch(query, &refs);
-            for ((offset, _), score) in pairs.into_iter().zip(scores) {
-                scored.push(ScoredPoint {
-                    offset,
-                    score,
-                    tier: Tier::Hot,
-                });
-            }
-        }
-        drop(view);
-        scored.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        scored.truncate(top_k);
-        Ok(scored)
     }
 }
 
@@ -223,47 +118,7 @@ impl VectorSegment for SealedHotSegment {
         vectors: &VectorStore,
         allowed_offsets: Option<&RoaringBitmap>,
     ) -> crate::Result<Vec<ScoredPoint>> {
-        validate_dimension(query, self.dim)?;
-
-        // For very selective filters, an exact scan over the allowed offsets in
-        // this segment is more reliable than HNSW with post-filtering. This
-        // approximates Qdrant's plain-index fallback for selective filters.
-        if let Some(bitmap) = allowed_offsets {
-            let threshold = self.search_list_size.max(100);
-            let allowed_in_segment: Vec<PointOffset> = self
-                .offsets
-                .iter()
-                .copied()
-                .filter(|o| bitmap.contains(*o as u32))
-                .collect();
-            if allowed_in_segment.len() <= threshold {
-                return self.search_exact(query, top_k, vectors, &allowed_in_segment);
-            }
-        }
-
-        // The caller (SegmentHolder) already applies the ef/over-fetch multiplier,
-        // so we use `top_k` directly here.
-        let matches = self
-            .index
-            .search(query, top_k)
-            .map_err(|e| StorageError::IndexError(format!("usearch search failed: {e}")))?;
-        let mut results: Vec<ScoredPoint> = Vec::with_capacity(matches.keys.len());
-        for (offset, distance) in matches.keys.into_iter().zip(matches.distances) {
-            if let Some(bitmap) = allowed_offsets {
-                if !bitmap.contains(offset as u32) {
-                    continue;
-                }
-            }
-            results.push(ScoredPoint {
-                offset,
-                score: (1.0 - distance).clamp(-1.0, 1.0),
-                tier: Tier::Hot,
-            });
-            if results.len() >= top_k {
-                break;
-            }
-        }
-        Ok(results)
+        self.index.search(query, top_k, allowed_offsets, vectors)
     }
 
     fn point_count(&self) -> usize {
@@ -275,7 +130,11 @@ impl VectorSegment for SealedHotSegment {
     }
 
     fn memory_bytes(&self) -> usize {
-        self.index.memory_usage()
+        self.index.memory_bytes()
+    }
+
+    fn segment_path(&self) -> Option<&std::path::Path> {
+        Some(&self.path)
     }
 
     fn flusher(&self) -> Flusher {

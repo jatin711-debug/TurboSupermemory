@@ -272,7 +272,8 @@ def run_benchmark():
         dimension=args.dimension,
         max_edges=16,
         search_list_size=100,
-        outlier_count=0
+        outlier_count=0,
+        initial_capacity=args.num_items,
     )
     
     flat_baseline = FlatNumPyBaseline(args.dimension)
@@ -394,8 +395,12 @@ def run_benchmark():
     qdrant_recall = calculate_recall(ground_truth, qdrant_results) if (not args.tsm_only and qdrant_baseline) else 0.0
 
     tsm_size_kb = get_dir_size(db_dir) / 1024.0
+    # Close the engine (stops the background optimizer and flushes durable
+    # state) before deleting the on-disk directory so pending segment writes
+    # don't race with cleanup.
+    tsm_engine.close()
     if os.path.exists(db_dir):
-        shutil.rmtree(db_dir)
+        shutil.rmtree(db_dir, ignore_errors=True)
 
     # Output Table
     print("\n=========================================================================")

@@ -71,8 +71,9 @@ impl ColdSegment {
             quantizer: quantizer.clone(),
             offsets: offsets.clone(),
         };
-        let manifest_json = serde_json::to_string_pretty(&manifest)
-            .map_err(|e| StorageError::Serialize(Box::new(bincode::ErrorKind::Custom(e.to_string()))))?;
+        let manifest_json = serde_json::to_string_pretty(&manifest).map_err(|e| {
+            StorageError::Serialize(Box::new(bincode::ErrorKind::Custom(e.to_string())))
+        })?;
         fs::write(path.join(MANIFEST_FILE), manifest_json)?;
 
         Ok(Self {
@@ -146,23 +147,40 @@ impl VectorSegment for ColdSegment {
             .encode_query(query)
             .map_err(StorageError::Core)?;
 
-        let candidates = crate::segments::top_k_minheap(
-            self.offsets.iter().enumerate().filter_map(|(idx, &offset)| {
+        // Score vectors in batches so the sign-quantized batch kernel can
+        // amortize the query lookup tables over many vectors.
+        const CHUNK: usize = 64;
+        let bytes_per_vec = self.quantizer.encoded_bytes_per_vector();
+        let mut candidates = Vec::with_capacity(top_k * 2);
+        for (chunk_idx, chunk) in self.offsets.chunks(CHUNK).enumerate() {
+            let base = chunk_idx * CHUNK;
+            let mut chunk_bytes = Vec::with_capacity(chunk.len() * bytes_per_vec);
+            let mut chunk_offsets = Vec::with_capacity(chunk.len());
+            for (local, &offset) in chunk.iter().enumerate() {
                 if let Some(bitmap) = allowed_offsets {
                     if !bitmap.contains(offset as u32) {
-                        return None;
+                        continue;
                     }
                 }
-                let encoded = self.encoded_vector(idx);
-                let score = eq.score(encoded);
-                Some(ScoredPoint {
-                    offset,
-                    score,
-                    tier: Tier::Cold,
-                })
-            }),
-            top_k,
-        );
+                chunk_bytes.extend_from_slice(self.encoded_vector(base + local));
+                chunk_offsets.push(offset);
+            }
+            if chunk_offsets.is_empty() {
+                continue;
+            }
+            let scores = eq.score_batch(&chunk_bytes);
+            candidates.extend(
+                chunk_offsets
+                    .into_iter()
+                    .zip(scores)
+                    .map(|(offset, score)| ScoredPoint {
+                        offset,
+                        score,
+                        tier: Tier::Cold,
+                    }),
+            );
+        }
+        let candidates = crate::segments::top_k_minheap(candidates.into_iter(), top_k);
 
         let view = vectors.read_view();
         let mut reranked: Vec<ScoredPoint> = candidates
@@ -194,6 +212,10 @@ impl VectorSegment for ColdSegment {
 
     fn memory_bytes(&self) -> usize {
         self.buffer.len()
+    }
+
+    fn segment_path(&self) -> Option<&Path> {
+        Some(&self.path)
     }
 
     fn flusher(&self) -> Flusher {

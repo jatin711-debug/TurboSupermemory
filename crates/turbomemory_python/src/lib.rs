@@ -90,27 +90,28 @@ pub struct PyMemoryEngine {
 #[pymethods]
 impl PyMemoryEngine {
     #[new]
-    #[pyo3(signature = (db_path, dimension, max_edges, search_list_size, outlier_count))]
+    #[pyo3(signature = (db_path, dimension, max_edges, search_list_size, outlier_count, initial_capacity=None))]
     fn new(
         db_path: &str,
         dimension: usize,
         max_edges: usize,
         search_list_size: usize,
         outlier_count: usize,
+        initial_capacity: Option<usize>,
     ) -> PyResult<Self> {
-        let config = StoreConfig {
-            dimension,
-            max_edges,
-            search_list_size,
-            outlier_count,
-            initial_capacity: 1024,
-            tier: turbomemory_storage::config::TierConfig::default(),
-            auto_consolidation_interval: Some(Duration::from_secs(60)),
-        };
+        let mut config = StoreConfig::default_for_dimension(dimension);
+        config.max_edges = max_edges;
+        config.search_list_size = search_list_size;
+        config.outlier_count = outlier_count;
+        if let Some(cap) = initial_capacity {
+            config.initial_capacity = cap.max(1024);
+        }
+        config.auto_consolidation_interval = Some(Duration::from_secs(60));
         let inner = StorageEngine::open(db_path, config).map_err(storage_err)?;
         Ok(Self { inner })
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (id, text, embedding, importance_score, concepts, payload=None))]
     fn insert(
         &self,
@@ -131,6 +132,7 @@ impl PyMemoryEngine {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (ids, texts, embeddings, scores, concepts, payloads=None))]
     fn insert_batch(
         &self,
@@ -157,36 +159,53 @@ impl PyMemoryEngine {
         })
     }
 
+    #[pyo3(signature = (query_embedding, top_k, search_list_size=None))]
     fn search_ann(
         &self,
         py: Python<'_>,
         query_embedding: &Bound<'_, PyAny>,
         top_k: usize,
+        search_list_size: Option<usize>,
     ) -> PyResult<Vec<(String, f32)>> {
         let q = extract_f32_vec(query_embedding)?;
-        py.allow_threads(|| self.inner.search_ann(&q, top_k).map_err(storage_err))
+        py.allow_threads(|| {
+            self.inner
+                .search_ann_with_ef(&q, top_k, search_list_size)
+                .map_err(storage_err)
+        })
     }
 
+    #[pyo3(signature = (query_embedding, top_k, search_list_size=None))]
     fn search_ann_candidates(
         &self,
         py: Python<'_>,
         query_embedding: &Bound<'_, PyAny>,
         top_k: usize,
+        search_list_size: Option<usize>,
     ) -> PyResult<Vec<(String, f32)>> {
         let q = extract_f32_vec(query_embedding)?;
-        py.allow_threads(|| self.inner.search_ann_candidates(&q, top_k).map_err(storage_err))
+        py.allow_threads(|| {
+            self.inner
+                .search_ann_candidates_with_ef(&q, top_k, search_list_size)
+                .map_err(storage_err)
+        })
     }
 
-    #[pyo3(signature = (query_text, query_embedding, top_k))]
+    #[pyo3(signature = (query_text, query_embedding, top_k, search_list_size=None))]
     fn search(
         &self,
         py: Python<'_>,
         query_text: &str,
         query_embedding: &Bound<'_, PyAny>,
         top_k: usize,
+        search_list_size: Option<usize>,
     ) -> PyResult<Option<Vec<(String, f32)>>> {
         let q = extract_f32_vec(query_embedding)?;
-        py.allow_threads(|| self.inner.search(query_text, &q, top_k).map_err(storage_err))
+        py.allow_threads(|| {
+            self.inner
+                .search_with_ef(query_text, &q, top_k, search_list_size)
+                .map_err(storage_err)
+        })
     }
 
     fn step_session(
@@ -214,6 +233,7 @@ impl PyMemoryEngine {
         py.allow_threads(|| self.inner.delete_by_id(id).map_err(storage_err))
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (id, text, embedding, importance_score, concepts, payload=None))]
     fn update(
         &self,

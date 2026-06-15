@@ -5,7 +5,7 @@
 //! after the OS has flushed the mmap/WAL files to disk.
 
 use std::fs;
-use turbomemory_storage::config::{StoreConfig, TierConfig};
+use turbomemory_storage::config::{OptimizerBudget, StoreConfig, TierConfig};
 use turbomemory_storage::StorageEngine;
 
 fn test_config(dim: usize, hot_capacity: usize, warm_capacity: usize) -> StoreConfig {
@@ -21,11 +21,14 @@ fn test_config(dim: usize, hot_capacity: usize, warm_capacity: usize) -> StoreCo
             warm_bits: 8,
             warm_chunk_bytes: 16 * 1024 * 1024,
             hnsw_threshold: 1000,
+            merge_threshold_segments: 4,
+            merge_max_records: 200_000,
             cold_sign: true,
             hot_promote_threshold: 2.0,
             warm_demote_threshold: 0.5,
             recency_half_life_secs: 3600,
         },
+        optimizer_budget: OptimizerBudget::default(),
         auto_consolidation_interval: None,
     }
 }
@@ -85,7 +88,10 @@ fn reopen_reloads_hot_warm_cold_tiers() {
     let dim = 32;
     // Small tiers so a Cold segment appears quickly while keeping the test fast.
     let n = 1_500;
-    let config = test_config(dim, 500, 500);
+    // Small tiers so a Cold segment appears quickly while keeping the test fast.
+    // Each sealed Hot segment is below the HNSW threshold, so it becomes a Warm
+    // segment; Warm compaction then merges them into a persisted Cold segment.
+    let config = test_config(dim, 400, 400);
 
     {
         let engine = StorageEngine::open(tmp.path(), config.clone()).unwrap();
@@ -97,8 +103,7 @@ fn reopen_reloads_hot_warm_cold_tiers() {
     assert_eq!(engine.record_count(), n);
 
     let segments_dir = tmp.path().join("segments");
-    assert!(segments_dir.join("sealed_hot").read_dir().unwrap().count() > 0);
-    assert!(segments_dir.join("Cold").read_dir().unwrap().count() > 0);
+    assert!(segments_dir.join("cold").read_dir().unwrap().count() > 0);
 
     let query = random_vec(dim, n + 1);
     let results = engine.search_ann(&query, 10).unwrap();
@@ -120,7 +125,10 @@ fn reopen_tolerates_truncated_wal_record() {
     }
 
     // Simulate a crash that truncated the trailing CRC of the last WAL record.
-    let wal_path = tmp.path().join("wal").join(turbomemory_storage::wal::WAL_FILE);
+    let wal_path = tmp
+        .path()
+        .join("wal")
+        .join(turbomemory_storage::wal::WAL_FILE);
     let mut wal_bytes = fs::read(&wal_path).unwrap();
     wal_bytes.truncate(wal_bytes.len().saturating_sub(4));
     fs::write(&wal_path, &wal_bytes).unwrap();

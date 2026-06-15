@@ -30,7 +30,7 @@ pub struct Node {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum EdgeKind {
     Association,
     Temporal,
@@ -109,7 +109,6 @@ impl MemoryGraph {
             );
         }
         self.last_memory_id = Some(id.to_string());
-        self.normalize_edges();
     }
 
     /// Remove a memory node and all edges connected to it.
@@ -118,34 +117,27 @@ impl MemoryGraph {
         if self.nodes.remove(&mem_key).is_none() {
             return;
         }
-        self.edges.retain(|e| e.source.as_str() != mem_key && e.target.as_str() != mem_key);
-        self.normalize_edges();
+        self.edges
+            .retain(|e| e.source.as_str() != mem_key && e.target.as_str() != mem_key);
+        self.rebuild_adjacency();
     }
 
     fn add_edge_internal(&mut self, source: NodeId, target: NodeId, kind: EdgeKind, weight: f32) {
+        let idx = self.edges.len();
         self.edges.push(Edge {
-            source,
+            source: source.clone(),
             target,
             kind,
             weight,
         });
+        self.adjacency.entry(source.as_str()).or_default().push(idx);
     }
 
-    /// Sort edges and rebuild adjacency so iteration is deterministic across
-    /// incremental builds and reloads.
-    fn normalize_edges(&mut self) {
-        self.edges.sort_by(|a, b| {
-            a.source
-                .as_str()
-                .cmp(&b.source.as_str())
-                .then(a.target.as_str().cmp(&b.target.as_str()))
-                .then(format!("{:?}", a.kind).cmp(&format!("{:?}", b.kind)))
-                .then(
-                    a.weight
-                        .partial_cmp(&b.weight)
-                        .unwrap_or(std::cmp::Ordering::Equal),
-                )
-        });
+    /// Rebuild the adjacency map from the current edge list without sorting.
+    ///
+    /// Used after operations that change edge indices (e.g. removal).  Edges are
+    /// kept in insertion order during normal use so that add_memory stays O(1).
+    fn rebuild_adjacency(&mut self) {
         self.adjacency.clear();
         for (idx, edge) in self.edges.iter().enumerate() {
             self.adjacency
@@ -153,6 +145,31 @@ impl MemoryGraph {
                 .or_default()
                 .push(idx);
         }
+    }
+
+    /// Sort edges and rebuild adjacency so iteration is deterministic across
+    /// incremental builds and reloads.
+    ///
+    /// This is only called on explicit compaction or serialization, not on the
+    /// insert hot path.
+    pub fn compact(&mut self) {
+        self.edges.sort_by(|a, b| {
+            a.source
+                .as_str()
+                .cmp(&b.source.as_str())
+                .then(a.target.as_str().cmp(&b.target.as_str()))
+                .then(a.kind.cmp(&b.kind))
+                .then(
+                    a.weight
+                        .partial_cmp(&b.weight)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+        });
+        self.rebuild_adjacency();
+    }
+
+    fn normalize_edges(&mut self) {
+        self.compact();
     }
 
     pub fn node_count(&self) -> usize {
@@ -185,18 +202,7 @@ impl MemoryGraph {
     pub fn to_json(&self) -> String {
         // Return a deterministic serialization so reloads reproduce the same graph.
         let mut sorted = self.clone();
-        sorted.edges.sort_by(|a, b| {
-            a.source
-                .as_str()
-                .cmp(&b.source.as_str())
-                .then(a.target.as_str().cmp(&b.target.as_str()))
-                .then(format!("{:?}", a.kind).cmp(&format!("{:?}", b.kind)))
-                .then(
-                    a.weight
-                        .partial_cmp(&b.weight)
-                        .unwrap_or(std::cmp::Ordering::Equal),
-                )
-        });
+        sorted.compact();
         serde_json::to_string_pretty(&sorted).unwrap_or_default()
     }
 

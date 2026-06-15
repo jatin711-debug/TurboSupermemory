@@ -151,7 +151,10 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 /// All slices must have the same length.  Returns a vector of scores in
 /// `[-1, 1]` parallel to `vectors`.
 pub fn cosine_similarity_batch(query: &[f32], vectors: &[&[f32]]) -> Vec<f32> {
-    vectors.iter().map(|v| cosine_similarity(query, v)).collect()
+    vectors
+        .iter()
+        .map(|v| cosine_similarity(query, v))
+        .collect()
 }
 
 fn dot_product_scalar(a: &[f32], b: &[f32]) -> f32 {
@@ -449,7 +452,9 @@ mod tests {
 
     #[test]
     fn cosine_against_reference_across_dims() {
-        let dims = [1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129];
+        let dims = [
+            1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129,
+        ];
         for &dim in &dims {
             let a: Vec<f32> = (0..dim).map(|i| (i as f32).sin()).collect();
             let b: Vec<f32> = (0..dim).map(|i| (i as f32 + 1.0).cos()).collect();

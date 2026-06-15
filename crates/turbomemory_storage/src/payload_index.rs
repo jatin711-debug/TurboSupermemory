@@ -25,7 +25,11 @@ pub enum Filter {
     /// Equality match on a top-level payload field.
     Eq { field: String, value: Value },
     /// Numeric range match on a top-level payload field.
-    Range { field: String, low: Bound<f64>, high: Bound<f64> },
+    Range {
+        field: String,
+        low: Bound<f64>,
+        high: Bound<f64>,
+    },
     /// Full-text contains query (handled by the engine's text index).
     FullText { field: String, query: String },
     /// All sub-filters must match.
@@ -88,14 +92,12 @@ impl PayloadIndex {
     }
 
     /// Index the payload attached to `offset`.
-    pub fn add(
-        &mut self,
-        offset: PointOffset,
-        payload: Option<&str>,
-    ) -> crate::Result<()> {
+    pub fn add(&mut self, offset: PointOffset, payload: Option<&str>) -> crate::Result<()> {
         let bo = bm_offset(offset);
         self.all_offsets.insert(bo);
-        let Some(payload) = payload else { return Ok(()) };
+        let Some(payload) = payload else {
+            return Ok(());
+        };
         let value: Value = serde_json::from_str(payload)
             .map_err(|e| StorageError::InvalidArgument(format!("invalid payload JSON: {e}")))?;
         let Value::Object(map) = value else {
@@ -175,12 +177,7 @@ impl PayloadIndex {
             .unwrap_or_default()
     }
 
-    fn query_range(
-        &self,
-        field: &str,
-        low: &Bound<f64>,
-        high: &Bound<f64>,
-    ) -> RoaringBitmap {
+    fn query_range(&self, field: &str, low: &Bound<f64>, high: &Bound<f64>) -> RoaringBitmap {
         let Some(tree) = self.numeric.get(field) else {
             return RoaringBitmap::new();
         };
@@ -338,9 +335,12 @@ mod tests {
     #[test]
     fn equality_and_range() {
         let mut idx = PayloadIndex::new();
-        idx.add(0, payload(r#"{"tags":["rust","ai"],"count":42}"#)).unwrap();
-        idx.add(1, payload(r#"{"tags":["python","ai"],"count":7}"#)).unwrap();
-        idx.add(2, payload(r#"{"tags":["rust"],"count":100}"#)).unwrap();
+        idx.add(0, payload(r#"{"tags":["rust","ai"],"count":42}"#))
+            .unwrap();
+        idx.add(1, payload(r#"{"tags":["python","ai"],"count":7}"#))
+            .unwrap();
+        idx.add(2, payload(r#"{"tags":["rust"],"count":100}"#))
+            .unwrap();
 
         let f = Filter::Eq {
             field: "tags".into(),
@@ -356,8 +356,15 @@ mod tests {
         assert_eq!(idx.query(&f).iter().collect::<Vec<_>>(), vec![0]);
 
         let f = Filter::And(vec![
-            Filter::Eq { field: "tags".into(), value: Value::String("ai".into()) },
-            Filter::Range { field: "count".into(), low: Bound::Included(0.0), high: Bound::Included(10.0) },
+            Filter::Eq {
+                field: "tags".into(),
+                value: Value::String("ai".into()),
+            },
+            Filter::Range {
+                field: "count".into(),
+                low: Bound::Included(0.0),
+                high: Bound::Included(10.0),
+            },
         ]);
         assert_eq!(idx.query(&f).iter().collect::<Vec<_>>(), vec![1]);
     }
@@ -369,10 +376,17 @@ mod tests {
         idx.add(1, payload(r#"{"category":"a","n":2}"#)).unwrap();
         idx.remove(0, payload(r#"{"category":"a","n":1}"#));
 
-        let f = Filter::Eq { field: "category".into(), value: Value::String("a".into()) };
+        let f = Filter::Eq {
+            field: "category".into(),
+            value: Value::String("a".into()),
+        };
         assert_eq!(idx.query(&f).iter().collect::<Vec<_>>(), vec![1]);
 
-        let f = Filter::Range { field: "n".into(), low: Bound::Included(0.0), high: Bound::Included(1.5) };
+        let f = Filter::Range {
+            field: "n".into(),
+            low: Bound::Included(0.0),
+            high: Bound::Included(1.5),
+        };
         assert!(idx.query(&f).is_empty());
     }
 }

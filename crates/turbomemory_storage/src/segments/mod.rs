@@ -4,6 +4,8 @@ pub mod cold;
 pub mod hot;
 pub mod mmap_array;
 pub mod sealed_hot;
+pub mod usearch_index;
+pub mod vector_index;
 pub mod warm;
 
 use crate::config::{Flusher, Tier};
@@ -13,11 +15,15 @@ use crate::StorageError;
 use ahash::AHashSet;
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
+use std::path::Path;
+use turbomemory_core::{cosine_similarity_batch, validate_dimension};
 
 pub use cold::ColdSegment;
 pub use hot::HotSegment;
 pub use mmap_array::MmapBuffer;
 pub use sealed_hot::SealedHotSegment;
+pub use usearch_index::UsearchIndex;
+pub use vector_index::{VectorIndex, VectorIndexManifest};
 pub use warm::WarmSegment;
 
 pub type Result<T> = std::result::Result<T, StorageError>;
@@ -50,6 +56,11 @@ pub trait VectorSegment: Send + Sync {
     fn point_count(&self) -> usize;
     fn memory_bytes(&self) -> usize;
     fn flusher(&self) -> Flusher;
+    /// On-disk directory for persisted segments.  Hot segments are not persisted
+    /// directly, so they return `None`.
+    fn segment_path(&self) -> Option<&Path> {
+        None
+    }
     /// Offsets stored in this segment.  Hot segments return an empty slice
     /// because they do not track a stable offset list.
     fn offsets(&self) -> &[PointOffset] {
@@ -90,10 +101,7 @@ impl Ord for HeapScored {
 
 /// Collect the top-k highest-scoring points from an iterator without sorting
 /// the whole set. This turns the O(N log N) Warm/Cold scans into O(N log k).
-pub fn top_k_minheap(
-    scored: impl Iterator<Item = ScoredPoint>,
-    k: usize,
-) -> Vec<ScoredPoint> {
+pub fn top_k_minheap(scored: impl Iterator<Item = ScoredPoint>, k: usize) -> Vec<ScoredPoint> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
@@ -113,10 +121,54 @@ pub fn top_k_minheap(
         }
     }
 
-    let mut out: Vec<ScoredPoint> = heap.into_sorted_vec().into_iter().map(|r| r.0.0).collect();
+    let mut out: Vec<ScoredPoint> = heap.into_sorted_vec().into_iter().map(|r| r.0 .0).collect();
     // `into_sorted_vec` produces ascending order; reverse to get highest first.
     out.reverse();
     out
+}
+
+/// Exact brute-force search over a specific set of offsets.
+///
+/// This is used by index implementations (e.g. `UsearchIndex`) as a fallback
+/// for very selective filters where approximate search would be unreliable.
+pub fn exact_search_over_offsets(
+    query: &[f32],
+    top_k: usize,
+    vectors: &VectorStore,
+    offsets: &[PointOffset],
+    tier: Tier,
+) -> crate::Result<Vec<ScoredPoint>> {
+    validate_dimension(query, vectors.dimension())?;
+    let view = vectors.read_view();
+
+    const CHUNK: usize = 64;
+    let mut scored: Vec<ScoredPoint> = Vec::with_capacity(offsets.len());
+    for chunk in offsets.chunks(CHUNK) {
+        let mut pairs = Vec::with_capacity(chunk.len());
+        for &offset in chunk {
+            if let Some(v) = view.get(offset) {
+                pairs.push((offset, v));
+            }
+        }
+        let refs: Vec<&[f32]> = pairs.iter().map(|(_, v)| *v).collect();
+        let scores = cosine_similarity_batch(query, &refs);
+        for ((offset, _), score) in pairs.into_iter().zip(scores) {
+            scored.push(ScoredPoint {
+                offset,
+                score,
+                tier,
+            });
+        }
+    }
+    drop(view);
+
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    scored.truncate(top_k);
+    Ok(scored)
 }
 
 /// Merge candidate lists from multiple segments, preserving the highest scores.
