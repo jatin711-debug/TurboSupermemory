@@ -671,8 +671,7 @@ impl StorageEngine {
         ef: Option<usize>,
     ) -> crate::Result<Option<Vec<(String, f32)>>> {
         validate_dimension(query_embedding, self.config.dimension)?;
-        let seeds =
-            self.search_ann_candidates_with_ef(query_embedding, top_k.max(10), ef)?;
+        let seeds = self.search_ann_candidates_with_ef(query_embedding, top_k.max(10), ef)?;
         let graph = self.graph.read();
         let activated = graph.search(query_text, &seeds, top_k);
         drop(graph);
@@ -878,6 +877,11 @@ impl StorageEngine {
         let (sealed, compacted, promoted) =
             segments.trigger_consolidation(&self.meta, &self.vectors)?;
         drop(segments);
+
+        // Drain the background optimizer so sealed/merged segments are fully
+        // materialized before the caller begins searching.
+        self.optimizer.drain(self);
+
         self.save_graph()?;
         Ok((sealed, compacted, promoted))
     }
@@ -971,18 +975,21 @@ mod tests {
         StoreConfig {
             dimension: dim,
             max_edges: 3,
+            level0_factor: 2,
+            ef_construction: 100,
             search_list_size: 5,
             outlier_count: 0,
             initial_capacity: 16,
             tier: TierConfig {
                 hot_capacity: 3,
                 warm_capacity: 6,
-                warm_bits: 4,
+                warm_quantizer: crate::config::QuantizerKind::Scalar { bits: 4 },
                 warm_chunk_bytes: 4096,
                 hnsw_threshold: 1000,
+                full_scan_threshold_kb: 10_000,
                 merge_threshold_segments: 2,
                 merge_max_records: 200_000,
-                cold_sign: true,
+                cold_quantizer: crate::config::QuantizerKind::Sign,
                 hot_promote_threshold: 2.0,
                 warm_demote_threshold: 0.5,
                 recency_half_life_secs: 60,
@@ -1002,18 +1009,21 @@ mod tests {
         StoreConfig {
             dimension: dim,
             max_edges: 8,
+            level0_factor: 2,
+            ef_construction: 100,
             search_list_size: 10,
             outlier_count: 0,
             initial_capacity: 4096,
             tier: TierConfig {
                 hot_capacity: 100,
                 warm_capacity: 10_000,
-                warm_bits: 8,
+                warm_quantizer: crate::config::QuantizerKind::Scalar { bits: 8 },
                 warm_chunk_bytes: 4096,
                 hnsw_threshold: 10,
+                full_scan_threshold_kb: 10_000,
                 merge_threshold_segments: 2,
                 merge_max_records: 10_000,
-                cold_sign: true,
+                cold_quantizer: crate::config::QuantizerKind::Sign,
                 hot_promote_threshold: 2.0,
                 warm_demote_threshold: 0.5,
                 recency_half_life_secs: 60,
@@ -1537,12 +1547,14 @@ mod tests {
                     .collect();
                 scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 scored.truncate(5);
-                scored.into_iter().map(|(id, _)| id).collect::<std::collections::HashSet<_>>()
+                scored
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect::<std::collections::HashSet<_>>()
             };
             let low = engine.search_ann_with_ef(q, 5, None).unwrap();
             let high = engine.search_ann_with_ef(q, 5, Some(200)).unwrap();
-            let low_ids: std::collections::HashSet<_> =
-                low.into_iter().map(|(id, _)| id).collect();
+            let low_ids: std::collections::HashSet<_> = low.into_iter().map(|(id, _)| id).collect();
             let high_ids: std::collections::HashSet<_> =
                 high.into_iter().map(|(id, _)| id).collect();
             low_recall += low_ids.intersection(&gt).count() as f32 / 5.0;

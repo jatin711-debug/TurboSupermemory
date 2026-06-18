@@ -7,7 +7,7 @@ use crate::segments::cold::ColdSegment;
 use crate::segments::hot::HotSegment;
 use crate::segments::sealed_hot::SealedHotSegment;
 use crate::segments::warm::WarmSegment;
-use crate::segments::{merge_candidates, ScoredPoint, VectorSegment};
+use crate::segments::{kway_merge_topk, merge_candidates, ScoredPoint, VectorSegment};
 use crate::vector_store::VectorStore;
 use parking_lot::RwLock;
 use rayon::prelude::*;
@@ -125,10 +125,11 @@ impl SegmentHolder {
 
     /// Choose a group of sealed HNSW segments to merge.
     ///
-    /// Returns clones of the segment Arcs (oldest first) while keeping the total
-    /// point count under `max_records`. The caller builds a replacement segment
-    /// outside the holder lock, then uses [`remove_sealed_hot_segments`] to swap
-    /// it in.
+    /// Returns clones of the segment Arcs (smallest first) while keeping the
+    /// total point count under `hard_cap`. Segments are sorted by ascending
+    /// point count so small segments are merged first. `hard_cap` allows
+    /// exceeding `max_records` up to 3x when the optimizer is stuck above the
+    /// target segment count, so the merge can always converge.
     pub(crate) fn sealed_hot_merge_candidates(
         &self,
         threshold: usize,
@@ -137,19 +138,20 @@ impl SegmentHolder {
         if self.sealed_hot.len() < threshold {
             return None;
         }
+        // Sort by point count ascending so small segments are merged first.
+        let mut sorted: Vec<Arc<RwLock<dyn VectorSegment>>> = self.sealed_hot.clone();
+        sorted.sort_by_key(|s| s.read().point_count());
+
+        let hard_cap = max_records.saturating_mul(2).max(max_records);
         let mut candidates = Vec::with_capacity(self.sealed_hot.len());
         let mut total = 0usize;
-        for seg in &self.sealed_hot {
+        for seg in sorted {
             let count = seg.read().point_count();
-            if total > 0 && total.saturating_add(count) > max_records {
+            if total > 0 && total.saturating_add(count) > hard_cap {
                 break;
             }
-            candidates.push(Arc::clone(seg));
+            candidates.push(seg);
             total += count;
-            if candidates.len() >= threshold && total >= self.config.tier.hot_capacity {
-                // At least merge `threshold` segments, but keep going until we
-                // would exceed the record budget.
-            }
         }
         if candidates.len() >= threshold {
             Some(candidates)
@@ -225,14 +227,16 @@ impl SegmentHolder {
             base_multiplier
         } else {
             let selectivity_factor = (1.0f32 / selectivity.sqrt()).clamp(1.0f32, 16.0f32);
+            // Cap the segment-factor growth so high segment counts do not
+            // explode the candidate pool and rerank cost.
             let segment_factor =
-                (1.0f32 + (segment_count.saturating_sub(1)) as f32 * 0.5f32).clamp(1.0f32, 4.0f32);
+                (1.0f32 + (segment_count.saturating_sub(1)) as f32 * 0.25f32).clamp(1.0f32, 2.5f32);
             (base_multiplier as f32 * selectivity_factor * segment_factor) as usize
         };
         let pool_k = top_k
             .saturating_mul(multiplier)
             .max(base_ef)
-            .min(top_k.saturating_mul(64));
+            .min(top_k.saturating_mul(48));
 
         // Collect all searchable segments and query them in parallel.
         let mut segments: Vec<Arc<RwLock<dyn VectorSegment>>> = Vec::with_capacity(
@@ -268,32 +272,66 @@ impl SegmentHolder {
                 .map(|seg| seg.read().search(query, pool_k, vectors, allowed_offsets))
                 .collect::<crate::Result<Vec<_>>>()?
         };
-        let candidates = merge_candidates(lists, pool_k);
+        // Merge per-segment candidates with a k-way heap merge (PR-B).
+        // Fall back to the old sort-based merge for very small result sets.
+        let candidates = if lists.len() >= 4 && pool_k >= 64 {
+            kway_merge_topk(&lists, pool_k)
+        } else {
+            merge_candidates(lists, pool_k)
+        };
 
         // Final rerank with full f32 embeddings from the vector store.
         let view = vectors.read_view();
-        let mut reranked: Vec<ScoredPoint> = candidates
-            .chunks(64)
-            .flat_map(|chunk| {
-                let mut pairs = Vec::with_capacity(chunk.len());
-                for c in chunk {
-                    if let Some(v) = view.get(c.offset) {
-                        pairs.push((c, v));
+        let reranked: Vec<ScoredPoint> = if candidates.len() >= 256 {
+            let chunks: Vec<&[ScoredPoint]> = candidates.chunks(64).collect();
+            chunks
+                .into_par_iter()
+                .flat_map(|chunk| {
+                    let mut pairs = Vec::with_capacity(chunk.len());
+                    for c in chunk {
+                        if let Some(v) = view.get(c.offset) {
+                            pairs.push((*c, v));
+                        }
                     }
-                }
-                let refs: Vec<&[f32]> = pairs.iter().map(|(_, v)| *v).collect();
-                let scores = turbomemory_core::cosine_similarity_batch(query, &refs);
-                pairs
-                    .into_iter()
-                    .zip(scores)
-                    .map(|((c, _), score)| ScoredPoint {
-                        offset: c.offset,
-                        score,
-                        tier: c.tier,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+                    let refs: Vec<&[f32]> = pairs.iter().map(|(_, v)| *v).collect();
+                    let scores = turbomemory_core::cosine_similarity_batch(query, &refs);
+                    pairs
+                        .into_iter()
+                        .zip(scores)
+                        .map(|((c, _), score)| ScoredPoint {
+                            offset: c.offset,
+                            score,
+                            tier: c.tier,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        } else {
+            candidates
+                .chunks(64)
+                .flat_map(|chunk| {
+                    let mut pairs = Vec::with_capacity(chunk.len());
+                    for c in chunk {
+                        if let Some(v) = view.get(c.offset) {
+                            pairs.push((c, v));
+                        }
+                    }
+                    let refs: Vec<&[f32]> = pairs.iter().map(|(_, v)| *v).collect();
+                    let scores = turbomemory_core::cosine_similarity_batch(query, &refs);
+                    pairs
+                        .into_iter()
+                        .zip(scores)
+                        .map(|((c, _), score)| ScoredPoint {
+                            offset: c.offset,
+                            score,
+                            tier: c.tier,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+
+        let mut reranked = reranked;
         reranked.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -362,7 +400,7 @@ impl SegmentHolder {
         let records = self.build_records(&offsets, vectors)?;
         if !records.is_empty() {
             let path = self.segment_path(Tier::Cold);
-            let cold = ColdSegment::from_records(&path, &records)?;
+            let cold = ColdSegment::from_records(&path, &records, self.config.tier.cold_quantizer)?;
             self.cold
                 .push(Arc::new(RwLock::new(cold)) as Arc<RwLock<dyn VectorSegment>>);
         }

@@ -7,7 +7,7 @@ use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use std::sync::Arc;
 use std::time::Duration;
-use turbomemory_storage::config::StoreConfig;
+use turbomemory_storage::config::{QuantizerKind, StoreConfig};
 use turbomemory_storage::engine::StorageEngine;
 
 /// Map storage errors to specific Python exception types.
@@ -70,6 +70,58 @@ fn extract_f32_matrix(obj: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<f32>>> {
     ))
 }
 
+/// Parse a Python quantizer specifier into a [`QuantizerKind`].
+///
+/// Accepted forms:
+/// - `"scalar"` or `"scalar<N>"` -> `QuantizerKind::Scalar { bits: N }`
+/// - `"sign"` -> `QuantizerKind::Sign`
+/// - `"turbo_mse"` or `"turbo_mse<N>"` -> `QuantizerKind::TurboQuantMse { bits: N }`
+/// - `"turbo_prod"` or `"turbo_prod<N>"` -> `QuantizerKind::TurboQuantProd { bits: N }`
+fn parse_quantizer_kind(spec: Option<String>, default: QuantizerKind) -> PyResult<QuantizerKind> {
+    let spec = match spec {
+        Some(s) => s,
+        None => return Ok(default),
+    };
+    let spec = spec.trim().to_lowercase();
+    if spec.is_empty() {
+        return Ok(default);
+    }
+
+    fn extract_bits(prefix: &str, spec: &str) -> PyResult<u8> {
+        if spec == prefix {
+            return Err(PyValueError::new_err(format!(
+                "{prefix} quantizer requires a bit width, e.g. {prefix}2"
+            )));
+        }
+        if let Some(rest) = spec.strip_prefix(prefix) {
+            rest.parse::<u8>()
+                .map_err(|_| PyValueError::new_err(format!("invalid bit width in '{spec}'")))
+        } else {
+            Err(PyValueError::new_err(format!("unknown quantizer '{spec}'")))
+        }
+    }
+
+    if spec.starts_with("scalar") {
+        Ok(QuantizerKind::Scalar {
+            bits: extract_bits("scalar", &spec)?,
+        })
+    } else if spec == "sign" {
+        Ok(QuantizerKind::Sign)
+    } else if spec.starts_with("turbo_prod") {
+        Ok(QuantizerKind::TurboQuantProd {
+            bits: extract_bits("turbo_prod", &spec)?,
+        })
+    } else if spec.starts_with("turbo_mse") {
+        Ok(QuantizerKind::TurboQuantMse {
+            bits: extract_bits("turbo_mse", &spec)?,
+        })
+    } else {
+        Err(PyValueError::new_err(format!(
+            "unknown quantizer '{spec}'; expected scalar<N>, sign, turbo_mse<N>, or turbo_prod<N>"
+        )))
+    }
+}
+
 /// Validate an optional JSON payload string and return it as-is.
 fn parse_payload(payload: Option<String>) -> PyResult<Option<String>> {
     match payload {
@@ -90,7 +142,24 @@ pub struct PyMemoryEngine {
 #[pymethods]
 impl PyMemoryEngine {
     #[new]
-    #[pyo3(signature = (db_path, dimension, max_edges, search_list_size, outlier_count, initial_capacity=None))]
+    #[pyo3(signature = (
+        db_path,
+        dimension,
+        max_edges,
+        search_list_size,
+        outlier_count,
+        initial_capacity=None,
+        warm_quantizer=None,
+        warm_bits=None,
+        cold_quantizer=None,
+        hot_capacity=None,
+        warm_capacity=None,
+        hnsw_threshold=None,
+        ef_construction=None,
+        level0_factor=None,
+        full_scan_threshold_kb=None
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         db_path: &str,
         dimension: usize,
@@ -98,6 +167,15 @@ impl PyMemoryEngine {
         search_list_size: usize,
         outlier_count: usize,
         initial_capacity: Option<usize>,
+        warm_quantizer: Option<String>,
+        warm_bits: Option<u8>,
+        cold_quantizer: Option<String>,
+        hot_capacity: Option<usize>,
+        warm_capacity: Option<usize>,
+        hnsw_threshold: Option<usize>,
+        ef_construction: Option<usize>,
+        level0_factor: Option<usize>,
+        full_scan_threshold_kb: Option<usize>,
     ) -> PyResult<Self> {
         let mut config = StoreConfig::default_for_dimension(dimension);
         config.max_edges = max_edges;
@@ -106,6 +184,38 @@ impl PyMemoryEngine {
         if let Some(cap) = initial_capacity {
             config.initial_capacity = cap.max(1024);
         }
+
+        // Resolve warm quantizer.  An explicit warm_quantizer string wins over
+        // warm_bits; when neither is given the default scalar quantizer is kept.
+        if warm_quantizer.is_some() {
+            config.tier.warm_quantizer =
+                parse_quantizer_kind(warm_quantizer, config.tier.warm_quantizer)?;
+        } else if let Some(bits) = warm_bits {
+            config.tier.warm_quantizer = QuantizerKind::Scalar { bits };
+        }
+
+        config.tier.cold_quantizer =
+            parse_quantizer_kind(cold_quantizer, config.tier.cold_quantizer)?;
+
+        if let Some(cap) = hot_capacity {
+            config.tier.hot_capacity = cap;
+        }
+        if let Some(cap) = warm_capacity {
+            config.tier.warm_capacity = cap;
+        }
+        if let Some(th) = hnsw_threshold {
+            config.tier.hnsw_threshold = th;
+        }
+        if let Some(ef) = ef_construction {
+            config.ef_construction = ef;
+        }
+        if let Some(lf) = level0_factor {
+            config.level0_factor = lf;
+        }
+        if let Some(fs) = full_scan_threshold_kb {
+            config.tier.full_scan_threshold_kb = fs;
+        }
+
         config.auto_consolidation_interval = Some(Duration::from_secs(60));
         let inner = StorageEngine::open(db_path, config).map_err(storage_err)?;
         Ok(Self { inner })

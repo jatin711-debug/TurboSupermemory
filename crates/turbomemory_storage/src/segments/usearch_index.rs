@@ -53,6 +53,10 @@ impl UsearchIndex {
         let options = Self::index_options(config.dimension, config);
         let index = Index::new(&options)
             .map_err(|e| StorageError::IndexError(format!("usearch index creation failed: {e}")))?;
+        // Single-threaded build produces the most reliable HNSW graph quality.
+        // The parallel path in usearch v2.25 occasionally produces graphs with
+        // very low recall at our scale; revisit once usearch's parallel
+        // insertion stabilises (TODO 2.11).
         index
             .reserve(vectors.len().max(1))
             .map_err(|e| StorageError::IndexError(format!("usearch reserve failed: {e}")))?;
@@ -256,18 +260,21 @@ mod tests {
         StoreConfig {
             dimension: dim,
             max_edges: 8,
+            level0_factor: 2,
+            ef_construction: 100,
             search_list_size: 16,
             outlier_count: 0,
             initial_capacity: 16,
             tier: TierConfig {
                 hot_capacity: 100,
                 warm_capacity: 1000,
-                warm_bits: 8,
+                warm_quantizer: crate::config::QuantizerKind::Scalar { bits: 8 },
                 warm_chunk_bytes: 4096,
                 hnsw_threshold: 10,
+                full_scan_threshold_kb: 10_000,
                 merge_threshold_segments: 4,
                 merge_max_records: 200_000,
-                cold_sign: true,
+                cold_quantizer: crate::config::QuantizerKind::Sign,
                 hot_promote_threshold: 2.0,
                 warm_demote_threshold: 0.5,
                 recency_half_life_secs: 60,

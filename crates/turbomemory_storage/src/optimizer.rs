@@ -77,13 +77,15 @@ impl ResourceBudget {
         }
 
         if let Some(max_mem) = budget.max_memory_bytes {
-            // Rough estimate: vector data plus HNSW graph edges. The factor of
-            // two accounts for usearch's internal overhead during construction.
-            let est = n
-                .saturating_mul(dim)
-                .saturating_mul(4)
-                .saturating_mul(max_edges.saturating_add(1))
-                .saturating_mul(2);
+            // Realistic HNSW footprint: vector data + graph edges + 30% overhead.
+            // The previous estimate multiplied vector data by max_edges, which
+            // massively over-counted and rejected large but valid merges.
+            let vector_bytes = n.saturating_mul(dim).saturating_mul(4);
+            let graph_bytes = n.saturating_mul(max_edges).saturating_mul(8);
+            let est = vector_bytes
+                .saturating_add(graph_bytes)
+                .saturating_mul(13)
+                .div_euclid(10);
             if est > max_mem {
                 return None;
             }
@@ -108,6 +110,9 @@ pub struct BackgroundOptimizer {
     tx: Sender<OptimizerMsg>,
     handle: Option<JoinHandle<()>>,
     running: Arc<AtomicBool>,
+    /// Set while the foreground `drain` is running so the background loop
+    /// yields and does not race for the same segments.
+    draining: Arc<AtomicBool>,
     budget: Arc<ResourceBudget>,
     /// Directories of merged-away segments that are waiting to be deleted. They
     /// may still be mmap'd by in-flight searches, so deletion is retried.
@@ -128,6 +133,8 @@ impl BackgroundOptimizer {
         let (tx, rx) = channel::<OptimizerMsg>();
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = running.clone();
+        let draining = Arc::new(AtomicBool::new(false));
+        let draining_clone = draining.clone();
         let budget_clone = Arc::clone(&budget);
         let pending_deletion: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
         let pending_deletion_clone = Arc::clone(&pending_deletion);
@@ -136,6 +143,12 @@ impl BackgroundOptimizer {
             .spawn(move || {
                 let mut last_run = Instant::now();
                 while running_clone.load(Ordering::Relaxed) {
+                    // Yield to the foreground `drain` so it can complete merges
+                    // without racing the background loop for the same segments.
+                    if draining_clone.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
                     Self::try_cleanup_pending(&pending_deletion_clone);
                     let timeout = Duration::from_millis(100);
                     match rx.recv_timeout(timeout) {
@@ -148,6 +161,7 @@ impl BackgroundOptimizer {
                                     &engine,
                                     &budget_clone,
                                     &pending_deletion_clone,
+                                    &draining_clone,
                                 );
                             }
                         }
@@ -157,6 +171,7 @@ impl BackgroundOptimizer {
                                     &engine,
                                     &budget_clone,
                                     &pending_deletion_clone,
+                                    &draining_clone,
                                 );
                             }
                         }
@@ -167,6 +182,7 @@ impl BackgroundOptimizer {
                                         &engine,
                                         &budget_clone,
                                         &pending_deletion_clone,
+                                        &draining_clone,
                                     );
                                     last_run = Instant::now();
                                 }
@@ -175,6 +191,7 @@ impl BackgroundOptimizer {
                                     &engine,
                                     &budget_clone,
                                     &pending_deletion_clone,
+                                    &draining_clone,
                                 );
                             }
                         }
@@ -187,6 +204,7 @@ impl BackgroundOptimizer {
             tx,
             handle: Some(handle),
             running,
+            draining,
             budget,
             pending_deletion,
         }
@@ -225,7 +243,18 @@ impl BackgroundOptimizer {
             if offsets.is_empty() {
                 return Ok(true);
             }
-            let threshold_met = offsets.len() >= engine.config().tier.hnsw_threshold;
+            let threshold_met = {
+                let cfg = engine.config();
+                let count_met = offsets.len() >= cfg.tier.hnsw_threshold;
+                let bytes = offsets
+                    .len()
+                    .saturating_mul(cfg.dimension)
+                    .saturating_mul(4);
+                let kb = bytes / 1024;
+                let byte_met =
+                    cfg.tier.full_scan_threshold_kb > 0 && kb >= cfg.tier.full_scan_threshold_kb;
+                count_met || byte_met
+            };
             let use_hnsw = threshold_met
                 && ResourceBudget::try_acquire(
                     budget,
@@ -276,12 +305,16 @@ impl BackgroundOptimizer {
         engine: &StorageEngine,
         budget: &Arc<ResourceBudget>,
         pending_deletion: &Arc<Mutex<Vec<PathBuf>>>,
+        draining: &Arc<AtomicBool>,
     ) {
+        if draining.load(Ordering::Acquire) {
+            return;
+        }
         let _ = engine.trigger_consolidation();
         // Drain any pending seal builds within the resource budget. The remaining
         // work will be picked up by the next optimizer tick.
         Self::process_pending_seals(engine, budget);
-        Self::process_pending_merges(engine, budget, pending_deletion);
+        Self::process_pending_merges(engine, budget, pending_deletion, draining);
         let _ = engine.flush();
     }
 
@@ -289,10 +322,13 @@ impl BackgroundOptimizer {
         engine: &StorageEngine,
         budget: &Arc<ResourceBudget>,
         pending_deletion: &Arc<Mutex<Vec<PathBuf>>>,
+        draining: &Arc<AtomicBool>,
     ) {
-        while let Ok(true) =
-            Self::process_one_merge_with_budget(engine, budget, pending_deletion)
-        {
+        while !draining.load(Ordering::Acquire) {
+            match Self::process_one_merge_with_budget(engine, budget, pending_deletion) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => break,
+            }
         }
     }
 
@@ -310,10 +346,7 @@ impl BackgroundOptimizer {
         let max_records = config.tier.merge_max_records();
 
         // 1. Choose candidate segments under a read lock.
-        let (candidates, old_paths): (
-            Vec<Arc<RwLock<dyn VectorSegment>>>,
-            Vec<PathBuf>,
-        ) = {
+        let (candidates, old_paths): (Vec<Arc<RwLock<dyn VectorSegment>>>, Vec<PathBuf>) = {
             let segments = engine.segments.read();
             let cands = match segments.sealed_hot_merge_candidates(threshold, max_records) {
                 Some(c) => c,
@@ -426,6 +459,31 @@ impl BackgroundOptimizer {
         }
         Self::try_cleanup_pending(&self.pending_deletion);
     }
+
+    /// Synchronously process every pending seal and merge until the work queue
+    /// is empty. This is useful when the caller wants to search immediately
+    /// after consolidation and does not want to wait for the background thread.
+    ///
+    /// While `drain` is running the background loop yields so it does not race
+    /// for the same segments and cause spurious "candidates disappeared" errors.
+    pub fn drain(&self, engine: &StorageEngine) {
+        self.draining.store(true, Ordering::Release);
+        // Wait for any in-progress background builds to finish so we don't race
+        // for the same merge candidates mid-build.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while self.budget.inflight.load(Ordering::Acquire) > 0 {
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        while self.process_one_seal(engine).unwrap_or(false) {}
+        while Self::process_one_merge_with_budget(engine, &self.budget, &self.pending_deletion)
+            .unwrap_or(false)
+        {}
+        Self::try_cleanup_pending(&self.pending_deletion);
+        self.draining.store(false, Ordering::Release);
+    }
 }
 
 impl Drop for BackgroundOptimizer {
@@ -488,7 +546,8 @@ fn build_segment(engine: &StorageEngine, job: &Job) -> crate::Result<BuiltSegmen
                 )
             })
             .collect();
-        let warm = WarmSegment::from_records(&job.path, &records, engine.config().tier.warm_bits)?;
+        let warm =
+            WarmSegment::from_records(&job.path, &records, engine.config().tier.warm_quantizer)?;
         Ok(BuiltSegment::Warm(warm))
     }
 }

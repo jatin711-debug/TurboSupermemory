@@ -1,6 +1,6 @@
 //! Warm tier: scalar-quantized vectors stored in a memory-mapped file.
 
-use crate::config::{Flusher, Tier};
+use crate::config::{Flusher, QuantizerKind, Tier};
 use crate::record::{PointOffset, Record};
 use crate::segments::mmap_array::{MmapBuffer, MmapFileWriter};
 use crate::segments::{ScoredPoint, VectorSegment};
@@ -10,8 +10,9 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use turbomemory_core::quantization::{Quantizer, ScalarQuantizer};
+use turbomemory_core::quantization::{Quantizer, ScalarQuantizer, SignQuantizer, VectorQuantizer};
 use turbomemory_core::quantized_search::{EncodedQuery, QuantizedStore};
+use turbomemory_core::turbo_quant::{TurboQuantMseQuantizer, TurboQuantProdQuantizer};
 use turbomemory_core::{cosine_similarity, validate_dimension};
 
 const DATA_FILE: &str = "data.bin";
@@ -21,14 +22,14 @@ const MANIFEST_FILE: &str = "manifest.json";
 struct Manifest {
     version: u32,
     dimension: usize,
-    quantizer: ScalarQuantizer,
+    quantizer: VectorQuantizer,
     offsets: Vec<PointOffset>,
 }
 
 /// Immutable Warm segment.
 pub struct WarmSegment {
     dim: usize,
-    quantizer: ScalarQuantizer,
+    quantizer: VectorQuantizer,
     offsets: Vec<PointOffset>,
     buffer: MmapBuffer,
     path: PathBuf,
@@ -42,7 +43,7 @@ impl WarmSegment {
     pub fn from_records(
         path: impl AsRef<Path>,
         records: &[(PointOffset, Record)],
-        bits: u8,
+        kind: QuantizerKind,
     ) -> crate::Result<Self> {
         if records.is_empty() {
             return Err(StorageError::InvalidArgument(
@@ -53,12 +54,31 @@ impl WarmSegment {
         let path = path.as_ref().to_path_buf();
         fs::create_dir_all(&path)?;
 
-        let embeddings: Vec<_> = records
-            .iter()
-            .map(|(_, r)| r.embedding_f32().to_vec())
-            .collect();
-        let quantizer =
-            ScalarQuantizer::calibrate(&embeddings, bits).map_err(StorageError::Core)?;
+        let quantizer = match kind {
+            QuantizerKind::Scalar { bits } => {
+                let embeddings: Vec<_> = records
+                    .iter()
+                    .map(|(_, r)| r.embedding_f32().to_vec())
+                    .collect();
+                VectorQuantizer::Scalar(
+                    ScalarQuantizer::calibrate(&embeddings, bits).map_err(StorageError::Core)?,
+                )
+            }
+            QuantizerKind::Sign => VectorQuantizer::Sign(SignQuantizer::new(dim)),
+            QuantizerKind::TurboQuantMse { bits } => VectorQuantizer::TurboQuantMse(
+                TurboQuantMseQuantizer::new(dim, bits, QuantizerKind::ROTATION_SEED)
+                    .map_err(StorageError::Core)?,
+            ),
+            QuantizerKind::TurboQuantProd { bits } => VectorQuantizer::TurboQuantProd(
+                TurboQuantProdQuantizer::new(
+                    dim,
+                    bits,
+                    QuantizerKind::ROTATION_SEED,
+                    QuantizerKind::QJL_SEED,
+                )
+                .map_err(StorageError::Core)?,
+            ),
+        };
 
         let bytes_per_vec = quantizer.encoded_bytes_per_vector();
         let data_path = path.join(DATA_FILE);
@@ -158,36 +178,47 @@ impl VectorSegment for WarmSegment {
 
         // Score vectors in SIMD-friendly batches to reduce iterator/closure
         // overhead and let the quantized kernels amortize query setup.
-        const CHUNK: usize = 64;
+        const CHUNK: usize = 1024;
         let bytes_per_vec = self.quantizer.encoded_bytes_per_vector();
         let mut candidates = Vec::with_capacity(top_k * 2);
+        let mut filtered_bytes = Vec::with_capacity(CHUNK * bytes_per_vec);
+        let mut filtered_offsets = Vec::with_capacity(CHUNK);
         for (chunk_idx, chunk) in self.offsets.chunks(CHUNK).enumerate() {
             let base = chunk_idx * CHUNK;
-            let mut chunk_bytes = Vec::with_capacity(chunk.len() * bytes_per_vec);
-            let mut chunk_offsets = Vec::with_capacity(chunk.len());
-            for (local, &offset) in chunk.iter().enumerate() {
-                if let Some(bitmap) = allowed_offsets {
-                    if !bitmap.contains(offset as u32) {
-                        continue;
+            if let Some(bitmap) = allowed_offsets {
+                // Filtered path: copy only the vectors that pass the bitmap.
+                filtered_bytes.clear();
+                filtered_offsets.clear();
+                for (local, &offset) in chunk.iter().enumerate() {
+                    if bitmap.contains(offset as u32) {
+                        filtered_bytes.extend_from_slice(self.encoded_vector(base + local));
+                        filtered_offsets.push(offset);
                     }
                 }
-                chunk_bytes.extend_from_slice(self.encoded_vector(base + local));
-                chunk_offsets.push(offset);
-            }
-            if chunk_offsets.is_empty() {
-                continue;
-            }
-            let scores = eq.score_batch(&chunk_bytes);
-            candidates.extend(
-                chunk_offsets
-                    .into_iter()
-                    .zip(scores)
-                    .map(|(offset, score)| ScoredPoint {
+                if filtered_offsets.is_empty() {
+                    continue;
+                }
+                let scores = eq.score_batch(&filtered_bytes);
+                candidates.extend(filtered_offsets.iter().copied().zip(scores).map(
+                    |(offset, score)| ScoredPoint {
                         offset,
                         score,
                         tier: Tier::Warm,
-                    }),
-            );
+                    },
+                ));
+            } else {
+                // Fast path: contiguous mmap slice, no copy.
+                let start = base * bytes_per_vec;
+                let end = start + chunk.len() * bytes_per_vec;
+                let scores = eq.score_batch(&self.buffer.as_bytes()[start..end]);
+                candidates.extend(chunk.iter().copied().zip(scores).map(|(offset, score)| {
+                    ScoredPoint {
+                        offset,
+                        score,
+                        tier: Tier::Warm,
+                    }
+                }));
+            }
         }
         let candidates = crate::segments::top_k_minheap(candidates.into_iter(), top_k);
 
@@ -240,5 +271,82 @@ impl VectorSegment for WarmSegment {
                 ))
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::record::Record;
+    use std::sync::Arc;
+
+    fn make_record(offset: PointOffset, dim: usize, idx: usize) -> (PointOffset, Record) {
+        let mut v = vec![0.0f32; dim];
+        v[idx % dim] = 1.0;
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter_mut().for_each(|x| *x /= norm);
+        (
+            offset,
+            Record {
+                id: format!("id-{idx}"),
+                text: String::new(),
+                embedding: Arc::from(v),
+                importance: 1.0,
+                concepts: Vec::new(),
+                created_at: 0,
+                insert_seq: 0,
+                access_count: 0,
+                last_accessed: 0,
+                tier: Tier::Warm,
+                payload: None,
+            },
+        )
+    }
+
+    #[test]
+    fn warm_segment_turbo_quant_prod_search() {
+        let dim = 64;
+        let tmp = tempfile::tempdir().unwrap();
+        let records: Vec<_> = (0..20).map(|i| make_record(i as u64 + 1, dim, i)).collect();
+        let segment = WarmSegment::from_records(
+            tmp.path().join("warm"),
+            &records,
+            QuantizerKind::TurboQuantProd { bits: 3 },
+        )
+        .unwrap();
+        assert_eq!(segment.point_count(), 20);
+
+        // Build a minimal VectorStore so search can rerank.
+        let vectors_path = tmp.path().join("vectors");
+        let vectors = VectorStore::new_with_capacity(&vectors_path, dim, 32).unwrap();
+        for (offset, rec) in &records {
+            vectors.put(*offset, rec.embedding_f32()).unwrap();
+        }
+
+        let query = {
+            let mut v = vec![0.0f32; dim];
+            v[0] = 1.0;
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter_mut().for_each(|x| *x /= norm);
+            v
+        };
+        let results = segment.search(&query, 5, &vectors, None).unwrap();
+        assert!(!results.is_empty());
+        // The top result should be the vector that has mass on dimension 0.
+        assert_eq!(results[0].offset, 1);
+    }
+
+    #[test]
+    fn warm_segment_scalar_still_works() {
+        let dim = 32;
+        let tmp = tempfile::tempdir().unwrap();
+        let records: Vec<_> = (0..10).map(|i| make_record(i as u64 + 1, dim, i)).collect();
+        let segment = WarmSegment::from_records(
+            tmp.path().join("warm"),
+            &records,
+            QuantizerKind::Scalar { bits: 4 },
+        )
+        .unwrap();
+        assert_eq!(segment.point_count(), 10);
     }
 }

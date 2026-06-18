@@ -97,6 +97,13 @@ def parse_args():
     parser.add_argument("--dimension", type=int, default=8, help="Embedding dimension")
     parser.add_argument("--llm-delay", type=float, default=0.15, help="Simulated LLM latency per write/read (seconds)")
     parser.add_argument("--tsm-only", action="store_true", help="Only benchmark TurboSuperMemory (skip baselines)")
+    parser.add_argument("--warm-quantizer", type=str, default=None, help="Warm tier quantizer (e.g. scalar8, turbo_prod3)")
+    parser.add_argument("--cold-quantizer", type=str, default=None, help="Cold tier quantizer (e.g. sign, turbo_mse1)")
+    parser.add_argument("--warm-bits", type=int, default=None, help="Warm tier scalar bits (legacy override)")
+    parser.add_argument("--hot-capacity", type=int, default=None, help="Hot segment capacity (forces sealing)")
+    parser.add_argument("--warm-capacity", type=int, default=None, help="Warm segment capacity")
+    parser.add_argument("--hnsw-threshold", type=int, default=None, help="Min records before building HNSW")
+    parser.add_argument("--trigger-consolidation", action="store_true", help="Force background consolidation after ingestion")
     return parser.parse_args()
 
 
@@ -267,14 +274,27 @@ def run_benchmark():
     # HNSW parameters aligned with Malkov & Yashunin (2016): M=16 gives a
     # denser, more navigable graph; ef_construction=100 provides enough
     # backtracking during build so that search can use a modest ef_search.
-    tsm_engine = turbomemory.MemoryEngine(
-        db_path=db_dir,
-        dimension=args.dimension,
-        max_edges=16,
-        search_list_size=100,
-        outlier_count=0,
-        initial_capacity=args.num_items,
-    )
+    engine_kwargs = {
+        "db_path": db_dir,
+        "dimension": args.dimension,
+        "max_edges": 16,
+        "search_list_size": 100,
+        "outlier_count": 0,
+        "initial_capacity": args.num_items,
+    }
+    if args.warm_quantizer is not None:
+        engine_kwargs["warm_quantizer"] = args.warm_quantizer
+    if args.warm_bits is not None:
+        engine_kwargs["warm_bits"] = args.warm_bits
+    if args.cold_quantizer is not None:
+        engine_kwargs["cold_quantizer"] = args.cold_quantizer
+    if args.hot_capacity is not None:
+        engine_kwargs["hot_capacity"] = args.hot_capacity
+    if args.warm_capacity is not None:
+        engine_kwargs["warm_capacity"] = args.warm_capacity
+    if args.hnsw_threshold is not None:
+        engine_kwargs["hnsw_threshold"] = args.hnsw_threshold
+    tsm_engine = turbomemory.MemoryEngine(**engine_kwargs)
     
     flat_baseline = FlatNumPyBaseline(args.dimension)
     llm_baseline = LLMInTheLoopBaseline(args.dimension, args.llm_delay)
@@ -325,6 +345,13 @@ def run_benchmark():
                 flush=True,
             )
     tsm_ingest = (time.perf_counter() - t0) * 1000.0 / args.num_items
+
+    if args.trigger_consolidation:
+        print("  triggering background consolidation...")
+        t0 = time.perf_counter()
+        tsm_engine.trigger_consolidation()
+        consolidate_ms = (time.perf_counter() - t0) * 1000.0
+        print(f"  consolidation took {consolidate_ms:.1f} ms")
 
     # 4. ChromaDB
     chroma_ingest = 0.0

@@ -1,6 +1,7 @@
 //! Quantized distance computation via lookup tables and SIMD kernels.
 
-use crate::quantization::{Quantizer, ScalarQuantizer, SignQuantizer};
+use crate::quantization::{Quantizer, ScalarQuantizer, SignQuantizer, VectorQuantizer};
+use crate::turbo_quant::{TurboQuantMseEncodedQuery, TurboQuantProdEncodedQuery};
 use crate::Result;
 
 /// An encoded query that can score a quantized vector without decoding it.
@@ -179,6 +180,56 @@ impl QuantizedStore for SignQuantizer {
     type Query = SignEncodedQuery;
     fn encode_query(&self, query: &[f32]) -> Result<Self::Query> {
         SignEncodedQuery::new(query, self)
+    }
+}
+
+/// Encoded-query enum that matches [`VectorQuantizer`].
+pub enum AnyEncodedQuery {
+    Scalar(ScalarEncodedQuery),
+    Sign(SignEncodedQuery),
+    TurboQuantMse(TurboQuantMseEncodedQuery),
+    TurboQuantProd(TurboQuantProdEncodedQuery),
+}
+
+impl EncodedQuery for AnyEncodedQuery {
+    fn score(&self, encoded: &[u8]) -> f32 {
+        match self {
+            Self::Scalar(q) => q.score(encoded),
+            Self::Sign(q) => q.score(encoded),
+            Self::TurboQuantMse(q) => q.score(encoded),
+            Self::TurboQuantProd(q) => q.score(encoded),
+        }
+    }
+
+    fn score_batch(&self, encoded: &[u8]) -> Vec<f32> {
+        match self {
+            Self::Scalar(q) => q.score_batch(encoded),
+            Self::Sign(q) => q.score_batch(encoded),
+            Self::TurboQuantMse(q) => EncodedQuery::score_batch(q, encoded),
+            Self::TurboQuantProd(q) => q.score_batch(encoded),
+        }
+    }
+
+    fn encoded_bytes_per_vector(&self) -> usize {
+        match self {
+            Self::Scalar(q) => q.encoded_bytes_per_vector(),
+            Self::Sign(q) => q.encoded_bytes_per_vector(),
+            Self::TurboQuantMse(q) => q.encoded_bytes_per_vector(),
+            Self::TurboQuantProd(q) => q.encoded_bytes_per_vector(),
+        }
+    }
+}
+
+impl QuantizedStore for VectorQuantizer {
+    type Query = AnyEncodedQuery;
+
+    fn encode_query(&self, query: &[f32]) -> Result<Self::Query> {
+        match self {
+            Self::Scalar(q) => Ok(AnyEncodedQuery::Scalar(ScalarEncodedQuery::new(query, q)?)),
+            Self::Sign(q) => Ok(AnyEncodedQuery::Sign(SignEncodedQuery::new(query, q)?)),
+            Self::TurboQuantMse(q) => Ok(AnyEncodedQuery::TurboQuantMse(q.encode_query(query)?)),
+            Self::TurboQuantProd(q) => Ok(AnyEncodedQuery::TurboQuantProd(q.encode_query(query)?)),
+        }
     }
 }
 

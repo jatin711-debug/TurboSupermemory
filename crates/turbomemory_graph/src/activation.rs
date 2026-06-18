@@ -18,6 +18,13 @@ pub struct SpreadingConfig {
     pub beta: f32,
     /// Feeling-of-Knowing gate threshold. If the peak memory activation is below this, return None.
     pub fok_threshold: f32,
+    /// Maximum number of activated nodes kept after each propagation iteration.
+    /// Limits memory and time for queries that would otherwise activate the
+    /// whole graph (e.g. empty text or very common terms).
+    pub max_frontier: usize,
+    /// When `query_text` is empty, concept nodes that connect to more than this
+    /// fraction of all memories are treated as hubs and are not expanded.
+    pub hub_fraction_threshold: f32,
 }
 
 impl Default for SpreadingConfig {
@@ -29,6 +36,8 @@ impl Default for SpreadingConfig {
             iterations: 4,
             beta: 0.3,
             fok_threshold: 0.58,
+            max_frontier: 1_000,
+            hub_fraction_threshold: 0.05,
         }
     }
 }
@@ -95,6 +104,19 @@ impl SpreadingActivation {
             return None;
         }
 
+        // Early-exit FOK gate: if even the best seed is below threshold,
+        // propagation cannot rescue the query.
+        let peak_seed = activation.values().cloned().fold(0.0f32, f32::max);
+        if peak_seed < self.config.fok_threshold {
+            return None;
+        }
+
+        let total_memories = self.graph.memory_count().max(1);
+        let is_empty_query = query_text.trim().is_empty();
+        let hub_threshold =
+            (total_memories as f32 * self.config.hub_fraction_threshold).max(2.0) as usize;
+        let max_frontier = self.config.max_frontier.max(top_k * 4);
+
         // Spreading activation (BTreeMap iteration is sorted/deterministic)
         for _ in 0..self.config.iterations {
             let mut next = activation.clone();
@@ -106,13 +128,48 @@ impl SpreadingActivation {
                     if edge.kind == EdgeKind::Temporal && edge.weight < 0.0 {
                         continue;
                     }
+                    // Hub suppression for empty queries: do not expand concept
+                    // nodes that are connected to a large fraction of memories.
+                    if is_empty_query
+                        && edge.kind == EdgeKind::Association
+                        && edge.source.as_str().starts_with("concept:")
+                    {
+                        let source_key = edge.source.as_str();
+                        let concept = source_key.strip_prefix("concept:").unwrap_or("");
+                        if self.graph.concept_degree(concept) > hub_threshold {
+                            continue;
+                        }
+                    }
                     let target = edge.target.as_str();
                     *next.entry(target).or_insert(0.0) += energy * edge.weight * self.config.decay;
                 }
             }
             activation = next;
 
-            // Lateral inhibition among memory nodes
+            // Frontier cap: keep only the top-max_frontier activated nodes.
+            // Always keep at least top_k memory nodes so we do not discard
+            // genuine results prematurely.
+            if activation.len() > max_frontier {
+                let mut ranked: Vec<(String, f32)> = activation.into_iter().collect();
+                ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let mut kept_memory = 0usize;
+                let mut kept = BTreeMap::new();
+                for (k, v) in ranked {
+                    let is_mem = k.starts_with("mem:");
+                    if kept.len() < max_frontier || (is_mem && kept_memory < top_k) {
+                        if is_mem {
+                            kept_memory += 1;
+                        }
+                        kept.insert(k, v);
+                    }
+                    if kept.len() >= max_frontier && kept_memory >= top_k {
+                        break;
+                    }
+                }
+                activation = kept;
+            }
+
+            // Lateral inhibition among memory nodes in the current frontier.
             let memory_keys: Vec<String> = activation
                 .keys()
                 .filter(|k| k.starts_with("mem:"))

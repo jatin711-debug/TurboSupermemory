@@ -1,6 +1,6 @@
 //! Cold tier: 1-bit sign-quantized vectors stored in a memory-mapped file.
 
-use crate::config::{Flusher, Tier};
+use crate::config::{Flusher, QuantizerKind, Tier};
 use crate::record::{PointOffset, Record};
 use crate::segments::mmap_array::{MmapBuffer, MmapFileWriter};
 use crate::segments::{ScoredPoint, VectorSegment};
@@ -10,8 +10,9 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use turbomemory_core::quantization::{Quantizer, SignQuantizer};
+use turbomemory_core::quantization::{Quantizer, ScalarQuantizer, SignQuantizer, VectorQuantizer};
 use turbomemory_core::quantized_search::{EncodedQuery, QuantizedStore};
+use turbomemory_core::turbo_quant::{TurboQuantMseQuantizer, TurboQuantProdQuantizer};
 use turbomemory_core::{cosine_similarity, validate_dimension};
 
 const DATA_FILE: &str = "data.bin";
@@ -21,14 +22,14 @@ const MANIFEST_FILE: &str = "manifest.json";
 struct Manifest {
     version: u32,
     dimension: usize,
-    quantizer: SignQuantizer,
+    quantizer: VectorQuantizer,
     offsets: Vec<PointOffset>,
 }
 
 /// Immutable Cold segment.
 pub struct ColdSegment {
     dim: usize,
-    quantizer: SignQuantizer,
+    quantizer: VectorQuantizer,
     offsets: Vec<PointOffset>,
     buffer: MmapBuffer,
     path: PathBuf,
@@ -42,6 +43,7 @@ impl ColdSegment {
     pub fn from_records(
         path: impl AsRef<Path>,
         records: &[(PointOffset, Record)],
+        kind: QuantizerKind,
     ) -> crate::Result<Self> {
         if records.is_empty() {
             return Err(StorageError::InvalidArgument(
@@ -49,7 +51,31 @@ impl ColdSegment {
             ));
         }
         let dim = records[0].1.embedding_f32().len();
-        let quantizer = SignQuantizer::new(dim);
+        let quantizer = match kind {
+            QuantizerKind::Scalar { bits } => {
+                let embeddings: Vec<_> = records
+                    .iter()
+                    .map(|(_, r)| r.embedding_f32().to_vec())
+                    .collect();
+                VectorQuantizer::Scalar(
+                    ScalarQuantizer::calibrate(&embeddings, bits).map_err(StorageError::Core)?,
+                )
+            }
+            QuantizerKind::Sign => VectorQuantizer::Sign(SignQuantizer::new(dim)),
+            QuantizerKind::TurboQuantMse { bits } => VectorQuantizer::TurboQuantMse(
+                TurboQuantMseQuantizer::new(dim, bits, QuantizerKind::ROTATION_SEED)
+                    .map_err(StorageError::Core)?,
+            ),
+            QuantizerKind::TurboQuantProd { bits } => VectorQuantizer::TurboQuantProd(
+                TurboQuantProdQuantizer::new(
+                    dim,
+                    bits,
+                    QuantizerKind::ROTATION_SEED,
+                    QuantizerKind::QJL_SEED,
+                )
+                .map_err(StorageError::Core)?,
+            ),
+        };
         let path = path.as_ref().to_path_buf();
         fs::create_dir_all(&path)?;
 
@@ -149,36 +175,47 @@ impl VectorSegment for ColdSegment {
 
         // Score vectors in batches so the sign-quantized batch kernel can
         // amortize the query lookup tables over many vectors.
-        const CHUNK: usize = 64;
+        const CHUNK: usize = 1024;
         let bytes_per_vec = self.quantizer.encoded_bytes_per_vector();
         let mut candidates = Vec::with_capacity(top_k * 2);
+        let mut filtered_bytes = Vec::with_capacity(CHUNK * bytes_per_vec);
+        let mut filtered_offsets = Vec::with_capacity(CHUNK);
         for (chunk_idx, chunk) in self.offsets.chunks(CHUNK).enumerate() {
             let base = chunk_idx * CHUNK;
-            let mut chunk_bytes = Vec::with_capacity(chunk.len() * bytes_per_vec);
-            let mut chunk_offsets = Vec::with_capacity(chunk.len());
-            for (local, &offset) in chunk.iter().enumerate() {
-                if let Some(bitmap) = allowed_offsets {
-                    if !bitmap.contains(offset as u32) {
-                        continue;
+            if let Some(bitmap) = allowed_offsets {
+                // Filtered path: copy only the vectors that pass the bitmap.
+                filtered_bytes.clear();
+                filtered_offsets.clear();
+                for (local, &offset) in chunk.iter().enumerate() {
+                    if bitmap.contains(offset as u32) {
+                        filtered_bytes.extend_from_slice(self.encoded_vector(base + local));
+                        filtered_offsets.push(offset);
                     }
                 }
-                chunk_bytes.extend_from_slice(self.encoded_vector(base + local));
-                chunk_offsets.push(offset);
-            }
-            if chunk_offsets.is_empty() {
-                continue;
-            }
-            let scores = eq.score_batch(&chunk_bytes);
-            candidates.extend(
-                chunk_offsets
-                    .into_iter()
-                    .zip(scores)
-                    .map(|(offset, score)| ScoredPoint {
+                if filtered_offsets.is_empty() {
+                    continue;
+                }
+                let scores = eq.score_batch(&filtered_bytes);
+                candidates.extend(filtered_offsets.iter().copied().zip(scores).map(
+                    |(offset, score)| ScoredPoint {
                         offset,
                         score,
                         tier: Tier::Cold,
-                    }),
-            );
+                    },
+                ));
+            } else {
+                // Fast path: contiguous mmap slice, no copy.
+                let start = base * bytes_per_vec;
+                let end = start + chunk.len() * bytes_per_vec;
+                let scores = eq.score_batch(&self.buffer.as_bytes()[start..end]);
+                candidates.extend(chunk.iter().copied().zip(scores).map(|(offset, score)| {
+                    ScoredPoint {
+                        offset,
+                        score,
+                        tier: Tier::Cold,
+                    }
+                }));
+            }
         }
         let candidates = crate::segments::top_k_minheap(candidates.into_iter(), top_k);
 

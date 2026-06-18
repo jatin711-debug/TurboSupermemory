@@ -12,6 +12,7 @@ pub mod segments;
 pub mod text_index;
 pub mod update_worker;
 pub mod vector_store;
+pub mod visited_pool;
 pub mod wal;
 
 pub use engine::StorageEngine;

@@ -198,3 +198,81 @@ pub fn merge_candidates(lists: Vec<Vec<ScoredPoint>>, top_k: usize) -> Vec<Score
     }
     deduped.into_vec()
 }
+
+/// K-way heap merge of sorted per-segment candidate lists.
+///
+/// Each input list is assumed to be sorted by descending score.  Returns the
+/// top-`k` unique offsets across all lists.  This avoids the `O(N log N)` full
+/// sort in `merge_candidates` when many segments are involved.
+pub fn kway_merge_topk(lists: &[Vec<ScoredPoint>], k: usize) -> Vec<ScoredPoint> {
+    if k == 0 {
+        return Vec::new();
+    }
+    if lists.is_empty() {
+        return Vec::new();
+    }
+    if lists.len() == 1 {
+        let mut v = lists[0].clone();
+        v.truncate(k);
+        return v;
+    }
+
+    use std::collections::BinaryHeap;
+
+    // Heap item: (reverse score so max-heap, list index, element index).
+    struct Item {
+        score: f32,
+        list: usize,
+        idx: usize,
+    }
+    impl PartialEq for Item {
+        fn eq(&self, other: &Self) -> bool {
+            self.score.to_bits() == other.score.to_bits()
+        }
+    }
+    impl Eq for Item {}
+    impl PartialOrd for Item {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for Item {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.score
+                .partial_cmp(&other.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }
+    }
+
+    let mut heap: BinaryHeap<Item> = BinaryHeap::with_capacity(lists.len());
+    for (i, list) in lists.iter().enumerate() {
+        if !list.is_empty() {
+            heap.push(Item {
+                score: list[0].score,
+                list: i,
+                idx: 0,
+            });
+        }
+    }
+
+    let mut seen = AHashSet::with_capacity(k.min(1024));
+    let mut out = Vec::with_capacity(k);
+    while let Some(item) = heap.pop() {
+        let candidate = lists[item.list][item.idx];
+        if seen.insert(candidate.offset) {
+            out.push(candidate);
+            if out.len() >= k {
+                break;
+            }
+        }
+        let next_idx = item.idx + 1;
+        if next_idx < lists[item.list].len() {
+            heap.push(Item {
+                score: lists[item.list][next_idx].score,
+                list: item.list,
+                idx: next_idx,
+            });
+        }
+    }
+    out
+}

@@ -16,7 +16,7 @@ This guide is written for AI coding agents that need to build, test, and modify 
 | Vector index | `usearch` 2.25 (HNSW) for sealed Hot segments; plain brute-force for mutable Hot segment |
 | Vector storage | mmap-backed `VectorStore` (`vectors.bin`) with CRC-validated header |
 | Metadata durability | `redb` 4.1 for lazy snapshots; append-only WAL (`wal/wal_meta.bin`) is the runtime source of truth |
-| Quantization | FWHT preconditioning, Lloyd-Max tables, scalar quantizer (Warm tier), 1-bit sign quantizer (Cold tier) |
+| Quantization | FWHT preconditioning, Lloyd-Max tables, scalar quantizer, 1-bit sign quantizer, and TurboQuant MSE/prod quantizers (configurable per tier) |
 | Full-text search | Tantivy 0.22 (`text_index/`) |
 | Payload filtering | In-memory Roaring bitmap index (`payload_index.rs`) |
 | Concurrency | `parking_lot` RwLock/Mutex inside `StorageEngine`; Python binding holds `Arc<StorageEngine>` directly |
@@ -29,7 +29,7 @@ This guide is written for AI coding agents that need to build, test, and modify 
 
 ```text
 crates/
-├── turbomemory_core/      # Vector math, SIMD kernels, FWHT, Lloyd-Max, scalar/sign quantization, LUT search
+├── turbomemory_core/      # Vector math, SIMD kernels, FWHT, Lloyd-Max, scalar/sign/TurboQuant quantization, LUT search
 ├── turbomemory_storage/   # MemoryStore/StorageEngine, tiered segments, HNSW, WAL, redb persistence, payload/text indexes
 ├── turbomemory_graph/     # BM25, episodic-semantic graph, spreading activation, FOK gate, CCS stub
 ├── turbomemory_python/    # PyO3 bindings exposing MemoryEngine
@@ -134,8 +134,8 @@ make clean        # cargo clean + remove turbomemory.pyd
 |------|-----------|---------|--------|
 | Hot | Appendable | Plain offset list + shared `VectorStore` | Exact scan (SIMD batched) |
 | SealedHot | Immutable | `usearch` HNSW index file + manifest | HNSW; selective filters fall back to exact scan |
-| Warm | Immutable | Scalar-quantized (`u8`) mmap data + manifest | Quantized LUT scan + full-f32 rerank |
-| Cold | Immutable | 1-bit sign-quantized mmap data + manifest | Binary LUT scan + full-f32 rerank |
+| Warm | Immutable | Quantized mmap data + manifest (scalar or TurboQuant prod) | Quantized LUT scan + full-f32 rerank |
+| Cold | Immutable | Quantized mmap data + manifest (sign or TurboQuant MSE) | Binary/quantized LUT scan + full-f32 rerank |
 
 Lifecycle: records land in Hot; when `hot_capacity` is reached the Hot segment is sealed. Large sealed segments become SealedHot (HNSW); smaller ones become Warm. When total Warm records exceed `warm_capacity`, all Warm segments are merged into a Cold segment. Frequently accessed records can be promoted back to Hot via `promote_hot`.
 
@@ -215,8 +215,9 @@ Shared service logic lives in `service.rs`, including filter conversion for both
 ### Quantization
 
 - Keep compression as a pluggable metric/tier trait (`Quantizer`).
-- The MVP uses FP32 Hot storage with scalar-quantized Warm and sign-quantized Cold tiers.
-- Quantized scoring uses LUT-based kernels in `metrics_quantized.rs`.
+- The MVP uses FP32 Hot storage with scalar-quantized Warm and sign-quantized Cold tiers by default.
+- TurboQuant MSE and inner-product-optimal (`prod`) quantizers are available via `QuantizerKind` and can be assigned to Warm/Cold tiers.
+- Quantized scoring uses LUT-based kernels in `metrics_quantized.rs` for scalar/sign quantizers and rotated/projected query buffers for TurboQuant.
 
 ### Simplicity
 
@@ -242,7 +243,7 @@ cargo test --workspace --exclude turbomemory_python
 
 Notable test areas:
 
-- `turbomemory_core`: SIMD distance kernels against reference implementations, quantizer round-trips, FWHT invertibility.
+- `turbomemory_core`: SIMD distance kernels against reference implementations, quantizer round-trips (scalar/sign/TurboQuant), FWHT invertibility, TurboQuant distortion vs paper bounds.
 - `turbomemory_storage`: insert/search, tier sealing/reload, WAL replay, crash recovery, payload/text filtering, promotion/demotion, batch idempotency.
 - `turbomemory_graph`: graph construction, BM25 scoring, spreading activation, FOK gating.
 
@@ -301,8 +302,8 @@ Database state is stored in the directory passed to `MemoryEngine`/server:
 ├── text_index/          # Tantivy index
 └── segments/
     ├── sealed_hot/      # persisted usearch HNSW segments
-    ├── warm/            # scalar-quantized segments
-    └── cold/            # 1-bit sign-quantized segments
+    ├── warm/            # quantized segments (scalar or TurboQuant prod)
+    └── cold/            # quantized segments (sign or TurboQuant MSE)
 ```
 
 ---

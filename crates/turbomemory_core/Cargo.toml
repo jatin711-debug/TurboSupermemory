@@ -7,8 +7,16 @@ edition = "2021"
 serde = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
+rand_distr = { workspace = true }
 rayon = { workspace = true }
 ndarray = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+serde_json = { workspace = true }
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = { workspace = true }
+
+[[bench]]
+name = "turbo_quant"
+harness = false

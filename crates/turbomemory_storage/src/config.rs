@@ -1,6 +1,53 @@
 //! Configuration for the tiered storage engine.
 
 use std::time::Duration;
+use turbomemory_core::quantization::{ScalarQuantizer, SignQuantizer, VectorQuantizer};
+use turbomemory_core::turbo_quant::{TurboQuantMseQuantizer, TurboQuantProdQuantizer};
+
+/// Which quantizer a tier uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum QuantizerKind {
+    /// Per-calibration min/max scalar quantizer.
+    Scalar { bits: u8 },
+    /// 1-bit sign quantization.
+    Sign,
+    /// TurboQuant MSE-optimal quantizer (direction only; store norms separately).
+    TurboQuantMse { bits: u8 },
+    /// TurboQuant inner-product-optimal quantizer (direction only).
+    TurboQuantProd { bits: u8 },
+}
+
+impl QuantizerKind {
+    /// Default fixed-seed rotation/projection seeds.  These are deterministic
+    /// across restarts so serialized segments remain readable.
+    pub(crate) const ROTATION_SEED: u64 = 0x1234_5678_9ABC_DEF0;
+    pub(crate) const QJL_SEED: u64 = 0xFEDC_BA98_7654_3210;
+
+    /// Build a concrete quantizer for the given dimension.
+    ///
+    /// For [`QuantizerKind::Scalar`] the caller must supply calibration vectors
+    /// because the min/max are data-dependent; this method returns a zero-range
+    /// placeholder that must be replaced by [`ScalarQuantizer::calibrate`].
+    pub fn build(self, dim: usize) -> VectorQuantizer {
+        match self {
+            Self::Scalar { bits } => VectorQuantizer::Scalar(ScalarQuantizer {
+                bits,
+                dim,
+                min: 0.0,
+                max: 0.0,
+            }),
+            Self::Sign => VectorQuantizer::Sign(SignQuantizer::new(dim)),
+            Self::TurboQuantMse { bits } => VectorQuantizer::TurboQuantMse(
+                TurboQuantMseQuantizer::new(dim, bits, Self::ROTATION_SEED)
+                    .expect("valid TurboQuantMse bits"),
+            ),
+            Self::TurboQuantProd { bits } => VectorQuantizer::TurboQuantProd(
+                TurboQuantProdQuantizer::new(dim, bits, Self::ROTATION_SEED, Self::QJL_SEED)
+                    .expect("valid TurboQuantProd bits"),
+            ),
+        }
+    }
+}
 
 /// Which tier a vector segment occupies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -33,8 +80,15 @@ pub struct OptimizerBudget {
 
 impl Default for OptimizerBudget {
     fn default() -> Self {
+        // Allow the foreground `drain` and the background optimizer to merge
+        // concurrently. Qdrant uses `clamp(num_cpus, 1, 16)` indexing threads
+        // (TODO 2.11). We allow up to half the CPUs so we don't oversubscribe
+        // the machine.
+        let max_concurrent = std::thread::available_parallelism()
+            .map(|n| (n.get() / 2).max(2))
+            .unwrap_or(2);
         Self {
-            max_concurrent_builds: 1,
+            max_concurrent_builds: max_concurrent,
             max_build_memory_bytes: Some(512 * 1024 * 1024), // 512 MiB
         }
     }
@@ -47,21 +101,24 @@ pub struct TierConfig {
     pub hot_capacity: usize,
     /// Number of records before the Warm segment is demoted to Cold.
     pub warm_capacity: usize,
-    /// Bits used by the Warm tier scalar quantizer (1-8).
-    pub warm_bits: u8,
+    /// Quantizer used by the Warm tier.
+    pub warm_quantizer: QuantizerKind,
     /// Byte size of a single Warm tier mmap chunk.
     pub warm_chunk_bytes: usize,
     /// Minimum number of records in a sealed segment before building an HNSW
     /// index. Smaller segments stay quantized/plain for efficiency.
     pub hnsw_threshold: usize,
+    /// Minimum size (in KB of FP32 vector data) of a sealed segment before
+    /// building an HNSW index.  If non-zero this overrides `hnsw_threshold`.
+    pub full_scan_threshold_kb: usize,
     /// Maximum number of sealed HNSW segments before the merge optimizer combines
     /// them. Keeping this small improves recall and search latency.
     pub merge_threshold_segments: usize,
     /// Maximum number of records a single merge operation may combine. This
     /// limits peak memory during HNSW rebuilds.
     pub merge_max_records: usize,
-    /// True if the Cold tier uses 1-bit sign quantization.
-    pub cold_sign: bool,
+    /// Quantizer used by the Cold tier.
+    pub cold_quantizer: QuantizerKind,
     /// Access-score threshold above which a record is promoted back to Hot.
     pub hot_promote_threshold: f64,
     /// Access-score threshold below which a record in Hot is demoted.
@@ -75,12 +132,13 @@ impl TierConfig {
     pub const FIXED: Self = Self {
         hot_capacity: 10_000,
         warm_capacity: 100_000,
-        warm_bits: 8,
+        warm_quantizer: QuantizerKind::Scalar { bits: 8 },
         warm_chunk_bytes: 16 * 1024 * 1024, // 16 MiB
         hnsw_threshold: 1000,
-        merge_threshold_segments: 4,
-        merge_max_records: 200_000,
-        cold_sign: true,
+        full_scan_threshold_kb: 10_000,
+        merge_threshold_segments: 2,
+        merge_max_records: 20_000,
+        cold_quantizer: QuantizerKind::Sign,
         hot_promote_threshold: 2.0,
         warm_demote_threshold: 0.5,
         recency_half_life_secs: 3600,
@@ -102,15 +160,26 @@ impl TierConfig {
         // low dimensions so we require more records there.
         let hnsw_threshold = (20_000.0 / (dim as f64).sqrt()) as usize;
         let hnsw_threshold = hnsw_threshold.max(512);
+        let full_scan_threshold_kb = 10_000usize;
         // Target ~16 MiB of 8-bit quantized vectors in the Warm tier.
         let warm_capacity = (16usize * 1024 * 1024)
             .saturating_div(dim)
             .clamp(2_048, 200_000);
+        // Cap merged HNSW segments at a size that one indexing thread can
+        // build quickly and that parallel multi-segment search can keep in
+        // cache. This is the Qdrant "one segment per indexing thread" model
+        // (lib/collection/src/optimizers_builder.rs:155): target ~10k vectors
+        // at D=1024, fewer at higher dimensions.
+        let merge_max_records = (40usize * 1024 * 1024)
+            .saturating_div(dim.saturating_mul(4))
+            .clamp(4_000, 25_000);
 
         Self {
             hot_capacity,
             warm_capacity,
             hnsw_threshold,
+            full_scan_threshold_kb,
+            merge_max_records,
             ..Self::FIXED
         }
     }
@@ -120,7 +189,9 @@ impl TierConfig {
     }
 
     pub fn merge_max_records(&self) -> usize {
-        self.merge_max_records.max(self.hot_capacity)
+        // Always at least one hot segment worth of records, and never less
+        // than 2 to avoid degenerate single-vector merges.
+        self.merge_max_records.max(self.hot_capacity).max(2)
     }
 }
 
@@ -135,6 +206,13 @@ impl Default for TierConfig {
 pub struct StoreConfig {
     pub dimension: usize,
     pub max_edges: usize,
+    /// HNSW level-0 connectivity factor.  `M0 = max_edges * level0_factor`.
+    pub level0_factor: usize,
+    /// HNSW construction beam width.  If zero, falls back to
+    /// `search_list_size.max(max_edges * 2)` for backward compatibility.
+    pub ef_construction: usize,
+    /// Search-time beam width (`ef`).  Used as the floor for the per-segment
+    /// candidate pool.
     pub search_list_size: usize,
     pub outlier_count: usize,
     pub initial_capacity: usize,
@@ -146,8 +224,23 @@ pub struct StoreConfig {
 }
 
 impl StoreConfig {
+    /// Effective HNSW construction beam width.
     pub fn ef_construction(&self) -> usize {
-        self.search_list_size.max(self.max_edges * 2)
+        let ef = if self.ef_construction == 0 {
+            self.search_list_size.max(self.max_edges * 2)
+        } else {
+            self.ef_construction
+        };
+        ef.max(self.max_edges * 2)
+    }
+
+    /// Effective HNSW level-0 connectivity.
+    pub fn m0(&self) -> usize {
+        if self.level0_factor == 0 {
+            self.max_edges * 2
+        } else {
+            self.max_edges * self.level0_factor
+        }
     }
 
     /// Sensible defaults scaled for the given vector dimension.
@@ -165,6 +258,8 @@ impl Default for StoreConfig {
         Self {
             dimension: 768,
             max_edges: 16,
+            level0_factor: 2,
+            ef_construction: 100,
             search_list_size: 100,
             outlier_count: 0,
             initial_capacity: 1024,

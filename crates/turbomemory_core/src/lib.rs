@@ -7,13 +7,15 @@ pub mod metrics;
 pub mod metrics_quantized;
 pub mod quantization;
 pub mod quantized_search;
+pub mod turbo_quant;
 
 pub use metrics::{
     cosine_distance, cosine_similarity, cosine_similarity_batch, dot_and_norms, dot_product,
     l2_distance_sq, CosineMetric, DotProductMetric, EuclideanMetric, Metric,
 };
-pub use quantization::{LloydMaxTable, Quantizer, ScalarQuantizer, SignQuantizer};
-pub use quantized_search::{EncodedQuery, QuantizedStore};
+pub use quantization::{LloydMaxTable, Quantizer, ScalarQuantizer, SignQuantizer, VectorQuantizer};
+pub use quantized_search::{AnyEncodedQuery, EncodedQuery, QuantizedStore};
+pub use turbo_quant::{TurboQuantMseQuantizer, TurboQuantProdQuantizer};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -86,8 +88,12 @@ pub fn random_diagonal_precondition(v: &mut [f32], seed: u64) {
     }
 }
 
-/// Preconditioning: random diagonal + FWHT. This spreads coordinate variance uniformly
-/// and is the first step of the TurboQuant pipeline.
+/// Preconditioning: random diagonal + FWHT, normalized to preserve L2 norm.
+///
+/// This implements a fast approximate random rotation: for a unit-norm input
+/// the output is also unit-norm, and each coordinate is approximately
+/// `N(0, 1/d)` distributed.  TurboQuant scales the Lloyd-Max centroids by
+/// `1/sqrt(d)` to match this distribution.
 pub fn precondition(v: &mut [f32], seed: u64) {
     random_diagonal_precondition(v, seed);
     fwht(v);
@@ -95,6 +101,23 @@ pub fn precondition(v: &mut [f32], seed: u64) {
     for x in v.iter_mut() {
         *x *= inv;
     }
+}
+
+/// Rotate a vector to the TurboQuant coordinate system and return its original norm.
+///
+/// The input is L2-normalized, then a fast approximate random rotation is
+/// applied.  The rotation is norm-preserving, so output coordinates are
+/// approximately `N(0, 1/d)`.  The original norm is returned so callers can
+/// rescale the decoded reconstruction.
+pub fn rotate_to_turbo_quant_domain(v: &mut [f32], seed: u64) -> f32 {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
+    }
+    precondition(v, seed);
+    norm
 }
 
 /// A lightweight owned-or-borrowed vector view.
@@ -115,10 +138,19 @@ mod tests {
     }
 
     #[test]
-    fn test_fwht_invertible() {
+    fn test_precondition_preserves_norm() {
         let mut v = vec![1.0f32, 0.0, 0.0, 0.0];
         precondition(&mut v, 42);
         let norm_sq: f32 = v.iter().map(|x| x * x).sum();
         assert!((norm_sq - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_rotate_to_turbo_quant_domain() {
+        let mut v = vec![3.0f32, 4.0, 0.0, 0.0];
+        let norm = rotate_to_turbo_quant_domain(&mut v, 42);
+        assert!((norm - 5.0).abs() < 1e-5);
+        let out_norm_sq: f32 = v.iter().map(|x| x * x).sum();
+        assert!((out_norm_sq - 1.0).abs() < 1e-5);
     }
 }

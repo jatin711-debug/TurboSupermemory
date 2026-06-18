@@ -1,5 +1,6 @@
 //! Quantization primitives for tiered vector storage.
 
+use crate::turbo_quant::{TurboQuantMseQuantizer, TurboQuantProdQuantizer};
 use crate::{validate_dimension, Result, TurboError};
 use serde::{Deserialize, Serialize};
 
@@ -150,6 +151,56 @@ impl Quantizer for ScalarQuantizer {
     }
     fn decode(&self, q: &[u8]) -> Result<Vec<f32>> {
         self.decode(q)
+    }
+}
+
+/// Unified quantizer enum used by storage manifests.
+///
+/// Lets Warm/Cold segments switch between scalar, sign, and TurboQuant
+/// quantizers without being generic over the concrete type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum VectorQuantizer {
+    Scalar(ScalarQuantizer),
+    Sign(SignQuantizer),
+    TurboQuantMse(TurboQuantMseQuantizer),
+    TurboQuantProd(TurboQuantProdQuantizer),
+}
+
+impl Quantizer for VectorQuantizer {
+    fn dim(&self) -> usize {
+        match self {
+            Self::Scalar(q) => q.dim(),
+            Self::Sign(q) => q.dim(),
+            Self::TurboQuantMse(q) => q.dim(),
+            Self::TurboQuantProd(q) => q.dim(),
+        }
+    }
+
+    fn encoded_bytes_per_vector(&self) -> usize {
+        match self {
+            Self::Scalar(q) => q.encoded_bytes_per_vector(),
+            Self::Sign(q) => q.encoded_bytes_per_vector(),
+            Self::TurboQuantMse(q) => q.encoded_bytes_per_vector(),
+            Self::TurboQuantProd(q) => q.encoded_bytes_per_vector(),
+        }
+    }
+
+    fn encode(&self, v: &[f32]) -> Result<Vec<u8>> {
+        match self {
+            Self::Scalar(q) => q.encode(v),
+            Self::Sign(q) => q.encode(v),
+            Self::TurboQuantMse(q) => q.encode(v),
+            Self::TurboQuantProd(q) => q.encode(v),
+        }
+    }
+
+    fn decode(&self, encoded: &[u8]) -> Result<Vec<f32>> {
+        match self {
+            Self::Scalar(q) => q.decode(encoded),
+            Self::Sign(q) => q.decode(encoded),
+            Self::TurboQuantMse(q) => q.decode(encoded),
+            Self::TurboQuantProd(q) => q.decode(encoded),
+        }
     }
 }
 

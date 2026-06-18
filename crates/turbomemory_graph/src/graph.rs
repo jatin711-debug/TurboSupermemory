@@ -180,6 +180,21 @@ impl MemoryGraph {
         self.edges.len()
     }
 
+    /// Number of memory nodes in the graph.
+    pub fn memory_count(&self) -> usize {
+        self.iter_memory_nodes().count()
+    }
+
+    /// Number of memory-node neighbors (outgoing association edges) for a
+    /// concept node.  Returns 0 if the node does not exist or is not a concept.
+    pub fn concept_degree(&self, concept: &str) -> usize {
+        let key = NodeId::concept(concept).as_str();
+        self.neighbors(&key)
+            .iter()
+            .filter(|e| matches!(e.kind, EdgeKind::Association))
+            .count()
+    }
+
     pub fn nodes(&self) -> &BTreeMap<String, Node> {
         &self.nodes
     }
