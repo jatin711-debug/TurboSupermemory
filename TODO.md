@@ -6,6 +6,18 @@
 
 ---
 
+## Recently Completed — 2026-06-18 (session 2)
+
+Shipped in commit `9fd68f5` ("feat: implement oversampling in reranking for improved neighbor recovery in vector segments"). Three improvement areas targeting consolidation speed, high-dimensional recall, and ingest cost.
+
+- **Multi-threaded HNSW build (resolves 2.11).** `usearch_index.rs::build` now seeds the graph with the first `PARALLEL_SEED_POINTS = 256` points single-threaded, then inserts the remainder via a bounded rayon pool. Per-build thread count is `clamp(num_cpus / max_concurrent_builds, 1, 16)` so concurrent segment builds don't oversubscribe. Measured at 10k: consolidation time roughly halved — 768-dim 28.5 s → 14.2 s, 1024-dim 34.8 s → 17.9 s — with no recall regression (a self-recall guard test, `usearch_parallel_build_preserves_recall`, asserts recall@1 ≥ 0.95).
+- **Oversampling margin in quantize-and-rerank (recall fix).** `warm.rs`/`cold.rs` `search` previously shortlisted *exactly* `top_k` quantized candidates before f32 rerank, so a true neighbor that quantizes to rank `top_k+1` was dropped before rerank could recover it. Now shortlists `max(top_k * RERANK_OVERSAMPLE, MIN_RERANK_SHORTLIST)` (8× / 64-floor) then reranks and truncates to `top_k`. Effect is muted at 10k (everything merges into one HNSW segment, so recall is HNSW-bound); the payoff is at 100k+ where Warm/Cold dominate. Guard test `warm_segment_oversampling_recovers_exact_nearest`.
+- **Zero-copy numpy ingest (resolves 1.9 / 8.1).** PyO3 bindings now borrow contiguous `float32` numpy arrays directly (`F32Input`/`F32Matrix` View variants) instead of `slice.to_vec()` / `row.to_vec()`; lists, non-contiguous arrays, and wrong-dtype inputs fall back to owned copies. Engine batch signature changed to `&[&[f32]]` to carry the borrow through. The borrowed view is held on-stack across `py.allow_threads`; only the derived `&[f32]` is captured by the GIL-released closure.
+
+Validated: full workspace test suite passes (storage incl. 2 new guard tests, core, graph, api); PyO3 build clean.
+
+---
+
 ## Recently Completed — 2026-06-18
 
 Shipped in commit `35cc6c7` ("fix: improve ANN recall with 8-bit Cold tier and configurable consolidation"). These resolve part of Phase 3/4 ahead of the structural work and fix a recall regression surfaced by high-dimensional benchmarks.
@@ -28,7 +40,7 @@ Validated at 50k × 1024 after full consolidation: adversarial-data recall floor
 3. **Global `RwLock<SegmentHolder>`** — searches and segment mutations contend on one lock.
 4. **In-memory metadata cache** — every record's metadata lives in a `HashMap`; won't fit RAM at 1M+ text records.
 5. **No vacuum / physical deletion** — deleted vectors and old segments are never reclaimed.
-6. **Single-threaded HNSW builds** with a 512 MiB default budget — sealing 1M × 4k would take hours.
+6. **~~Single-threaded HNSW builds~~** — **Fixed (2026-06-18).** Builds now seed 256 points single-threaded then insert the remainder in parallel; see [Recently Completed](#recently-completed--2026-06-18-session-2). The 512 MiB default budget still applies.
 7. **~~1-bit Cold tier collapse at 4k~~** — **Fixed (2026-06-18).** Cold tier now defaults to 8-bit scalar quantization; see [Recently Completed](#recently-completed--2026-06-18).
 8. **No visited-set pool, no adaptive filtering, no segment-level parallelism**, and heavy per-query allocation.
 9. **No GPU acceleration** — CPU-only HNSW build and distance compute.
@@ -67,7 +79,7 @@ Qdrant's ingestion is fast because inserts are **appends to plain segments + WAL
 | 1.6 | **Group commit / async WAL fsync** | `crates/turbomemory_storage/src/wal.rs` | Pending | Batch multiple in-flight inserts into one fsync. Separate committer thread. |
 | 1.7 | **Smallest-appendable-segment selection** | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | If multiple Hot segments exist, write to the one with most free capacity. Qdrant: `lib/shard/src/segment_holder/mod.rs:313`. |
 | 1.8 | **Batch payload / text / graph updates** | `crates/turbomemory_storage/src/update_worker.rs` | Pending | Apply metadata, payload index, text index, and graph edges in chunks, not per-point. Qdrant chunks payload ops at 32 (`lib/shard/src/update.rs:714`). |
-| 1.9 | **Zero-copy Python ingest** | `crates/turbomemory_python/src/lib.rs` | Pending | Remove `slice.to_vec()` / `row.to_vec()` in `extract_f32_vec` / `extract_f32_matrix`. Borrow `numpy` arrays directly; copy only when non-contiguous or wrong dtype. |
+| 1.9 | **Zero-copy Python ingest** | `crates/turbomemory_python/src/lib.rs` | Done | Done (2026-06-18). Borrows contiguous `float32` numpy arrays via `F32Input`/`F32Matrix`; copies only for non-contiguous / wrong-dtype / list inputs. Engine batch API now takes `&[&[f32]]`. |
 | 1.10 | **Streaming bulk insert API** | `crates/turbomemory_python/src/lib.rs` | Pending | Accept iterator/reader or chunked callback API for datasets larger than RAM. |
 | 1.11 | **Pipeline insert: validate → WAL append → segment append → ack** | `crates/turbomemory_storage/src/engine.rs` | Pending | Decouple durability ack from index visibility. Qdrant acks after WAL write; segment update is async. |
 
@@ -89,7 +101,7 @@ Qdrant uses four optimizers: **Indexing**, **Merge**, **Vacuum**, **ConfigMismat
 | 2.8 | **Build new segments in temp directory + atomic rename** | `crates/turbomemory_storage/src/optimizer.rs`, `segment_builder.rs` (new) | Pending | Qdrant `temp_segments/` → atomic rename into `segments/` (`lib/segment/src/segment_constructor/segment_builder.rs:761`). Current TSM builds in-place under lock; fix. |
 | 2.9 | **Disk-space guard before optimization** | `crates/turbomemory_storage/src/optimizer.rs` | Pending | Require ≥2× source segment size free in temp path. Qdrant: `lib/shard/src/optimize.rs:601`. |
 | 2.10 | **Resource budget: IO permit → CPU permit** | `crates/turbomemory_storage/src/optimizer.rs`, `resource_budget.rs` | Pending | Acquire IO permit for data copying, replace with CPU permit for HNSW indexing. Qdrant: `lib/shard/src/optimize.rs:330`. |
-| 2.11 | **Multi-threaded HNSW construction** | `crates/turbomemory_storage/src/segments/sealed_hot.rs`, `usearch_index.rs` | Pending | First 256 points single-threaded, then parallel insertion. Default build threads: `clamp(num_cpus, 1, 16)` (Qdrant: `lib/common/common/src/defaults.rs:79`). |
+| 2.11 | **Multi-threaded HNSW construction** | `crates/turbomemory_storage/src/segments/usearch_index.rs` | Done | Done (2026-06-18). First 256 points single-threaded (`PARALLEL_SEED_POINTS`), remainder via bounded rayon pool; threads = `clamp(num_cpus / max_concurrent_builds, 1, 16)`. ~2× faster consolidation at 10k, no recall regression. |
 | 2.12 | **Old-index reuse / heal on merge** | `crates/turbomemory_storage/src/segments/sealed_hot.rs` | Pending | When merging already-indexed segments, reuse/heal existing HNSW graph instead of rebuilding from scratch. Qdrant: `OldIndexCandidate` in `lib/segment/src/index/hnsw_index/hnsw/build.rs:150`. |
 | 2.13 | **Cache hygiene: prefault before build, drop after build** | `crates/turbomemory_storage/src/optimizer.rs` | Pending | `populate()` vectors before HNSW build; `clear_cache()` after sealing to avoid page-cache pollution. Qdrant: `lib/segment/src/segment_constructor/segment_builder.rs:834`, `:675-733`. |
 | 2.14 | **Deferred points / `prevent_unoptimized`** | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Hide new writes in over-capacity segments until optimization completes, preventing unbounded exact-scan segments. Qdrant pattern. |
@@ -124,7 +136,7 @@ At 4k dimensions, distance compute is the bottleneck. We need SIMD, batched kern
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
 | 4.1 | **Batched SIMD distance kernel (matrix × query)** | `crates/turbomemory_core/src/metrics.rs` | Pending | Replace per-vector `cosine_similarity` with blocked AVX2/FMA matrix multiply. Four-accumulator unroll. Threshold: AVX for `dim >= 32`, SSE/NEON for `dim >= 16`. Qdrant: `lib/segment/src/spaces/`. |
-| 4.2 | **Pre-normalize cosine vectors** | `crates/turbomemory_core/src/metrics.rs` | Pending | Store normalized vectors so cosine = dot. Query normalized once. |
+| 4.2 | **Pre-normalize cosine vectors** | `crates/turbomemory_core/src/metrics.rs` | Done | Already implemented. Vectors are L2-normalized on insert/update (`engine.rs` `normalize`); usearch index uses `MetricKind::Cos`; rerank uses self-normalizing `cosine_similarity_batch`. |
 | 4.3 | **Scalar int8 quantizer** | `crates/turbomemory_core/src/quantization/` (new) | Pending | `alpha=(max-min)/127`, offset=min, per-metric multiplier, vector offset prefix. SIMD i8 dot/L1. Qdrant: `lib/quantization/src/encoded_vectors_u8.rs`. |
 | 4.4 | **Product Quantization (PQ)** | `crates/turbomemory_core/src/quantization/` (new) | Pending | 256 centroids/subspace, kmeans sample 10k, max 100 iter, tol 1e-5. Query builds LUT; SIMD LUT gather. Qdrant: `lib/quantization/src/encoded_vectors_pq.rs`. |
 | 4.5 | **Binary / 1-bit + 1.5-bit / 2-bit quantizers** | `crates/turbomemory_core/src/quantization/` (new) | Pending | XOR-popcount via SSE4.2/AVX-512/NEON; optional scalar query encoding. Default rescoring=true. Qdrant: `lib/quantization/src/encoded_vectors_binary.rs`. |
@@ -207,7 +219,7 @@ GPU is **not a magic bullet**. Qdrant uses GPU only for HNSW **build**, not sear
 
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
-| 8.1 | **Zero-copy numpy ingest** | `crates/turbomemory_python/src/lib.rs` | Pending | See 1.9. |
+| 8.1 | **Zero-copy numpy ingest** | `crates/turbomemory_python/src/lib.rs` | Done | Done (2026-06-18). See 1.9. |
 | 8.2 | **Streaming / chunked bulk insert** | `crates/turbomemory_python/src/lib.rs` | Pending | See 1.10. |
 | 8.3 | **Async Python API (`asyncio`)** | `crates/turbomemory_python/src/lib.rs` | Pending | Return awaitable futures for insert/search; release GIL. |
 | 8.4 | **Collection / shard config in Python** | `crates/turbomemory_python/src/lib.rs` | Pending | Expose `num_shards`, `indexing_threshold_kb`, `max_segment_size_kb`, quantization config. |
