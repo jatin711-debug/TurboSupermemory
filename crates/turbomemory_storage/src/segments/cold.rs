@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use turbomemory_core::quantization::{Quantizer, ScalarQuantizer, SignQuantizer, VectorQuantizer};
 use turbomemory_core::quantized_search::{EncodedQuery, QuantizedStore};
 use turbomemory_core::turbo_quant::{TurboQuantMseQuantizer, TurboQuantProdQuantizer};
-use turbomemory_core::{cosine_similarity, validate_dimension};
+use turbomemory_core::{cosine_similarity_batch, validate_dimension};
 
 const DATA_FILE: &str = "data.bin";
 const MANIFEST_FILE: &str = "manifest.json";
@@ -220,14 +220,22 @@ impl VectorSegment for ColdSegment {
         let candidates = crate::segments::top_k_minheap(candidates.into_iter(), top_k);
 
         let view = vectors.read_view();
-        let mut reranked: Vec<ScoredPoint> = candidates
+        let mut offsets = Vec::with_capacity(candidates.len());
+        let mut refs: Vec<&[f32]> = Vec::with_capacity(candidates.len());
+        for c in &candidates {
+            if let Some(v) = view.get(c.offset) {
+                offsets.push(c.offset);
+                refs.push(v);
+            }
+        }
+        let scores = cosine_similarity_batch(query, &refs);
+        let mut reranked: Vec<ScoredPoint> = offsets
             .into_iter()
-            .filter_map(|c| {
-                view.get(c.offset).map(|v| ScoredPoint {
-                    offset: c.offset,
-                    score: cosine_similarity(query, v),
-                    tier: Tier::Cold,
-                })
+            .zip(scores)
+            .map(|(offset, score)| ScoredPoint {
+                offset,
+                score,
+                tier: Tier::Cold,
             })
             .collect();
         reranked.sort_by(|a, b| {

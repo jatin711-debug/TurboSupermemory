@@ -76,10 +76,9 @@ impl IndexApplier {
                     needs_seal = true;
                 }
             }
-        }
-        if needs_seal {
-            let mut segments = self.segments.write();
-            segments.seal_hot(&self.vectors)?;
+            if needs_seal {
+                segments.seal_hot(&self.vectors)?;
+            }
         }
         Ok(())
     }

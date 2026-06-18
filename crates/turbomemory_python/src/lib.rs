@@ -157,7 +157,8 @@ impl PyMemoryEngine {
         hnsw_threshold=None,
         ef_construction=None,
         level0_factor=None,
-        full_scan_threshold_kb=None
+        full_scan_threshold_kb=None,
+        auto_consolidation_secs=60
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -176,6 +177,7 @@ impl PyMemoryEngine {
         ef_construction: Option<usize>,
         level0_factor: Option<usize>,
         full_scan_threshold_kb: Option<usize>,
+        auto_consolidation_secs: u64,
     ) -> PyResult<Self> {
         let mut config = StoreConfig::default_for_dimension(dimension);
         config.max_edges = max_edges;
@@ -216,7 +218,14 @@ impl PyMemoryEngine {
             config.tier.full_scan_threshold_kb = fs;
         }
 
-        config.auto_consolidation_interval = Some(Duration::from_secs(60));
+        // 0 disables background consolidation entirely; otherwise it runs on
+        // the given interval. Disabling is useful for benchmarks and for
+        // workloads that drive consolidation manually via trigger_consolidation.
+        config.auto_consolidation_interval = if auto_consolidation_secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(auto_consolidation_secs))
+        };
         let inner = StorageEngine::open(db_path, config).map_err(storage_err)?;
         Ok(Self { inner })
     }

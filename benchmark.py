@@ -104,6 +104,12 @@ def parse_args():
     parser.add_argument("--warm-capacity", type=int, default=None, help="Warm segment capacity")
     parser.add_argument("--hnsw-threshold", type=int, default=None, help="Min records before building HNSW")
     parser.add_argument("--trigger-consolidation", action="store_true", help="Force background consolidation after ingestion")
+    parser.add_argument("--ef", type=int, default=200, help="Search list size (ef) passed to TSM search_ann; higher trades latency for recall")
+    parser.add_argument("--auto-consolidation-secs", type=int, default=0,
+                        help="TSM background consolidation interval in seconds; 0 disables it (default 0 to avoid penalizing idle time during baseline ingest)")
+    parser.add_argument("--data-distribution", choices=["clustered", "random"], default="clustered",
+                        help="Embedding distribution: 'clustered' (realistic, correlated) or 'random' (near-orthogonal Gaussian)")
+    parser.add_argument("--num-clusters", type=int, default=64, help="Number of clusters when --data-distribution=clustered")
     return parser.parse_args()
 
 
@@ -251,18 +257,42 @@ def run_benchmark():
     print(f"  - Query Count    : {args.num_queries}")
     print(f"  - Vector Dim     : {args.dimension}")
     print(f"  - LLM Latency    : {args.llm_delay * 1000:.1f} ms")
+    print(f"  - Data Dist      : {args.data_distribution}" +
+          (f" ({args.num_clusters} clusters)" if args.data_distribution == "clustered" else ""))
+    print(f"  - TSM ef         : {args.ef}")
+    print(f"  - TSM auto-consol: {'disabled' if args.auto_consolidation_secs == 0 else f'{args.auto_consolidation_secs}s'}")
     print(f"  - Qdrant Status  : {'AVAILABLE (In-Memory)' if HAS_QDRANT else 'NOT INSTALLED'}")
     if args.tsm_only:
         print("  - Mode           : TurboSuperMemory only")
     print("=========================================================================\n")
 
-    # Generate synthetic dataset
+    # Generate synthetic dataset.
+    # Real embeddings are not uniformly random: they live on a lower-dimensional
+    # manifold with strong local clustering. Pure random Gaussian unit vectors in
+    # high dimensions are near-orthogonal (pairwise cosine ~ 1/sqrt(dim)), which
+    # makes the true top-k separated by noise-level gaps (~0.001) and is adversarial
+    # for every ANN/quantization scheme. 'clustered' models realistic structure;
+    # 'random' keeps the old behavior for stress testing.
     np.random.seed(42)
-    raw_embeddings = np.random.randn(args.num_items, args.dimension).astype(np.float32)
+    if args.data_distribution == "clustered":
+        n_clusters = max(1, min(args.num_clusters, args.num_items))
+        centers = np.random.randn(n_clusters, args.dimension).astype(np.float32)
+        centers /= np.linalg.norm(centers, axis=1, keepdims=True)
+        assign = np.random.randint(0, n_clusters, size=args.num_items)
+        # Tight intra-cluster spread so members are genuinely similar.
+        jitter = 0.15 * np.random.randn(args.num_items, args.dimension).astype(np.float32)
+        raw_embeddings = centers[assign] + jitter
+        # Queries are perturbed cluster members (the realistic "find similar" case).
+        q_assign = np.random.randint(0, n_clusters, size=args.num_queries)
+        q_jitter = 0.15 * np.random.randn(args.num_queries, args.dimension).astype(np.float32)
+        raw_queries = centers[q_assign] + q_jitter
+    else:
+        raw_embeddings = np.random.randn(args.num_items, args.dimension).astype(np.float32)
+        raw_queries = np.random.randn(args.num_queries, args.dimension).astype(np.float32)
+
     norms = np.linalg.norm(raw_embeddings, axis=1, keepdims=True)
     embeddings = raw_embeddings / np.where(norms == 0, 1.0, norms)
-    
-    raw_queries = np.random.randn(args.num_queries, args.dimension).astype(np.float32)
+
     q_norms = np.linalg.norm(raw_queries, axis=1, keepdims=True)
     queries = raw_queries / np.where(q_norms == 0, 1.0, q_norms)
 
@@ -281,6 +311,7 @@ def run_benchmark():
         "search_list_size": 100,
         "outlier_count": 0,
         "initial_capacity": args.num_items,
+        "auto_consolidation_secs": args.auto_consolidation_secs,
     }
     if args.warm_quantizer is not None:
         engine_kwargs["warm_quantizer"] = args.warm_quantizer
@@ -392,7 +423,7 @@ def run_benchmark():
     tsm_results = []
     t0 = time.perf_counter()
     for q in queries:
-        tsm_results.append(tsm_engine.search_ann(q, top_k))
+        tsm_results.append(tsm_engine.search_ann(q, top_k, args.ef))
         if HAS_PSUTIL:
             tsm_peak_rss = max(tsm_peak_rss, peak_memory_mb())
     tsm_search = (time.perf_counter() - t0) * 1000.0 / args.num_queries

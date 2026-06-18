@@ -138,7 +138,11 @@ impl TierConfig {
         full_scan_threshold_kb: 10_000,
         merge_threshold_segments: 2,
         merge_max_records: 20_000,
-        cold_quantizer: QuantizerKind::Sign,
+        // 8-bit scalar, not 1-bit sign: sign quantization cannot resolve the
+        // tiny cosine gaps between near-orthogonal high-dimensional vectors, so
+        // candidate selection from a sign-quantized Cold tier silently drops the
+        // true top-k before the full-f32 rerank ever sees them.
+        cold_quantizer: QuantizerKind::Scalar { bits: 8 },
         hot_promote_threshold: 2.0,
         warm_demote_threshold: 0.5,
         recency_half_life_secs: 3600,
@@ -161,10 +165,14 @@ impl TierConfig {
         let hnsw_threshold = (20_000.0 / (dim as f64).sqrt()) as usize;
         let hnsw_threshold = hnsw_threshold.max(512);
         let full_scan_threshold_kb = 10_000usize;
-        // Target ~16 MiB of 8-bit quantized vectors in the Warm tier.
-        let warm_capacity = (16usize * 1024 * 1024)
+        // Target ~64 MiB of 8-bit quantized vectors in the Warm tier. The Warm
+        // tier keeps full 8-bit precision and reranks with f32, so it preserves
+        // recall on near-orthogonal high-dim data; the Cold tier exists for
+        // capacity, not recall. Sizing Warm generously keeps realistic
+        // collections (tens of thousands of vectors) out of Cold.
+        let warm_capacity = (64usize * 1024 * 1024)
             .saturating_div(dim)
-            .clamp(2_048, 200_000);
+            .clamp(2_048, 500_000);
         // Cap merged HNSW segments at a size that one indexing thread can
         // build quickly and that parallel multi-segment search can keep in
         // cache. This is the Qdrant "one segment per indexing thread" model
@@ -301,14 +309,14 @@ mod tests {
         assert!(tiny.hot_capacity <= 8192);
         assert!(tiny.hot_capacity >= 512);
         assert!(tiny.hnsw_threshold >= 512);
-        assert!(tiny.warm_capacity <= 200_000);
+        assert!(tiny.warm_capacity <= 500_000);
         assert!(tiny.warm_capacity >= 2_048);
 
         let huge = TierConfig::scaled_for_dimension(8192);
         assert!(huge.hot_capacity >= 512);
         assert!(huge.hot_capacity <= 8192);
         assert!(huge.warm_capacity >= 2_048);
-        assert!(huge.warm_capacity <= 200_000);
+        assert!(huge.warm_capacity <= 500_000);
     }
 
     #[test]

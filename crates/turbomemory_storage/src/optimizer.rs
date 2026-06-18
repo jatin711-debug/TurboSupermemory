@@ -213,7 +213,7 @@ impl BackgroundOptimizer {
     }
 
     fn run_seal(engine: &StorageEngine) {
-        let mut segments = engine.segments.write();
+        let segments = engine.segments.read();
         let _ = segments.seal_hot(&engine.vectors);
     }
 
@@ -236,7 +236,7 @@ impl BackgroundOptimizer {
     ) -> crate::Result<bool> {
         // Grab the next plain segment and the metadata needed to build it.
         let job = {
-            let mut segments = engine.segments.write();
+            let segments = engine.segments.read();
             let plain = match segments.pop_sealing_plain() {
                 Some(p) => p,
                 None => return Ok(false),
@@ -284,7 +284,7 @@ impl BackgroundOptimizer {
         let built = build_segment(engine, &job);
 
         // Install the new segment and drop the old plain one.
-        let mut segments = engine.segments.write();
+        let segments = engine.segments.read();
         segments.remove_sealing_plain(&job.plain);
         match built {
             Ok(BuiltSegment::Sealed(sealed)) => {
@@ -374,7 +374,7 @@ impl BackgroundOptimizer {
             }
         }
         if offsets.is_empty() {
-            let mut segments = engine.segments.write();
+            let segments = engine.segments.read();
             segments.remove_sealed_hot_segments(&candidates);
             segments.publish_snapshot();
             return Ok(true);
@@ -405,10 +405,7 @@ impl BackgroundOptimizer {
             .collect();
 
         // 4. Build the new segment outside the holder lock.
-        let new_path = {
-            let mut segments = engine.segments.write();
-            segments.sealed_hot_path()
-        };
+        let new_path = engine.segments.read().sealed_hot_path();
         let sealed = match SealedHotSegment::from_vectors(&new_path, config, &borrowed) {
             Ok(s) => s,
             Err(e) => {
@@ -418,7 +415,7 @@ impl BackgroundOptimizer {
         };
 
         // 5. Atomically install the merged segment and remove the old ones.
-        let mut segments = engine.segments.write();
+        let segments = engine.segments.read();
         let removed = segments.remove_sealed_hot_segments(&candidates);
         if removed == 0 {
             // The candidates disappeared; the new segment is orphaned. Keep it

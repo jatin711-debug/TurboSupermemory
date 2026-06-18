@@ -224,7 +224,7 @@ impl StorageEngine {
             }
         }
 
-        let mut segments = SegmentHolder::from_records(
+        let segments = SegmentHolder::from_records(
             config.clone(),
             segments_dir,
             &records_vec,
@@ -873,7 +873,7 @@ impl StorageEngine {
     pub fn trigger_consolidation(&self) -> crate::Result<(usize, usize, usize)> {
         // Make sure recent access counts are visible to the promotion scorer.
         self.access_counters.drain_into(&self.meta)?;
-        let mut segments = self.segments.write();
+        let segments = self.segments.read();
         let (sealed, compacted, promoted) =
             segments.trigger_consolidation(&self.meta, &self.vectors)?;
         drop(segments);
@@ -1501,6 +1501,76 @@ mod tests {
         // return either of them. Just verify the top result is a perfect cosine match.
         assert!(results[0].1 > 0.9999, "top result should be an exact match");
         assert!(results[0].0.starts_with("mem_"));
+    }
+
+    /// Run searches on many threads while another thread drives consolidation
+    /// (seal + merge installs) on the same engine. The ArcSwap snapshot path
+    /// means searches must keep returning valid results and never deadlock with
+    /// the now-internally-synchronized SegmentHolder mutations.
+    #[test]
+    fn concurrent_search_during_consolidation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::open(tmp.path(), hnsw_test_config(32)).unwrap();
+        let n = 600usize;
+        for i in 0..n {
+            engine
+                .insert(
+                    &format!("mem_{i}"),
+                    &format!("text {i}"),
+                    &make_vec(32, i),
+                    1.0,
+                    &[],
+                )
+                .unwrap();
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Searcher threads hammer the engine while consolidation runs.
+        let searchers: Vec<_> = (0..4)
+            .map(|t| {
+                let engine = Arc::clone(&engine);
+                let stop = Arc::clone(&stop);
+                thread::spawn(move || {
+                    let mut iters = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let results = engine
+                            .search_ann(&make_vec(32, t), 5)
+                            .expect("search must not fail during consolidation");
+                        for (id, _) in &results {
+                            assert!(id.starts_with("mem_"), "unexpected id {id}");
+                        }
+                        iters += 1;
+                    }
+                    iters
+                })
+            })
+            .collect();
+
+        // Driver thread: repeatedly consolidate (seal + merge + flush).
+        let driver = {
+            let engine = Arc::clone(&engine);
+            thread::spawn(move || {
+                for _ in 0..5 {
+                    engine.trigger_consolidation().unwrap();
+                }
+            })
+        };
+
+        driver.join().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        for s in searchers {
+            let iters = s.join().unwrap();
+            assert!(iters > 0, "searcher should have run at least once");
+        }
+
+        // Final search still returns a full result set with a perfect top match.
+        let results = engine.search_ann(&make_vec(32, 0), 5).unwrap();
+        assert_eq!(results.len(), 5);
+        assert!(results[0].1 > 0.9999, "top result should be an exact match");
     }
 
     #[test]

@@ -150,11 +150,100 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// All slices must have the same length.  Returns a vector of scores in
 /// `[-1, 1]` parallel to `vectors`.
+///
+/// The query's squared norm is computed once for the whole batch, and vectors
+/// are scored four at a time so each query SIMD load is reused across the
+/// block (a blocked AVX2/FMA matrix-multiply with a four-accumulator unroll).
 pub fn cosine_similarity_batch(query: &[f32], vectors: &[&[f32]]) -> Vec<f32> {
-    vectors
-        .iter()
-        .map(|v| cosine_similarity(query, v))
-        .collect()
+    let mut out = Vec::with_capacity(vectors.len());
+    if vectors.is_empty() {
+        return out;
+    }
+    // ||query||^2 computed once instead of once per vector.
+    let na = dot_product(query, query);
+
+    let mut chunks = vectors.chunks_exact(4);
+    for chunk in &mut chunks {
+        let dn = dot_and_nb_x4(query, chunk[0], chunk[1], chunk[2], chunk[3]);
+        for (dot, nb) in dn {
+            out.push(finalize_cosine(dot, na, nb));
+        }
+    }
+    for v in chunks.remainder() {
+        let dot = dot_product(query, v);
+        let nb = dot_product(v, v);
+        out.push(finalize_cosine(dot, na, nb));
+    }
+    out
+}
+
+/// Combine a dot product and the two squared norms into a clamped cosine score.
+#[inline]
+fn finalize_cosine(dot: f32, norm_sq_a: f32, norm_sq_b: f32) -> f32 {
+    let denom = (norm_sq_a * norm_sq_b).sqrt();
+    if denom == 0.0 {
+        0.0
+    } else {
+        (dot / denom).clamp(-1.0, 1.0)
+    }
+}
+
+/// Dot product and squared norm of four vectors against one query, in lockstep.
+///
+/// Returns `[(dot, ||v||^2); 4]`.  All five slices must have the same length.
+#[inline]
+fn dot_and_nb_x4(
+    q: &[f32],
+    v0: &[f32],
+    v1: &[f32],
+    v2: &[f32],
+    v3: &[f32],
+) -> [(f32, f32); 4] {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: guarded by runtime feature detection above.
+            return unsafe { dot_and_nb_x4_avx2(q, v0, v1, v2, v3) };
+        }
+        if std::is_x86_feature_detected!("sse") {
+            // SAFETY: guarded by runtime feature detection above.
+            return unsafe { dot_and_nb_x4_sse(q, v0, v1, v2, v3) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: AArch64 guarantees NEON.
+        return unsafe { dot_and_nb_x4_neon(q, v0, v1, v2, v3) };
+    }
+    dot_and_nb_x4_scalar(q, v0, v1, v2, v3)
+}
+
+fn dot_and_nb_x4_scalar(
+    q: &[f32],
+    v0: &[f32],
+    v1: &[f32],
+    v2: &[f32],
+    v3: &[f32],
+) -> [(f32, f32); 4] {
+    let vs = [v0, v1, v2, v3];
+    let mut dot = [0.0f32; 4];
+    let mut nb = [0.0f32; 4];
+    for (k, v) in vs.iter().enumerate() {
+        let mut d = 0.0f32;
+        let mut n = 0.0f32;
+        for (x, y) in q.iter().zip(v.iter()) {
+            d += x * y;
+            n += y * y;
+        }
+        dot[k] = d;
+        nb[k] = n;
+    }
+    [
+        (dot[0], nb[0]),
+        (dot[1], nb[1]),
+        (dot[2], nb[2]),
+        (dot[3], nb[3]),
+    ]
 }
 
 fn dot_product_scalar(a: &[f32], b: &[f32]) -> f32 {
@@ -347,6 +436,142 @@ mod x86 {
         }
         (dot, na, nb)
     }
+
+    #[inline]
+    unsafe fn hsum256(v: __m256) -> f32 {
+        let mut tmp = [0.0f32; 8];
+        _mm256_storeu_ps(tmp.as_mut_ptr(), v);
+        tmp.iter().sum::<f32>()
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn dot_and_nb_x4_avx2(
+        q: &[f32],
+        v0: &[f32],
+        v1: &[f32],
+        v2: &[f32],
+        v3: &[f32],
+    ) -> [(f32, f32); 4] {
+        let len = q.len();
+        let mut d0 = _mm256_setzero_ps();
+        let mut d1 = _mm256_setzero_ps();
+        let mut d2 = _mm256_setzero_ps();
+        let mut d3 = _mm256_setzero_ps();
+        let mut n0 = _mm256_setzero_ps();
+        let mut n1 = _mm256_setzero_ps();
+        let mut n2 = _mm256_setzero_ps();
+        let mut n3 = _mm256_setzero_ps();
+        let mut i = 0usize;
+        while i + 8 <= len {
+            let qv = _mm256_loadu_ps(q.as_ptr().add(i));
+            let a0 = _mm256_loadu_ps(v0.as_ptr().add(i));
+            let a1 = _mm256_loadu_ps(v1.as_ptr().add(i));
+            let a2 = _mm256_loadu_ps(v2.as_ptr().add(i));
+            let a3 = _mm256_loadu_ps(v3.as_ptr().add(i));
+            d0 = _mm256_fmadd_ps(qv, a0, d0);
+            d1 = _mm256_fmadd_ps(qv, a1, d1);
+            d2 = _mm256_fmadd_ps(qv, a2, d2);
+            d3 = _mm256_fmadd_ps(qv, a3, d3);
+            n0 = _mm256_fmadd_ps(a0, a0, n0);
+            n1 = _mm256_fmadd_ps(a1, a1, n1);
+            n2 = _mm256_fmadd_ps(a2, a2, n2);
+            n3 = _mm256_fmadd_ps(a3, a3, n3);
+            i += 8;
+        }
+        let mut dot = [hsum256(d0), hsum256(d1), hsum256(d2), hsum256(d3)];
+        let mut nb = [hsum256(n0), hsum256(n1), hsum256(n2), hsum256(n3)];
+        while i < len {
+            let qx = *q.get_unchecked(i);
+            let x0 = *v0.get_unchecked(i);
+            let x1 = *v1.get_unchecked(i);
+            let x2 = *v2.get_unchecked(i);
+            let x3 = *v3.get_unchecked(i);
+            dot[0] += qx * x0;
+            dot[1] += qx * x1;
+            dot[2] += qx * x2;
+            dot[3] += qx * x3;
+            nb[0] += x0 * x0;
+            nb[1] += x1 * x1;
+            nb[2] += x2 * x2;
+            nb[3] += x3 * x3;
+            i += 1;
+        }
+        [
+            (dot[0], nb[0]),
+            (dot[1], nb[1]),
+            (dot[2], nb[2]),
+            (dot[3], nb[3]),
+        ]
+    }
+
+    #[inline]
+    unsafe fn hsum128(v: __m128) -> f32 {
+        let mut tmp = [0.0f32; 4];
+        _mm_storeu_ps(tmp.as_mut_ptr(), v);
+        tmp.iter().sum::<f32>()
+    }
+
+    #[inline]
+    #[target_feature(enable = "sse")]
+    pub unsafe fn dot_and_nb_x4_sse(
+        q: &[f32],
+        v0: &[f32],
+        v1: &[f32],
+        v2: &[f32],
+        v3: &[f32],
+    ) -> [(f32, f32); 4] {
+        let len = q.len();
+        let mut d0 = _mm_setzero_ps();
+        let mut d1 = _mm_setzero_ps();
+        let mut d2 = _mm_setzero_ps();
+        let mut d3 = _mm_setzero_ps();
+        let mut n0 = _mm_setzero_ps();
+        let mut n1 = _mm_setzero_ps();
+        let mut n2 = _mm_setzero_ps();
+        let mut n3 = _mm_setzero_ps();
+        let mut i = 0usize;
+        while i + 4 <= len {
+            let qv = _mm_loadu_ps(q.as_ptr().add(i));
+            let a0 = _mm_loadu_ps(v0.as_ptr().add(i));
+            let a1 = _mm_loadu_ps(v1.as_ptr().add(i));
+            let a2 = _mm_loadu_ps(v2.as_ptr().add(i));
+            let a3 = _mm_loadu_ps(v3.as_ptr().add(i));
+            d0 = _mm_add_ps(d0, _mm_mul_ps(qv, a0));
+            d1 = _mm_add_ps(d1, _mm_mul_ps(qv, a1));
+            d2 = _mm_add_ps(d2, _mm_mul_ps(qv, a2));
+            d3 = _mm_add_ps(d3, _mm_mul_ps(qv, a3));
+            n0 = _mm_add_ps(n0, _mm_mul_ps(a0, a0));
+            n1 = _mm_add_ps(n1, _mm_mul_ps(a1, a1));
+            n2 = _mm_add_ps(n2, _mm_mul_ps(a2, a2));
+            n3 = _mm_add_ps(n3, _mm_mul_ps(a3, a3));
+            i += 4;
+        }
+        let mut dot = [hsum128(d0), hsum128(d1), hsum128(d2), hsum128(d3)];
+        let mut nb = [hsum128(n0), hsum128(n1), hsum128(n2), hsum128(n3)];
+        while i < len {
+            let qx = *q.get_unchecked(i);
+            let x0 = *v0.get_unchecked(i);
+            let x1 = *v1.get_unchecked(i);
+            let x2 = *v2.get_unchecked(i);
+            let x3 = *v3.get_unchecked(i);
+            dot[0] += qx * x0;
+            dot[1] += qx * x1;
+            dot[2] += qx * x2;
+            dot[3] += qx * x3;
+            nb[0] += x0 * x0;
+            nb[1] += x1 * x1;
+            nb[2] += x2 * x2;
+            nb[3] += x3 * x3;
+            i += 1;
+        }
+        [
+            (dot[0], nb[0]),
+            (dot[1], nb[1]),
+            (dot[2], nb[2]),
+            (dot[3], nb[3]),
+        ]
+    }
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -424,6 +649,67 @@ mod aarch64 {
         }
         (dot, na, nb)
     }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    pub unsafe fn dot_and_nb_x4_neon(
+        q: &[f32],
+        v0: &[f32],
+        v1: &[f32],
+        v2: &[f32],
+        v3: &[f32],
+    ) -> [(f32, f32); 4] {
+        let len = q.len();
+        let mut d0 = vdupq_n_f32(0.0);
+        let mut d1 = vdupq_n_f32(0.0);
+        let mut d2 = vdupq_n_f32(0.0);
+        let mut d3 = vdupq_n_f32(0.0);
+        let mut n0 = vdupq_n_f32(0.0);
+        let mut n1 = vdupq_n_f32(0.0);
+        let mut n2 = vdupq_n_f32(0.0);
+        let mut n3 = vdupq_n_f32(0.0);
+        let mut i = 0usize;
+        while i + 4 <= len {
+            let qv = vld1q_f32(q.as_ptr().add(i));
+            let a0 = vld1q_f32(v0.as_ptr().add(i));
+            let a1 = vld1q_f32(v1.as_ptr().add(i));
+            let a2 = vld1q_f32(v2.as_ptr().add(i));
+            let a3 = vld1q_f32(v3.as_ptr().add(i));
+            d0 = vfmaq_f32(d0, qv, a0);
+            d1 = vfmaq_f32(d1, qv, a1);
+            d2 = vfmaq_f32(d2, qv, a2);
+            d3 = vfmaq_f32(d3, qv, a3);
+            n0 = vfmaq_f32(n0, a0, a0);
+            n1 = vfmaq_f32(n1, a1, a1);
+            n2 = vfmaq_f32(n2, a2, a2);
+            n3 = vfmaq_f32(n3, a3, a3);
+            i += 4;
+        }
+        let mut dot = [vaddvq_f32(d0), vaddvq_f32(d1), vaddvq_f32(d2), vaddvq_f32(d3)];
+        let mut nb = [vaddvq_f32(n0), vaddvq_f32(n1), vaddvq_f32(n2), vaddvq_f32(n3)];
+        while i < len {
+            let qx = *q.get_unchecked(i);
+            let x0 = *v0.get_unchecked(i);
+            let x1 = *v1.get_unchecked(i);
+            let x2 = *v2.get_unchecked(i);
+            let x3 = *v3.get_unchecked(i);
+            dot[0] += qx * x0;
+            dot[1] += qx * x1;
+            dot[2] += qx * x2;
+            dot[3] += qx * x3;
+            nb[0] += x0 * x0;
+            nb[1] += x1 * x1;
+            nb[2] += x2 * x2;
+            nb[3] += x3 * x3;
+            i += 1;
+        }
+        [
+            (dot[0], nb[0]),
+            (dot[1], nb[1]),
+            (dot[2], nb[2]),
+            (dot[3], nb[3]),
+        ]
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -483,5 +769,45 @@ mod tests {
         CosineMetric::preprocess(&mut v);
         let norm_sq: f32 = v.iter().map(|x| x * x).sum();
         assert!((norm_sq - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn batch_cosine_matches_per_vector() {
+        // Cover dims that straddle the SIMD width and batch sizes that exercise
+        // the four-wide blocks plus a remainder.
+        let dims = [1usize, 3, 8, 9, 15, 16, 17, 64, 65, 128];
+        let counts = [0usize, 1, 2, 3, 4, 5, 7, 11];
+        for &dim in &dims {
+            for &n in &counts {
+                let query: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.37).sin()).collect();
+                let owned: Vec<Vec<f32>> = (0..n)
+                    .map(|j| {
+                        (0..dim)
+                            .map(|i| ((i + j) as f32 * 0.21 + 0.5).cos())
+                            .collect()
+                    })
+                    .collect();
+                let refs: Vec<&[f32]> = owned.iter().map(|v| v.as_slice()).collect();
+                let got = cosine_similarity_batch(&query, &refs);
+                assert_eq!(got.len(), n);
+                for (j, v) in owned.iter().enumerate() {
+                    let expected = cosine_similarity(&query, v);
+                    assert!(
+                        (got[j] - expected).abs() < 1e-4,
+                        "dim={dim} n={n} j={j} expected={expected} got={}",
+                        got[j]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batch_cosine_handles_zero_vector() {
+        let query = vec![1.0f32, 2.0, 3.0, 4.0];
+        let zero = vec![0.0f32; 4];
+        let refs: Vec<&[f32]> = vec![&zero];
+        let got = cosine_similarity_batch(&query, &refs);
+        assert_eq!(got, vec![0.0]);
     }
 }
