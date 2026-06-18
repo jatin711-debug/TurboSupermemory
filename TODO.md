@@ -6,6 +6,19 @@
 
 ---
 
+## Recently Completed — 2026-06-18
+
+Shipped in commit `35cc6c7` ("fix: improve ANN recall with 8-bit Cold tier and configurable consolidation"). These resolve part of Phase 3/4 ahead of the structural work and fix a recall regression surfaced by high-dimensional benchmarks.
+
+- **8-bit Cold tier (resolves Exec-Summary #7).** Cold tier default quantizer changed from 1-bit `Sign` to 8-bit `Scalar` (`config.rs`). Sign-only quantization could not resolve the tiny cosine gaps in high-dim data and floored recall at ~27% after full consolidation. `warm_capacity` budget also raised (16→64 MiB, clamp 200k→500k) so vectors stay in 8-bit Warm longer before demotion.
+- **Caller-specified `ef` (partial 3.10).** `search_ann(query, top_k, ef)` is now wired through Python; benchmark exposes `--ef`. Adaptive auto-raise still pending.
+- **Configurable background consolidation (partial 8.4).** `auto_consolidation_secs` Python kwarg (0 disables) replaces the hardcoded 60 s interval, so benchmarks and manual-consolidation workloads aren't silently penalized.
+- **Realistic benchmark data (partial 10.5).** `benchmark.py` now defaults to clustered embeddings (64 centers, 0.15 jitter) instead of near-orthogonal Gaussian; old behavior available via `--data-distribution random`.
+
+Validated at 50k × 1024 after full consolidation: adversarial-data recall floor lifted ~27% → ~71% at default `ef`; clustered data reaches 65–78% and scales with `ef`.
+
+---
+
 ## Executive Summary — Are We Ready for 1M × 4k?
 
 **No.** The codebase is solid for 100k × 128, but 1M+ vectors at high dimension introduces bottlenecks that are structural, not incremental:
@@ -16,7 +29,7 @@
 4. **In-memory metadata cache** — every record's metadata lives in a `HashMap`; won't fit RAM at 1M+ text records.
 5. **No vacuum / physical deletion** — deleted vectors and old segments are never reclaimed.
 6. **Single-threaded HNSW builds** with a 512 MiB default budget — sealing 1M × 4k would take hours.
-7. **1-bit Cold tier collapse at 4k** — sign-only quantization is too coarse for high-dimensional recall.
+7. **~~1-bit Cold tier collapse at 4k~~** — **Fixed (2026-06-18).** Cold tier now defaults to 8-bit scalar quantization; see [Recently Completed](#recently-completed--2026-06-18).
 8. **No visited-set pool, no adaptive filtering, no segment-level parallelism**, and heavy per-query allocation.
 9. **No GPU acceleration** — CPU-only HNSW build and distance compute.
 
@@ -98,7 +111,7 @@ Search at 1M × 4k is dominated by HNSW traversal, multi-segment aggregation, an
 | 3.7 | **Cardinality-aware filter routing** | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Estimate `{min, exp, max}` cardinality. `max < full_scan_threshold` → plain; `min > threshold` → HNSW; else sample ≤1,000 points with Agresti-Coull confidence interval. Qdrant: `lib/segment/src/index/hnsw_index/hnsw/vector_index_impl.rs:55-173`. |
 | 3.8 | **ACORN-1 adaptive filtered search** | `crates/turbomemory_storage/src/segments/sealed_hot.rs` | Pending | When selectivity ≤ 0.4, expand 1-hop and conditional 2-hop neighbors during HNSW traversal. Use two pooled visited lists. Qdrant: `lib/segment/src/index/hnsw_index/hnsw/search.rs:36-85`. |
 | 3.9 | **Plain search with SIMD + early-exit top-k** | `crates/turbomemory_storage/src/segments/hot.rs` | Pending | Hot segment exact scan must be competitive. Use batched SIMD distance + min-heap top-k. |
-| 3.10 | **Per-query latency budget / adaptive `ef`** | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Allow caller to specify `ef`; optionally auto-raise `ef` if recall audit is below target. |
+| 3.10 | **Per-query latency budget / adaptive `ef`** | `crates/turbomemory_storage/src/segment_holder.rs` | In Progress | Caller-specified `ef` done (2026-06-18) — `search_ann(q, top_k, ef)` + benchmark `--ef`. Auto-raise on low recall audit still pending. |
 | 3.11 | **Exact reranking after quantization** | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Rescore top-k approximate results with full f32 vectors. Default on for binary/TurboQuant, off for scalar/PQ. Qdrant: `lib/segment/src/index/vector_index_search_common.rs:48-87`. |
 | 3.12 | **Abort-on-drop for long searches** | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Wrap blocking search tasks so dropping the request cancels the thread work. Qdrant: `AbortOnDropHandle`. |
 
@@ -117,7 +130,7 @@ At 4k dimensions, distance compute is the bottleneck. We need SIMD, batched kern
 | 4.5 | **Binary / 1-bit + 1.5-bit / 2-bit quantizers** | `crates/turbomemory_core/src/quantization/` (new) | Pending | XOR-popcount via SSE4.2/AVX-512/NEON; optional scalar query encoding. Default rescoring=true. Qdrant: `lib/quantization/src/encoded_vectors_binary.rs`. |
 | 4.6 | **TurboQuant-style 1/2/4-bit quantizer** | `crates/turbomemory_core/src/quantization/` (new) | Pending | FWHT rotation + length rescale + Lloyd-Max + per-coordinate shift/scale error correction. Asymmetric scoring. |
 | 4.7 | **OPQ / learned rotation before PQ** | `crates/turbomemory_core/src/quantization/` (new) | Pending | Reduce PQ distortion for high-dimensional embeddings. |
-| 4.8 | **Quantization auto-selection by dimension and recall target** | `crates/turbomemory_storage/src/config.rs` | Pending | Warm tier picks scalar/PQ/TurboQuant based on dim and target recall. Cold tier avoids 1-bit sign-only at dim ≥ 1024. |
+| 4.8 | **Quantization auto-selection by dimension and recall target** | `crates/turbomemory_storage/src/config.rs` | In Progress | Cold tier no longer defaults to 1-bit sign at high dim — now 8-bit scalar by default (2026-06-18). Full auto-selection (scalar/PQ/TurboQuant by dim + recall target) still pending. |
 | 4.9 | **Zero-copy quantized scans** | `crates/turbomemory_storage/src/segments/warm.rs`, `cold.rs` | Pending | Read mmap slices directly; remove `chunk_bytes.extend_from_slice` copies. |
 | 4.10 | **Query LUT precomputation for quantized tiers** | `crates/turbomemory_storage/src/segments/warm.rs`, `cold.rs` | Pending | Build lookup table once per query, reuse across chunks. |
 | 4.11 | **Distance compute thread pool with work stealing** | `crates/turbomemory_storage/src/runtime.rs` | Pending | Use `rayon` or custom pool for batch distance jobs; separate from search threads. |
@@ -227,7 +240,7 @@ GPU is **not a magic bullet**. Qdrant uses GPU only for HNSW **build**, not sear
 | 10.2 | **Add concurrent ingest + search benchmark** | `benchmark.py` | Pending | Catch lock contention and tail latency. |
 | 10.3 | **Add crash-recovery tests for sharded WAL** | `crates/turbomemory_storage/tests/` | Pending | Kill mid-seal, verify no data loss. |
 | 10.4 | **Add property-based tests for segment lifecycle** | `crates/turbomemory_storage/tests/` | Pending | Seal/merge/vacuum correctness. |
-| 10.5 | **Add comparison harness vs Qdrant/Chroma/Faiss** | `benchmark.py` | Pending | Same dataset, same recall target. |
+| 10.5 | **Add comparison harness vs Qdrant/Chroma/Faiss** | `benchmark.py` | In Progress | TSM vs NumPy/Chroma/Qdrant harness with clustered + random data and configurable `ef`/dim/N (2026-06-18). Faiss and fixed recall-target alignment still pending. |
 | 10.6 | **Continuous benchmark tracking** | CI / `benches/` | Pending | Detect regressions on PRs. |
 | 10.7 | **GPU correctness tests** | `crates/turbomemory_gpu/tests/` | Pending | Compare GPU exact top-k vs CPU brute force bit-exact. |
 

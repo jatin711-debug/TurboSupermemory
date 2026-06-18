@@ -145,9 +145,9 @@ impl PyMemoryEngine {
     #[pyo3(signature = (
         db_path,
         dimension,
-        max_edges,
-        search_list_size,
-        outlier_count,
+        max_edges=None,
+        search_list_size=None,
+        outlier_count=0,
         initial_capacity=None,
         warm_quantizer=None,
         warm_bits=None,
@@ -164,8 +164,8 @@ impl PyMemoryEngine {
     fn new(
         db_path: &str,
         dimension: usize,
-        max_edges: usize,
-        search_list_size: usize,
+        max_edges: Option<usize>,
+        search_list_size: Option<usize>,
         outlier_count: usize,
         initial_capacity: Option<usize>,
         warm_quantizer: Option<String>,
@@ -180,8 +180,12 @@ impl PyMemoryEngine {
         auto_consolidation_secs: u64,
     ) -> PyResult<Self> {
         let mut config = StoreConfig::default_for_dimension(dimension);
-        config.max_edges = max_edges;
-        config.search_list_size = search_list_size;
+        if let Some(me) = max_edges {
+            config.max_edges = me;
+        }
+        if let Some(sls) = search_list_size {
+            config.search_list_size = sls;
+        }
         config.outlier_count = outlier_count;
         if let Some(cap) = initial_capacity {
             config.initial_capacity = cap.max(1024);

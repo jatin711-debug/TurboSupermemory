@@ -79,10 +79,15 @@ impl SegmentSnapshot {
                 (1.0f32 + (segment_count.saturating_sub(1)) as f32 * 0.25f32).clamp(1.0f32, 2.5f32);
             (base_multiplier as f32 * selectivity_factor * segment_factor) as usize
         };
+        // The automatic multiplier is capped to bound rerank cost, but an
+        // explicit caller `ef` must always be honored as the pool floor. Apply
+        // the cap to the multiplier-derived width first, then floor at base_ef,
+        // so a large caller-provided ef widens the HNSW beam instead of being
+        // silently clamped back down to top_k*48.
         let pool_k = top_k
             .saturating_mul(multiplier)
-            .max(base_ef)
-            .min(top_k.saturating_mul(48));
+            .min(top_k.saturating_mul(48))
+            .max(base_ef);
 
         let segments = self.segments.clone();
         let lists: Vec<Vec<ScoredPoint>> = if segments.len() <= 1 {

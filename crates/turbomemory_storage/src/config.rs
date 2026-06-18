@@ -265,9 +265,9 @@ impl Default for StoreConfig {
     fn default() -> Self {
         Self {
             dimension: 768,
-            max_edges: 16,
+            max_edges: 32,
             level0_factor: 2,
-            ef_construction: 100,
+            ef_construction: 200,
             search_list_size: 100,
             outlier_count: 0,
             initial_capacity: 1024,
