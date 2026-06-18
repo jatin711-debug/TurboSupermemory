@@ -9,6 +9,7 @@ use crate::segments::sealed_hot::SealedHotSegment;
 use crate::segments::warm::WarmSegment;
 use crate::segments::{kway_merge_topk, merge_candidates, ScoredPoint, VectorSegment};
 use crate::vector_store::VectorStore;
+use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
@@ -18,6 +19,154 @@ use std::sync::Arc;
 
 pub const SEALED_HOT_DIR: &str = "sealed_hot";
 
+/// Immutable, atomically-published view of the searchable segment set.
+///
+/// Searches load one of these snapshots and never need to hold the
+/// `SegmentHolder` lock while segment scoring, candidate merging, or reranking
+/// runs. Segment mutation still happens under the holder write lock, then
+/// publishes a fresh snapshot with an atomic pointer swap.
+pub struct SegmentSnapshot {
+    config: StoreConfig,
+    segments: Vec<Arc<RwLock<dyn VectorSegment>>>,
+}
+
+impl SegmentSnapshot {
+    fn empty(config: StoreConfig) -> Self {
+        Self {
+            config,
+            segments: Vec::new(),
+        }
+    }
+
+    fn point_count(&self) -> usize {
+        self.segments
+            .iter()
+            .map(|s| s.read().point_count())
+            .sum::<usize>()
+    }
+
+    pub(crate) fn search(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        ef: Option<usize>,
+        vectors: &VectorStore,
+        allowed_offsets: Option<&RoaringBitmap>,
+    ) -> crate::Result<Vec<ScoredPoint>> {
+        // Use Qdrant-style ef semantics: floor the per-segment candidate pool at
+        // the caller-provided `ef` (or the configured search list size), then
+        // apply an over-fetch multiplier that grows with filter strictness and
+        // the number of segments.
+        let base_ef = ef.unwrap_or(self.config.search_list_size);
+        let base_multiplier = if allowed_offsets.is_some() { 8 } else { 4 };
+        let segment_count = self.segments.len().max(1);
+        let selectivity = allowed_offsets
+            .map(|b| {
+                let total = self.point_count().max(1);
+                let allowed = b.len() as usize;
+                (allowed as f32) / (total as f32)
+            })
+            .unwrap_or(1.0f32);
+        let multiplier = if selectivity < 0.01 {
+            // Very selective filters rely on the exact fallback in each segment.
+            base_multiplier
+        } else {
+            let selectivity_factor = (1.0f32 / selectivity.sqrt()).clamp(1.0f32, 16.0f32);
+            // Cap the segment-factor growth so high segment counts do not
+            // explode the candidate pool and rerank cost.
+            let segment_factor =
+                (1.0f32 + (segment_count.saturating_sub(1)) as f32 * 0.25f32).clamp(1.0f32, 2.5f32);
+            (base_multiplier as f32 * selectivity_factor * segment_factor) as usize
+        };
+        let pool_k = top_k
+            .saturating_mul(multiplier)
+            .max(base_ef)
+            .min(top_k.saturating_mul(48));
+
+        let segments = self.segments.clone();
+        let lists: Vec<Vec<ScoredPoint>> = if segments.len() <= 1 {
+            // Avoid Rayon's thread-pool overhead when there is only one segment
+            // (the common small-collection case).
+            segments
+                .into_iter()
+                .map(|seg| seg.read().search(query, pool_k, vectors, allowed_offsets))
+                .collect::<crate::Result<Vec<_>>>()?
+        } else {
+            segments
+                .into_par_iter()
+                .map(|seg| seg.read().search(query, pool_k, vectors, allowed_offsets))
+                .collect::<crate::Result<Vec<_>>>()?
+        };
+        // Merge per-segment candidates with a k-way heap merge (PR-B).
+        // Fall back to the old sort-based merge for very small result sets.
+        let candidates = if lists.len() >= 4 && pool_k >= 64 {
+            kway_merge_topk(&lists, pool_k)
+        } else {
+            merge_candidates(lists, pool_k)
+        };
+
+        // Final rerank with full f32 embeddings from the vector store.
+        let view = vectors.read_view();
+        let reranked: Vec<ScoredPoint> = if candidates.len() >= 256 {
+            let chunks: Vec<&[ScoredPoint]> = candidates.chunks(64).collect();
+            chunks
+                .into_par_iter()
+                .flat_map(|chunk| {
+                    let mut pairs = Vec::with_capacity(chunk.len());
+                    for c in chunk {
+                        if let Some(v) = view.get(c.offset) {
+                            pairs.push((*c, v));
+                        }
+                    }
+                    let refs: Vec<&[f32]> = pairs.iter().map(|(_, v)| *v).collect();
+                    let scores = turbomemory_core::cosine_similarity_batch(query, &refs);
+                    pairs
+                        .into_iter()
+                        .zip(scores)
+                        .map(|((c, _), score)| ScoredPoint {
+                            offset: c.offset,
+                            score,
+                            tier: c.tier,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        } else {
+            candidates
+                .chunks(64)
+                .flat_map(|chunk| {
+                    let mut pairs = Vec::with_capacity(chunk.len());
+                    for c in chunk {
+                        if let Some(v) = view.get(c.offset) {
+                            pairs.push((c, v));
+                        }
+                    }
+                    let refs: Vec<&[f32]> = pairs.iter().map(|(_, v)| *v).collect();
+                    let scores = turbomemory_core::cosine_similarity_batch(query, &refs);
+                    pairs
+                        .into_iter()
+                        .zip(scores)
+                        .map(|((c, _), score)| ScoredPoint {
+                            offset: c.offset,
+                            score,
+                            tier: c.tier,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+
+        let mut reranked = reranked;
+        reranked.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        reranked.truncate(top_k);
+        Ok(reranked)
+    }
+}
+
 /// Owns Hot/Warm/Cold segments for a single collection.
 pub struct SegmentHolder {
     config: StoreConfig,
@@ -26,27 +175,38 @@ pub struct SegmentHolder {
     /// for the background optimizer to build their HNSW replacements. They remain
     /// searchable as exact segments until the build completes.
     sealing_plain: Vec<Arc<RwLock<HotSegment>>>,
+    /// Plain segments currently being converted by an optimizer worker. These
+    /// are no longer pending work, but they must remain visible to search until
+    /// their replacement is published.
+    building_plain: Vec<Arc<RwLock<HotSegment>>>,
     sealed_hot: Vec<Arc<RwLock<dyn VectorSegment>>>,
     warm: Vec<Arc<RwLock<dyn VectorSegment>>>,
     cold: Vec<Arc<RwLock<dyn VectorSegment>>>,
     next_segment_id: u64,
     base_path: PathBuf,
+    snapshot: Arc<ArcSwap<SegmentSnapshot>>,
 }
 
 impl SegmentHolder {
     pub fn new(config: StoreConfig, base_path: impl AsRef<Path>) -> crate::Result<Self> {
         let base_path = base_path.as_ref().to_path_buf();
         std::fs::create_dir_all(&base_path)?;
-        Ok(Self {
+        let holder = Self {
             hot: Arc::new(RwLock::new(HotSegment::new(&config)?)),
             sealing_plain: Vec::new(),
+            building_plain: Vec::new(),
             sealed_hot: Vec::new(),
             warm: Vec::new(),
             cold: Vec::new(),
             next_segment_id: 0,
             base_path,
+            snapshot: Arc::new(ArcSwap::from_pointee(SegmentSnapshot::empty(
+                config.clone(),
+            ))),
             config,
-        })
+        };
+        holder.publish_snapshot();
+        Ok(holder)
     }
 
     /// Create a holder from records, skipping offsets that are already captured
@@ -67,6 +227,48 @@ impl SegmentHolder {
         Ok(holder)
     }
 
+    pub(crate) fn snapshot_handle(&self) -> Arc<ArcSwap<SegmentSnapshot>> {
+        Arc::clone(&self.snapshot)
+    }
+
+    pub(crate) fn publish_snapshot(&self) {
+        self.snapshot.store(Arc::new(self.build_snapshot()));
+    }
+
+    fn build_snapshot(&self) -> SegmentSnapshot {
+        SegmentSnapshot {
+            config: self.config.clone(),
+            segments: self.searchable_segments(),
+        }
+    }
+
+    fn searchable_segments(&self) -> Vec<Arc<RwLock<dyn VectorSegment>>> {
+        let mut segments: Vec<Arc<RwLock<dyn VectorSegment>>> = Vec::with_capacity(
+            2 + self.sealing_plain.len()
+                + self.building_plain.len()
+                + self.sealed_hot.len()
+                + self.warm.len()
+                + self.cold.len(),
+        );
+        segments.push(self.hot.clone());
+        for plain in &self.sealing_plain {
+            segments.push(plain.clone());
+        }
+        for plain in &self.building_plain {
+            segments.push(plain.clone());
+        }
+        for sealed in &self.sealed_hot {
+            segments.push(sealed.clone());
+        }
+        for warm in &self.warm {
+            segments.push(warm.clone());
+        }
+        for cold in &self.cold {
+            segments.push(cold.clone());
+        }
+        segments
+    }
+
     pub(crate) fn segment_path(&mut self, tier: Tier) -> PathBuf {
         let id = self.next_segment_id;
         self.next_segment_id += 1;
@@ -84,15 +286,20 @@ impl SegmentHolder {
     }
 
     pub(crate) fn pop_sealing_plain(&mut self) -> Option<Arc<RwLock<HotSegment>>> {
-        self.sealing_plain.pop()
+        let plain = self.sealing_plain.pop()?;
+        self.building_plain.push(plain.clone());
+        Some(plain)
     }
 
     pub(crate) fn push_sealing_plain(&mut self, plain: Arc<RwLock<HotSegment>>) {
+        self.building_plain.retain(|p| !Arc::ptr_eq(p, &plain));
         self.sealing_plain.push(plain);
+        self.publish_snapshot();
     }
 
     pub(crate) fn remove_sealing_plain(&mut self, target: &Arc<RwLock<HotSegment>>) {
         self.sealing_plain.retain(|p| !Arc::ptr_eq(p, target));
+        self.building_plain.retain(|p| !Arc::ptr_eq(p, target));
     }
 
     pub(crate) fn push_sealed_hot(&mut self, segment: SealedHotSegment) {
@@ -106,16 +313,19 @@ impl SegmentHolder {
     pub fn add_sealed_hot(&mut self, segment: SealedHotSegment) {
         self.sealed_hot
             .push(Arc::new(RwLock::new(segment)) as Arc<RwLock<dyn VectorSegment>>);
+        self.publish_snapshot();
     }
 
     pub fn add_warm(&mut self, segment: WarmSegment) {
         self.warm
             .push(Arc::new(RwLock::new(segment)) as Arc<RwLock<dyn VectorSegment>>);
+        self.publish_snapshot();
     }
 
     pub fn add_cold(&mut self, segment: ColdSegment) {
         self.cold
             .push(Arc::new(RwLock::new(segment)) as Arc<RwLock<dyn VectorSegment>>);
+        self.publish_snapshot();
     }
 
     #[allow(dead_code)]
@@ -204,141 +414,9 @@ impl SegmentHolder {
         vectors: &VectorStore,
         allowed_offsets: Option<&RoaringBitmap>,
     ) -> crate::Result<Vec<ScoredPoint>> {
-        // Use Qdrant-style ef semantics: floor the per-segment candidate pool at
-        // the caller-provided `ef` (or the configured search list size), then
-        // apply an over-fetch multiplier that grows with filter strictness and
-        // the number of segments.
-        let base_ef = ef.unwrap_or(self.config.search_list_size);
-        let base_multiplier = if allowed_offsets.is_some() { 8 } else { 4 };
-        let segment_count = 1
-            + self.sealing_plain.len()
-            + self.sealed_hot.len()
-            + self.warm.len()
-            + self.cold.len();
-        let selectivity = allowed_offsets
-            .map(|b| {
-                let total = self.point_count().max(1);
-                let allowed = b.len() as usize;
-                (allowed as f32) / (total as f32)
-            })
-            .unwrap_or(1.0f32);
-        let multiplier = if selectivity < 0.01 {
-            // Very selective filters rely on the exact fallback in each segment.
-            base_multiplier
-        } else {
-            let selectivity_factor = (1.0f32 / selectivity.sqrt()).clamp(1.0f32, 16.0f32);
-            // Cap the segment-factor growth so high segment counts do not
-            // explode the candidate pool and rerank cost.
-            let segment_factor =
-                (1.0f32 + (segment_count.saturating_sub(1)) as f32 * 0.25f32).clamp(1.0f32, 2.5f32);
-            (base_multiplier as f32 * selectivity_factor * segment_factor) as usize
-        };
-        let pool_k = top_k
-            .saturating_mul(multiplier)
-            .max(base_ef)
-            .min(top_k.saturating_mul(48));
-
-        // Collect all searchable segments and query them in parallel.
-        let mut segments: Vec<Arc<RwLock<dyn VectorSegment>>> = Vec::with_capacity(
-            2 + self.sealing_plain.len()
-                + self.sealed_hot.len()
-                + self.warm.len()
-                + self.cold.len(),
-        );
-        segments.push(self.hot.clone());
-        for plain in &self.sealing_plain {
-            segments.push(plain.clone());
-        }
-        for sealed in &self.sealed_hot {
-            segments.push(sealed.clone());
-        }
-        for warm in &self.warm {
-            segments.push(warm.clone());
-        }
-        for cold in &self.cold {
-            segments.push(cold.clone());
-        }
-
-        let lists: Vec<Vec<ScoredPoint>> = if segments.len() <= 1 {
-            // Avoid Rayon's thread-pool overhead when there is only one segment
-            // (the common small-collection case).
-            segments
-                .into_iter()
-                .map(|seg| seg.read().search(query, pool_k, vectors, allowed_offsets))
-                .collect::<crate::Result<Vec<_>>>()?
-        } else {
-            segments
-                .into_par_iter()
-                .map(|seg| seg.read().search(query, pool_k, vectors, allowed_offsets))
-                .collect::<crate::Result<Vec<_>>>()?
-        };
-        // Merge per-segment candidates with a k-way heap merge (PR-B).
-        // Fall back to the old sort-based merge for very small result sets.
-        let candidates = if lists.len() >= 4 && pool_k >= 64 {
-            kway_merge_topk(&lists, pool_k)
-        } else {
-            merge_candidates(lists, pool_k)
-        };
-
-        // Final rerank with full f32 embeddings from the vector store.
-        let view = vectors.read_view();
-        let reranked: Vec<ScoredPoint> = if candidates.len() >= 256 {
-            let chunks: Vec<&[ScoredPoint]> = candidates.chunks(64).collect();
-            chunks
-                .into_par_iter()
-                .flat_map(|chunk| {
-                    let mut pairs = Vec::with_capacity(chunk.len());
-                    for c in chunk {
-                        if let Some(v) = view.get(c.offset) {
-                            pairs.push((*c, v));
-                        }
-                    }
-                    let refs: Vec<&[f32]> = pairs.iter().map(|(_, v)| *v).collect();
-                    let scores = turbomemory_core::cosine_similarity_batch(query, &refs);
-                    pairs
-                        .into_iter()
-                        .zip(scores)
-                        .map(|((c, _), score)| ScoredPoint {
-                            offset: c.offset,
-                            score,
-                            tier: c.tier,
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect()
-        } else {
-            candidates
-                .chunks(64)
-                .flat_map(|chunk| {
-                    let mut pairs = Vec::with_capacity(chunk.len());
-                    for c in chunk {
-                        if let Some(v) = view.get(c.offset) {
-                            pairs.push((c, v));
-                        }
-                    }
-                    let refs: Vec<&[f32]> = pairs.iter().map(|(_, v)| *v).collect();
-                    let scores = turbomemory_core::cosine_similarity_batch(query, &refs);
-                    pairs
-                        .into_iter()
-                        .zip(scores)
-                        .map(|((c, _), score)| ScoredPoint {
-                            offset: c.offset,
-                            score,
-                            tier: c.tier,
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect()
-        };
-
-        let mut reranked = reranked;
-        reranked.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        reranked.truncate(top_k);
-        Ok(reranked)
+        self.snapshot
+            .load_full()
+            .search(query, top_k, ef, vectors, allowed_offsets)
     }
 
     /// Move the current Hot segment into the `sealing_plain` queue and create a
@@ -364,6 +442,7 @@ impl SegmentHolder {
             std::mem::replace(&mut *hot, HotSegment::new(&self.config)?)
         };
         self.sealing_plain.push(Arc::new(RwLock::new(old_hot)));
+        self.publish_snapshot();
         Ok(())
     }
 
@@ -405,6 +484,7 @@ impl SegmentHolder {
                 .push(Arc::new(RwLock::new(cold)) as Arc<RwLock<dyn VectorSegment>>);
         }
         self.warm.clear();
+        self.publish_snapshot();
         Ok(())
     }
 
@@ -449,6 +529,11 @@ impl SegmentHolder {
                 .map(|s| s.read().point_count())
                 .sum::<usize>()
             + self
+                .building_plain
+                .iter()
+                .map(|s| s.read().point_count())
+                .sum::<usize>()
+            + self
                 .sealed_hot
                 .iter()
                 .map(|s| s.read().point_count())
@@ -473,6 +558,11 @@ impl SegmentHolder {
                 .map(|s| s.read().memory_bytes())
                 .sum::<usize>()
             + self
+                .building_plain
+                .iter()
+                .map(|s| s.read().memory_bytes())
+                .sum::<usize>()
+            + self
                 .sealed_hot
                 .iter()
                 .map(|s| s.read().memory_bytes())
@@ -492,6 +582,9 @@ impl SegmentHolder {
     pub fn flush(&self) -> crate::Result<()> {
         (self.hot.read().flusher())()?;
         for plain in &self.sealing_plain {
+            (plain.read().flusher())()?;
+        }
+        for plain in &self.building_plain {
             (plain.read().flusher())()?;
         }
         for sealed in &self.sealed_hot {
@@ -543,6 +636,11 @@ impl SegmentHolder {
                 candidate_offsets.push(offset);
             }
         }
+        for plain in &self.building_plain {
+            for &offset in plain.read().offsets() {
+                candidate_offsets.push(offset);
+            }
+        }
         for sealed in &self.sealed_hot {
             for &offset in sealed.read().offsets() {
                 candidate_offsets.push(offset);
@@ -586,6 +684,9 @@ impl SegmentHolder {
             }
             promoted += 1;
         }
+        if promoted > 0 {
+            self.publish_snapshot();
+        }
         Ok(promoted)
     }
 }
@@ -594,4 +695,77 @@ fn access_score(meta: &MetaRecord, now: u64, half_life: u64) -> f64 {
     let age = now.saturating_sub(meta.last_accessed).max(1);
     let recency = 2.0f64.powf(-(age as f64) / half_life as f64);
     meta.access_count as f64 * recency
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn make_record(offset: PointOffset, dim: usize, idx: usize) -> (PointOffset, Record) {
+        let mut v = vec![0.0f32; dim];
+        v[idx % dim] = 1.0;
+        (
+            offset,
+            Record {
+                id: format!("id-{idx}"),
+                text: String::new(),
+                embedding: Arc::from(v),
+                importance: 1.0,
+                concepts: Vec::new(),
+                created_at: 0,
+                insert_seq: idx as u64,
+                access_count: 0,
+                last_accessed: 0,
+                tier: Tier::Hot,
+                payload: None,
+            },
+        )
+    }
+
+    #[test]
+    fn snapshot_keeps_building_plain_searchable() {
+        let dim = 8;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = StoreConfig::default_for_dimension(dim);
+        config.tier.hot_capacity = 2;
+
+        let vectors = VectorStore::new_with_capacity(tmp.path().join("vectors"), dim, 8).unwrap();
+        let mut holder = SegmentHolder::new(config, tmp.path().join("segments")).unwrap();
+        let records: Vec<_> = (0..2)
+            .map(|i| make_record(i as PointOffset + 1, dim, i))
+            .collect();
+        for (offset, record) in &records {
+            vectors.put(*offset, record.embedding_f32()).unwrap();
+            holder.insert(*offset, record, &vectors).unwrap();
+        }
+        holder.seal_hot(&vectors).unwrap();
+
+        let query = records[0].1.embedding_f32().to_vec();
+        let snapshot = holder.snapshot_handle();
+        let before = snapshot
+            .load_full()
+            .search(&query, 1, None, &vectors, None)
+            .unwrap();
+        assert_eq!(before[0].offset, records[0].0);
+
+        let building = holder.pop_sealing_plain().unwrap();
+        // Simulate an unrelated segment-list publish while the optimizer is
+        // still building a replacement for the popped plain segment.
+        holder.publish_snapshot();
+
+        let during = snapshot
+            .load_full()
+            .search(&query, 1, None, &vectors, None)
+            .unwrap();
+        assert_eq!(during[0].offset, records[0].0);
+
+        holder.remove_sealing_plain(&building);
+        holder.publish_snapshot();
+        let after = snapshot
+            .load_full()
+            .search(&query, 1, None, &vectors, None)
+            .unwrap();
+        assert!(after.is_empty());
+    }
 }

@@ -127,82 +127,84 @@ impl BackgroundOptimizer {
     /// or when `Shutdown` is received.
     pub fn new(
         weak_engine: Weak<StorageEngine>,
-        interval: Duration,
+        interval: Option<Duration>,
         budget: Arc<ResourceBudget>,
     ) -> Self {
         let (tx, rx) = channel::<OptimizerMsg>();
-        let running = Arc::new(AtomicBool::new(true));
+        let running = Arc::new(AtomicBool::new(interval.is_some()));
         let running_clone = running.clone();
         let draining = Arc::new(AtomicBool::new(false));
-        let draining_clone = draining.clone();
-        let budget_clone = Arc::clone(&budget);
         let pending_deletion: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
-        let pending_deletion_clone = Arc::clone(&pending_deletion);
-        let handle = Builder::new()
-            .name("turbo-optimizer".into())
-            .spawn(move || {
-                let mut last_run = Instant::now();
-                while running_clone.load(Ordering::Relaxed) {
-                    // Yield to the foreground `drain` so it can complete merges
-                    // without racing the background loop for the same segments.
-                    if draining_clone.load(Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_millis(10));
-                        continue;
-                    }
-                    Self::try_cleanup_pending(&pending_deletion_clone);
-                    let timeout = Duration::from_millis(100);
-                    match rx.recv_timeout(timeout) {
-                        Ok(OptimizerMsg::Shutdown) => break,
-                        Ok(OptimizerMsg::Seal) => {
-                            if let Some(engine) = weak_engine.upgrade() {
-                                Self::run_seal(&engine);
-                                Self::process_pending_seals(&engine, &budget_clone);
-                                Self::process_pending_merges(
-                                    &engine,
-                                    &budget_clone,
-                                    &pending_deletion_clone,
-                                    &draining_clone,
-                                );
-                            }
+        let handle = interval.map(|interval| {
+            let draining_clone = draining.clone();
+            let budget_clone = Arc::clone(&budget);
+            let pending_deletion_clone = Arc::clone(&pending_deletion);
+            Builder::new()
+                .name("turbo-optimizer".into())
+                .spawn(move || {
+                    let mut last_run = Instant::now();
+                    while running_clone.load(Ordering::Relaxed) {
+                        // Yield to the foreground `drain` so it can complete merges
+                        // without racing the background loop for the same segments.
+                        if draining_clone.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(10));
+                            continue;
                         }
-                        Ok(OptimizerMsg::Consolidate) => {
-                            if let Some(engine) = weak_engine.upgrade() {
-                                Self::run_consolidation(
-                                    &engine,
-                                    &budget_clone,
-                                    &pending_deletion_clone,
-                                    &draining_clone,
-                                );
+                        Self::try_cleanup_pending(&pending_deletion_clone);
+                        let timeout = Duration::from_millis(100);
+                        match rx.recv_timeout(timeout) {
+                            Ok(OptimizerMsg::Shutdown) => break,
+                            Ok(OptimizerMsg::Seal) => {
+                                if let Some(engine) = weak_engine.upgrade() {
+                                    Self::run_seal(&engine);
+                                    Self::process_pending_seals(&engine, &budget_clone);
+                                    Self::process_pending_merges(
+                                        &engine,
+                                        &budget_clone,
+                                        &pending_deletion_clone,
+                                        &draining_clone,
+                                    );
+                                }
                             }
-                        }
-                        Err(_) => {
-                            if let Some(engine) = weak_engine.upgrade() {
-                                if last_run.elapsed() >= interval {
+                            Ok(OptimizerMsg::Consolidate) => {
+                                if let Some(engine) = weak_engine.upgrade() {
                                     Self::run_consolidation(
                                         &engine,
                                         &budget_clone,
                                         &pending_deletion_clone,
                                         &draining_clone,
                                     );
-                                    last_run = Instant::now();
                                 }
-                                Self::process_pending_seals(&engine, &budget_clone);
-                                Self::process_pending_merges(
-                                    &engine,
-                                    &budget_clone,
-                                    &pending_deletion_clone,
-                                    &draining_clone,
-                                );
+                            }
+                            Err(_) => {
+                                if let Some(engine) = weak_engine.upgrade() {
+                                    if last_run.elapsed() >= interval {
+                                        Self::run_consolidation(
+                                            &engine,
+                                            &budget_clone,
+                                            &pending_deletion_clone,
+                                            &draining_clone,
+                                        );
+                                        last_run = Instant::now();
+                                    }
+                                    Self::process_pending_seals(&engine, &budget_clone);
+                                    Self::process_pending_merges(
+                                        &engine,
+                                        &budget_clone,
+                                        &pending_deletion_clone,
+                                        &draining_clone,
+                                    );
+                                }
                             }
                         }
                     }
-                }
-                Self::try_cleanup_pending(&pending_deletion_clone);
-            })
-            .expect("failed to spawn turbo-optimizer");
+                    Self::try_cleanup_pending(&pending_deletion_clone);
+                })
+                .expect("failed to spawn turbo-optimizer")
+        });
         Self {
             tx,
-            handle: Some(handle),
+            handle,
             running,
             draining,
             budget,
@@ -241,6 +243,8 @@ impl BackgroundOptimizer {
             };
             let offsets: Vec<PointOffset> = plain.read().offsets().to_vec();
             if offsets.is_empty() {
+                segments.remove_sealing_plain(&plain);
+                segments.publish_snapshot();
                 return Ok(true);
             }
             let threshold_met = {
@@ -372,6 +376,7 @@ impl BackgroundOptimizer {
         if offsets.is_empty() {
             let mut segments = engine.segments.write();
             segments.remove_sealed_hot_segments(&candidates);
+            segments.publish_snapshot();
             return Ok(true);
         }
 

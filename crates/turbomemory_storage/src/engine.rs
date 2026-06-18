@@ -16,7 +16,7 @@ use crate::metadata_store::MetadataStore;
 use crate::optimizer::BackgroundOptimizer;
 use crate::payload_index::{Filter, PayloadIndex};
 use crate::record::{MetaRecord, PointOffset, Record};
-use crate::segment_holder::SegmentHolder;
+use crate::segment_holder::{SegmentHolder, SegmentSnapshot};
 use crate::text_index::TextIndex;
 use crate::update_worker::UpdateWorker;
 use crate::vector_store::VectorStore;
@@ -28,7 +28,6 @@ use roaring::RoaringBitmap;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 use turbomemory_core::{cosine_similarity, normalize, validate_dimension};
 use turbomemory_graph::{
     step_session, CompressedCognitiveState, MemoryGraph, SpreadingActivation, SpreadingConfig,
@@ -46,6 +45,7 @@ pub struct StorageEngine {
     meta: Arc<MetadataStore>,
     pub(crate) vectors: Arc<VectorStore>,
     pub(crate) segments: Arc<RwLock<SegmentHolder>>,
+    segment_snapshot: Arc<arc_swap::ArcSwap<SegmentSnapshot>>,
     graph: Arc<RwLock<SpreadingActivation>>,
     ccs: Arc<Mutex<Option<CompressedCognitiveState>>>,
     id_index: Arc<RwLock<AHashMap<Arc<str>, PointOffset>>>,
@@ -64,6 +64,7 @@ impl Clone for StorageEngine {
             meta: self.meta.clone(),
             vectors: self.vectors.clone(),
             segments: self.segments.clone(),
+            segment_snapshot: self.segment_snapshot.clone(),
             graph: self.graph.clone(),
             ccs: self.ccs.clone(),
             id_index: self.id_index.clone(),
@@ -240,12 +241,11 @@ impl StorageEngine {
             segments.add_cold(seg);
         }
 
-        let interval = config
-            .auto_consolidation_interval
-            .unwrap_or_else(|| Duration::from_secs(60));
+        let interval = config.auto_consolidation_interval;
 
         let meta = Arc::new(meta);
         let vectors = Arc::new(vectors);
+        let segment_snapshot = segments.snapshot_handle();
         let segments = Arc::new(RwLock::new(segments));
         let graph = Arc::new(RwLock::new(graph));
         let id_index = Arc::new(RwLock::new(id_index));
@@ -271,6 +271,7 @@ impl StorageEngine {
                 meta,
                 vectors,
                 segments,
+                segment_snapshot,
                 graph,
                 ccs: Arc::new(Mutex::new(ccs)),
                 id_index,
@@ -609,15 +610,14 @@ impl StorageEngine {
             }
             return Ok(results);
         }
-        let segments = self.segments.read();
-        let scored = segments.search(
+        let snapshot = self.segment_snapshot.load_full();
+        let scored = snapshot.search(
             query_embedding,
             top_k,
             ef,
             &self.vectors,
             allowed_offsets.as_ref(),
         )?;
-        drop(segments);
         let mut results = Vec::with_capacity(scored.len());
         for c in scored {
             if let Some(meta_rec) = self.meta.get(c.offset)? {
