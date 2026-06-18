@@ -220,9 +220,14 @@ impl VectorSegment for WarmSegment {
                 }));
             }
         }
-        let candidates = crate::segments::top_k_minheap(candidates.into_iter(), top_k);
-
-        // Rerank with full f32 embeddings from the vector store.
+        // Oversample the quantized shortlist before reranking. 8-bit scalar
+        // quantization noise reshuffles the tiny cosine gaps between
+        // near-orthogonal high-dim vectors, so a true top-k neighbor can land
+        // outside the quantized top-k. Rerank can only recover neighbors that
+        // survive this shortlist, so widen it before scoring with full f32.
+        let shortlist = (top_k.saturating_mul(crate::segments::RERANK_OVERSAMPLE))
+            .max(crate::segments::MIN_RERANK_SHORTLIST);
+        let candidates = crate::segments::top_k_minheap(candidates.into_iter(), shortlist);
         let view = vectors.read_view();
         let mut offsets = Vec::with_capacity(candidates.len());
         let mut refs: Vec<&[f32]> = Vec::with_capacity(candidates.len());
@@ -356,5 +361,97 @@ mod tests {
         )
         .unwrap();
         assert_eq!(segment.point_count(), 10);
+    }
+
+    fn rand_unit_vec(dim: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        let mut v = vec![0.0f32; dim];
+        for x in v.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x = ((s >> 11) as f32 / (1u64 << 53) as f32) - 0.5;
+        }
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            v.iter_mut().for_each(|x| *x /= norm);
+        }
+        v
+    }
+
+    /// With coarse 2-bit quantization over a dataset much larger than `top_k`,
+    /// the oversampled shortlist plus full-f32 rerank must still surface the
+    /// exact f32-nearest neighbor — the recall margin the oversampling buys.
+    #[test]
+    fn warm_segment_oversampling_recovers_exact_nearest() {
+        let dim = 64;
+        let n = 128usize; // > MIN_RERANK_SHORTLIST and >> top_k
+        let tmp = tempfile::tempdir().unwrap();
+        let records: Vec<(PointOffset, Record)> = (0..n)
+            .map(|i| {
+                let v = rand_unit_vec(dim, i as u64);
+                (
+                    i as u64 + 1,
+                    Record {
+                        id: format!("id-{i}"),
+                        text: String::new(),
+                        embedding: Arc::from(v),
+                        importance: 1.0,
+                        concepts: Vec::new(),
+                        created_at: 0,
+                        insert_seq: 0,
+                        access_count: 0,
+                        last_accessed: 0,
+                        tier: Tier::Warm,
+                        payload: None,
+                    },
+                )
+            })
+            .collect();
+
+        let segment = WarmSegment::from_records(
+            tmp.path().join("warm"),
+            &records,
+            QuantizerKind::Scalar { bits: 2 },
+        )
+        .unwrap();
+
+        let vectors_path = tmp.path().join("vectors");
+        let vectors = VectorStore::new_with_capacity(&vectors_path, dim, n).unwrap();
+        for (offset, rec) in &records {
+            vectors.put(*offset, rec.embedding_f32()).unwrap();
+        }
+
+        // Query is a lightly perturbed copy of one indexed vector.
+        let target_idx = 100usize;
+        let query = {
+            let mut v = records[target_idx].1.embedding_f32().to_vec();
+            v[0] += 0.02;
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter_mut().for_each(|x| *x /= norm);
+            v
+        };
+
+        // Brute-force exact f32 nearest over the same set.
+        let exact_best = records
+            .iter()
+            .map(|(offset, rec)| {
+                let dot: f32 = query
+                    .iter()
+                    .zip(rec.embedding_f32())
+                    .map(|(a, b)| a * b)
+                    .sum();
+                (*offset, dot)
+            })
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .map(|(offset, _)| offset)
+            .unwrap();
+
+        let results = segment.search(&query, 5, &vectors, None).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(
+            results[0].offset, exact_best,
+            "oversampled rerank should return the exact f32-nearest neighbor"
+        );
     }
 }

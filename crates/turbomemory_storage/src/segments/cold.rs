@@ -217,7 +217,13 @@ impl VectorSegment for ColdSegment {
                 }));
             }
         }
-        let candidates = crate::segments::top_k_minheap(candidates.into_iter(), top_k);
+        // Oversample the quantized shortlist before reranking: quantization
+        // noise reshuffles near-orthogonal high-dim rankings, so widen the
+        // candidate pool so the full-f32 rerank can recover true neighbors that
+        // landed past top_k under the quantized score.
+        let shortlist = (top_k.saturating_mul(crate::segments::RERANK_OVERSAMPLE))
+            .max(crate::segments::MIN_RERANK_SHORTLIST);
+        let candidates = crate::segments::top_k_minheap(candidates.into_iter(), shortlist);
 
         let view = vectors.read_view();
         let mut offsets = Vec::with_capacity(candidates.len());

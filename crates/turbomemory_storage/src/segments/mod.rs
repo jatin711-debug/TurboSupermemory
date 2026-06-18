@@ -28,6 +28,12 @@ pub use warm::WarmSegment;
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
+/// Quantized-tier rerank oversampling. The quantized shortlist is sized to
+/// `max(top_k * RERANK_OVERSAMPLE, MIN_RERANK_SHORTLIST)` so the full-f32 rerank
+/// can recover true neighbors that quantization noise pushed past `top_k`.
+pub const RERANK_OVERSAMPLE: usize = 8;
+pub const MIN_RERANK_SHORTLIST: usize = 64;
+
 /// A scored point returned by a segment search.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScoredPoint {

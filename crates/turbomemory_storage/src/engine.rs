@@ -352,14 +352,15 @@ impl StorageEngine {
         importances: &[f32],
         concepts: &[Vec<String>],
     ) -> crate::Result<usize> {
-        self.insert_batch_with_payload(ids, texts, embeddings, importances, concepts, &[])
+        let refs: Vec<&[f32]> = embeddings.iter().map(|v| v.as_slice()).collect();
+        self.insert_batch_with_payload(ids, texts, &refs, importances, concepts, &[])
     }
 
     pub fn insert_batch_with_payload(
         &self,
         ids: &[String],
         texts: &[String],
-        embeddings: &[Vec<f32>],
+        embeddings: &[&[f32]],
         importances: &[f32],
         concepts: &[Vec<String>],
         payloads: &[Option<String>],
@@ -378,7 +379,7 @@ impl StorageEngine {
                 "batch arrays have mismatched lengths".into(),
             ));
         }
-        for emb in embeddings {
+        for &emb in embeddings {
             validate_dimension(emb, self.config.dimension)?;
         }
 
@@ -398,7 +399,7 @@ impl StorageEngine {
 
         let mut records: Vec<(PointOffset, Record)> = Vec::with_capacity(indices.len());
         for &i in &indices {
-            let mut emb = embeddings[i].clone();
+            let mut emb = embeddings[i].to_vec();
             normalize(&mut emb)?;
             let offset = self.meta.allocate_offset();
             let seq = self.meta.allocate_seq();

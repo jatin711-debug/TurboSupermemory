@@ -159,10 +159,11 @@ async fn insert_batch(
     } else {
         req.payloads.into_iter().map(Some).collect()
     };
+    let emb_refs: Vec<&[f32]> = req.embeddings.iter().map(|v| v.as_slice()).collect();
     let count = service.engine().insert_batch_with_payload(
         &req.ids,
         &req.texts,
-        &req.embeddings,
+        &emb_refs,
         &req.scores,
         &req.concepts,
         &payloads,

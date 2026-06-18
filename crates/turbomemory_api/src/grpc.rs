@@ -48,6 +48,7 @@ impl Memory for MemoryService {
         let ids = req.ids;
         let texts = req.texts;
         let embeddings: Vec<Vec<f32>> = req.embeddings.into_iter().map(|e| e.values).collect();
+        let emb_refs: Vec<&[f32]> = embeddings.iter().map(|v| v.as_slice()).collect();
         let concepts: Vec<Vec<String>> = req.concepts.into_iter().map(|c| c.values).collect();
         let payloads: Vec<Option<String>> = if req.payloads.is_empty() {
             Vec::new()
@@ -56,7 +57,7 @@ impl Memory for MemoryService {
         };
         let count = self
             .engine()
-            .insert_batch_with_payload(&ids, &texts, &embeddings, &req.scores, &concepts, &payloads)
+            .insert_batch_with_payload(&ids, &texts, &emb_refs, &req.scores, &concepts, &payloads)
             .map_err(ApiError::from)?;
         Ok(Response::new(InsertBatchResponse {
             count: count as u32,

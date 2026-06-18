@@ -5,6 +5,7 @@
 
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use numpy::PyUntypedArrayMethods;
 use std::sync::Arc;
 use std::time::Duration;
 use turbomemory_storage::config::{QuantizerKind, StoreConfig};
@@ -22,48 +23,97 @@ fn storage_err(e: turbomemory_storage::StorageError) -> PyErr {
     }
 }
 
-/// Extract a 1-D f32 vector from a Python object (list, tuple, or numpy array).
-///
-/// Uses a zero-copy view when the input is a numpy `ndarray` of `float32`.
-fn extract_f32_vec(obj: &Bound<'_, PyAny>) -> PyResult<Vec<f32>> {
-    if let Ok(v) = obj.extract::<Vec<f32>>() {
-        return Ok(v);
-    }
-    if let Ok(arr) = numpy::PyReadonlyArray1::<f32>::extract_bound(obj) {
-        if let Ok(slice) = arr.as_slice() {
-            return Ok(slice.to_vec());
+/// A 1-D f32 input that borrows a contiguous numpy array when possible and
+/// only allocates for lists, non-contiguous arrays, or non-f32 dtypes.
+enum F32Input<'py> {
+    View(numpy::PyReadonlyArray1<'py, f32>),
+    Owned(Vec<f32>),
+}
+
+impl F32Input<'_> {
+    fn as_slice(&self) -> &[f32] {
+        match self {
+            // Constructed only when `as_slice` already succeeded, so this is
+            // guaranteed contiguous.
+            F32Input::View(arr) => arr.as_slice().expect("contiguous view"),
+            F32Input::Owned(v) => v.as_slice(),
         }
+    }
+}
+
+/// Borrow a 1-D f32 vector from a Python object (list, tuple, or numpy array).
+///
+/// Zero-copy for a contiguous `float32` ndarray; copies otherwise.
+fn extract_f32_input<'py>(obj: &Bound<'py, PyAny>) -> PyResult<F32Input<'py>> {
+    if let Ok(arr) = numpy::PyReadonlyArray1::<f32>::extract_bound(obj) {
+        if arr.as_slice().is_ok() {
+            return Ok(F32Input::View(arr));
+        }
+        // Non-contiguous f32 array: materialize a contiguous copy.
+        return Ok(F32Input::Owned(arr.as_array().to_vec()));
+    }
+    if let Ok(v) = obj.extract::<Vec<f32>>() {
+        return Ok(F32Input::Owned(v));
     }
     if obj.hasattr("tolist")? {
         let list_obj = obj.call_method0("tolist")?;
-        return list_obj.extract::<Vec<f32>>();
+        return Ok(F32Input::Owned(list_obj.extract::<Vec<f32>>()?));
     }
     Err(PyValueError::new_err(
         "embedding must be a sequence or numpy array of f32",
     ))
 }
 
-/// Extract a 2-D f32 matrix from a Python object (list-of-lists or 2-D numpy array).
-///
-/// Uses a zero-copy view when the input is a 2-D numpy `ndarray` of `float32`.
-fn extract_f32_matrix(obj: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<f32>>> {
-    if let Ok(m) = obj.extract::<Vec<Vec<f32>>>() {
-        return Ok(m);
+/// A 2-D f32 input that borrows a contiguous numpy array when possible.
+enum F32Matrix<'py> {
+    View {
+        arr: numpy::PyReadonlyArray2<'py, f32>,
+        cols: usize,
+    },
+    Owned(Vec<Vec<f32>>),
+}
+
+impl F32Matrix<'_> {
+    /// Per-row slices suitable for the engine's `&[&[f32]]` batch API. Borrows
+    /// directly from the numpy buffer for the contiguous fast path.
+    fn rows(&self) -> Vec<&[f32]> {
+        match self {
+            F32Matrix::View { arr, cols } => {
+                let flat = arr.as_slice().expect("contiguous view");
+                if *cols == 0 {
+                    Vec::new()
+                } else {
+                    flat.chunks_exact(*cols).collect()
+                }
+            }
+            F32Matrix::Owned(rows) => rows.iter().map(|r| r.as_slice()).collect(),
+        }
     }
+}
+
+/// Borrow a 2-D f32 matrix from a Python object (list-of-lists or 2-D numpy array).
+///
+/// Zero-copy for a C-contiguous `float32` ndarray; copies otherwise.
+fn extract_f32_matrix<'py>(obj: &Bound<'py, PyAny>) -> PyResult<F32Matrix<'py>> {
     if let Ok(arr) = numpy::PyReadonlyArray2::<f32>::extract_bound(obj) {
-        let arr = arr.as_array();
-        if arr.shape().len() != 2 {
+        let shape = arr.shape();
+        if shape.len() != 2 {
             return Err(PyValueError::new_err("embeddings must be 2-D"));
         }
-        let mut out = Vec::with_capacity(arr.shape()[0]);
-        for row in arr.rows() {
-            out.push(row.to_vec());
+        let cols = shape[1];
+        if arr.as_slice().is_ok() {
+            return Ok(F32Matrix::View { arr, cols });
         }
-        return Ok(out);
+        // Non-contiguous: materialize row-major copies.
+        let owned: Vec<Vec<f32>> = arr.as_array().rows().into_iter().map(|r| r.to_vec()).collect();
+        return Ok(F32Matrix::Owned(owned));
+    }
+    if let Ok(m) = obj.extract::<Vec<Vec<f32>>>() {
+        return Ok(F32Matrix::Owned(m));
     }
     if obj.hasattr("tolist")? {
         let list_obj = obj.call_method0("tolist")?;
-        return list_obj.extract::<Vec<Vec<f32>>>();
+        return Ok(F32Matrix::Owned(list_obj.extract::<Vec<Vec<f32>>>()?));
     }
     Err(PyValueError::new_err(
         "embeddings must be a 2-D sequence or numpy array of f32",
@@ -246,11 +296,12 @@ impl PyMemoryEngine {
         concepts: Vec<String>,
         payload: Option<String>,
     ) -> PyResult<bool> {
-        let emb = extract_f32_vec(embedding)?;
+        let emb_input = extract_f32_input(embedding)?;
+        let emb = emb_input.as_slice();
         let payload = parse_payload(payload)?;
         py.allow_threads(|| {
             self.inner
-                .insert_with_payload(id, text, &emb, importance_score, &concepts, payload)
+                .insert_with_payload(id, text, emb, importance_score, &concepts, payload)
                 .map_err(storage_err)
         })
     }
@@ -268,6 +319,7 @@ impl PyMemoryEngine {
         payloads: Option<Vec<String>>,
     ) -> PyResult<usize> {
         let matrix = extract_f32_matrix(embeddings)?;
+        let rows = matrix.rows();
         let payloads: Vec<Option<String>> = match payloads {
             Some(list) => list
                 .into_iter()
@@ -277,7 +329,7 @@ impl PyMemoryEngine {
         };
         py.allow_threads(|| {
             self.inner
-                .insert_batch_with_payload(&ids, &texts, &matrix, &scores, &concepts, &payloads)
+                .insert_batch_with_payload(&ids, &texts, &rows, &scores, &concepts, &payloads)
                 .map_err(storage_err)
         })
     }
@@ -290,10 +342,11 @@ impl PyMemoryEngine {
         top_k: usize,
         search_list_size: Option<usize>,
     ) -> PyResult<Vec<(String, f32)>> {
-        let q = extract_f32_vec(query_embedding)?;
+        let q_input = extract_f32_input(query_embedding)?;
+        let q = q_input.as_slice();
         py.allow_threads(|| {
             self.inner
-                .search_ann_with_ef(&q, top_k, search_list_size)
+                .search_ann_with_ef(q, top_k, search_list_size)
                 .map_err(storage_err)
         })
     }
@@ -306,10 +359,11 @@ impl PyMemoryEngine {
         top_k: usize,
         search_list_size: Option<usize>,
     ) -> PyResult<Vec<(String, f32)>> {
-        let q = extract_f32_vec(query_embedding)?;
+        let q_input = extract_f32_input(query_embedding)?;
+        let q = q_input.as_slice();
         py.allow_threads(|| {
             self.inner
-                .search_ann_candidates_with_ef(&q, top_k, search_list_size)
+                .search_ann_candidates_with_ef(q, top_k, search_list_size)
                 .map_err(storage_err)
         })
     }
@@ -323,10 +377,11 @@ impl PyMemoryEngine {
         top_k: usize,
         search_list_size: Option<usize>,
     ) -> PyResult<Option<Vec<(String, f32)>>> {
-        let q = extract_f32_vec(query_embedding)?;
+        let q_input = extract_f32_input(query_embedding)?;
+        let q = q_input.as_slice();
         py.allow_threads(|| {
             self.inner
-                .search_with_ef(query_text, &q, top_k, search_list_size)
+                .search_with_ef(query_text, q, top_k, search_list_size)
                 .map_err(storage_err)
         })
     }
@@ -368,11 +423,12 @@ impl PyMemoryEngine {
         concepts: Vec<String>,
         payload: Option<String>,
     ) -> PyResult<bool> {
-        let emb = extract_f32_vec(embedding)?;
+        let emb_input = extract_f32_input(embedding)?;
+        let emb = emb_input.as_slice();
         let payload = parse_payload(payload)?;
         py.allow_threads(|| {
             self.inner
-                .update_with_payload(id, text, &emb, importance_score, &concepts, payload)
+                .update_with_payload(id, text, emb, importance_score, &concepts, payload)
                 .map_err(storage_err)
         })
     }

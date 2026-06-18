@@ -6,6 +6,7 @@ use crate::segments::vector_index::{VectorIndex, VectorIndexManifest};
 use crate::segments::{exact_search_over_offsets, ScoredPoint};
 use crate::vector_store::VectorStore;
 use crate::StorageError;
+use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use std::path::{Path, PathBuf};
 use turbomemory_core::validate_dimension;
@@ -13,6 +14,25 @@ use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
 const MANIFEST_FILE: &str = "manifest.json";
 const INDEX_FILE: &str = "index.usearch";
+
+/// Number of points inserted single-threaded before switching to parallel
+/// insertion. Seeding the graph sequentially establishes a stable entry-point
+/// structure; usearch's parallel insertion only degrades recall when it starts
+/// from an empty graph. This is the Qdrant pattern (TODO 2.11).
+const PARALLEL_SEED_POINTS: usize = 256;
+
+/// Number of threads to use for a single parallel HNSW build.
+///
+/// Bounded so that `max_concurrent_builds` simultaneous segment builds × this
+/// per-build thread count stays near the core count rather than oversubscribing
+/// the machine. Qdrant uses `clamp(num_cpus, 1, 16)` overall.
+fn build_threads(config: &StoreConfig) -> usize {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let concurrent = config.optimizer_budget.max_concurrent_builds.max(1);
+    (cpus / concurrent).clamp(1, 16)
+}
 
 /// `usearch`-backed HNSW index.
 pub struct UsearchIndex {
@@ -53,18 +73,36 @@ impl UsearchIndex {
         let options = Self::index_options(config.dimension, config);
         let index = Index::new(&options)
             .map_err(|e| StorageError::IndexError(format!("usearch index creation failed: {e}")))?;
-        // Single-threaded build produces the most reliable HNSW graph quality.
-        // The parallel path in usearch v2.25 occasionally produces graphs with
-        // very low recall at our scale; revisit once usearch's parallel
-        // insertion stabilises (TODO 2.11).
+        // Seed the graph single-threaded, then insert the remainder in parallel.
+        // usearch's `Index` is `Send + Sync` and supports concurrent `add`; the
+        // sequential seed avoids the low-recall graphs that parallel insertion
+        // produces when started from empty (TODO 2.11).
+        let threads = build_threads(config);
         index
-            .reserve(vectors.len().max(1))
+            .reserve_capacity_and_threads(vectors.len().max(1), threads)
             .map_err(|e| StorageError::IndexError(format!("usearch reserve failed: {e}")))?;
 
-        for (offset, vector) in vectors {
+        let seed = PARALLEL_SEED_POINTS.min(vectors.len());
+        for (offset, vector) in &vectors[..seed] {
             index
                 .add(*offset, vector)
                 .map_err(|e| StorageError::IndexError(format!("usearch add failed: {e}")))?;
+        }
+
+        if vectors.len() > seed {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|e| {
+                    StorageError::IndexError(format!("usearch build pool failed: {e}"))
+                })?;
+            pool.install(|| {
+                vectors[seed..].par_iter().try_for_each(|(offset, vector)| {
+                    index
+                        .add(*offset, vector)
+                        .map_err(|e| StorageError::IndexError(format!("usearch add failed: {e}")))
+                })
+            })?;
         }
 
         let index_path = path.join(INDEX_FILE);
@@ -406,5 +444,60 @@ mod tests {
         for r in &results {
             assert!(allowed.contains(r.offset as u32));
         }
+    }
+
+    /// Deterministic pseudo-random unit vector for recall tests.
+    fn rand_unit_vec(dim: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        let mut v = vec![0.0f32; dim];
+        for x in v.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x = ((s >> 11) as f32 / (1u64 << 53) as f32) - 0.5;
+        }
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            v.iter_mut().for_each(|x| *x /= norm);
+        }
+        v
+    }
+
+    /// The parallel build path (N > PARALLEL_SEED_POINTS) must produce a graph
+    /// whose recall is intact: querying an indexed vector returns itself.
+    #[test]
+    fn usearch_parallel_build_preserves_recall() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dim = 32;
+        let n = PARALLEL_SEED_POINTS + 200; // force the parallel remainder path
+        let config = test_config(dim);
+        let vectors: Vec<(u64, Vec<f32>)> = (0..n)
+            .map(|i| (i as u64, rand_unit_vec(dim, i as u64)))
+            .collect();
+        let borrowed: Vec<(u64, &[f32])> =
+            vectors.iter().map(|(o, v)| (*o, v.as_slice())).collect();
+
+        let index = UsearchIndex::build(tmp.path(), &config, &borrowed).unwrap();
+        assert_eq!(index.point_count(), n);
+
+        let vs_path = tmp.path().join("vectors.bin");
+        let vector_store = crate::vector_store::VectorStore::new(&vs_path, dim).unwrap();
+        for (offset, v) in &vectors {
+            vector_store.put(*offset, v).unwrap();
+        }
+
+        // Query each indexed vector with itself; the top hit should be itself.
+        let mut hits = 0usize;
+        for (offset, v) in &vectors {
+            let results = index.search(v, 1, None, &vector_store).unwrap();
+            if results.first().map(|r| r.offset) == Some(*offset) {
+                hits += 1;
+            }
+        }
+        let recall = hits as f64 / n as f64;
+        assert!(
+            recall >= 0.95,
+            "parallel build self-recall@1 too low: {recall:.3}"
+        );
     }
 }
