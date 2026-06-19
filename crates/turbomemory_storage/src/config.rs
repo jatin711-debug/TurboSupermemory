@@ -3,6 +3,7 @@
 use std::time::Duration;
 use turbomemory_core::quantization::{ScalarQuantizer, SignQuantizer, VectorQuantizer};
 use turbomemory_core::turbo_quant::{TurboQuantMseQuantizer, TurboQuantProdQuantizer};
+use turbomemory_graph::SpreadingConfig;
 
 /// Which quantizer a tier uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -28,24 +29,35 @@ impl QuantizerKind {
     /// For [`QuantizerKind::Scalar`] the caller must supply calibration vectors
     /// because the min/max are data-dependent; this method returns a zero-range
     /// placeholder that must be replaced by [`ScalarQuantizer::calibrate`].
-    pub fn build(self, dim: usize) -> VectorQuantizer {
+    ///
+    /// Returns `Err` instead of panicking when the quantizer cannot be built for
+    /// the given dimension (e.g. TurboQuant requires a power-of-two dimension,
+    /// and the default `dimension = 768` is not a power of two).
+    pub fn build(self, dim: usize) -> Result<VectorQuantizer, turbomemory_core::TurboError> {
         match self {
-            Self::Scalar { bits } => VectorQuantizer::Scalar(ScalarQuantizer {
+            Self::Scalar { bits } => Ok(VectorQuantizer::Scalar(ScalarQuantizer {
                 bits,
                 dim,
                 min: 0.0,
                 max: 0.0,
-            }),
-            Self::Sign => VectorQuantizer::Sign(SignQuantizer::new(dim)),
-            Self::TurboQuantMse { bits } => VectorQuantizer::TurboQuantMse(
-                TurboQuantMseQuantizer::new(dim, bits, Self::ROTATION_SEED)
-                    .expect("valid TurboQuantMse bits"),
-            ),
-            Self::TurboQuantProd { bits } => VectorQuantizer::TurboQuantProd(
-                TurboQuantProdQuantizer::new(dim, bits, Self::ROTATION_SEED, Self::QJL_SEED)
-                    .expect("valid TurboQuantProd bits"),
-            ),
+            })),
+            Self::Sign => Ok(VectorQuantizer::Sign(SignQuantizer::new(dim))),
+            Self::TurboQuantMse { bits } => Ok(VectorQuantizer::TurboQuantMse(
+                TurboQuantMseQuantizer::new(dim, bits, Self::ROTATION_SEED)?,
+            )),
+            Self::TurboQuantProd { bits } => Ok(VectorQuantizer::TurboQuantProd(
+                TurboQuantProdQuantizer::new(dim, bits, Self::ROTATION_SEED, Self::QJL_SEED)?,
+            )),
         }
+    }
+
+    /// Returns `true` when this quantizer requires a power-of-two dimension
+    /// (i.e. the TurboQuant variants that rely on the FWHT preconditioner).
+    pub fn requires_pow2_dim(self) -> bool {
+        matches!(
+            self,
+            Self::TurboQuantMse { .. } | Self::TurboQuantProd { .. }
+        )
     }
 }
 
@@ -144,6 +156,42 @@ pub struct TierConfig {
     /// consolidation cycle, to bound per-cycle work. Ignored when
     /// `dedup_cosine_threshold` is `None`.
     pub dedup_max_pairs_per_cycle: usize,
+    /// Co-occurrence threshold for building abstraction (parent concept)
+    /// edges during consolidation. When two concepts co-occur on at least
+    /// this many memories, a parent concept node is created with
+    /// `Abstraction` edges to both. `0` (default) disables abstraction
+    /// building. A typical value is 3 — meaning two concepts must be seen
+    /// together at least 3 times before the graph generalizes them.
+    pub abstraction_co_occurrence_threshold: usize,
+    /// Edge-decay half-life in seconds. On each consolidation, reinforced
+    /// edges are decayed by `0.5^((now - last_reinforced) / half_life)`,
+    /// floored at the edge's baseline weight. `0` (default) disables decay,
+    /// preserving the pre-learning behavior. A typical value is 86400 (1
+    /// day) — memories not recalled within a day fade toward baseline.
+    pub edge_decay_half_life_secs: u64,
+    /// Maximum number of concepts to attach to a record. When the caller
+    /// provides fewer concepts than this, the remaining slots are filled by
+    /// automatic concept extraction from the record's text. When the caller
+    /// provides more, the caller's concepts are used as-is (no truncation).
+    /// Set to `0` to disable auto-extraction entirely (caller must always
+    /// supply concepts). Default is `5`.
+    pub max_concepts: usize,
+    /// Cosine-similarity threshold for memory refinement (belief revision).
+    /// When `Some(t)` (e.g. 0.85), consolidation creates `Refines` edges
+    /// from older memories to newer memories that are semantically close
+    /// (cosine >= t) AND share at least one concept. The old memory is NOT
+    /// deleted — it stays in the graph so the agent can reason about how
+    /// its understanding evolved. Instead, a `Refines` edge (old → new) lets
+    /// spreading activation propagate from the old memory to the newer one,
+    /// ensuring the most current version surfaces. `None` (default) disables
+    /// refinement. This threshold should be LOWER than
+    /// `dedup_cosine_threshold` — refinement is "same topic, more recent"
+    /// while dedup is "essentially identical content, merge them".
+    pub refinement_cosine_threshold: Option<f32>,
+    /// Upper bound on the number of refinement edges created in a single
+    /// consolidation cycle, to bound per-cycle work. Ignored when
+    /// `refinement_cosine_threshold` is `None`.
+    pub refinement_max_pairs_per_cycle: usize,
 }
 
 impl TierConfig {
@@ -170,6 +218,21 @@ impl TierConfig {
         evict_score_floor: None,
         dedup_cosine_threshold: None,
         dedup_max_pairs_per_cycle: 1024,
+        // Cognitive-layer learning: disabled by default to preserve the
+        // pre-learning retrieval behavior. Enable `abstraction_co_occurrence_threshold`
+        // (e.g. 3) and `edge_decay_half_life_secs` (e.g. 86400) to turn on
+        // abstraction hierarchy building and edge forgetting.
+        abstraction_co_occurrence_threshold: 0,
+        edge_decay_half_life_secs: 0,
+        // Auto-extract up to 5 concepts from record text when the caller
+        // provides fewer than that. Set to 0 to require explicit concepts.
+        max_concepts: 5,
+        // Memory refinement (belief revision): opt-in. When enabled, the
+        // engine creates Refines edges from older memories to newer ones
+        // that are about the same topic, so retrieval surfaces the most
+        // current version. None = disabled.
+        refinement_cosine_threshold: None,
+        refinement_max_pairs_per_cycle: 1024,
     };
 
     /// Recommended thresholds for a given vector dimension.
@@ -253,6 +316,9 @@ pub struct StoreConfig {
     pub optimizer_budget: OptimizerBudget,
     /// How often the background consolidation worker runs.  `None` disables it.
     pub auto_consolidation_interval: Option<Duration>,
+    /// Cognitive-layer spreading-activation parameters (FOK threshold, decay,
+    /// iterations, lateral inhibition). Defaults to `SpreadingConfig::default()`.
+    pub spreading: SpreadingConfig,
 }
 
 impl StoreConfig {
@@ -298,6 +364,7 @@ impl Default for StoreConfig {
             tier: TierConfig::default(),
             optimizer_budget: OptimizerBudget::default(),
             auto_consolidation_interval: Some(Duration::from_secs(60)),
+            spreading: SpreadingConfig::default(),
         }
     }
 }

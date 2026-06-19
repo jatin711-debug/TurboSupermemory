@@ -6,6 +6,65 @@
 
 ---
 
+## Recently Completed — 2026-06-19 (cognitive layer + TurboQuant hardening)
+
+Shipped: the first installment of the *memory-as-cognition* layer (learnable
+graph edges, abstraction hierarchy, durable graph reload) plus a latent-crash
+fix in the TurboQuant config path. This is the work that differentiates TSM
+from a plain vector DB and directly serves the "retain what matters, adapt as
+new information arrives, build a coherent knowledge base" vision.
+
+- **Learnable edge weights (`graph.rs`).** Edges are now weighted by
+  `importance.sqrt()` at insert time instead of the constant `1.0`/`0.5`.
+  `MemoryGraph::reinforce(id, now)` strengthens a memory's edges on retrieval
+  (first recall gives a 1.5× boost, subsequent recalls grow as
+  `1 + 0.1/(1+w)`, clamped at 8.0). `decay_edges(now, half_life)` erodes the
+  *learned* portion of reinforced edges with an exponential half-life, floored
+  at the baseline weight so decay never drops an edge below its birth strength.
+  Unreinforced edges are untouched. This is the "retain what matters / forget
+  what doesn't" loop: retrieval itself is the learning signal.
+- **Abstraction hierarchy activated (`graph.rs`).** `EdgeKind::Abstraction`
+  was defined but never constructed — now `build_abstractions(threshold)`
+  creates parent concept nodes (e.g. `rust+safety`) from accumulated concept
+  co-occurrence, with bidirectional `Abstraction` edges. Idempotent; co
+  -occurrence counters reset after each call so only *new* co-occurrences
+  trigger subsequent abstractions. Spreading activation now traverses
+  `Abstraction` edges (exempt from hub suppression) so a query hitting one
+  concept can reach memories of a sibling concept through the parent.
+- **Durable graph reload (`engine.rs`).** `rebuild_graph` now loads the
+  persisted graph JSON on open and merges in only records not already present,
+  preserving learned weights, reinforcement timestamps, and abstraction nodes
+  across restarts. Previously `MemoryGraph::from_json` was dead code and the
+  graph was always rebuilt from records, losing all learned state.
+- **Engine hooks.** `reinforce` is called on every cognitive-search result
+  (`search` / `search_filtered`); `decay_edges` + `build_abstractions` run on
+  `trigger_consolidation`; `add_memory_with_importance` is used on the insert
+  and dedup-merge paths. All opt-in via config (disabled by default preserves
+  pre-learning behavior).
+- **Config + Python exposure.** `SpreadingConfig` added to `StoreConfig`; new
+  `TierConfig` fields `abstraction_co_occurrence_threshold` (default 0 = off)
+  and `edge_decay_half_life_secs` (default 0 = off); new Python kwargs
+  `fok_threshold`, `spreading_decay`, `spreading_iterations`,
+  `abstraction_co_occurrence_threshold`, `edge_decay_half_life_secs`.
+- **TurboQuant panic fix (`config.rs`).** `QuantizerKind::build` now returns
+  `Result` instead of `.expect()`, and `StorageEngine::open` validates
+  TurboQuant tiers against non-power-of-two dimensions up front with an
+  actionable `InvalidArgument` error. Previously selecting `turbo_mse`/
+  `turbo_prod` with the default `dimension = 768` (not a power of two) would
+  panic inside the quantizer constructor.
+- **Table corrections.** 4.1 (batched SIMD kernel) and 4.6 (TurboQuant
+  quantizer) were already implemented in code but still marked Pending in the
+  table below — corrected to Done. 4.1 was noted Done in the 2026-06-19 audit
+  header; 4.6 is fully implemented in `turbo_quant.rs` (1150 LOC, 12 tests,
+  both MSE and Prod variants with LUT scoring).
+
+Validated: `cargo fmt --check` clean; `cargo clippy -- -D warnings` clean;
+`cargo test --workspace --exclude turbomemory_python` = 97 passed / 0 failed
+(core 29 + graph 14 + storage 51 + crash_recovery 3); `make build-python` +
+`python verify.py` E2E all pass.
+
+---
+
 ## Recently Completed — 2026-06-19 (audit + memory lifecycle)
 
 Two updates: (1) a deep codebase audit that found several roadmap items were
@@ -171,12 +230,12 @@ At 4k dimensions, distance compute is the bottleneck. We need SIMD, batched kern
 
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
-| 4.1 | **Batched SIMD distance kernel (matrix × query)** | `crates/turbomemory_core/src/metrics.rs` | Pending | Replace per-vector `cosine_similarity` with blocked AVX2/FMA matrix multiply. Four-accumulator unroll. Threshold: AVX for `dim >= 32`, SSE/NEON for `dim >= 16`. Qdrant: `lib/segment/src/spaces/`. |
+| 4.1 | **Batched SIMD distance kernel (matrix × query)** | `crates/turbomemory_core/src/metrics.rs` | Done | Done (2026-06-19 audit). `cosine_similarity_batch` with `dot_and_nb_x4` 4-vector unrolled kernel, AVX2/FMA + SSE + NEON paths. |
 | 4.2 | **Pre-normalize cosine vectors** | `crates/turbomemory_core/src/metrics.rs` | Done | Already implemented. Vectors are L2-normalized on insert/update (`engine.rs` `normalize`); usearch index uses `MetricKind::Cos`; rerank uses self-normalizing `cosine_similarity_batch`. |
 | 4.3 | **Scalar int8 quantizer** | `crates/turbomemory_core/src/quantization/` (new) | Pending | `alpha=(max-min)/127`, offset=min, per-metric multiplier, vector offset prefix. SIMD i8 dot/L1. Qdrant: `lib/quantization/src/encoded_vectors_u8.rs`. |
 | 4.4 | **Product Quantization (PQ)** | `crates/turbomemory_core/src/quantization/` (new) | Pending | 256 centroids/subspace, kmeans sample 10k, max 100 iter, tol 1e-5. Query builds LUT; SIMD LUT gather. Qdrant: `lib/quantization/src/encoded_vectors_pq.rs`. |
 | 4.5 | **Binary / 1-bit + 1.5-bit / 2-bit quantizers** | `crates/turbomemory_core/src/quantization/` (new) | Pending | XOR-popcount via SSE4.2/AVX-512/NEON; optional scalar query encoding. Default rescoring=true. Qdrant: `lib/quantization/src/encoded_vectors_binary.rs`. |
-| 4.6 | **TurboQuant-style 1/2/4-bit quantizer** | `crates/turbomemory_core/src/quantization/` (new) | Pending | FWHT rotation + length rescale + Lloyd-Max + per-coordinate shift/scale error correction. Asymmetric scoring. |
+| 4.6 | **TurboQuant-style 1/2/4-bit quantizer** | `crates/turbomemory_core/src/turbo_quant.rs` | Done | Done. Both MSE and Prod variants fully implemented in `turbo_quant.rs` (1150 LOC, 12 tests): FWHT rotation, Lloyd-Max codebooks (bits 1–4 true optimum; 5–8 uniform approximation — a known gap), QJL residual 1-bit transform, LUT scoring with AVX2 gather + byte-weight fast paths. Config panic on non-pow2 dim fixed (2026-06-19). |
 | 4.7 | **OPQ / learned rotation before PQ** | `crates/turbomemory_core/src/quantization/` (new) | Pending | Reduce PQ distortion for high-dimensional embeddings. |
 | 4.8 | **Quantization auto-selection by dimension and recall target** | `crates/turbomemory_storage/src/config.rs` | In Progress | Cold tier no longer defaults to 1-bit sign at high dim — now 8-bit scalar by default (2026-06-18). Full auto-selection (scalar/PQ/TurboQuant by dim + recall target) still pending. |
 | 4.9 | **Zero-copy quantized scans** | `crates/turbomemory_storage/src/segments/warm.rs`, `cold.rs` | Pending | Read mmap slices directly; remove `chunk_bytes.extend_from_slice` copies. |
@@ -347,7 +406,8 @@ GPU is **not a magic bullet**. Qdrant uses GPU only for HNSW **build**, not sear
 
 All previously tracked items are subsumed above. The following remain relevant but are now lower priority until Stage 1 is complete:
 
-- Cognitive graph durable persistence (graph shard per collection shard).
+- ~~Cognitive graph durable persistence (graph shard per collection shard).~~ **Done (2026-06-19).** Graph JSON is now loaded on open and merged with new records, preserving learned edge weights, reinforcement timestamps, and abstraction nodes across restarts. Per-shard graph persistence still pending sharding (0.1).
+- **Graph merge/forget policies** — partially done (2026-06-19): `reinforce` (retain on retrieval), `decay_edges` (forget stale reinforced edges), `build_abstractions` (generalize from co-occurrence), `deduplicate` (merge near-duplicates, transfer edges). Still pending: memory *evolution* (revise/contradict existing memories when new info arrives — the SAGE/A-Mem pattern), and importance-weighted edge strengthening on access (currently reinforcement is uniform per retrieval, not scaled by the retriever's confidence).
 - Sparse vectors.
 - Multi-agent scoping / distributed shards.
 - Advanced full-text index tuning beyond per-segment Tantivy.

@@ -93,9 +93,7 @@ impl UsearchIndex {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .build()
-                .map_err(|e| {
-                    StorageError::IndexError(format!("usearch build pool failed: {e}"))
-                })?;
+                .map_err(|e| StorageError::IndexError(format!("usearch build pool failed: {e}")))?;
             pool.install(|| {
                 vectors[seed..].par_iter().try_for_each(|(offset, vector)| {
                     index
@@ -320,9 +318,15 @@ mod tests {
                 evict_score_floor: None,
                 dedup_cosine_threshold: None,
                 dedup_max_pairs_per_cycle: 1024,
+                abstraction_co_occurrence_threshold: 0,
+                edge_decay_half_life_secs: 0,
+                max_concepts: 5,
+                refinement_cosine_threshold: None,
+                refinement_max_pairs_per_cycle: 1024,
             },
             optimizer_budget: OptimizerBudget::default(),
             auto_consolidation_interval: None,
+            spreading: turbomemory_graph::SpreadingConfig::default(),
         }
     }
 

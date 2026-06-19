@@ -30,7 +30,8 @@ use std::path::Path;
 use std::sync::Arc;
 use turbomemory_core::{cosine_similarity, normalize, validate_dimension};
 use turbomemory_graph::{
-    step_session, CompressedCognitiveState, MemoryGraph, SpreadingActivation, SpreadingConfig,
+    merge_concepts, step_session_with_compressor, CognitiveCompressor, CompressedCognitiveState,
+    DeterministicCompressor, MemoryGraph, SpreadingActivation, SpreadingConfig,
 };
 
 /// For small collections an exact scan is deterministic and higher-recall than
@@ -48,6 +49,15 @@ pub struct StorageEngine {
     segment_snapshot: Arc<arc_swap::ArcSwap<SegmentSnapshot>>,
     graph: Arc<RwLock<SpreadingActivation>>,
     ccs: Arc<Mutex<Option<CompressedCognitiveState>>>,
+    /// The cognitive compressor used by `step_session`. Defaults to
+    /// `DeterministicCompressor`; callers can install an `LlmCompressor`
+    /// via `set_compressor` to get LLM-driven working-memory compression.
+    /// Stored behind `Arc<RwLock<Arc<...>>>` so it can be replaced at
+    /// runtime and shared across engine clones. A `RwLock` is used instead
+    /// of `ArcSwap` because `ArcSwap` does not support unsized `dyn Trait`
+    /// types without additional wrapper boilerplate. The compressor is
+    /// swapped rarely (once at setup), so the lock overhead is negligible.
+    compressor: Arc<RwLock<Arc<dyn CognitiveCompressor>>>,
     id_index: Arc<RwLock<AHashMap<Arc<str>, PointOffset>>>,
     payload_index: Arc<RwLock<PayloadIndex>>,
     text_index: Arc<TextIndex>,
@@ -67,6 +77,7 @@ impl Clone for StorageEngine {
             segment_snapshot: self.segment_snapshot.clone(),
             graph: self.graph.clone(),
             ccs: self.ccs.clone(),
+            compressor: self.compressor.clone(),
             id_index: self.id_index.clone(),
             payload_index: self.payload_index.clone(),
             text_index: self.text_index.clone(),
@@ -81,6 +92,29 @@ impl Clone for StorageEngine {
 impl StorageEngine {
     pub fn open(db_path: impl AsRef<Path>, config: StoreConfig) -> crate::Result<Arc<Self>> {
         let db_path = db_path.as_ref();
+
+        // Fail fast on a TurboQuant tier configured for a non-power-of-two
+        // dimension. TurboQuant relies on the in-place FWHT preconditioner
+        // (lib.rs:fwht), which asserts that the vector length is a power of
+        // two. The default `dimension = 768` is NOT a power of two, so
+        // selecting `turbo_mse`/`turbo_prod` with the default config would
+        // otherwise panic inside the quantizer constructor. Surface this as a
+        // recoverable `InvalidArgument` error with an actionable message.
+        let dim = config.dimension;
+        for (name, kind) in [
+            ("warm_quantizer", config.tier.warm_quantizer),
+            ("cold_quantizer", config.tier.cold_quantizer),
+        ] {
+            if kind.requires_pow2_dim() && !dim.is_power_of_two() {
+                return Err(crate::StorageError::InvalidArgument(format!(
+                    "{name} {:?} requires a power-of-two dimension, but dimension is {dim}. \
+                     Use a power-of-two dimension (e.g. 256, 512, 1024) or switch to a \
+                     non-FWHT quantizer (scalar / sign).",
+                    kind
+                )));
+            }
+        }
+
         let meta = MetadataStore::open(db_path)?;
         let vectors = VectorStore::open(
             db_path.join("vectors.bin"),
@@ -172,7 +206,11 @@ impl StorageEngine {
             .iter()
             .map(|(offset, rec)| (Arc::from(rec.id.as_str()), *offset))
             .collect();
-        let graph = build_graph(&records_vec);
+        // Load the persisted graph (if any) so learned edge weights and
+        // abstraction nodes survive restart. Falls back to a full rebuild
+        // when the graph JSON is absent or unparseable.
+        let saved_graph = meta.load_meta_str("graph");
+        let graph = rebuild_graph(&records_vec, saved_graph, &config.spreading);
         let ccs = meta
             .load_meta_str("ccs")
             .and_then(|s| serde_json::from_str::<CompressedCognitiveState>(&s).ok());
@@ -253,6 +291,8 @@ impl StorageEngine {
             config.optimizer_budget.clone(),
         ));
         let access_counters = Arc::new(AccessCounters::new());
+        let compressor: Arc<RwLock<Arc<dyn CognitiveCompressor>>> =
+            Arc::new(RwLock::new(Arc::new(DeterministicCompressor)));
 
         Ok(Arc::new_cyclic(move |weak| {
             let optimizer = BackgroundOptimizer::new(weak.clone(), interval, budget);
@@ -274,6 +314,7 @@ impl StorageEngine {
                 segment_snapshot,
                 graph,
                 ccs: Arc::new(Mutex::new(ccs)),
+                compressor,
                 id_index,
                 payload_index,
                 text_index,
@@ -311,6 +352,10 @@ impl StorageEngine {
         }
         let mut emb = embedding.to_vec();
         normalize(&mut emb)?;
+        // Augment caller-supplied concepts with auto-extracted ones from the
+        // text. If the caller already provided >= max_concepts, their tags
+        // are used as-is. If max_concepts is 0, auto-extraction is disabled.
+        let concepts = merge_concepts(concepts, text, self.config.tier.max_concepts);
         let offset = self.meta.allocate_offset();
         let seq = self.meta.allocate_seq();
         let record = Record {
@@ -318,7 +363,7 @@ impl StorageEngine {
             text: text.to_string(),
             embedding: Arc::from(emb),
             importance,
-            concepts: concepts.to_vec(),
+            concepts,
             created_at: now_secs(),
             insert_seq: seq,
             access_count: 0,
@@ -398,6 +443,7 @@ impl StorageEngine {
         drop(idx);
 
         let mut records: Vec<(PointOffset, Record)> = Vec::with_capacity(indices.len());
+        let max_concepts = self.config.tier.max_concepts;
         for &i in &indices {
             let mut emb = embeddings[i].to_vec();
             normalize(&mut emb)?;
@@ -408,12 +454,14 @@ impl StorageEngine {
             } else {
                 payloads[i].clone()
             };
+            // Augment caller-supplied concepts with auto-extracted ones.
+            let concepts = merge_concepts(&concepts[i], &texts[i], max_concepts);
             let record = Record {
                 id: ids[i].clone(),
                 text: texts[i].clone(),
                 embedding: Arc::from(emb),
                 importance: importances[i],
-                concepts: concepts[i].clone(),
+                concepts,
                 created_at: now_secs(),
                 insert_seq: seq,
                 access_count: 0,
@@ -691,9 +739,12 @@ impl StorageEngine {
             if hydrated.is_empty() {
                 return Ok(None);
             }
-            // Bump access counts.
+            // Bump access counts and reinforce graph edges for retrieved
+            // memories. Reinforcement is the learning signal that a memory
+            // was useful, strengthening its graph links for future retrieval.
             for (id, _) in &hydrated {
                 self.bump_access_by_id(id);
+                self.reinforce_graph_by_id(id);
             }
             Ok(Some(hydrated))
         } else {
@@ -756,6 +807,7 @@ impl StorageEngine {
             }
             for (id, _) in &hydrated {
                 self.bump_access_by_id(id);
+                self.reinforce_graph_by_id(id);
             }
             Ok(Some(hydrated))
         } else {
@@ -837,16 +889,42 @@ impl StorageEngine {
         }
     }
 
+    /// Reinforce the cognitive-graph edges of a retrieved memory (rehearsal).
+    /// Called alongside `bump_access_by_id` on every cognitive-search result
+    /// so that frequently-recalled memories get stronger graph links over
+    /// time. This is the "retain what matters" learning loop: retrieval
+    /// itself is the signal that a memory was useful.
+    fn reinforce_graph_by_id(&self, id: &str) {
+        let mut graph = self.graph.write();
+        graph.reinforce(id, now_secs());
+    }
+
     pub fn step_session(
         &self,
         user_input: &str,
         assistant_response: &str,
     ) -> crate::Result<String> {
         let ccs_json = self.ccs.lock().as_ref().map(|c| c.to_json());
-        let json = step_session(ccs_json.as_deref(), user_input, assistant_response);
+        let compressor = self.compressor.read().clone();
+        let json = step_session_with_compressor(
+            compressor.as_ref(),
+            ccs_json.as_deref(),
+            user_input,
+            assistant_response,
+        );
         *self.ccs.lock() = serde_json::from_str(&json).ok();
         self.save_ccs()?;
         Ok(json)
+    }
+
+    /// Install a custom cognitive compressor (e.g. an `LlmCompressor`).
+    ///
+    /// The default compressor is `DeterministicCompressor`. Call this to
+    /// replace it with an LLM-backed compressor so that `step_session`
+    /// distills turns using an external model instead of the deterministic
+    /// keyword extractor.
+    pub fn set_compressor(&self, compressor: Arc<dyn CognitiveCompressor>) {
+        *self.compressor.write() = compressor;
     }
 
     fn save_ccs(&self) -> crate::Result<()> {
@@ -888,6 +966,27 @@ impl StorageEngine {
         // when their config thresholds are unset.
         self.deduplicate()?;
         self.evict()?;
+
+        // Memory evolution: detect refinements (newer memories that
+        // supersede older ones about the same topic) and create Refines
+        // edges so retrieval surfaces the most current version. Opt-in.
+        self.check_refinements()?;
+
+        // Cognitive-layer learning: decay stale reinforced edges and build
+        // abstraction hierarchies from concept co-occurrence. Both are opt-in
+        // (no-op when their config is 0) so the default behavior is unchanged.
+        let now = now_secs();
+        let half_life = self.config.tier.edge_decay_half_life_secs;
+        let abstraction_threshold = self.config.tier.abstraction_co_occurrence_threshold;
+        {
+            let mut graph = self.graph.write();
+            if half_life > 0 {
+                graph.decay_edges(now, half_life);
+            }
+            if abstraction_threshold > 0 {
+                graph.build_abstractions(abstraction_threshold);
+            }
+        }
 
         self.save_graph()?;
         Ok((sealed, compacted, promoted))
@@ -946,7 +1045,9 @@ impl StorageEngine {
         // Cap pass: if still over the cap, evict the lowest-scoring survivors.
         if let Some(max_records) = max_records {
             let live = self.meta.record_count();
-            let mut over = live.saturating_sub(victims.len()).saturating_sub(max_records);
+            let mut over = live
+                .saturating_sub(victims.len())
+                .saturating_sub(max_records);
             if over > 0 {
                 // Survivors not already marked, sorted by ascending score.
                 let mut survivors: Vec<&(PointOffset, String, f64)> = scored
@@ -1104,7 +1205,12 @@ impl StorageEngine {
                         }
                     }
                     let mut graph = self.graph.write();
-                    graph.add_memory(survivor_id, &survivor.text, &concepts);
+                    graph.add_memory_with_importance(
+                        survivor_id,
+                        &survivor.text,
+                        &concepts,
+                        survivor.importance,
+                    );
                     drop(graph);
                 }
             }
@@ -1113,6 +1219,165 @@ impl StorageEngine {
             }
         }
         Ok(count)
+    }
+
+    /// Memory evolution: detect when a newer memory refines an older one
+    /// and create `Refines` edges (old → new) so retrieval surfaces the
+    /// most current version.
+    ///
+    /// For each pair of memories where:
+    /// - cosine similarity >= `refinement_cosine_threshold`
+    /// - they share at least one concept
+    /// - the newer one has a higher `insert_seq`
+    ///
+    /// a `Refines` edge is created from the older memory to the newer one.
+    /// The older memory is NOT deleted — it stays in the graph so the agent
+    /// can reason about how its understanding evolved. The newer memory
+    /// also inherits the older one's unique concepts (so it's discoverable
+    /// through the same concept paths).
+    ///
+    /// Opt-in: a no-op when `refinement_cosine_threshold` is `None`. Work
+    /// is bounded by `refinement_max_pairs_per_cycle`. Candidate pairs are
+    /// found via the existing ANN index (no O(n²) scan).
+    ///
+    /// Returns the number of new `Refines` edges created.
+    pub fn check_refinements(&self) -> crate::Result<usize> {
+        let Some(threshold) = self.config.tier.refinement_cosine_threshold else {
+            return Ok(0);
+        };
+        let max_pairs = self.config.tier.refinement_max_pairs_per_cycle;
+        if max_pairs == 0 {
+            return Ok(0);
+        }
+
+        self.access_counters.drain_into(&self.meta)?;
+
+        // Snapshot live records sorted by insert_seq (newest first, so we
+        // process the most recent refinements first).
+        struct Cand {
+            id: String,
+            offset: PointOffset,
+            insert_seq: u64,
+            concepts: Vec<String>,
+        }
+        let mut cands: Vec<Cand> = Vec::new();
+        self.meta.for_each_record(|offset, rec| {
+            cands.push(Cand {
+                offset,
+                id: rec.id.clone(),
+                insert_seq: rec.insert_seq,
+                concepts: rec.concepts.clone(),
+            });
+        })?;
+        cands.sort_by_key(|c| std::cmp::Reverse(c.insert_seq));
+
+        let mut created = 0usize;
+        let mut processed: HashSet<PointOffset> = HashSet::new();
+
+        for cand in &cands {
+            if created >= max_pairs {
+                break;
+            }
+            // Get this record's embedding for ANN search.
+            let view = self.vectors.read_view();
+            let Some(vec) = view.get(cand.offset) else {
+                continue;
+            };
+            let embedding: Vec<f32> = vec.to_vec();
+            drop(view);
+
+            // Find near neighbors via ANN.
+            let neighbors = self.search_ann_candidates(&embedding, 10)?;
+            for (nid, _) in neighbors {
+                if created >= max_pairs {
+                    break;
+                }
+                if nid == cand.id {
+                    continue;
+                }
+                // Find the neighbor in our candidate list.
+                let Some(other) = cands.iter().find(|c| c.id == nid) else {
+                    continue;
+                };
+                // The neighbor must be OLDER (lower insert_seq).
+                if other.insert_seq >= cand.insert_seq {
+                    continue;
+                }
+                // They must share at least one concept.
+                let shares_concept = cand.concepts.iter().any(|c| other.concepts.contains(c));
+                if !shares_concept {
+                    continue;
+                }
+                // Verify exact cosine.
+                let view = self.vectors.read_view();
+                let Some(other_vec) = view.get(other.offset) else {
+                    continue;
+                };
+                let sim = cosine_similarity(&embedding, other_vec);
+                drop(view);
+                if sim < threshold {
+                    continue;
+                }
+                // Create the Refines edge: old (other) → new (cand).
+                let mut graph = self.graph.write();
+                let added = graph.add_refinement(&other.id, &cand.id, 0.8);
+                drop(graph);
+                if added {
+                    created += 1;
+                    // Transfer the older memory's unique concepts to the
+                    // newer one, so the refinement is discoverable through
+                    // all the same concept paths.
+                    let unique_concepts: Vec<String> = other
+                        .concepts
+                        .iter()
+                        .filter(|c| !cand.concepts.contains(c))
+                        .cloned()
+                        .collect();
+                    if !unique_concepts.is_empty() {
+                        let mut new_concepts = cand.concepts.clone();
+                        for c in &unique_concepts {
+                            if !new_concepts.contains(c) {
+                                new_concepts.push(c.clone());
+                            }
+                        }
+                        // Update the record's concepts in metadata so the
+                        // transfer persists across restarts.
+                        if let Some(mut rec) = self.meta.get(cand.offset)? {
+                            rec.concepts = new_concepts;
+                            self.meta.put(
+                                cand.offset,
+                                &rec.with_embedding(
+                                    // Re-attach a dummy embedding — put only
+                                    // stores metadata, the embedding lives in
+                                    // VectorStore and is not affected.
+                                    Arc::from(embedding.as_slice()),
+                                ),
+                            )?;
+                        }
+                        // Also update the graph: re-add the new memory with
+                        // the augmented concepts so the new concept edges
+                        // exist. This is idempotent for existing concepts
+                        // (graph dedupes by node id).
+                        let mut graph = self.graph.write();
+                        if let Some(rec) = self.find_record_by_id(&cand.id) {
+                            graph.add_memory_with_importance(
+                                &cand.id,
+                                &rec.text,
+                                &rec.concepts,
+                                rec.importance,
+                            );
+                        }
+                        drop(graph);
+                    }
+                }
+            }
+            processed.insert(cand.offset);
+        }
+
+        if created > 0 {
+            self.save_graph()?;
+        }
+        Ok(created)
     }
 
     pub fn flush(&self) -> crate::Result<()> {
@@ -1180,12 +1445,86 @@ impl StorageEngine {
     }
 }
 
-fn build_graph(records: &[(PointOffset, Record)]) -> SpreadingActivation {
+fn build_graph(records: &[(PointOffset, Record)], config: &SpreadingConfig) -> SpreadingActivation {
     let mut graph = MemoryGraph::new();
     for (_, rec) in records {
-        graph.add_memory(&rec.id, &rec.text, &rec.concepts);
+        graph.add_memory_with_importance(&rec.id, &rec.text, &rec.concepts, rec.importance);
     }
-    SpreadingActivation::new(graph, SpreadingConfig::default())
+    SpreadingActivation::new(graph, config.clone())
+}
+
+/// Rebuild the cognitive graph, preserving learned edge weights and
+/// abstraction nodes from a previously-saved graph when available.
+///
+/// The persisted graph JSON (written by `save_graph`) captures learned state
+/// that is not reconstructable from records alone: reinforced edge weights,
+/// reinforcement timestamps, and abstraction (parent concept) nodes. If the
+/// persisted graph is present, we load it and add only records that are not
+/// already memory nodes in it (using `insert_seq` ordering to decide which
+/// records are new). If the persisted graph is absent or fails to parse, we
+/// fall back to a full rebuild from records — this preserves the pre-learning
+/// behavior and is always correct, just without learned state.
+fn rebuild_graph(
+    records: &[(PointOffset, Record)],
+    saved_graph_json: Option<String>,
+    config: &SpreadingConfig,
+) -> SpreadingActivation {
+    let Some(json) = saved_graph_json else {
+        return build_graph(records, config);
+    };
+    let Ok(mut graph) = MemoryGraph::from_json(&json) else {
+        return build_graph(records, config);
+    };
+    // Add records that are not already memory nodes in the persisted graph.
+    // Records are sorted by (created_at, insert_seq) by the caller, so we
+    // process them in insertion order, preserving temporal chaining for the
+    // new tail. We track the last memory id seen so temporal edges chain
+    // correctly from the last persisted memory to the first new one.
+    let existing_mem_ids: HashSet<String> = graph
+        .iter_memory_nodes()
+        .map(|(k, _)| k.strip_prefix("mem:").unwrap_or(k).to_string())
+        .collect();
+    // Reset last_memory_id so new temporal edges chain from the most recent
+    // persisted memory (if any) rather than from an arbitrary one. We find
+    // the last memory by scanning the existing set — the graph stores nodes
+    // in a BTreeMap keyed by "mem:{id}", so we pick the lexicographically
+    // largest. This is a heuristic; exact temporal ordering of persisted
+    // memories is not recoverable from the graph alone, but the chain only
+    // matters for the *new* tail, and any persisted memory as the chain
+    // anchor is sufficient for that.
+    if let Some((last_key, _)) = graph.iter_memory_nodes().last() {
+        let last_id = last_key
+            .strip_prefix("mem:")
+            .unwrap_or(last_key)
+            .to_string();
+        graph_reset_last_memory(&mut graph, &last_id);
+    }
+    let mut added_any = false;
+    for (_, rec) in records {
+        if existing_mem_ids.contains(&rec.id) {
+            continue;
+        }
+        graph.add_memory_with_importance(&rec.id, &rec.text, &rec.concepts, rec.importance);
+        added_any = true;
+    }
+    let _ = added_any; // suppress unused warning when no new records
+    SpreadingActivation::new(graph, config.clone())
+}
+
+/// Helper to set the `last_memory_id` of a `MemoryGraph` so that the next
+/// `add_memory` call chains temporally from the given id. We do this by
+/// inserting a no-op: since `last_memory_id` is private, we exploit the fact
+/// that calling `add_memory` on an existing id re-inserts it and re-chains.
+/// Actually, the cleanest approach is to not fight the encapsulation: if no
+/// new records are added, the temporal chain doesn't matter. If new records
+/// are added, they chain from whatever `last_memory_id` the deserialized
+/// graph carries. Since the graph was serialized after potentially many
+/// adds, `last_memory_id` is already the last-added memory's id. So this
+/// function is a no-op — we keep it as a documented placeholder.
+fn graph_reset_last_memory(_graph: &mut MemoryGraph, _id: &str) {
+    // No-op: the deserialized graph already carries `last_memory_id` from the
+    // last `add_memory` call before serialization. New records will chain
+    // from it naturally. See `rebuild_graph` for the rationale.
 }
 
 pub(crate) fn now_secs() -> u64 {
@@ -1236,9 +1575,15 @@ mod tests {
                 evict_score_floor: None,
                 dedup_cosine_threshold: None,
                 dedup_max_pairs_per_cycle: 1024,
+                abstraction_co_occurrence_threshold: 0,
+                edge_decay_half_life_secs: 0,
+                max_concepts: 5,
+                refinement_cosine_threshold: None,
+                refinement_max_pairs_per_cycle: 1024,
             },
             optimizer_budget: crate::config::OptimizerBudget::default(),
             auto_consolidation_interval: None,
+            spreading: turbomemory_graph::SpreadingConfig::default(),
         }
     }
 
@@ -1274,9 +1619,15 @@ mod tests {
                 evict_score_floor: None,
                 dedup_cosine_threshold: None,
                 dedup_max_pairs_per_cycle: 1024,
+                abstraction_co_occurrence_threshold: 0,
+                edge_decay_half_life_secs: 0,
+                max_concepts: 5,
+                refinement_cosine_threshold: None,
+                refinement_max_pairs_per_cycle: 1024,
             },
             optimizer_budget: crate::config::OptimizerBudget::default(),
             auto_consolidation_interval: None,
+            spreading: turbomemory_graph::SpreadingConfig::default(),
         }
     }
 
@@ -1306,6 +1657,195 @@ mod tests {
             .search_ann(&[0.9f32, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 1)
             .unwrap();
         assert_eq!(results[0].0, "m1");
+    }
+
+    #[test]
+    fn auto_extracts_concepts_when_none_provided() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+        // Insert with NO caller concepts — the engine should auto-extract
+        // concepts from the text.
+        engine
+            .insert(
+                "m1",
+                "Rust memory safety concurrency",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &[],
+            )
+            .unwrap();
+        // Verify the record has extracted concepts by checking the graph.
+        let graph = engine.graph.read();
+        let graph = graph.graph();
+        // "rust", "memory", "safety", "concurrency" should all be concept nodes.
+        assert!(
+            graph.nodes().contains_key("concept:rust"),
+            "auto-extracted concept 'rust' should be a graph node"
+        );
+        assert!(
+            graph.nodes().contains_key("concept:safety"),
+            "auto-extracted concept 'safety' should be a graph node"
+        );
+        assert!(
+            graph.nodes().contains_key("concept:concurrency"),
+            "auto-extracted concept 'concurrency' should be a graph node"
+        );
+    }
+
+    #[test]
+    fn caller_concepts_are_preserved_and_augmented() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+        // Insert with one caller concept — it should be preserved, and the
+        // remaining slots filled by extraction.
+        engine
+            .insert(
+                "m1",
+                "Rust memory safety concurrency",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["my_tag".to_string()],
+            )
+            .unwrap();
+        let graph = engine.graph.read();
+        let graph = graph.graph();
+        // Caller concept preserved.
+        assert!(graph.nodes().contains_key("concept:my_tag"));
+        // Extracted concepts augmented.
+        assert!(graph.nodes().contains_key("concept:rust"));
+    }
+
+    #[test]
+    fn max_concepts_zero_disables_extraction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        config.tier.max_concepts = 0;
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        engine
+            .insert(
+                "m1",
+                "Rust memory safety concurrency",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &[],
+            )
+            .unwrap();
+        let graph = engine.graph.read();
+        let graph = graph.graph();
+        // With max_concepts=0 and no caller concepts, no concept nodes should exist.
+        assert!(
+            !graph.nodes().contains_key("concept:rust"),
+            "extraction should be disabled when max_concepts=0"
+        );
+    }
+
+    #[test]
+    fn check_refinements_creates_edge_for_related_memories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        // Enable refinement with a low threshold so our test vectors trigger it.
+        config.tier.refinement_cosine_threshold = Some(0.5);
+        config.tier.refinement_max_pairs_per_cycle = 100;
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+
+        // Insert an "old" memory about rust safety.
+        engine
+            .insert(
+                "old",
+                "Rust memory safety",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+        // Insert a "new" memory about the same topic (high cosine, shares concept).
+        engine
+            .insert(
+                "new",
+                "Rust borrow checker safety",
+                &[0.9f32, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+
+        // Run check_refinements — should create a Refines edge old → new.
+        let created = engine.check_refinements().unwrap();
+        assert!(
+            created >= 1,
+            "should create at least one Refines edge, got {created}"
+        );
+
+        let graph = engine.graph.read();
+        let graph = graph.graph();
+        assert!(
+            graph.refinement_count() >= 1,
+            "graph should have Refines edges"
+        );
+        // The edge should be old → new.
+        let refined = graph.refined_by("old");
+        assert!(
+            refined.contains(&"new".to_string()),
+            "old should refine to new, got {refined:?}"
+        );
+    }
+
+    #[test]
+    fn check_refinements_disabled_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+        engine
+            .insert(
+                "old",
+                "Rust",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+        engine
+            .insert(
+                "new",
+                "Rust",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+        let created = engine.check_refinements().unwrap();
+        assert_eq!(
+            created, 0,
+            "refinement should be disabled when threshold is None"
+        );
+    }
+
+    #[test]
+    fn check_refinements_skips_unrelated_concepts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        config.tier.refinement_cosine_threshold = Some(0.5);
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        // Two memories with high cosine (same vector) but NO shared concepts.
+        engine
+            .insert(
+                "old",
+                "Rust",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+        engine
+            .insert(
+                "new",
+                "Python",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["python".to_string()],
+            )
+            .unwrap();
+        let created = engine.check_refinements().unwrap();
+        assert_eq!(created, 0, "should not refine when concepts don't match");
     }
 
     #[test]
@@ -1493,7 +2033,13 @@ mod tests {
         let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
         for i in 0..6usize {
             engine
-                .insert(&format!("mem_{i}"), &format!("text {i}"), &make_vec(8, i), 1.0, &[])
+                .insert(
+                    &format!("mem_{i}"),
+                    &format!("text {i}"),
+                    &make_vec(8, i),
+                    1.0,
+                    &[],
+                )
                 .unwrap();
         }
         // Default config has max_records = None and evict_score_floor = None.
@@ -1512,7 +2058,13 @@ mod tests {
         let engine = StorageEngine::open(tmp.path(), config).unwrap();
         for i in 0..5usize {
             engine
-                .insert(&format!("mem_{i}"), &format!("text {i}"), &make_vec(8, i), 1.0, &[])
+                .insert(
+                    &format!("mem_{i}"),
+                    &format!("text {i}"),
+                    &make_vec(8, i),
+                    1.0,
+                    &[],
+                )
                 .unwrap();
         }
         // Give mem_0 and mem_1 a high access score so they survive the cap.
@@ -1525,7 +2077,10 @@ mod tests {
             }
         }
         let evicted = engine.evict().unwrap();
-        assert!(evicted >= 3, "expected to evict down to the cap, got {evicted}");
+        assert!(
+            evicted >= 3,
+            "expected to evict down to the cap, got {evicted}"
+        );
         assert!(engine.record_count() <= 2);
         // The frequently-accessed records must survive.
         assert!(engine.find_record_by_id("mem_0").is_some());
@@ -1543,7 +2098,13 @@ mod tests {
         let engine = StorageEngine::open(tmp.path(), config).unwrap();
         for i in 0..4usize {
             engine
-                .insert(&format!("mem_{i}"), &format!("text {i}"), &make_vec(8, i), 1.0, &[])
+                .insert(
+                    &format!("mem_{i}"),
+                    &format!("text {i}"),
+                    &make_vec(8, i),
+                    1.0,
+                    &[],
+                )
                 .unwrap();
         }
         // Access mem_0 so its score climbs above the floor and the grace window
@@ -1572,7 +2133,13 @@ mod tests {
         // grace window even though its score is below the floor.
         for i in 0..3usize {
             engine
-                .insert(&format!("mem_{i}"), &format!("text {i}"), &make_vec(8, i), 1.0, &[])
+                .insert(
+                    &format!("mem_{i}"),
+                    &format!("text {i}"),
+                    &make_vec(8, i),
+                    1.0,
+                    &[],
+                )
                 .unwrap();
             engine.search_ann(&make_vec(8, i), 1).unwrap();
         }
@@ -1590,10 +2157,22 @@ mod tests {
         let engine = StorageEngine::open(tmp.path(), config).unwrap();
         // Two near-identical vectors (same direction) plus a distinct one.
         engine
-            .insert("dup_keep", "keep me", &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 1.0, &["a".to_string()])
+            .insert(
+                "dup_keep",
+                "keep me",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["a".to_string()],
+            )
             .unwrap();
         engine
-            .insert("dup_drop", "drop me", &[0.999f32, 0.001, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 1.0, &["b".to_string()])
+            .insert(
+                "dup_drop",
+                "drop me",
+                &[0.999f32, 0.001, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["b".to_string()],
+            )
             .unwrap();
         engine
             .insert("distinct", "different", &make_vec(8, 4), 1.0, &[])
@@ -1604,7 +2183,10 @@ mod tests {
             engine.search_ann(&q, 1).unwrap();
         }
         let merged = engine.deduplicate().unwrap();
-        assert_eq!(merged, 1, "exactly one of the duplicate pair should be merged");
+        assert_eq!(
+            merged, 1,
+            "exactly one of the duplicate pair should be merged"
+        );
         assert!(engine.find_record_by_id("dup_keep").is_some());
         assert!(engine.find_record_by_id("dup_drop").is_none());
         // The distinct record is untouched.
@@ -1613,7 +2195,10 @@ mod tests {
         let survivor = engine.find_record_by_id("dup_keep").unwrap();
         assert!(survivor.concepts.contains(&"a".to_string()));
         let graph = engine.graph.read();
-        assert!(graph.graph().concept_degree("b") >= 1, "survivor should inherit victim concept 'b'");
+        assert!(
+            graph.graph().concept_degree("b") >= 1,
+            "survivor should inherit victim concept 'b'"
+        );
     }
 
     #[test]
@@ -1621,10 +2206,22 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
         engine
-            .insert("a", "x", &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 1.0, &[])
+            .insert(
+                "a",
+                "x",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &[],
+            )
             .unwrap();
         engine
-            .insert("b", "y", &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 1.0, &[])
+            .insert(
+                "b",
+                "y",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &[],
+            )
             .unwrap();
         // dedup_cosine_threshold defaults to None.
         let merged = engine.deduplicate().unwrap();

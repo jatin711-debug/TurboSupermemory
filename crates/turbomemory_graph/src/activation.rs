@@ -69,9 +69,48 @@ impl SpreadingActivation {
         self.bm25.add(id, text);
     }
 
+    /// Insert a memory with an importance-weighted edge contribution. See
+    /// [`MemoryGraph::add_memory_with_importance`].
+    pub fn add_memory_with_importance(
+        &mut self,
+        id: &str,
+        text: &str,
+        concepts: &[String],
+        importance: f32,
+    ) {
+        self.graph
+            .add_memory_with_importance(id, text, concepts, importance);
+        self.bm25.add(id, text);
+    }
+
     pub fn remove_memory(&mut self, id: &str) {
         self.graph.remove_memory(id);
         self.bm25.remove(id);
+    }
+
+    /// Reinforce the edges of a retrieved memory (rehearsal). See
+    /// [`MemoryGraph::reinforce`].
+    pub fn reinforce(&mut self, id: &str, now: u64) {
+        self.graph.reinforce(id, now);
+    }
+
+    /// Apply time-decay to all reinforced edges. See [`MemoryGraph::decay_edges`].
+    pub fn decay_edges(&mut self, now: u64, half_life: u64) {
+        self.graph.decay_edges(now, half_life);
+    }
+
+    /// Build abstraction hierarchy from accumulated concept co-occurrence.
+    /// See [`MemoryGraph::build_abstractions`]. Returns the number of new
+    /// abstraction edges added.
+    pub fn build_abstractions(&mut self, threshold: usize) -> usize {
+        self.graph.build_abstractions(threshold)
+    }
+
+    /// Create a `Refines` edge from an older memory to a newer one. See
+    /// [`MemoryGraph::add_refinement`]. Returns `true` if a new edge was
+    /// created.
+    pub fn add_refinement(&mut self, old_id: &str, new_id: &str, weight: f32) -> bool {
+        self.graph.add_refinement(old_id, new_id, weight)
     }
 
     /// Semantic seeds are `(memory_id, normalized_similarity)` pairs from dense ANN search.
@@ -128,8 +167,17 @@ impl SpreadingActivation {
                     if edge.kind == EdgeKind::Temporal && edge.weight < 0.0 {
                         continue;
                     }
+                    // All edge kinds are traversed: Association (mem<->concept),
+                    // Temporal (prev_mem -> mem), Abstraction (concept <-> parent),
+                    // and Refines (old_mem -> new_mem). The Refines traversal is
+                    // what makes memory evolution work: when activation reaches
+                    // an older, superseded memory, it propagates to the newer
+                    // refinement, ensuring the most current knowledge surfaces.
                     // Hub suppression for empty queries: do not expand concept
                     // nodes that are connected to a large fraction of memories.
+                    // Abstraction (parent concept) edges are exempt from hub
+                    // suppression because they connect concepts to concepts,
+                    // not to memories, and are the graph's generalization path.
                     if is_empty_query
                         && edge.kind == EdgeKind::Association
                         && edge.source.as_str().starts_with("concept:")

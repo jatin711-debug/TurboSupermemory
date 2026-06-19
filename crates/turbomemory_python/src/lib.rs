@@ -3,9 +3,9 @@
 //! Exposes a single `MemoryEngine` class with the exact API expected by
 //! `verify.py` and `benchmark.py`.
 
+use numpy::PyUntypedArrayMethods;
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use numpy::PyUntypedArrayMethods;
 use std::sync::Arc;
 use std::time::Duration;
 use turbomemory_storage::config::{QuantizerKind, StoreConfig};
@@ -105,7 +105,12 @@ fn extract_f32_matrix<'py>(obj: &Bound<'py, PyAny>) -> PyResult<F32Matrix<'py>> 
             return Ok(F32Matrix::View { arr, cols });
         }
         // Non-contiguous: materialize row-major copies.
-        let owned: Vec<Vec<f32>> = arr.as_array().rows().into_iter().map(|r| r.to_vec()).collect();
+        let owned: Vec<Vec<f32>> = arr
+            .as_array()
+            .rows()
+            .into_iter()
+            .map(|r| r.to_vec())
+            .collect();
         return Ok(F32Matrix::Owned(owned));
     }
     if let Ok(m) = obj.extract::<Vec<Vec<f32>>>() {
@@ -212,7 +217,12 @@ impl PyMemoryEngine {
         evict_score_floor=None,
         dedup_cosine_threshold=None,
         dedup_max_pairs_per_cycle=None,
-        auto_consolidation_secs=60
+        auto_consolidation_secs=60,
+        fok_threshold=None,
+        spreading_decay=None,
+        spreading_iterations=None,
+        abstraction_co_occurrence_threshold=None,
+        edge_decay_half_life_secs=None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -236,6 +246,11 @@ impl PyMemoryEngine {
         dedup_cosine_threshold: Option<f32>,
         dedup_max_pairs_per_cycle: Option<usize>,
         auto_consolidation_secs: u64,
+        fok_threshold: Option<f32>,
+        spreading_decay: Option<f32>,
+        spreading_iterations: Option<usize>,
+        abstraction_co_occurrence_threshold: Option<usize>,
+        edge_decay_half_life_secs: Option<u64>,
     ) -> PyResult<Self> {
         let mut config = StoreConfig::default_for_dimension(dimension);
         if let Some(me) = max_edges {
@@ -297,6 +312,35 @@ impl PyMemoryEngine {
         } else {
             Some(Duration::from_secs(auto_consolidation_secs))
         };
+
+        // Cognitive-layer tuning (all optional, defaults preserved when None).
+        // - fok_threshold: Feeling-of-Knowing gate. Lower = more permissive
+        //   retrieval (returns more results); higher = stricter (rejects weak
+        //   matches). Default 0.58.
+        // - spreading_decay / spreading_iterations: control how far activation
+        //   propagates through the memory graph. Defaults 0.5 / 4.
+        // - abstraction_co_occurrence_threshold: enable abstraction hierarchy
+        //   building. 0 (default) disables. A value of 3 means two concepts
+        //   must co-occur on >= 3 memories before a parent concept is created.
+        // - edge_decay_half_life_secs: enable edge forgetting. 0 (default)
+        //   disables. A value of 86400 (1 day) means unrehearsed reinforced
+        //   edges fade toward baseline with a 1-day half-life.
+        if let Some(fok) = fok_threshold {
+            config.spreading.fok_threshold = fok;
+        }
+        if let Some(decay) = spreading_decay {
+            config.spreading.decay = decay;
+        }
+        if let Some(iters) = spreading_iterations {
+            config.spreading.iterations = iters;
+        }
+        if let Some(th) = abstraction_co_occurrence_threshold {
+            config.tier.abstraction_co_occurrence_threshold = th;
+        }
+        if let Some(hl) = edge_decay_half_life_secs {
+            config.tier.edge_decay_half_life_secs = hl;
+        }
+
         let inner = StorageEngine::open(db_path, config).map_err(storage_err)?;
         Ok(Self { inner })
     }

@@ -29,9 +29,15 @@ fn bench_config(dim: usize, hot_capacity: usize, warm_capacity: usize) -> StoreC
             evict_score_floor: None,
             dedup_cosine_threshold: None,
             dedup_max_pairs_per_cycle: 1024,
+            abstraction_co_occurrence_threshold: 0,
+            edge_decay_half_life_secs: 0,
+            max_concepts: 5,
+            refinement_cosine_threshold: None,
+            refinement_max_pairs_per_cycle: 1024,
         },
         optimizer_budget: OptimizerBudget::default(),
         auto_consolidation_interval: None,
+        spreading: turbomemory_graph::SpreadingConfig::default(),
     }
 }
 

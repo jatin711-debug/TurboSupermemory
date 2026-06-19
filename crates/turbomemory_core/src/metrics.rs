@@ -192,13 +192,7 @@ fn finalize_cosine(dot: f32, norm_sq_a: f32, norm_sq_b: f32) -> f32 {
 ///
 /// Returns `[(dot, ||v||^2); 4]`.  All five slices must have the same length.
 #[inline]
-fn dot_and_nb_x4(
-    q: &[f32],
-    v0: &[f32],
-    v1: &[f32],
-    v2: &[f32],
-    v3: &[f32],
-) -> [(f32, f32); 4] {
+fn dot_and_nb_x4(q: &[f32], v0: &[f32], v1: &[f32], v2: &[f32], v3: &[f32]) -> [(f32, f32); 4] {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
@@ -685,8 +679,18 @@ mod aarch64 {
             n3 = vfmaq_f32(n3, a3, a3);
             i += 4;
         }
-        let mut dot = [vaddvq_f32(d0), vaddvq_f32(d1), vaddvq_f32(d2), vaddvq_f32(d3)];
-        let mut nb = [vaddvq_f32(n0), vaddvq_f32(n1), vaddvq_f32(n2), vaddvq_f32(n3)];
+        let mut dot = [
+            vaddvq_f32(d0),
+            vaddvq_f32(d1),
+            vaddvq_f32(d2),
+            vaddvq_f32(d3),
+        ];
+        let mut nb = [
+            vaddvq_f32(n0),
+            vaddvq_f32(n1),
+            vaddvq_f32(n2),
+            vaddvq_f32(n3),
+        ];
         while i < len {
             let qx = *q.get_unchecked(i);
             let x0 = *v0.get_unchecked(i);
