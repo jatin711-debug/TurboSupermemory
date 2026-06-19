@@ -208,6 +208,10 @@ impl PyMemoryEngine {
         ef_construction=None,
         level0_factor=None,
         full_scan_threshold_kb=None,
+        max_records=None,
+        evict_score_floor=None,
+        dedup_cosine_threshold=None,
+        dedup_max_pairs_per_cycle=None,
         auto_consolidation_secs=60
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -227,6 +231,10 @@ impl PyMemoryEngine {
         ef_construction: Option<usize>,
         level0_factor: Option<usize>,
         full_scan_threshold_kb: Option<usize>,
+        max_records: Option<usize>,
+        evict_score_floor: Option<f64>,
+        dedup_cosine_threshold: Option<f32>,
+        dedup_max_pairs_per_cycle: Option<usize>,
         auto_consolidation_secs: u64,
     ) -> PyResult<Self> {
         let mut config = StoreConfig::default_for_dimension(dimension);
@@ -270,6 +278,15 @@ impl PyMemoryEngine {
         }
         if let Some(fs) = full_scan_threshold_kb {
             config.tier.full_scan_threshold_kb = fs;
+        }
+
+        // Bounded-storage eviction and semantic dedup are opt-in; leaving these
+        // unset preserves the default unbounded, no-dedup behavior.
+        config.tier.max_records = max_records;
+        config.tier.evict_score_floor = evict_score_floor;
+        config.tier.dedup_cosine_threshold = dedup_cosine_threshold;
+        if let Some(mp) = dedup_max_pairs_per_cycle {
+            config.tier.dedup_max_pairs_per_cycle = mp;
         }
 
         // 0 disables background consolidation entirely; otherwise it runs on
@@ -403,12 +420,32 @@ impl PyMemoryEngine {
         py.allow_threads(|| self.inner.trigger_consolidation().map_err(storage_err))
     }
 
+    /// Run bounded-storage eviction directly, returning the number of records
+    /// dropped. No-op (returns 0) unless `max_records` or `evict_score_floor`
+    /// was configured.
+    fn evict(&self, py: Python<'_>) -> PyResult<usize> {
+        py.allow_threads(|| self.inner.evict().map_err(storage_err))
+    }
+
+    /// Run semantic near-duplicate consolidation directly, returning the number
+    /// of duplicate records merged away. No-op (returns 0) unless
+    /// `dedup_cosine_threshold` was configured.
+    fn deduplicate(&self, py: Python<'_>) -> PyResult<usize> {
+        py.allow_threads(|| self.inner.deduplicate().map_err(storage_err))
+    }
+
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
         py.allow_threads(|| self.inner.flush().map_err(storage_err))
     }
 
     fn delete(&self, py: Python<'_>, id: &str) -> PyResult<bool> {
         py.allow_threads(|| self.inner.delete_by_id(id).map_err(storage_err))
+    }
+
+    /// Number of live (non-tombstoned) records. Lets callers assert that
+    /// bounded-storage eviction is keeping the collection under `max_records`.
+    fn record_count(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(py.allow_threads(|| self.inner.record_count()))
     }
 
     #[allow(clippy::too_many_arguments)]

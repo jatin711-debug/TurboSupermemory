@@ -6,6 +6,42 @@
 
 ---
 
+## Recently Completed — 2026-06-19 (audit + memory lifecycle)
+
+Two updates: (1) a deep codebase audit that found several roadmap items were
+**already implemented but still marked Pending**, now corrected below; (2) the
+memory-lifecycle feature (bounded-storage eviction + semantic dedup) shipped.
+
+- **Bounded-storage eviction + semantic consolidation (new, opt-in, default OFF).**
+  `StorageEngine::evict()` and `StorageEngine::deduplicate()` (`engine.rs`), wired
+  into the consolidation cycle. Eviction selects victims by capacity cap
+  (`max_records`) and/or `access_score` floor (`evict_score_floor`), with a grace
+  period (`now - last_accessed < recency_half_life_secs / 8`) so freshly inserted,
+  never-queried records survive. Dedup reuses the ANN index for candidate pairs +
+  exact cosine above `dedup_cosine_threshold`, keeps the higher-salience record,
+  transfers the victim's concept edges to the survivor, then `delete_by_id`.
+  Config fields added to `TierConfig` (all `Option`, default `None` = current
+  unbounded/no-dedup behavior) and surfaced in the Python constructor plus
+  `evict()` / `deduplicate()` methods. Smoke-tested: eviction capped 60→20; dedup
+  merged 2 of 4 near-duplicates.
+
+- **Audit corrections — these were Pending in the roadmap but are DONE in code:**
+  - **0.2 / 6.1 lock-free segment list** — `ArcSwap<SegmentSnapshot>` in
+    `segment_holder.rs`; searches read a published snapshot, never block on swap.
+  - **0.5 single batched update worker** — `update_worker.rs` (`IndexApplier` +
+    crossbeam channel); all writes serialize through one `apply_batch`.
+  - **3.1 visited-set pool** — `visited_pool.rs` (`VisitedSet` token array +
+    generation wrap), parking_lot-guarded.
+  - **3.5 parallel multi-segment search** — `into_par_iter` over segments in
+    `segment_holder.rs` with top-k merge.
+  - **4.1 batched SIMD distance kernel** — `cosine_similarity_batch` in
+    `turbomemory_core/src/metrics.rs` with AVX2/FMA + SSE paths and a 4-vector
+    unrolled kernel (`dot_and_nb_x4_avx2`).
+  - **6.3 parking_lot** — in use across the storage crate (segment holder, update
+    worker, metadata cache, access counters).
+
+---
+
 ## Recently Completed — 2026-06-18 (session 2)
 
 Shipped in commit `9fd68f5` ("feat: implement oversampling in reranking for improved neighbor recovery in vector segments"). Three improvement areas targeting consolidation speed, high-dimensional recall, and ingest cost.
@@ -37,12 +73,12 @@ Validated at 50k × 1024 after full consolidation: adversarial-data recall floor
 
 1. **Single-node / single-shard design** — one `VectorStore`, one `SegmentHolder`, one `MetadataStore`, one graph.
 2. **Single-threaded update worker** — all writes serialize through one channel/worker.
-3. **Global `RwLock<SegmentHolder>`** — searches and segment mutations contend on one lock.
-4. **In-memory metadata cache** — every record's metadata lives in a `HashMap`; won't fit RAM at 1M+ text records.
+3. **~~Global `RwLock<SegmentHolder>`~~** — **Fixed (2026-06-19 audit).** Replaced with a lock-free `ArcSwap<SegmentSnapshot>`; searches read a published snapshot and never block on seal/merge swap (0.2 / 6.1).
+4. **In-memory metadata cache** — every record's metadata lives in a `HashMap`; won't fit RAM at 1M+ text records. (redb is a lazy snapshot, not the primary cache; the cache itself is still a single in-memory `HashMap`.)
 5. **No vacuum / physical deletion** — deleted vectors and old segments are never reclaimed.
 6. **~~Single-threaded HNSW builds~~** — **Fixed (2026-06-18).** Builds now seed 256 points single-threaded then insert the remainder in parallel; see [Recently Completed](#recently-completed--2026-06-18-session-2). The 512 MiB default budget still applies.
 7. **~~1-bit Cold tier collapse at 4k~~** — **Fixed (2026-06-18).** Cold tier now defaults to 8-bit scalar quantization; see [Recently Completed](#recently-completed--2026-06-18).
-8. **No visited-set pool, no adaptive filtering, no segment-level parallelism**, and heavy per-query allocation.
+8. **~~No visited-set pool, no segment-level parallelism~~** — **Fixed (2026-06-19 audit).** Visited pool (3.1) and parallel multi-segment search (3.5) are implemented. Adaptive/cardinality-aware filtering is still pending.
 9. **No GPU acceleration** — CPU-only HNSW build and distance compute.
 
 This roadmap is the complete set of optimizations needed to reach 1M+ nodes × high dimensions. Items are grouped by phase, with Qdrant-derived defaults and concrete file targets.
@@ -56,10 +92,10 @@ These are prerequisites. Without them, later optimizations are local fixes.
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
 | 0.1 | **Shard the collection** into N independent `Shard` instances | `crates/turbomemory_storage/src/shard.rs` (new) | Pending | Each shard owns its own `VectorStore`, `SegmentHolder`, `MetadataStore`, WAL, optimizers, graph shard. Default `num_shards = clamp(num_cpus / 4, 2, 16)`. Route by `id` hash or explicit partition key. Qdrant model: `lib/collection/src/shards/`. |
-| 0.2 | **Replace global `RwLock<SegmentHolder>` with lock-free segment list** | `crates/turbomemory_storage/src/segment_holder.rs` | Pending | Use `arc-swap` / `ArcSwap<Vec<Arc<Segment>>>` so searches never block on seal/merge swap. Segment mutations publish a new `Arc`. Qdrant uses `LockedSegmentHolder` + `updates_mutex`; we can do better for single-node. |
+| 0.2 | **Replace global `RwLock<SegmentHolder>` with lock-free segment list** | `crates/turbomemory_storage/src/segment_holder.rs` | Done | Done (2026-06-19 audit). `ArcSwap<SegmentSnapshot>` (`segment_holder.rs:208`); searches read the published snapshot via `snapshot_handle()`, mutations publish a new `Arc`. Single-node, never blocks on swap. |
 | 0.3 | **Add collection abstraction above `StorageEngine`** | `crates/turbomemory_storage/src/collection.rs` (new) | Pending | One `Collection` = many `Shard`s. Python `MemoryEngine` opens a collection directory. Required for sharding and config per collection. |
 | 0.4 | **Move metadata out of single in-memory `HashMap`** | `crates/turbomemory_storage/src/metadata_store.rs` | Pending | Use per-segment metadata files (Qdrant: `segment.json` + mmap id_tracker) or a paged metadata store. Keep hot cache, spill cold records to mmap. Target: < 20% of working set in RAM. |
-| 0.5 | **Introduce per-shard update worker pool** | `crates/turbomemory_storage/src/update_worker.rs` | Pending | One update worker per shard, not one global worker. Use `tokio::sync::mpsc` or crossbeam channels. Bound per-shard queue length. |
+| 0.5 | **Introduce per-shard update worker pool** | `crates/turbomemory_storage/src/update_worker.rs` | In Progress | A single batched update worker exists (`update_worker.rs`, `IndexApplier` + crossbeam channel; all writes serialize through `apply_batch`). The **per-shard pool** (one worker per shard) still depends on sharding (0.1) and is pending. |
 | 0.6 | **Separate read / write / optimize / flush thread pools** | `crates/turbomemory_storage/src/runtime.rs` (new) | Pending | CPU-bound search pool, IO-bound pool, optimizer pool, flush pool. Adaptive switching when CPU > 90% (Qdrant `AdaptiveSearchHandle`). |
 | 0.7 | **Add NUMA / huge-page awareness stubs** | `crates/turbomemory_storage/src/memory_policy.rs` (new) | Pending | Pin optimizer threads, advise `MEM_LARGE_PAGES` on Windows, `madvise(MADV_HUGEPAGE)` on Linux for vector mmap. |
 
@@ -114,7 +150,7 @@ Search at 1M × 4k is dominated by HNSW traversal, multi-segment aggregation, an
 
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
-| 3.1 | **Visited-set pool** | `crates/turbomemory_storage/src/visited_pool.rs` (new) | Pending | Replace per-search allocation with `Vec<u8>` token arrays. Pool size = `num_cpus.clamp(16, 128)`. Token wraps to 0 → refill vector. Qdrant: `lib/segment/src/index/hnsw_index/visited_pool.rs`. |
+| 3.1 | **Visited-set pool** | `crates/turbomemory_storage/src/visited_pool.rs` | Done | Done (2026-06-19 audit). `visited_pool.rs` — `VisitedSet { tokens: Vec<u8>, generation }`, token wrap → refill, parking_lot-guarded pool. |
 | 3.2 | **HNSW defaults aligned with Qdrant** | `crates/turbomemory_storage/src/config.rs` | Pending | `M = 16`, `M0 = 32`, `ef_construct = 100`, `ef_search = max(ef, top_k)`, `full_scan_threshold = 10_000` KB converted to vector count. |
 | 3.3 | **Compressed / inline-vector graph links for sealed segments** | `crates/turbomemory_storage/src/segments/sealed_hot.rs` | Pending | Reduce random seeks by inlining quantized vectors or packing neighbor lists. Qdrant graph formats: `Plain`, `Compressed`, `CompressedWithVectors`. |
 | 3.4 | **Heuristic neighbor selection (HNSW)** | `crates/turbomemory_storage/src/segments/sealed_hot.rs` | Pending | Use diverse neighbor heuristic during build, not just top-M by distance. |

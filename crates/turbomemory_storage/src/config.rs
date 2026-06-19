@@ -125,6 +125,25 @@ pub struct TierConfig {
     pub warm_demote_threshold: f64,
     /// Recency half-life in seconds for access scoring.
     pub recency_half_life_secs: u64,
+    /// Hard cap on the number of live records. When `Some(k)`, consolidation
+    /// evicts the lowest-`access_score` records until the live count is back
+    /// at or under `k`. `None` (default) means unbounded storage — existing
+    /// behavior, no eviction.
+    pub max_records: Option<usize>,
+    /// Eviction floor on `access_score`. When `Some(f)`, any record whose
+    /// recency-weighted access score drops below `f` is evicted during
+    /// consolidation, independent of `max_records`. `None` (default) disables
+    /// score-floor eviction.
+    pub evict_score_floor: Option<f64>,
+    /// Cosine-similarity threshold for near-duplicate merge. When `Some(t)`
+    /// (e.g. 0.97), consolidation merges record pairs whose cosine similarity
+    /// is `>= t`, keeping the higher-salience record. `None` (default) disables
+    /// semantic deduplication.
+    pub dedup_cosine_threshold: Option<f32>,
+    /// Upper bound on the number of duplicate pairs merged in a single
+    /// consolidation cycle, to bound per-cycle work. Ignored when
+    /// `dedup_cosine_threshold` is `None`.
+    pub dedup_max_pairs_per_cycle: usize,
 }
 
 impl TierConfig {
@@ -146,6 +165,11 @@ impl TierConfig {
         hot_promote_threshold: 2.0,
         warm_demote_threshold: 0.5,
         recency_half_life_secs: 3600,
+        // Eviction and dedup are opt-in; default to current unbounded behavior.
+        max_records: None,
+        evict_score_floor: None,
+        dedup_cosine_threshold: None,
+        dedup_max_pairs_per_cycle: 1024,
     };
 
     /// Recommended thresholds for a given vector dimension.

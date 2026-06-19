@@ -883,8 +883,236 @@ impl StorageEngine {
         // materialized before the caller begins searching.
         self.optimizer.drain(self);
 
+        // Semantic dedup first (merges duplicates), then bounded-storage
+        // eviction (drops low-salience records). Both are opt-in and no-op
+        // when their config thresholds are unset.
+        self.deduplicate()?;
+        self.evict()?;
+
         self.save_graph()?;
         Ok((sealed, compacted, promoted))
+    }
+
+    /// Bounded-storage eviction: drop the lowest-salience records when the
+    /// collection exceeds `max_records` or when a record's `access_score`
+    /// falls below `evict_score_floor`. Returns the number of records evicted.
+    ///
+    /// Both triggers are opt-in; when neither is configured this is a no-op.
+    /// Salience is the same recency-weighted `access_score` used for promotion.
+    /// A grace period protects freshly inserted records that simply have not
+    /// been queried yet from being evicted on their first consolidation.
+    pub fn evict(&self) -> crate::Result<usize> {
+        let tier = &self.config.tier;
+        let max_records = tier.max_records;
+        let floor = tier.evict_score_floor;
+        if max_records.is_none() && floor.is_none() {
+            return Ok(0);
+        }
+
+        // Make access counts current before scoring.
+        self.access_counters.drain_into(&self.meta)?;
+
+        let now = now_secs();
+        let half_life = tier.recency_half_life_secs.max(1);
+        // Grace window: never evict a record whose last access (or insertion)
+        // is more recent than this. Guards against evicting just-inserted
+        // records before they have had a chance to be queried.
+        let grace = half_life / 8;
+
+        // Snapshot (offset, id, score, protected) for every live record.
+        let mut scored: Vec<(PointOffset, String, f64)> = Vec::new();
+        let mut protected: Vec<(PointOffset, String)> = Vec::new();
+        self.meta.for_each_record(|offset, rec| {
+            if now.saturating_sub(rec.last_accessed) < grace {
+                protected.push((offset, rec.id.clone()));
+            } else {
+                scored.push((offset, rec.id.clone(), access_score(rec, now, half_life)));
+            }
+        })?;
+
+        // Collect victims by id (dedup via a set of offsets).
+        let mut victim_offsets: HashSet<PointOffset> = HashSet::new();
+        let mut victims: Vec<String> = Vec::new();
+
+        // Floor pass: anything below the score floor is a victim.
+        if let Some(floor) = floor {
+            for (offset, id, score) in &scored {
+                if *score < floor && victim_offsets.insert(*offset) {
+                    victims.push(id.clone());
+                }
+            }
+        }
+
+        // Cap pass: if still over the cap, evict the lowest-scoring survivors.
+        if let Some(max_records) = max_records {
+            let live = self.meta.record_count();
+            let mut over = live.saturating_sub(victims.len()).saturating_sub(max_records);
+            if over > 0 {
+                // Survivors not already marked, sorted by ascending score.
+                let mut survivors: Vec<&(PointOffset, String, f64)> = scored
+                    .iter()
+                    .filter(|(offset, _, _)| !victim_offsets.contains(offset))
+                    .collect();
+                survivors.sort_by(|a, b| a.2.total_cmp(&b.2));
+                for (offset, id, _) in survivors {
+                    if over == 0 {
+                        break;
+                    }
+                    if victim_offsets.insert(*offset) {
+                        victims.push(id.clone());
+                        over -= 1;
+                    }
+                }
+            }
+        }
+
+        let mut evicted = 0usize;
+        for id in &victims {
+            if self.delete_by_id(id)? {
+                evicted += 1;
+            }
+        }
+        Ok(evicted)
+    }
+
+    /// Semantic consolidation: merge near-duplicate records.
+    ///
+    /// Two records whose cosine similarity is `>= dedup_cosine_threshold` are
+    /// considered duplicates. For each duplicate pair the higher-salience
+    /// record is kept (tiebreak: `importance`, then earlier `insert_seq`) and
+    /// the other is deleted. The survivor inherits the victim's concept edges
+    /// so graph relationships are not lost. Returns the number of records
+    /// merged away.
+    ///
+    /// Opt-in: a no-op when `dedup_cosine_threshold` is `None`. Work is bounded
+    /// by `dedup_max_pairs_per_cycle`. Candidate neighbors are found via the
+    /// existing ANN index (no O(n^2) scan).
+    pub fn deduplicate(&self) -> crate::Result<usize> {
+        let Some(threshold) = self.config.tier.dedup_cosine_threshold else {
+            return Ok(0);
+        };
+        let max_pairs = self.config.tier.dedup_max_pairs_per_cycle;
+        if max_pairs == 0 {
+            return Ok(0);
+        }
+
+        self.access_counters.drain_into(&self.meta)?;
+        let now = now_secs();
+        let half_life = self.config.tier.recency_half_life_secs.max(1);
+
+        // Snapshot live records: id -> (offset, score, importance, insert_seq,
+        // concepts). Cloning concepts is acceptable; the set of live records is
+        // bounded and this runs only on consolidation.
+        struct Cand {
+            offset: PointOffset,
+            id: String,
+            score: f64,
+            importance: f32,
+            insert_seq: u64,
+            concepts: Vec<String>,
+        }
+        let mut cands: Vec<Cand> = Vec::new();
+        self.meta.for_each_record(|offset, rec| {
+            cands.push(Cand {
+                offset,
+                id: rec.id.clone(),
+                score: access_score(rec, now, half_life),
+                importance: rec.importance,
+                insert_seq: rec.insert_seq,
+                concepts: rec.concepts.clone(),
+            });
+        })?;
+
+        // Higher salience wins. Returns true if `a` should be kept over `b`.
+        let keeps = |a: &Cand, b: &Cand| -> bool {
+            a.score
+                .total_cmp(&b.score)
+                .then(a.importance.total_cmp(&b.importance))
+                .then(b.insert_seq.cmp(&a.insert_seq))
+                .is_ge()
+        };
+
+        let mut merged_offsets: HashSet<PointOffset> = HashSet::new();
+        // (survivor_id, victim_id, victim_concepts)
+        let mut merges: Vec<(String, String, Vec<String>)> = Vec::new();
+
+        'outer: for cand in &cands {
+            if merged_offsets.contains(&cand.offset) {
+                continue;
+            }
+            let view = self.vectors.read_view();
+            let Some(vec) = view.get(cand.offset) else {
+                continue;
+            };
+            let embedding: Vec<f32> = vec.to_vec();
+            drop(view);
+
+            // Find near neighbors via ANN, then verify exact cosine.
+            let neighbors = self.search_ann_candidates(&embedding, 5)?;
+            for (nid, _) in neighbors {
+                if nid == cand.id {
+                    continue;
+                }
+                let Some(other) = cands.iter().find(|c| c.id == nid) else {
+                    continue;
+                };
+                if merged_offsets.contains(&other.offset) {
+                    continue;
+                }
+                let view = self.vectors.read_view();
+                let Some(other_vec) = view.get(other.offset) else {
+                    continue;
+                };
+                let sim = cosine_similarity(&embedding, other_vec);
+                drop(view);
+                if sim < threshold {
+                    continue;
+                }
+                // Decide survivor vs victim.
+                let (survivor, victim) = if keeps(cand, other) {
+                    (cand, other)
+                } else {
+                    (other, cand)
+                };
+                merged_offsets.insert(victim.offset);
+                merges.push((
+                    survivor.id.clone(),
+                    victim.id.clone(),
+                    victim.concepts.clone(),
+                ));
+                if merges.len() >= max_pairs {
+                    break 'outer;
+                }
+                // `cand` may itself have become a victim; stop scanning its
+                // neighbors and move to the next candidate.
+                if victim.offset == cand.offset {
+                    continue 'outer;
+                }
+            }
+        }
+
+        let mut count = 0usize;
+        for (survivor_id, victim_id, victim_concepts) in &merges {
+            // Transfer the victim's concept edges to the survivor before
+            // deleting it, so relationships are preserved.
+            if !victim_concepts.is_empty() {
+                if let Some(survivor) = self.find_record_by_id(survivor_id) {
+                    let mut concepts = survivor.concepts.clone();
+                    for c in victim_concepts {
+                        if !concepts.contains(c) {
+                            concepts.push(c.clone());
+                        }
+                    }
+                    let mut graph = self.graph.write();
+                    graph.add_memory(survivor_id, &survivor.text, &concepts);
+                    drop(graph);
+                }
+            }
+            if self.delete_by_id(victim_id)? {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     pub fn flush(&self) -> crate::Result<()> {
@@ -967,6 +1195,16 @@ pub(crate) fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// Recency-weighted salience: `access_count * 2^(-age / half_life)`.
+///
+/// Mirrors `segment_holder::access_score` (kept private there); used by
+/// eviction and dedup to rank records by importance.
+fn access_score(meta: &MetaRecord, now: u64, half_life: u64) -> f64 {
+    let age = now.saturating_sub(meta.last_accessed).max(1);
+    let recency = 2.0f64.powf(-(age as f64) / half_life as f64);
+    meta.access_count as f64 * recency
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -994,6 +1232,10 @@ mod tests {
                 hot_promote_threshold: 2.0,
                 warm_demote_threshold: 0.5,
                 recency_half_life_secs: 60,
+                max_records: None,
+                evict_score_floor: None,
+                dedup_cosine_threshold: None,
+                dedup_max_pairs_per_cycle: 1024,
             },
             optimizer_budget: crate::config::OptimizerBudget::default(),
             auto_consolidation_interval: None,
@@ -1028,6 +1270,10 @@ mod tests {
                 hot_promote_threshold: 2.0,
                 warm_demote_threshold: 0.5,
                 recency_half_life_secs: 60,
+                max_records: None,
+                evict_score_floor: None,
+                dedup_cosine_threshold: None,
+                dedup_max_pairs_per_cycle: 1024,
             },
             optimizer_budget: crate::config::OptimizerBudget::default(),
             auto_consolidation_interval: None,
@@ -1239,6 +1485,151 @@ mod tests {
         // Search still works correctly after promotion.
         let results = engine.search_ann(&q, 1).unwrap();
         assert_eq!(results[0].0, "mem_0");
+    }
+
+    #[test]
+    fn eviction_disabled_by_default_keeps_all_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+        for i in 0..6usize {
+            engine
+                .insert(&format!("mem_{i}"), &format!("text {i}"), &make_vec(8, i), 1.0, &[])
+                .unwrap();
+        }
+        // Default config has max_records = None and evict_score_floor = None.
+        let evicted = engine.evict().unwrap();
+        assert_eq!(evicted, 0);
+        engine.trigger_consolidation().unwrap();
+        assert_eq!(engine.record_count(), 6);
+    }
+
+    #[test]
+    fn eviction_cap_bounds_record_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        config.tier.max_records = Some(2);
+        config.tier.recency_half_life_secs = 3600;
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        for i in 0..5usize {
+            engine
+                .insert(&format!("mem_{i}"), &format!("text {i}"), &make_vec(8, i), 1.0, &[])
+                .unwrap();
+        }
+        // Give mem_0 and mem_1 a high access score so they survive the cap.
+        // Searching bumps access_count and refreshes last_accessed (also
+        // protecting them via the grace window).
+        for idx in [0usize, 1] {
+            let q = make_vec(8, idx);
+            for _ in 0..5 {
+                engine.search_ann(&q, 1).unwrap();
+            }
+        }
+        let evicted = engine.evict().unwrap();
+        assert!(evicted >= 3, "expected to evict down to the cap, got {evicted}");
+        assert!(engine.record_count() <= 2);
+        // The frequently-accessed records must survive.
+        assert!(engine.find_record_by_id("mem_0").is_some());
+        assert!(engine.find_record_by_id("mem_1").is_some());
+    }
+
+    #[test]
+    fn eviction_score_floor_drops_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        // Floor above 0 so never-accessed records (score 0) are evicted, while
+        // accessed records stay above it.
+        config.tier.evict_score_floor = Some(0.5);
+        config.tier.recency_half_life_secs = 3600;
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        for i in 0..4usize {
+            engine
+                .insert(&format!("mem_{i}"), &format!("text {i}"), &make_vec(8, i), 1.0, &[])
+                .unwrap();
+        }
+        // Access mem_0 so its score climbs above the floor and the grace window
+        // protects it.
+        let q = make_vec(8, 0);
+        for _ in 0..3 {
+            engine.search_ann(&q, 1).unwrap();
+        }
+        let evicted = engine.evict().unwrap();
+        // mem_1, mem_2, mem_3 are never accessed (score 0 < 0.5) and were
+        // inserted with last_accessed = 0 (outside the grace window).
+        assert_eq!(evicted, 3);
+        assert!(engine.find_record_by_id("mem_0").is_some());
+        assert!(engine.find_record_by_id("mem_1").is_none());
+    }
+
+    #[test]
+    fn eviction_respects_grace_period() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        // Aggressive floor that would evict everything by score alone.
+        config.tier.evict_score_floor = Some(1000.0);
+        config.tier.recency_half_life_secs = 3600; // grace = 450s
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        // Touch each record so last_accessed = now, placing it inside the
+        // grace window even though its score is below the floor.
+        for i in 0..3usize {
+            engine
+                .insert(&format!("mem_{i}"), &format!("text {i}"), &make_vec(8, i), 1.0, &[])
+                .unwrap();
+            engine.search_ann(&make_vec(8, i), 1).unwrap();
+        }
+        let evicted = engine.evict().unwrap();
+        assert_eq!(evicted, 0, "freshly accessed records must be protected");
+        assert_eq!(engine.record_count(), 3);
+    }
+
+    #[test]
+    fn dedup_merges_near_duplicates_keeping_salient() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        config.tier.dedup_cosine_threshold = Some(0.95);
+        config.tier.recency_half_life_secs = 3600;
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        // Two near-identical vectors (same direction) plus a distinct one.
+        engine
+            .insert("dup_keep", "keep me", &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 1.0, &["a".to_string()])
+            .unwrap();
+        engine
+            .insert("dup_drop", "drop me", &[0.999f32, 0.001, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 1.0, &["b".to_string()])
+            .unwrap();
+        engine
+            .insert("distinct", "different", &make_vec(8, 4), 1.0, &[])
+            .unwrap();
+        // Make dup_keep the more salient of the pair.
+        let q = make_vec(8, 0);
+        for _ in 0..3 {
+            engine.search_ann(&q, 1).unwrap();
+        }
+        let merged = engine.deduplicate().unwrap();
+        assert_eq!(merged, 1, "exactly one of the duplicate pair should be merged");
+        assert!(engine.find_record_by_id("dup_keep").is_some());
+        assert!(engine.find_record_by_id("dup_drop").is_none());
+        // The distinct record is untouched.
+        assert!(engine.find_record_by_id("distinct").is_some());
+        // Survivor inherited the victim's concept edge.
+        let survivor = engine.find_record_by_id("dup_keep").unwrap();
+        assert!(survivor.concepts.contains(&"a".to_string()));
+        let graph = engine.graph.read();
+        assert!(graph.graph().concept_degree("b") >= 1, "survivor should inherit victim concept 'b'");
+    }
+
+    #[test]
+    fn dedup_disabled_leaves_duplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+        engine
+            .insert("a", "x", &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 1.0, &[])
+            .unwrap();
+        engine
+            .insert("b", "y", &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 1.0, &[])
+            .unwrap();
+        // dedup_cosine_threshold defaults to None.
+        let merged = engine.deduplicate().unwrap();
+        assert_eq!(merged, 0);
+        assert_eq!(engine.record_count(), 2);
     }
 
     #[test]
