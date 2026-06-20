@@ -28,6 +28,15 @@ impl NodeId {
 pub struct Node {
     pub id: NodeId,
     pub text: String,
+    /// For memory nodes: the `importance_factor` (= `importance.sqrt()`) the
+    /// node's association/temporal edges were created at, i.e. the edge
+    /// *baseline*. Tracked so [`MemoryGraph::reweight_memory`] can rescale
+    /// edges to a new importance while preserving learned reinforcement
+    /// (which lives in the weight above this baseline). `0.0` for concept
+    /// nodes and for graphs loaded from older snapshots (treated as "no
+    /// baseline known" by `reweight_memory`).
+    #[serde(default)]
+    pub base_importance_factor: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -81,6 +90,20 @@ pub struct Edge {
     pub weight: f32,
     #[serde(default)]
     pub last_reinforced_at: u64,
+}
+
+/// One-shot structural snapshot of the cognitive graph, returned by
+/// [`MemoryGraph::stats`]. Plain data carrier for introspection /
+/// debugging views — all fields are counts.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct GraphStats {
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub memory_count: usize,
+    pub concept_count: usize,
+    pub refinement_count: usize,
+    pub contradiction_count: usize,
+    pub abstraction_count: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -149,15 +172,15 @@ impl MemoryGraph {
         importance: f32,
     ) {
         let mem_key = NodeId::memory(id).as_str();
+        let imp = importance_factor(importance);
         self.nodes.insert(
             mem_key.clone(),
             Node {
                 id: NodeId::memory(id),
                 text: text.to_string(),
+                base_importance_factor: imp,
             },
         );
-
-        let imp = importance_factor(importance);
 
         // Normalize concepts to lowercase and dedup, so "Rust" and "rust"
         // share a single concept node. This is critical for the graph to
@@ -180,6 +203,7 @@ impl MemoryGraph {
                 .or_insert_with(|| Node {
                     id: NodeId::concept(concept.clone()),
                     text: concept.clone(),
+                    base_importance_factor: 0.0,
                 });
             self.add_edge_internal(
                 NodeId::memory(id),
@@ -407,6 +431,101 @@ impl MemoryGraph {
         }
     }
 
+    /// Rescale a memory's `Association` and `Temporal` edges so their
+    /// *baseline* component reflects `new_importance`, while preserving any
+    /// learned reinforcement/decay state on top of that baseline.
+    ///
+    /// Association edges are created at weight `importance_factor(importance)`
+    /// (= `importance.sqrt()`). When a record's importance changes (e.g. via
+    /// automatic importance scoring), we want the graph to reflect that. But
+    /// reinforcement multiplies edge weights up and decay brings them back
+    /// down, so we can't just re-derive each edge from `new_importance`
+    /// without erasing the learned state.
+    ///
+    /// Approach: an importance-factor-ratio rescale that preserves learned
+    /// reinforcement. The baseline (unreinforced) edge weight equals the old
+    /// `importance_factor`. The memory node tracks its `base_importance_factor`
+    /// (set at creation); the rescale ratio is `new_factor / old_factor`.
+    /// Unreinforced edges become exactly `new_factor` (the new baseline);
+    /// reinforced edges (weight > baseline) scale by the same ratio,
+    /// preserving their relative boost above the baseline. For legacy graphs
+    /// loaded from older snapshots (no stored baseline), we fall back to
+    /// inferring the baseline from unreinforced edges, then from the minimum
+    /// edge weight. Weights are clamped to `[0.01, 8.0]`.
+    ///
+    /// Refines / Contradicts edges are NOT rescaled — they are directed to a
+    /// newer memory and carry fixed semantic weight, not importance weight.
+    /// Returns `true` if the memory existed and was reweighted, `false` if it
+    /// is unknown or has no association edges to rescale.
+    pub fn reweight_memory(&mut self, id: &str, new_importance: f32) -> bool {
+        let mem_key = NodeId::memory(id).as_str();
+        if !self.nodes.contains_key(&mem_key) {
+            return false;
+        }
+        let new_factor = importance_factor(new_importance);
+
+        // Gather this memory's own edge indices (outgoing Association +
+        // Temporal) plus incoming Association edges (where the memory is the
+        // target). Temporal edges are directional (prev -> mem) so we only
+        // rescale the ones whose source or target is this memory; concept
+        // association edges are bidirectional so both directions count.
+        let mut own_idxs: Vec<usize> = self
+            .adjacency
+            .get(&mem_key)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|&i| {
+                let k = self.edges[i].kind;
+                k == EdgeKind::Association || k == EdgeKind::Temporal
+            })
+            .collect();
+        for (i, edge) in self.edges.iter().enumerate() {
+            if edge.target.as_str() == mem_key
+                && (edge.kind == EdgeKind::Association || edge.kind == EdgeKind::Temporal)
+                && !own_idxs.contains(&i)
+            {
+                own_idxs.push(i);
+            }
+        }
+        if own_idxs.is_empty() {
+            return false;
+        }
+
+        // Resolve the old baseline factor. Prefer the node's stored
+        // `base_importance_factor` (exact, set at creation). For legacy
+        // graphs (0.0) infer from unreinforced edges, then the min edge.
+        let stored = self.nodes[&mem_key].base_importance_factor;
+        let old_factor = if stored > 0.0 {
+            stored
+        } else {
+            // Legacy graph (no stored baseline): infer from unreinforced
+            // edges if any, else the minimum edge weight.
+            let unreinforced_min = own_idxs
+                .iter()
+                .filter(|&&i| self.edges[i].last_reinforced_at == 0)
+                .map(|&i| self.edges[i].weight)
+                .fold(f32::INFINITY, f32::min);
+            if unreinforced_min.is_finite() {
+                unreinforced_min
+            } else {
+                own_idxs
+                    .iter()
+                    .map(|&i| self.edges[i].weight)
+                    .fold(f32::INFINITY, f32::min)
+            }
+        }
+        .max(1e-6);
+        let ratio = new_factor / old_factor;
+
+        for &i in &own_idxs {
+            self.edges[i].weight = (self.edges[i].weight * ratio).clamp(0.01, 8.0);
+        }
+        // Record the new baseline so subsequent reweights stay correct.
+        self.nodes.get_mut(&mem_key).unwrap().base_importance_factor = new_factor;
+        true
+    }
+
     /// Build abstraction edges: when two concepts co-occur on at least
     /// `threshold` memories, create a parent concept node that abstracts
     /// both, with bidirectional `Abstraction` edges. The parent node's id
@@ -460,6 +579,7 @@ impl MemoryGraph {
                     Node {
                         id: NodeId::concept(&parent_name),
                         text: parent_name.clone(),
+                        base_importance_factor: 0.0,
                     },
                 );
             }
@@ -521,6 +641,45 @@ impl MemoryGraph {
             .values()
             .filter(|n| matches!(n.id, NodeId::Concept(ref c) if c.contains('+')))
             .count()
+    }
+
+    /// Number of concept nodes in the graph (excludes abstraction parents,
+    /// which are also `Concept`-kind nodes but contain `+`).
+    pub fn concept_count(&self) -> usize {
+        self.nodes
+            .values()
+            .filter(|n| matches!(n.id, NodeId::Concept(ref c) if !c.contains('+')))
+            .count()
+    }
+
+    /// Returns the concepts attached to memory `id` (the targets of its
+    /// outgoing `Association` edges that are concept nodes). Empty if the
+    /// memory is unknown or has no concepts. Order is the graph's internal
+    /// (deterministic BTreeMap) order.
+    pub fn memory_concepts(&self, id: &str) -> Vec<String> {
+        let key = NodeId::memory(id).as_str();
+        self.neighbors(&key)
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Association)
+            .filter_map(|e| match &e.target {
+                NodeId::Concept(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// One-shot structural snapshot of the graph for introspection /
+    /// debugging. Cheap: counts only, no traversal.
+    pub fn stats(&self) -> GraphStats {
+        GraphStats {
+            node_count: self.node_count(),
+            edge_count: self.edge_count(),
+            memory_count: self.memory_count(),
+            concept_count: self.concept_count(),
+            refinement_count: self.refinement_count(),
+            contradiction_count: self.contradiction_count(),
+            abstraction_count: self.abstraction_count(),
+        }
     }
 
     /// Create a `Refines` edge from an older memory to a newer memory that
@@ -1107,5 +1266,151 @@ mod tests {
             sim_diff < sim_same,
             "different texts should have lower Jaccard than identical: {sim_diff} < {sim_same}"
         );
+    }
+
+    #[test]
+    fn memory_concepts_returns_attached_concepts() {
+        let mut g = MemoryGraph::new();
+        g.add_memory("m1", "Rust safety", &["rust".into(), "safety".into()]);
+        g.add_memory(
+            "m2",
+            "Python concurrency",
+            &["python".into(), "concurrency".into()],
+        );
+        let mut c1 = g.memory_concepts("m1");
+        c1.sort();
+        assert_eq!(c1, vec!["rust".to_string(), "safety".to_string()]);
+        let mut c2 = g.memory_concepts("m2");
+        c2.sort();
+        assert_eq!(c2, vec!["concurrency".to_string(), "python".to_string()]);
+    }
+
+    #[test]
+    fn memory_concepts_unknown_id_returns_empty() {
+        let g = MemoryGraph::new();
+        assert!(g.memory_concepts("does_not_exist").is_empty());
+    }
+
+    #[test]
+    fn stats_reports_counts() {
+        let mut g = MemoryGraph::new();
+        g.add_memory("m1", "Rust safety", &["rust".into(), "safety".into()]);
+        g.add_memory(
+            "m2",
+            "Rust concurrency",
+            &["rust".into(), "concurrency".into()],
+        );
+        g.add_refinement("m1", "m2", 0.8);
+        // Build an abstraction so abstraction_count > 0. rust+safety would
+        // need co-occurrence; instead directly create one via build_abstractions
+        // (no co-occurrence here) — expect 0 abstraction edges. That's fine;
+        // we only assert the fields we control.
+        let s = g.stats();
+        assert_eq!(s.memory_count, 2);
+        // Concepts: rust, safety, concurrency (3) — none contain '+'.
+        assert_eq!(s.concept_count, 3);
+        assert_eq!(s.refinement_count, 1);
+        assert_eq!(s.contradiction_count, 0);
+        assert_eq!(s.abstraction_count, 0);
+        assert!(s.node_count >= 5); // 2 memories + 3 concepts
+        assert!(s.edge_count >= 6); // association edges (bidirectional) + temporal + refines
+    }
+
+    #[test]
+    fn concept_count_excludes_abstraction_parents() {
+        let mut g = MemoryGraph::new();
+        // Two memories co-occurring on rust+safety three times → parent node.
+        for i in 0..3 {
+            g.add_memory(&format!("m{i}"), "text", &["rust".into(), "safety".into()]);
+        }
+        g.build_abstractions(3);
+        // Concepts: rust, safety (2). Abstraction parent: rust+safety (1).
+        assert_eq!(g.concept_count(), 2);
+        assert_eq!(g.abstraction_count(), 1);
+    }
+
+    #[test]
+    fn reweight_memory_scales_edges_to_new_importance() {
+        let mut g = MemoryGraph::new();
+        g.add_memory_with_importance("m1", "Rust safety", &["rust".into(), "safety".into()], 1.0);
+        // Baseline: importance 1.0 -> factor 1.0, so assoc edges start at 1.0.
+        let before: f32 = g
+            .neighbors(&NodeId::memory("m1").as_str())
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Association)
+            .map(|e| e.weight)
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            (before - 1.0).abs() < 1e-5,
+            "baseline min assoc weight {before}"
+        );
+
+        // Raise importance to 4.0 -> factor 2.0. Min edge should become 2.0.
+        let changed = g.reweight_memory("m1", 4.0);
+        assert!(changed, "should reweight existing memory");
+        let after: f32 = g
+            .neighbors(&NodeId::memory("m1").as_str())
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Association)
+            .map(|e| e.weight)
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            (after - 2.0).abs() < 1e-4,
+            "min assoc weight should be importance_factor(4.0)=2.0, got {after}"
+        );
+    }
+
+    #[test]
+    fn reweight_memory_preserves_relative_reinforcement() {
+        let mut g = MemoryGraph::new();
+        g.add_memory_with_importance("m1", "Rust", &["rust".into()], 1.0);
+        // Baseline factor = importance_factor(1.0) = 1.0. Reinforce boosts
+        // the edge above baseline (1.5x on first recall).
+        g.reinforce("m1", 1000);
+        let reinforced_before: f32 = g
+            .neighbors(&NodeId::memory("m1").as_str())
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Association)
+            .map(|e| e.weight)
+            .fold(0.0, f32::max);
+        assert!(
+            reinforced_before > 1.0,
+            "reinforced edge should be above baseline: {reinforced_before}"
+        );
+
+        // Reweight to the SAME importance. ratio = 1.0/1.0 = 1.0, so the
+        // reinforced edge is preserved unchanged (reinforcement survives).
+        g.reweight_memory("m1", 1.0);
+        let reinforced_after: f32 = g
+            .neighbors(&NodeId::memory("m1").as_str())
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Association)
+            .map(|e| e.weight)
+            .fold(0.0, f32::max);
+        assert!(
+            (reinforced_after - reinforced_before).abs() < 1e-5,
+            "reweight to same importance should preserve reinforcement: {reinforced_after} vs {reinforced_before}"
+        );
+
+        // Reweight to importance 4.0 (factor 2.0). ratio = 2.0/1.0 = 2.0, so
+        // the reinforced edge doubles and stays above the new baseline 2.0.
+        g.reweight_memory("m1", 4.0);
+        let reinforced_scaled: f32 = g
+            .neighbors(&NodeId::memory("m1").as_str())
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Association)
+            .map(|e| e.weight)
+            .fold(0.0, f32::max);
+        assert!(
+            (reinforced_scaled - reinforced_before * 2.0).abs() < 1e-4,
+            "reinforced edge should scale by 2.0: {reinforced_scaled} vs {}",
+            reinforced_before * 2.0
+        );
+    }
+
+    #[test]
+    fn reweight_memory_unknown_id_returns_false() {
+        let mut g = MemoryGraph::new();
+        assert!(!g.reweight_memory("nope", 2.0));
     }
 }

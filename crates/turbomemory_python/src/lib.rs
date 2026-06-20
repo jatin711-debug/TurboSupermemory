@@ -231,7 +231,12 @@ impl PyMemoryEngine {
         contradiction_cosine_threshold=None,
         contradiction_text_threshold=None,
         contradiction_weaken_factor=None,
-        contradiction_max_pairs_per_cycle=None
+        contradiction_max_pairs_per_cycle=None,
+        importance_auto_scoring=None,
+        importance_learning_rate=None,
+        importance_access_weight=None,
+        importance_floor=None,
+        importance_ceiling=None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -269,6 +274,11 @@ impl PyMemoryEngine {
         contradiction_text_threshold: Option<f32>,
         contradiction_weaken_factor: Option<f32>,
         contradiction_max_pairs_per_cycle: Option<usize>,
+        importance_auto_scoring: Option<bool>,
+        importance_learning_rate: Option<f32>,
+        importance_access_weight: Option<f32>,
+        importance_floor: Option<f32>,
+        importance_ceiling: Option<f32>,
     ) -> PyResult<Self> {
         let mut config = StoreConfig::default_for_dimension(dimension);
         if let Some(me) = max_edges {
@@ -412,6 +422,32 @@ impl PyMemoryEngine {
         if let Some(cp) = contradiction_max_pairs_per_cycle {
             config.tier.contradiction_max_pairs_per_cycle = cp;
         }
+        // - importance_auto_scoring: enable self-organizing memory. When true,
+        //   each consolidation recomputes every record's importance as a blend
+        //   of retrieval salience (access_score) and graph connectivity (concept
+        //   degree), moving toward a computed target. Frequently retrieved +
+        //   well-connected memories rise; never-retrieved memories decay toward
+        //   the floor. None/false (default) keeps the caller-set importance.
+        // - importance_learning_rate: fraction of the way to move toward the
+        //   target each cycle (0.0..=1.0). Default 0.3.
+        // - importance_access_weight: weight on retrieval salience in the target
+        //   blend; the rest goes to connectivity. Default 0.6.
+        // - importance_floor / importance_ceiling: clamp range. Defaults 0.1/4.0.
+        if let Some(on) = importance_auto_scoring {
+            config.tier.importance_auto_scoring = on;
+        }
+        if let Some(lr) = importance_learning_rate {
+            config.tier.importance_learning_rate = lr;
+        }
+        if let Some(aw) = importance_access_weight {
+            config.tier.importance_access_weight = aw;
+        }
+        if let Some(fl) = importance_floor {
+            config.tier.importance_floor = fl;
+        }
+        if let Some(ce) = importance_ceiling {
+            config.tier.importance_ceiling = ce;
+        }
 
         let inner = StorageEngine::open(db_path, config).map_err(storage_err)?;
         Ok(Self { inner })
@@ -550,6 +586,15 @@ impl PyMemoryEngine {
         py.allow_threads(|| self.inner.deduplicate().map_err(storage_err))
     }
 
+    /// Run automatic importance scoring directly, returning the number of
+    /// records whose importance changed. No-op (returns 0) unless
+    /// `importance_auto_scoring` was enabled. Runs automatically on each
+    /// `trigger_consolidation` when enabled; this method lets callers run it
+    /// independently.
+    fn recompute_importance(&self, py: Python<'_>) -> PyResult<usize> {
+        py.allow_threads(|| self.inner.recompute_importance().map_err(storage_err))
+    }
+
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
         py.allow_threads(|| self.inner.flush().map_err(storage_err))
     }
@@ -562,6 +607,85 @@ impl PyMemoryEngine {
     /// bounded-storage eviction is keeping the collection under `max_records`.
     fn record_count(&self, py: Python<'_>) -> PyResult<usize> {
         Ok(py.allow_threads(|| self.inner.record_count()))
+    }
+
+    // ---- Graph introspection API (C7) -------------------------------------
+    // Read-only views over the learned cognitive graph. Each method acquires
+    // a read lock on the graph for the minimum work needed, collects into
+    // owned tuples/vecs (graph borrows cannot escape the lock guard), and
+    // returns. Unknown ids return empty lists (no KeyError), matching the
+    // underlying `refined_by` / `contradicted_by` semantics.
+
+    /// Structural snapshot of the cognitive graph.
+    /// Returns (node_count, edge_count, memory_count, concept_count,
+    /// refinement_count, contradiction_count, abstraction_count).
+    fn graph_stats(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<(usize, usize, usize, usize, usize, usize, usize)> {
+        Ok(py.allow_threads(|| {
+            let guard = self.inner.read_graph();
+            let s = guard.graph().stats();
+            (
+                s.node_count,
+                s.edge_count,
+                s.memory_count,
+                s.concept_count,
+                s.refinement_count,
+                s.contradiction_count,
+                s.abstraction_count,
+            )
+        }))
+    }
+
+    /// All concepts in the graph with their degree (number of memories
+    /// attached). Returns list[(concept, degree)] sorted by degree desc.
+    /// Abstraction parent nodes (containing '+') are excluded.
+    fn get_concepts(&self, py: Python<'_>) -> PyResult<Vec<(String, usize)>> {
+        Ok(py.allow_threads(|| {
+            let guard = self.inner.read_graph();
+            let graph = guard.graph();
+            let mut concepts: Vec<(String, usize)> = graph
+                .nodes()
+                .values()
+                .filter_map(|n| match &n.id {
+                    turbomemory_graph::NodeId::Concept(c) if !c.contains('+') => {
+                        Some((c.clone(), graph.concept_degree(c)))
+                    }
+                    _ => None,
+                })
+                .collect();
+            // Sort by degree desc, then concept asc for determinism.
+            concepts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            concepts
+        }))
+    }
+
+    /// Concepts attached to memory `id`. Returns list[concept]. Empty if the
+    /// memory is unknown.
+    fn get_memory_concepts(&self, py: Python<'_>, id: String) -> PyResult<Vec<String>> {
+        Ok(py.allow_threads(|| {
+            let guard = self.inner.read_graph();
+            guard.graph().memory_concepts(&id)
+        }))
+    }
+
+    /// Memories that `id` refines (the older memories `id` supersedes).
+    /// Returns list[id]. Empty if `id` has no Refines edges or is unknown.
+    fn get_refinements(&self, py: Python<'_>, id: String) -> PyResult<Vec<String>> {
+        Ok(py.allow_threads(|| {
+            let guard = self.inner.read_graph();
+            guard.graph().refined_by(&id)
+        }))
+    }
+
+    /// Memories that contradict `id` (the newer memories that correct it).
+    /// Returns list[id]. Empty if `id` has no Contradicts edges or is unknown.
+    fn get_contradictions(&self, py: Python<'_>, id: String) -> PyResult<Vec<String>> {
+        Ok(py.allow_threads(|| {
+            let guard = self.inner.read_graph();
+            guard.graph().contradicted_by(&id)
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]

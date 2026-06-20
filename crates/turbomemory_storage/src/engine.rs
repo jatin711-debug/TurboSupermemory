@@ -990,6 +990,12 @@ impl StorageEngine {
         // materialized before the caller begins searching.
         self.optimizer.drain(self);
 
+        // Automatic importance scoring: adjust each record's importance based
+        // on retrieval patterns + connectivity, then sync the graph. Runs
+        // before dedup/eviction so recomputed importance participates in
+        // dedup tiebreaking and eviction ranking. Opt-in (no-op when off).
+        self.recompute_importance()?;
+
         // Semantic dedup first (merges duplicates), then bounded-storage
         // eviction (drops low-salience records). Both are opt-in and no-op
         // when their config thresholds are unset.
@@ -1538,6 +1544,120 @@ impl StorageEngine {
         Ok(created)
     }
 
+    /// Automatic importance scoring (self-organizing memory). For each live
+    /// record, compute a target importance as a blend of:
+    ///   - retrieval salience: normalized `access_score` (recency-weighted
+    ///     access count), and
+    ///   - graph connectivity: normalized concept degree (how many distinct
+    ///     concepts the memory is linked to).
+    ///
+    /// Then move the record's current importance `importance_learning_rate`
+    /// of the way toward that target, clamped to `[floor, ceiling]`.
+    ///
+    /// Frequently retrieved + well-connected memories rise; never-retrieved
+    /// memories decay toward the floor. The recomputed importance is written
+    /// back to metadata and synced into the graph via `reweight_memory` so
+    /// edge weights reflect the new importance.
+    ///
+    /// Opt-in: a no-op when `importance_auto_scoring` is false (the default).
+    /// Returns the number of records whose importance changed by more than a
+    /// small epsilon.
+    pub fn recompute_importance(&self) -> crate::Result<usize> {
+        if !self.config.tier.importance_auto_scoring {
+            return Ok(0);
+        }
+        let rate = self.config.tier.importance_learning_rate.clamp(0.0, 1.0);
+        let access_weight = self.config.tier.importance_access_weight.clamp(0.0, 1.0);
+        let floor = self.config.tier.importance_floor;
+        let ceiling = self.config.tier.importance_ceiling.max(floor);
+
+        // Make access counts current before scoring.
+        self.access_counters.drain_into(&self.meta)?;
+
+        let now = now_secs();
+        let half_life = self.config.tier.recency_half_life_secs.max(1);
+
+        // Snapshot: offset, id, importance, salience (access_score), degree.
+        struct Cand {
+            offset: PointOffset,
+            id: String,
+            importance: f32,
+            salience: f64,
+            degree: usize,
+        }
+        let mut cands: Vec<Cand> = Vec::new();
+        let mut max_salience: f64 = 0.0;
+        let mut max_degree: usize = 0;
+        self.meta.for_each_record(|offset, rec| {
+            let salience = access_score(rec, now, half_life);
+            let degree = rec.concepts.len();
+            max_salience = max_salience.max(salience);
+            max_degree = max_degree.max(degree);
+            cands.push(Cand {
+                offset,
+                id: rec.id.clone(),
+                importance: rec.importance,
+                salience,
+                degree,
+            });
+        })?;
+
+        if cands.is_empty() {
+            return Ok(0);
+        }
+
+        let mut changed = 0usize;
+        for cand in &cands {
+            // Normalize salience and degree to [0, 1].
+            let sal = if max_salience > 0.0 {
+                cand.salience / max_salience
+            } else {
+                0.0
+            };
+            let deg = if max_degree > 0 {
+                cand.degree as f64 / max_degree as f64
+            } else {
+                0.0
+            };
+            // Target importance in [floor, ceiling]. Retrieval salience is the
+            // primary driver; connectivity is a bounded boost that can lift a
+            // retrieved memory but cannot, on its own, push a never-retrieved
+            // memory to the ceiling. `access_weight` blends how much of the
+            // band is salience-driven (the rest is a connectivity bonus scaled
+            // down by salience so it only matters once a memory is being
+            // retrieved). This keeps "never retrieved" decaying toward the
+            // floor regardless of how many concepts it touches.
+            let salience_band = sal;
+            let connectivity_bonus = (1.0 - access_weight as f64) * deg * (0.5 + 0.5 * sal);
+            let blend = (access_weight as f64 * salience_band + connectivity_bonus).clamp(0.0, 1.0);
+            let target = floor + (ceiling - floor) * blend as f32;
+            // Move a `rate` fraction of the way toward the target.
+            let new_importance =
+                (cand.importance + rate * (target - cand.importance)).clamp(floor, ceiling);
+
+            if (new_importance - cand.importance).abs() <= 1e-4 {
+                continue;
+            }
+
+            // Write back to metadata.
+            if let Some(mut rec) = self.meta.get(cand.offset)? {
+                rec.importance = new_importance;
+                self.meta.put_meta(cand.offset, &rec)?;
+            }
+            // Sync the graph's edge weights to the new importance.
+            {
+                let mut graph = self.graph.write();
+                graph.graph_mut().reweight_memory(&cand.id, new_importance);
+            }
+            changed += 1;
+        }
+
+        if changed > 0 {
+            self.save_graph()?;
+        }
+        Ok(changed)
+    }
+
     pub fn flush(&self) -> crate::Result<()> {
         // 1. Build any pending plain segments so the durable snapshot captures
         //    them as persisted HNSW / quantized segments rather than in-memory
@@ -1579,6 +1699,18 @@ impl StorageEngine {
 
     pub fn record_count(&self) -> usize {
         self.meta.record_count()
+    }
+
+    /// Read-only access to the cognitive graph's learned state (concept
+    /// nodes, edge weights, refinement/contradiction edges, abstraction
+    /// hierarchy). Holds a `parking_lot` read lock on the graph for the
+    /// lifetime of the returned guard — callers should drop it promptly.
+    ///
+    /// Intended for the introspection API (`graph_stats`, `get_concepts`,
+    /// `get_memory_concepts`, `get_refinements`, `get_contradictions`) and
+    /// debugging. Acquire, call `MemoryGraph` methods on `.graph()`, drop.
+    pub fn read_graph(&self) -> parking_lot::RwLockReadGuard<'_, SpreadingActivation> {
+        self.graph.read()
     }
 
     pub fn config(&self) -> &StoreConfig {
@@ -1743,6 +1875,11 @@ mod tests {
                 contradiction_text_threshold: 0.3,
                 contradiction_weaken_factor: 0.5,
                 contradiction_max_pairs_per_cycle: 1024,
+                importance_auto_scoring: false,
+                importance_learning_rate: 0.3,
+                importance_access_weight: 0.6,
+                importance_floor: 0.1,
+                importance_ceiling: 4.0,
             },
             optimizer_budget: crate::config::OptimizerBudget::default(),
             auto_consolidation_interval: None,
@@ -1792,6 +1929,11 @@ mod tests {
                 contradiction_text_threshold: 0.3,
                 contradiction_weaken_factor: 0.5,
                 contradiction_max_pairs_per_cycle: 1024,
+                importance_auto_scoring: false,
+                importance_learning_rate: 0.3,
+                importance_access_weight: 0.6,
+                importance_floor: 0.1,
+                importance_ceiling: 4.0,
             },
             optimizer_budget: crate::config::OptimizerBudget::default(),
             auto_consolidation_interval: None,
@@ -2130,6 +2272,106 @@ mod tests {
         assert_eq!(
             created, 0,
             "high text overlap should not be a contradiction"
+        );
+    }
+
+    #[test]
+    fn recompute_importance_disabled_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+        engine
+            .insert(
+                "a",
+                "Rust safety",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+        let changed = engine.recompute_importance().unwrap();
+        assert_eq!(changed, 0, "should be a no-op when auto scoring is off");
+    }
+
+    #[test]
+    fn recompute_importance_raises_frequently_retrieved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        config.tier.importance_auto_scoring = true;
+        config.tier.importance_learning_rate = 1.0; // jump straight to target
+                                                    // Both records start at importance 1.0.
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        engine
+            .insert(
+                "hot",
+                "Rust safety",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+        engine
+            .insert(
+                "cold",
+                "Python threads",
+                &[0.0f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["python".to_string()],
+            )
+            .unwrap();
+
+        // Retrieve "hot" many times so its access_count dominates. Each
+        // search_ann bumps the matched record's access counter.
+        let q = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        for _ in 0..20 {
+            let _ = engine.search_ann(&q, 1).unwrap();
+        }
+        // Drain counters into metadata so recompute sees them.
+        engine.recompute_importance().unwrap();
+
+        let hot_offset = *engine.id_index.read().get("hot").unwrap();
+        let cold_offset = *engine.id_index.read().get("cold").unwrap();
+        let hot_imp = engine.meta.get(hot_offset).unwrap().unwrap().importance;
+        let cold_imp = engine.meta.get(cold_offset).unwrap().unwrap().importance;
+        assert!(
+            hot_imp > cold_imp,
+            "frequently-retrieved record should have higher importance: hot={hot_imp} cold={cold_imp}"
+        );
+        // The never-retrieved record decays toward the floor.
+        assert!(
+            cold_imp < 1.0,
+            "never-retrieved record should decay below its start: cold={cold_imp}"
+        );
+    }
+
+    #[test]
+    fn recompute_importance_respects_floor_and_ceiling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        config.tier.importance_auto_scoring = true;
+        config.tier.importance_learning_rate = 1.0;
+        config.tier.importance_floor = 0.5;
+        config.tier.importance_ceiling = 2.0;
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        // One record, never retrieved. Its target blends to the floor.
+        engine
+            .insert(
+                "x",
+                "Rust safety",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                5.0, // above ceiling
+                &["rust".to_string()],
+            )
+            .unwrap();
+        engine.recompute_importance().unwrap();
+        let offset = *engine.id_index.read().get("x").unwrap();
+        let imp = engine.meta.get(offset).unwrap().unwrap().importance;
+        assert!(
+            imp <= 2.0 + 1e-5,
+            "importance should not exceed ceiling 2.0, got {imp}"
+        );
+        assert!(
+            imp >= 0.5 - 1e-5,
+            "importance should not drop below floor 0.5, got {imp}"
         );
     }
 

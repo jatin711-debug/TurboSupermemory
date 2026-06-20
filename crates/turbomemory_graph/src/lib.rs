@@ -18,4 +18,4 @@ pub use ccs::{
     DeterministicCompressor, LlmCompressor,
 };
 pub use extract::{extract_concepts, merge_concepts, text_jaccard_similarity};
-pub use graph::{ConceptKind, Edge, EdgeKind, MemoryGraph, Node, NodeId};
+pub use graph::{ConceptKind, Edge, EdgeKind, GraphStats, MemoryGraph, Node, NodeId};

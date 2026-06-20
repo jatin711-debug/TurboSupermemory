@@ -214,6 +214,29 @@ pub struct TierConfig {
     pub contradiction_weaken_factor: f32,
     /// Upper bound on contradiction edges created per consolidation cycle.
     pub contradiction_max_pairs_per_cycle: usize,
+    /// Enable automatic importance scoring (self-organizing memory). When
+    /// true, each consolidation cycle recomputes every record's `importance`
+    /// as a blend of retrieval salience (`access_score`) and graph
+    /// connectivity (concept degree), then moves the current importance
+    /// `importance_learning_rate` of the way toward that target. `false`
+    /// (default) disables — importance stays at the caller-set value.
+    pub importance_auto_scoring: bool,
+    /// Learning rate for auto-importance: fraction of the way to move the
+    /// current importance toward the computed target each cycle (0.0..=1.0).
+    /// Lower = more stable/slow; higher = more responsive. Default 0.3.
+    pub importance_learning_rate: f32,
+    /// Weight on retrieval salience (access_score) in the target blend; the
+    /// remaining `(1 - this)` goes to graph connectivity (concept degree).
+    /// Default 0.6 — retrieval matters more than connectivity.
+    pub importance_access_weight: f32,
+    /// Floor for auto-importance: a record's importance is never decayed
+    /// below this. Protects recently-inserted, not-yet-retrieved memories
+    /// from being zeroed out on their first consolidation. Default 0.1.
+    pub importance_floor: f32,
+    /// Upper cap for auto-importance: a record's importance is never raised
+    /// above this. Default 4.0 — matches the dynamic range of the
+    /// `importance_factor` sqrt curve (importance 4.0 -> factor 2.0).
+    pub importance_ceiling: f32,
 }
 
 impl TierConfig {
@@ -263,6 +286,15 @@ impl TierConfig {
         contradiction_text_threshold: 0.3,
         contradiction_weaken_factor: 0.5,
         contradiction_max_pairs_per_cycle: 1024,
+        // Automatic importance scoring: opt-in. When enabled, the engine
+        // adjusts each record's importance based on retrieval patterns +
+        // connectivity, making the memory self-organizing. Disabled by
+        // default preserves caller-set importance.
+        importance_auto_scoring: false,
+        importance_learning_rate: 0.3,
+        importance_access_weight: 0.6,
+        importance_floor: 0.1,
+        importance_ceiling: 4.0,
     };
 
     /// Recommended thresholds for a given vector dimension.

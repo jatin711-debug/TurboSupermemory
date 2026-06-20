@@ -13,6 +13,57 @@
 
 ---
 
+## Recently Completed — 2026-06-20 (graph introspection API — C7, auto-importance — C2)
+
+Shipped two more cognitive-layer features: a read-only **graph introspection
+API** (C7) for debugging and "what does the AI know" views, and **automatic
+importance scoring** (C2) that makes memory self-organizing — retrieval
+patterns raise what matters and decay what doesn't, without the caller
+tagging importance manually.
+
+- **Graph introspection API (C7, `graph.rs`, `engine.rs`, `lib.rs`).** Five
+  read-only Python methods on `MemoryEngine`: `graph_stats()` →
+  `(node_count, edge_count, memory_count, concept_count, refinement_count,
+  contradiction_count, abstraction_count)`; `get_concepts()` →
+  `list[(concept, degree)]` sorted by degree desc; `get_memory_concepts(id)`;
+  `get_refinements(id)`; `get_contradictions(id)`. Backed by new
+  `MemoryGraph` helpers (`concept_count`, `memory_concepts`, `stats()` returning
+  a `GraphStats` snapshot) and a `StorageEngine::read_graph()` accessor that
+  hands out a `parking_lot` read guard. Return shape is tuples / list-of-tuples
+  (matches the existing binding style). Unknown ids return empty lists.
+- **Automatic importance scoring (C2, `graph.rs`, `engine.rs`, `config.rs`,
+  `lib.rs`).** `StorageEngine::recompute_importance()` runs on consolidation
+  (opt-in via `importance_auto_scoring`). For each record it computes a target
+  importance from a blend of retrieval salience (normalized `access_score`) and
+  graph connectivity (normalized concept degree), moves the current importance
+  `importance_learning_rate` toward it, clamps to `[floor, ceiling]`, writes
+  back to metadata, and syncs the graph. Retrieval is the primary driver;
+  connectivity is a bounded boost scaled by salience so a never-retrieved memory
+  decays toward the floor regardless of how many concepts it touches. Runs
+  before dedup/eviction so recomputed importance participates in tiebreaking.
+  Five opt-in config fields + Python kwargs.
+- **Graph edge re-sync (`MemoryGraph::reweight_memory`).** The graph sets edge
+  weights from importance once at insert; until now there was no update path.
+  Added `reweight_memory(id, importance)` that rescales a memory's association +
+  temporal edges to a new importance while **preserving learned
+  reinforcement/decay**. Memory nodes now track their `base_importance_factor`
+  (set at creation) so the rescale ratio is exact; reinforced edges (weight >
+  baseline) scale by the same ratio as the baseline, keeping their relative
+  boost. `recompute_importance` calls it on every changed record.
+- **Python exposure.** New constructor kwargs: `importance_auto_scoring`,
+  `importance_learning_rate`, `importance_access_weight`, `importance_floor`,
+  `importance_ceiling`. New method `recompute_importance()` for manual
+  triggering.
+
+Validated: `cargo fmt --check` clean; `cargo clippy --workspace --all-targets
+-- -D warnings` clean; `cargo test --workspace --exclude turbomemory_python`
+= 144 passed / 0 failed (core 29 + graph 49 + storage 63 + crash_recovery 3);
+`make build-python` + `python verify.py` E2E all pass; Python smoke confirms
+auto-importance raises a frequently-retrieved memory above a never-retrieved
+one and introspection returns correct counts/concepts.
+
+---
+
 ## Recently Completed — 2026-06-20 (contradiction detection — C1)
 
 Shipped the second memory-evolution primitive: contradiction detection
@@ -423,12 +474,12 @@ compressor, score fusion). These are the remaining items that make TSM a
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
 | C1 | **Contradiction detection** | `crates/turbomemory_graph/src/graph.rs`, `engine.rs` | Done | Done (2026-06-20). `EdgeKind::Contradicts` (old→new); `add_contradiction` creates the edge + weakens the old memory's outgoing edges by `contradiction_weaken_factor`. `check_contradictions()` runs on consolidation: a pair is a contradiction when cosine >= `contradiction_cosine_threshold` AND shares a concept AND text Jaccard < `contradiction_text_threshold` (the dissimilarity signal that distinguishes contradiction from refinement). Spreading activation traverses `Contradicts` edges so the correction surfaces. 4 Python kwargs added; benchmark scenario 4 proves it flips the ranking (correction rank 1 cognitive vs rank 2 ANN). |
-| C2 | **Automatic importance scoring** | `crates/turbomemory_storage/src/engine.rs` | Pending | Derive `importance` from retrieval patterns instead of requiring the caller to set it. A memory that is frequently retrieved, frequently reinforced, and connected to many concepts should have its importance auto-raised. A memory that is never retrieved should auto-decay. This makes the memory self-organizing — the agent doesn't have to manually tag what matters. |
+| C2 | **Automatic importance scoring** | `crates/turbomemory_storage/src/engine.rs` | Done | Done (2026-06-20). `StorageEngine::recompute_importance()` runs on consolidation (opt-in via `importance_auto_scoring`): blends normalized access_score + concept-degree into a target importance, moves current importance `importance_learning_rate` toward it, clamps to `[floor, ceiling]`, writes back to metadata, and syncs the graph via new `MemoryGraph::reweight_memory` (which preserves learned reinforcement using a stored `base_importance_factor` per memory node). Runs before dedup/eviction so recomputed importance participates in tiebreaking. 5 config fields + Python kwargs + `recompute_importance()` method; 6 new tests. |
 | C3 | **Online concept vocabulary evolution** | `crates/turbomemory_graph/src/graph.rs` | Pending | Concepts are currently extracted per-text in isolation. Over time, similar concept nodes ("programming", "coding", "code") should be merged into a single canonical concept. Over-general concepts ("system") that connect to too many memories should be split or suppressed. This keeps the graph coherent as it accumulates thousands of concepts. |
 | C4 | **Per-agent memory scoping** | `crates/turbomemory_storage/src/engine.rs`, `config.rs` | Pending | Namespace isolation for multi-agent use: each agent gets its own memory scope (a prefix or collection key). An agent can read its own memories and optionally shared/global memories. This is the "AI agents, assistants, applications, and autonomous systems" use case from the vision — each agent has a persistent memory that grows with it. |
 | C5 | **Real-embedding cognitive benchmark** | `cognitive_benchmark.py` | Pending | The current cognitive benchmark uses random 64-dim vectors with 10 memories. Expand to 1000+ memories with realistic 768-dim embeddings (clustered, like real text embeddings) to validate that the cognitive layer scales beyond toy scenarios. |
 | C6 | **LLM compressor integration test** | `verify.py` or new script | Pending | The `LlmCompressor` trait + closure-based impl is shipped but untested with a real LLM. Write an integration test that calls a real model (or a mock with realistic JSON output) to validate the CCS compression loop end-to-end. |
-| C7 | **Graph introspection API** | `crates/turbomemory_python/src/lib.rs` | Pending | Expose Python methods to inspect the learned graph: `get_concepts()`, `get_memory_concepts(id)`, `get_refinements(id)`, `graph_stats()`. This is essential for debugging and for user-facing "what does the AI know" views. |
+| C7 | **Graph introspection API** | `crates/turbomemory_python/src/lib.rs` | Done | Done (2026-06-20). Five read-only Python methods: `graph_stats()`, `get_concepts()` → list[(concept, degree)], `get_memory_concepts(id)`, `get_refinements(id)`, `get_contradictions(id)`. Backed by `MemoryGraph::memory_concepts`/`concept_count`/`stats()` (returns `GraphStats`) and `StorageEngine::read_graph()` (hands out a read guard). Tuple/list-of-tuples return shape matches existing binding style; unknown ids return empty lists. |
 | C8 | **Streaming concept extraction** | `crates/turbomemory_graph/src/extract.rs` | Pending | The current extractor is keyword-based (stopword filtering + TF). Upgrade to n-gram extraction (catch "memory safety" as a single concept, not two separate ones) and optionally embedding-based concept matching (map new concepts to existing similar ones). |
 
 ---
@@ -505,14 +556,14 @@ compressor, score fusion). These are the remaining items that make TSM a
 
 ### Stage 1 — Deepen the cognitive layer (the differentiator)
 1. **C5** — Real-embedding cognitive benchmark (validate the cognitive layer at scale).
-2. **C2** — Automatic importance scoring (self-organizing memory).
-3. **C7** — Graph introspection API (debugging + user-facing views).
-4. **C3** — Online concept vocabulary evolution.
-5. **C4** — Per-agent memory scoping (multi-agent).
-6. **C6** — LLM compressor integration test.
-7. **C8** — Streaming concept extraction (n-gram + embedding-based).
+2. **C3** — Online concept vocabulary evolution.
+3. **C4** — Per-agent memory scoping (multi-agent).
+4. **C6** — LLM compressor integration test.
+5. **C8** — Streaming concept extraction (n-gram + embedding-based).
 
-> **C1 (Contradiction detection) — Done (2026-06-20).** See Recently Completed.
+> **C1 (Contradiction detection) — Done (2026-06-20).**
+> **C7 (Graph introspection API) — Done (2026-06-20).**
+> **C2 (Automatic importance scoring) — Done (2026-06-20).** See Recently Completed.
 
 ### Stage 2 — Unlock 1M × 4k structurally (production scaling)
 1. **0.1–0.3** — Shard collection, collection abstraction.
