@@ -300,6 +300,31 @@ pub fn merge_concepts(caller_concepts: &[String], text: &str, max: usize) -> Vec
     result
 }
 
+/// Compute Jaccard similarity between the token sets of two texts.
+///
+/// `Jaccard(A, B) = |A ∩ B| / |A ∪ B|` where A and B are the sets of
+/// lowercase alphanumeric tokens (length >= 3, stopwords removed). Returns
+/// 0.0 if either text has no valid tokens.
+///
+/// Used by the contradiction detector: two memories about the same topic
+/// (high vector cosine) but with *different content* (low Jaccard) are
+/// likely contradictions rather than refinements.
+pub fn text_jaccard_similarity(a: &str, b: &str) -> f32 {
+    let tokens_a: std::collections::HashSet<String> =
+        extract_concepts(a, 100).into_iter().collect();
+    let tokens_b: std::collections::HashSet<String> =
+        extract_concepts(b, 100).into_iter().collect();
+    if tokens_a.is_empty() || tokens_b.is_empty() {
+        return 0.0;
+    }
+    let intersection = tokens_a.intersection(&tokens_b).count();
+    let union = tokens_a.union(&tokens_b).count();
+    if union == 0 {
+        return 0.0;
+    }
+    intersection as f32 / union as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

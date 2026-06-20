@@ -45,6 +45,17 @@ pub enum EdgeKind {
     /// deleted — history is preserved so the agent can reason about how its
     /// understanding evolved.
     Refines,
+    /// A contradiction edge: points from an *older* memory to a *newer*
+    /// memory that contradicts it. Direction: old → new.
+    ///
+    /// Like `Refines`, this lets spreading activation propagate from the old
+    /// (discredited) memory to the new (correcting) one. Unlike `Refines`,
+    /// when a `Contradicts` edge is created, the old memory's outgoing
+    /// association edges are *weakened* (multiplied by a decay factor), so
+    /// the old memory gradually fades from retrieval while the new one
+    /// surfaces. The old memory is NOT deleted — the agent can still find
+    /// it if explicitly asked, but it won't dominate retrieval.
+    Contradicts,
 }
 
 /// An edge in the cognitive graph.
@@ -314,32 +325,51 @@ impl MemoryGraph {
 
     /// Reinforce the edges of a memory node, simulating rehearsal.
     ///
-    /// Called when a memory is retrieved. Strengthens every outgoing edge of
-    /// the memory node by a factor that grows with access but is bounded so a
-    /// single edge cannot dominate the graph. Edges that have never been
-    /// reinforced get a larger initial boost (capturing the "first recall
-    /// matters most" effect); subsequently reinforced edges grow more slowly.
+    /// Called when a memory is retrieved. Strengthens every edge touching
+    /// the memory — both outgoing (where the memory is the source) and
+    /// incoming association edges (where the memory is the target). This
+    /// ensures that when a concept node is activated by a query, it
+    /// propagates more energy to frequently-retrieved memories.
+    ///
+    /// Edges that have never been reinforced get a larger initial boost
+    /// (capturing the "first recall matters most" effect); subsequently
+    /// reinforced edges grow more slowly. Weights are clamped at 8.0.
     ///
     /// `now` is a unix-seconds timestamp used to stamp `last_reinforced_at`.
     pub fn reinforce(&mut self, id: &str, now: u64) {
         let mem_key = NodeId::memory(id).as_str();
-        let idxs: Vec<usize> = match self.adjacency.get(&mem_key) {
-            Some(v) => v.clone(),
-            None => return,
-        };
-        for i in idxs {
+
+        // Strengthen outgoing edges (where the memory is the source).
+        let out_idxs: Vec<usize> = self.adjacency.get(&mem_key).cloned().unwrap_or_default();
+        for i in out_idxs {
             let edge = &mut self.edges[i];
-            // First reinforcement gives a bigger relative boost than later
-            // ones, modelling the transition from "unseen" to "recalled".
             let boost = if edge.last_reinforced_at == 0 {
                 1.5
             } else {
                 1.0 + 0.1 / (1.0 + edge.weight)
             };
-            // Clamp to keep any single edge from growing unbounded and
-            // drowning out the rest of the graph during spreading activation.
             edge.weight = (edge.weight * boost).min(8.0);
             edge.last_reinforced_at = now;
+        }
+
+        // Strengthen incoming Association edges (where the memory is the
+        // target). This is what makes reinforcement actually boost a
+        // memory's activation: when a concept is activated by the query,
+        // it propagates more energy through the strengthened concept→memory
+        // edge to the reinforced memory than to non-reinforced ones.
+        // We scan the edge list for Association edges targeting this memory.
+        // This is O(edges) but reinforcement only happens on retrieval (not
+        // on the insert hot path), and the edge list is typically small.
+        for edge in &mut self.edges {
+            if edge.kind == EdgeKind::Association && edge.target.as_str() == mem_key {
+                let boost = if edge.last_reinforced_at == 0 {
+                    1.5
+                } else {
+                    1.0 + 0.1 / (1.0 + edge.weight)
+                };
+                edge.weight = (edge.weight * boost).min(8.0);
+                edge.last_reinforced_at = now;
+            }
         }
     }
 
@@ -549,6 +579,93 @@ impl MemoryGraph {
         self.neighbors(&key)
             .iter()
             .filter(|e| e.kind == EdgeKind::Refines)
+            .filter_map(|e| match &e.target {
+                NodeId::Memory(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Create a `Contradicts` edge from an older memory to a newer memory
+    /// that contradicts it, AND weaken the old memory's outgoing
+    /// association edges so it fades from retrieval.
+    ///
+    /// Direction: `old_id → new_id`.
+    ///
+    /// The `Contradicts` edge lets spreading activation propagate from the
+    /// discredited memory to the correcting one. Additionally, the old
+    /// memory's outgoing `Association` and `Temporal` edges are multiplied
+    /// by `weaken_factor` (typically 0.5), reducing its activation in
+    /// future retrievals. The old memory is NOT deleted — it can still be
+    /// found if explicitly queried, but it won't dominate results.
+    ///
+    /// Idempotent: if a `Contradicts` edge from `old_id` to `new_id`
+    /// already exists, this is a no-op (the weakening is also skipped).
+    /// Returns `true` if a new edge was created.
+    pub fn add_contradiction(
+        &mut self,
+        old_id: &str,
+        new_id: &str,
+        weight: f32,
+        weaken_factor: f32,
+    ) -> bool {
+        let old_key = NodeId::memory(old_id).as_str();
+        let new_key = NodeId::memory(new_id).as_str();
+        // Check if the edge already exists.
+        let exists = self
+            .adjacency
+            .get(&old_key)
+            .map(|idxs| {
+                idxs.iter().any(|&i| {
+                    self.edges[i].kind == EdgeKind::Contradicts
+                        && self.edges[i].target.as_str() == new_key
+                })
+            })
+            .unwrap_or(false);
+        if exists {
+            return false;
+        }
+        // Both nodes must exist.
+        if !self.nodes.contains_key(&old_key) || !self.nodes.contains_key(&new_key) {
+            return false;
+        }
+        // Weaken the old memory's outgoing Association and Temporal edges
+        // so it fades from retrieval. We do NOT weaken Refines or
+        // Contradicts edges — those are directed to the newer memory and
+        // should stay strong so the correction surfaces.
+        let old_idxs: Vec<usize> = self.adjacency.get(&old_key).cloned().unwrap_or_default();
+        for i in old_idxs {
+            let edge = &mut self.edges[i];
+            if edge.kind == EdgeKind::Association || edge.kind == EdgeKind::Temporal {
+                edge.weight *= weaken_factor;
+            }
+        }
+        // Create the Contradicts edge.
+        self.add_edge_internal(
+            NodeId::memory(old_id),
+            NodeId::memory(new_id),
+            EdgeKind::Contradicts,
+            weight,
+        );
+        true
+    }
+
+    /// Number of `Contradicts` edges in the graph.
+    pub fn contradiction_count(&self) -> usize {
+        self.edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Contradicts)
+            .count()
+    }
+
+    /// Returns the ids of memories that contradict `id` (i.e. the newer
+    /// memories that correct `id`). Empty if `id` has no outgoing
+    /// `Contradicts` edges.
+    pub fn contradicted_by(&self, id: &str) -> Vec<String> {
+        let key = NodeId::memory(id).as_str();
+        self.neighbors(&key)
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Contradicts)
             .filter_map(|e| match &e.target {
                 NodeId::Memory(s) => Some(s.clone()),
                 _ => None,
@@ -881,6 +998,114 @@ mod tests {
             restored.refinement_count(),
             1,
             "Refines edge should survive roundtrip"
+        );
+    }
+
+    #[test]
+    fn add_contradiction_creates_edge_and_weakens_old() {
+        let mut g = MemoryGraph::new();
+        g.add_memory("old", "Rust has a garbage collector", &["rust".into()]);
+        g.add_memory(
+            "new",
+            "Rust does not have a garbage collector",
+            &["rust".into()],
+        );
+        // Record the old memory's edge weight before contradiction.
+        let old_weight_before: f32 = g
+            .neighbors(&NodeId::memory("old").as_str())
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Association)
+            .map(|e| e.weight)
+            .next()
+            .unwrap_or(0.0);
+        let created = g.add_contradiction("old", "new", 0.8, 0.5);
+        assert!(created, "should create a Contradicts edge");
+        assert_eq!(g.contradiction_count(), 1);
+        // The old memory's Association edges should be weakened (halved).
+        let old_weight_after: f32 = g
+            .neighbors(&NodeId::memory("old").as_str())
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Association)
+            .map(|e| e.weight)
+            .next()
+            .unwrap_or(0.0);
+        assert!(
+            old_weight_after < old_weight_before,
+            "old edge should be weakened: {old_weight_after} < {old_weight_before}"
+        );
+        assert!(
+            (old_weight_after - old_weight_before * 0.5).abs() < 1e-5,
+            "old edge should be halved: {old_weight_after} vs {}",
+            old_weight_before * 0.5
+        );
+    }
+
+    #[test]
+    fn add_contradiction_is_idempotent() {
+        let mut g = MemoryGraph::new();
+        g.add_memory("old", "a", &["c".into()]);
+        g.add_memory("new", "b", &["c".into()]);
+        assert!(g.add_contradiction("old", "new", 0.8, 0.5));
+        assert!(
+            !g.add_contradiction("old", "new", 0.8, 0.5),
+            "second call no-op"
+        );
+        assert_eq!(g.contradiction_count(), 1);
+    }
+
+    #[test]
+    fn contradicted_by_returns_correcting_memories() {
+        let mut g = MemoryGraph::new();
+        g.add_memory("old", "a", &["rust".into()]);
+        g.add_memory("new", "b", &["rust".into()]);
+        g.add_contradiction("old", "new", 0.8, 0.5);
+        let corrected = g.contradicted_by("old");
+        assert_eq!(corrected, vec!["new".to_string()]);
+        assert!(g.contradicted_by("new").is_empty());
+    }
+
+    #[test]
+    fn contradicts_edges_survive_json_roundtrip() {
+        let mut g = MemoryGraph::new();
+        g.add_memory("old", "a", &["rust".into()]);
+        g.add_memory("new", "b", &["rust".into()]);
+        g.add_contradiction("old", "new", 0.8, 0.5);
+        let json = g.to_json();
+        let restored = MemoryGraph::from_json(&json).expect("roundtrip");
+        assert_eq!(
+            restored.contradiction_count(),
+            1,
+            "Contradicts edge should survive roundtrip"
+        );
+    }
+
+    #[test]
+    fn text_jaccard_distinguishes_same_and_different_content() {
+        use crate::extract::text_jaccard_similarity;
+        // Same topic, same content → high Jaccard.
+        let sim_same = text_jaccard_similarity(
+            "Rust memory safety guarantees",
+            "Rust memory safety guarantees",
+        );
+        assert!(
+            sim_same > 0.99,
+            "identical texts should have ~1.0 Jaccard: {sim_same}"
+        );
+        // Same topic, different content → lower Jaccard.
+        // Text A: "Rust memory safety guarantees" → {rust, memory, safety, guarantees}
+        // Text B: "Rust ownership borrow checker" → {rust, ownership, borrow, checker}
+        // intersection = {rust} = 1, union = 6, Jaccard = 1/6 ≈ 0.167
+        let sim_diff = text_jaccard_similarity(
+            "Rust memory safety guarantees",
+            "Rust ownership borrow checker",
+        );
+        assert!(
+            sim_diff < 0.3,
+            "different texts should have low Jaccard: {sim_diff}"
+        );
+        assert!(
+            sim_diff < sim_same,
+            "different texts should have lower Jaccard than identical: {sim_diff} < {sim_same}"
         );
     }
 }

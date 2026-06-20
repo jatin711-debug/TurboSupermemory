@@ -113,6 +113,20 @@ impl SpreadingActivation {
         self.graph.add_refinement(old_id, new_id, weight)
     }
 
+    /// Create a `Contradicts` edge and weaken the old memory's edges. See
+    /// [`MemoryGraph::add_contradiction`]. Returns `true` if a new edge
+    /// was created.
+    pub fn add_contradiction(
+        &mut self,
+        old_id: &str,
+        new_id: &str,
+        weight: f32,
+        weaken_factor: f32,
+    ) -> bool {
+        self.graph
+            .add_contradiction(old_id, new_id, weight, weaken_factor)
+    }
+
     /// Semantic seeds are `(memory_id, normalized_similarity)` pairs from dense ANN search.
     /// Returns `None` when the Feeling-of-Knowing gate rejects the query.
     pub fn search(

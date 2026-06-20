@@ -192,6 +192,28 @@ pub struct TierConfig {
     /// consolidation cycle, to bound per-cycle work. Ignored when
     /// `refinement_cosine_threshold` is `None`.
     pub refinement_max_pairs_per_cycle: usize,
+    /// Cosine-similarity threshold for contradiction detection (belief
+    /// revision). When `Some(t)` (e.g. 0.75), consolidation checks pairs
+    /// that are semantically close (cosine >= t) AND share at least one
+    /// concept AND have LOW text overlap (Jaccard < `contradiction_text_threshold`).
+    /// A `Contradicts` edge is created (old → new) and the old memory's
+    /// edges are weakened. `None` (default) disables. This threshold
+    /// should be LOWER than `refinement_cosine_threshold` — contradiction
+    /// is "same topic, opposing info" while refinement is "same topic,
+    /// updated info".
+    pub contradiction_cosine_threshold: Option<f32>,
+    /// Maximum Jaccard text similarity above which a pair is considered a
+    /// refinement (not a contradiction). Pairs with Jaccard BELOW this
+    /// threshold are candidates for contradiction. Default 0.3 — if the
+    /// texts share less than 30% of their tokens, they're saying different
+    /// things about the same topic.
+    pub contradiction_text_threshold: f32,
+    /// Factor by which the old (contradicted) memory's association edges
+    /// are multiplied when a contradiction is detected. Default 0.5 —
+    /// halve the edge weights so the old memory fades but is not invisible.
+    pub contradiction_weaken_factor: f32,
+    /// Upper bound on contradiction edges created per consolidation cycle.
+    pub contradiction_max_pairs_per_cycle: usize,
 }
 
 impl TierConfig {
@@ -233,6 +255,14 @@ impl TierConfig {
         // current version. None = disabled.
         refinement_cosine_threshold: None,
         refinement_max_pairs_per_cycle: 1024,
+        // Contradiction detection: opt-in. When enabled, the engine
+        // detects when a newer memory contradicts an older one (same
+        // topic, opposing content) and weakens the old memory's edges.
+        // None = disabled.
+        contradiction_cosine_threshold: None,
+        contradiction_text_threshold: 0.3,
+        contradiction_weaken_factor: 0.5,
+        contradiction_max_pairs_per_cycle: 1024,
     };
 
     /// Recommended thresholds for a given vector dimension.
@@ -309,6 +339,15 @@ pub struct StoreConfig {
     /// Search-time beam width (`ef`).  Used as the floor for the per-segment
     /// candidate pool.
     pub search_list_size: usize,
+    /// Fusion weight for cognitive search: `final_score = cognitive_alpha *
+    /// cosine + (1 - cognitive_alpha) * graph_activation`.  At `1.0`
+    /// (default) the final ranking is pure cosine — the graph only
+    /// influences *which* memories are candidates, not their rank. At `0.5`
+    /// the graph activation score has equal weight with cosine, allowing
+    /// reinforcement, refinement, and abstraction to re-rank memories
+    /// above what pure cosine would produce. Range `[0.0, 1.0]`; clamped
+    /// at runtime.
+    pub cognitive_alpha: f32,
     pub outlier_count: usize,
     pub initial_capacity: usize,
     pub tier: TierConfig,
@@ -359,6 +398,7 @@ impl Default for StoreConfig {
             level0_factor: 2,
             ef_construction: 200,
             search_list_size: 100,
+            cognitive_alpha: 1.0,
             outlier_count: 0,
             initial_capacity: 1024,
             tier: TierConfig::default(),

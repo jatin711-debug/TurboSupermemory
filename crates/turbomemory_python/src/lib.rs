@@ -221,8 +221,17 @@ impl PyMemoryEngine {
         fok_threshold=None,
         spreading_decay=None,
         spreading_iterations=None,
+        spreading_beta=None,
         abstraction_co_occurrence_threshold=None,
-        edge_decay_half_life_secs=None
+        edge_decay_half_life_secs=None,
+        max_concepts=None,
+        refinement_cosine_threshold=None,
+        refinement_max_pairs_per_cycle=None,
+        cognitive_alpha=None,
+        contradiction_cosine_threshold=None,
+        contradiction_text_threshold=None,
+        contradiction_weaken_factor=None,
+        contradiction_max_pairs_per_cycle=None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -249,8 +258,17 @@ impl PyMemoryEngine {
         fok_threshold: Option<f32>,
         spreading_decay: Option<f32>,
         spreading_iterations: Option<usize>,
+        spreading_beta: Option<f32>,
         abstraction_co_occurrence_threshold: Option<usize>,
         edge_decay_half_life_secs: Option<u64>,
+        max_concepts: Option<usize>,
+        refinement_cosine_threshold: Option<f32>,
+        refinement_max_pairs_per_cycle: Option<usize>,
+        cognitive_alpha: Option<f32>,
+        contradiction_cosine_threshold: Option<f32>,
+        contradiction_text_threshold: Option<f32>,
+        contradiction_weaken_factor: Option<f32>,
+        contradiction_max_pairs_per_cycle: Option<usize>,
     ) -> PyResult<Self> {
         let mut config = StoreConfig::default_for_dimension(dimension);
         if let Some(me) = max_edges {
@@ -334,11 +352,65 @@ impl PyMemoryEngine {
         if let Some(iters) = spreading_iterations {
             config.spreading.iterations = iters;
         }
+        if let Some(beta) = spreading_beta {
+            config.spreading.beta = beta;
+        }
         if let Some(th) = abstraction_co_occurrence_threshold {
             config.tier.abstraction_co_occurrence_threshold = th;
         }
         if let Some(hl) = edge_decay_half_life_secs {
             config.tier.edge_decay_half_life_secs = hl;
+        }
+        // - max_concepts: how many concepts to attach per record. Caller
+        //   concepts are used first; remaining slots filled by auto-extraction
+        //   from text. Set to 0 to disable extraction. Default 5.
+        // - refinement_cosine_threshold: enable memory evolution. When two
+        //   memories are about the same topic (cosine >= threshold AND share
+        //   a concept), a Refines edge lets retrieval surface the newer one.
+        //   None (default) disables. Should be LOWER than
+        //   dedup_cosine_threshold — refinement is "same topic, more recent"
+        //   while dedup is "essentially identical, merge".
+        // - refinement_max_pairs_per_cycle: cap on Refines edges per
+        //   consolidation. Default 1024.
+        if let Some(mc) = max_concepts {
+            config.tier.max_concepts = mc;
+        }
+        config.tier.refinement_cosine_threshold = refinement_cosine_threshold;
+        if let Some(rm) = refinement_max_pairs_per_cycle {
+            config.tier.refinement_max_pairs_per_cycle = rm;
+        }
+        // - cognitive_alpha: fusion weight for cognitive search.
+        //   final_score = cognitive_alpha * cosine + (1 - cognitive_alpha) * graph_activation
+        //   1.0 (default) = pure cosine (graph only chooses candidates).
+        //   0.5 = graph activation has equal vote with cosine (enables
+        //   reinforcement/refinement/abstraction to re-rank memories).
+        if let Some(ca) = cognitive_alpha {
+            config.cognitive_alpha = ca;
+        }
+        // - contradiction_cosine_threshold: enable belief revision. When a
+        //   newer memory contradicts an older one (cosine >= threshold AND
+        //   share a concept AND low text overlap), a Contradicts edge is
+        //   created (old -> new) and the old memory's edges are weakened.
+        //   None (default) disables. Should be LOWER than
+        //   refinement_cosine_threshold — contradiction is "same topic,
+        //   opposing content" (low text overlap) while refinement is
+        //   "same topic, updated content" (high text overlap).
+        // - contradiction_text_threshold: Jaccard similarity floor. Pairs
+        //   with text overlap BELOW this are contradiction candidates;
+        //   pairs at/above it are treated as refinements. Default 0.3.
+        // - contradiction_weaken_factor: the old (contradicted) memory's
+        //   association edges are multiplied by this factor. Default 0.5.
+        // - contradiction_max_pairs_per_cycle: cap on Contradicts edges
+        //   per consolidation. Default 1024.
+        config.tier.contradiction_cosine_threshold = contradiction_cosine_threshold;
+        if let Some(tt) = contradiction_text_threshold {
+            config.tier.contradiction_text_threshold = tt;
+        }
+        if let Some(wf) = contradiction_weaken_factor {
+            config.tier.contradiction_weaken_factor = wf;
+        }
+        if let Some(cp) = contradiction_max_pairs_per_cycle {
+            config.tier.contradiction_max_pairs_per_cycle = cp;
         }
 
         let inner = StorageEngine::open(db_path, config).map_err(storage_err)?;

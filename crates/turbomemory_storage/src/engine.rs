@@ -712,6 +712,50 @@ impl StorageEngine {
         self.search_with_ef(query_text, query_embedding, top_k, None)
     }
 
+    /// Hydrate graph results with embeddings and fuse the graph activation
+    /// score with the cosine similarity to produce the final ranking.
+    ///
+    /// `final_score = cognitive_alpha * cosine + (1 - cognitive_alpha) * normalized_activation`
+    ///
+    /// At `cognitive_alpha = 1.0` (default) this is pure cosine — the graph
+    /// only influences *which* memories are candidates. At lower values the
+    /// graph activation score has a vote in the final ranking, allowing
+    /// reinforcement, refinement, and abstraction to surface memories that
+    /// pure cosine would rank lower.
+    fn hydrate_and_fuse(
+        &self,
+        results: Vec<(String, f32)>,
+        query_embedding: &[f32],
+        top_k: usize,
+    ) -> crate::Result<Vec<(String, f32)>> {
+        if results.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Normalize graph activation scores to [0, 1].
+        let max_act = results
+            .iter()
+            .map(|(_, a)| *a)
+            .fold(0.0f32, f32::max)
+            .max(1e-10);
+        let alpha = self.config.cognitive_alpha.clamp(0.0, 1.0);
+
+        let mut hydrated: Vec<(String, f32)> = results
+            .into_iter()
+            .filter_map(|(id, act)| {
+                self.find_record_by_id(&id).map(|rec| {
+                    let cos = cosine_similarity(query_embedding, rec.embedding_f32());
+                    let norm_act = act / max_act;
+                    let fused = alpha * cos + (1.0 - alpha) * norm_act;
+                    (id, fused)
+                })
+            })
+            .collect();
+        hydrated.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        hydrated.truncate(top_k);
+        Ok(hydrated)
+    }
+
     pub fn search_with_ef(
         &self,
         query_text: &str,
@@ -722,26 +766,20 @@ impl StorageEngine {
         validate_dimension(query_embedding, self.config.dimension)?;
         let seeds = self.search_ann_candidates_with_ef(query_embedding, top_k.max(10), ef)?;
         let graph = self.graph.read();
-        let activated = graph.search(query_text, &seeds, top_k);
+        // Request more candidates from the graph than the final top_k so
+        // that memories reached through multi-hop traversal (abstraction
+        // edges, refinement edges) have a chance to be in the candidate
+        // set even if their graph activation is lower than direct matches.
+        // The fusion step (hydrate_and_fuse) will then re-rank using the
+        // combination of cosine + graph activation and truncate to top_k.
+        let graph_k = (top_k * 3).max(top_k + 5);
+        let activated = graph.search(query_text, &seeds, graph_k);
         drop(graph);
         if let Some(results) = activated {
-            let mut hydrated: Vec<(String, f32)> = results
-                .into_iter()
-                .filter_map(|(id, _)| {
-                    self.find_record_by_id(&id).map(|rec| {
-                        let score = cosine_similarity(query_embedding, rec.embedding_f32());
-                        (id, score)
-                    })
-                })
-                .collect();
-            hydrated.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            hydrated.truncate(top_k);
+            let hydrated = self.hydrate_and_fuse(results, query_embedding, top_k)?;
             if hydrated.is_empty() {
                 return Ok(None);
             }
-            // Bump access counts and reinforce graph edges for retrieved
-            // memories. Reinforcement is the learning signal that a memory
-            // was useful, strengthening its graph links for future retrieval.
             for (id, _) in &hydrated {
                 self.bump_access_by_id(id);
                 self.reinforce_graph_by_id(id);
@@ -788,20 +826,11 @@ impl StorageEngine {
             ef,
         )?;
         let graph = self.graph.read();
-        let activated = graph.search(query_text, &seeds, top_k);
+        let graph_k = (top_k * 3).max(top_k + 5);
+        let activated = graph.search(query_text, &seeds, graph_k);
         drop(graph);
         if let Some(results) = activated {
-            let mut hydrated: Vec<(String, f32)> = results
-                .into_iter()
-                .filter_map(|(id, _)| {
-                    self.find_record_by_id(&id).map(|rec| {
-                        let score = cosine_similarity(query_embedding, rec.embedding_f32());
-                        (id, score)
-                    })
-                })
-                .collect();
-            hydrated.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            hydrated.truncate(top_k);
+            let hydrated = self.hydrate_and_fuse(results, query_embedding, top_k)?;
             if hydrated.is_empty() {
                 return Ok(None);
             }
@@ -971,6 +1000,13 @@ impl StorageEngine {
         // supersede older ones about the same topic) and create Refines
         // edges so retrieval surfaces the most current version. Opt-in.
         self.check_refinements()?;
+
+        // Contradiction detection: when a newer memory contradicts an
+        // older one (same topic, opposing content), create Contradicts
+        // edges and weaken the old memory so it fades. Runs after
+        // check_refinements so refinement pairs (high text overlap) are
+        // not double-counted as contradictions. Opt-in.
+        self.check_contradictions()?;
 
         // Cognitive-layer learning: decay stale reinforced edges and build
         // abstraction hierarchies from concept co-occurrence. Both are opt-in
@@ -1380,6 +1416,128 @@ impl StorageEngine {
         Ok(created)
     }
 
+    /// Contradiction detection: when a newer memory contradicts an older
+    /// one (same topic, opposing content), create a `Contradicts` edge and
+    /// weaken the old memory's edges so it fades from retrieval.
+    ///
+    /// For each pair where:
+    /// - cosine similarity >= `contradiction_cosine_threshold`
+    /// - they share at least one concept
+    /// - text Jaccard similarity < `contradiction_text_threshold` (the
+    ///   texts say different things about the same topic)
+    /// - the newer one has a higher `insert_seq`
+    ///
+    /// a `Contradicts` edge is created (old → new) and the old memory's
+    /// outgoing Association/Temporal edges are weakened by
+    /// `contradiction_weaken_factor`. The old memory is NOT deleted.
+    ///
+    /// Opt-in: a no-op when `contradiction_cosine_threshold` is `None`.
+    /// Runs after `check_refinements` so that pairs that are refinements
+    /// (high text overlap) are not also flagged as contradictions.
+    ///
+    /// Returns the number of new `Contradicts` edges created.
+    pub fn check_contradictions(&self) -> crate::Result<usize> {
+        let Some(threshold) = self.config.tier.contradiction_cosine_threshold else {
+            return Ok(0);
+        };
+        let max_pairs = self.config.tier.contradiction_max_pairs_per_cycle;
+        if max_pairs == 0 {
+            return Ok(0);
+        }
+        let text_threshold = self.config.tier.contradiction_text_threshold;
+        let weaken_factor = self.config.tier.contradiction_weaken_factor;
+
+        self.access_counters.drain_into(&self.meta)?;
+
+        // Snapshot live records sorted by insert_seq (newest first).
+        struct Cand {
+            id: String,
+            offset: PointOffset,
+            insert_seq: u64,
+            text: String,
+            concepts: Vec<String>,
+        }
+        let mut cands: Vec<Cand> = Vec::new();
+        self.meta.for_each_record(|offset, rec| {
+            cands.push(Cand {
+                offset,
+                id: rec.id.clone(),
+                insert_seq: rec.insert_seq,
+                text: rec.text.clone(),
+                concepts: rec.concepts.clone(),
+            });
+        })?;
+        cands.sort_by_key(|c| std::cmp::Reverse(c.insert_seq));
+
+        let mut created = 0usize;
+        for cand in &cands {
+            if created >= max_pairs {
+                break;
+            }
+            let view = self.vectors.read_view();
+            let Some(vec) = view.get(cand.offset) else {
+                continue;
+            };
+            let embedding: Vec<f32> = vec.to_vec();
+            drop(view);
+
+            let neighbors = self.search_ann_candidates(&embedding, 10)?;
+            for (nid, _) in neighbors {
+                if created >= max_pairs {
+                    break;
+                }
+                if nid == cand.id {
+                    continue;
+                }
+                let Some(other) = cands.iter().find(|c| c.id == nid) else {
+                    continue;
+                };
+                // The neighbor must be OLDER.
+                if other.insert_seq >= cand.insert_seq {
+                    continue;
+                }
+                // They must share at least one concept.
+                let shares_concept = cand.concepts.iter().any(|c| other.concepts.contains(c));
+                if !shares_concept {
+                    continue;
+                }
+                // Verify exact cosine.
+                let view = self.vectors.read_view();
+                let Some(other_vec) = view.get(other.offset) else {
+                    continue;
+                };
+                let sim = cosine_similarity(&embedding, other_vec);
+                drop(view);
+                if sim < threshold {
+                    continue;
+                }
+                // KEY DISTINGUISHER from refinement: the texts must be
+                // DISSIMILAR (low Jaccard). A refinement has high text
+                // overlap (same topic, updated content); a contradiction
+                // has low text overlap (same topic, opposing content).
+                let text_sim = turbomemory_graph::text_jaccard_similarity(&cand.text, &other.text);
+                if text_sim >= text_threshold {
+                    // High text overlap → this is a refinement, not a
+                    // contradiction. Skip (check_refinements handles it).
+                    continue;
+                }
+                // Create the Contradicts edge: old (other) → new (cand).
+                // This also weakens the old memory's edges.
+                let mut graph = self.graph.write();
+                let added = graph.add_contradiction(&other.id, &cand.id, 0.8, weaken_factor);
+                drop(graph);
+                if added {
+                    created += 1;
+                }
+            }
+        }
+
+        if created > 0 {
+            self.save_graph()?;
+        }
+        Ok(created)
+    }
+
     pub fn flush(&self) -> crate::Result<()> {
         // 1. Build any pending plain segments so the durable snapshot captures
         //    them as persisted HNSW / quantized segments rather than in-memory
@@ -1556,6 +1714,7 @@ mod tests {
             level0_factor: 2,
             ef_construction: 100,
             search_list_size: 5,
+            cognitive_alpha: 1.0,
             outlier_count: 0,
             initial_capacity: 16,
             tier: TierConfig {
@@ -1580,6 +1739,10 @@ mod tests {
                 max_concepts: 5,
                 refinement_cosine_threshold: None,
                 refinement_max_pairs_per_cycle: 1024,
+                contradiction_cosine_threshold: None,
+                contradiction_text_threshold: 0.3,
+                contradiction_weaken_factor: 0.5,
+                contradiction_max_pairs_per_cycle: 1024,
             },
             optimizer_budget: crate::config::OptimizerBudget::default(),
             auto_consolidation_interval: None,
@@ -1600,6 +1763,7 @@ mod tests {
             level0_factor: 2,
             ef_construction: 100,
             search_list_size: 10,
+            cognitive_alpha: 1.0,
             outlier_count: 0,
             initial_capacity: 4096,
             tier: TierConfig {
@@ -1624,6 +1788,10 @@ mod tests {
                 max_concepts: 5,
                 refinement_cosine_threshold: None,
                 refinement_max_pairs_per_cycle: 1024,
+                contradiction_cosine_threshold: None,
+                contradiction_text_threshold: 0.3,
+                contradiction_weaken_factor: 0.5,
+                contradiction_max_pairs_per_cycle: 1024,
             },
             optimizer_budget: crate::config::OptimizerBudget::default(),
             auto_consolidation_interval: None,
@@ -1846,6 +2014,123 @@ mod tests {
             .unwrap();
         let created = engine.check_refinements().unwrap();
         assert_eq!(created, 0, "should not refine when concepts don't match");
+    }
+
+    #[test]
+    fn check_contradictions_creates_edge_and_weakens_old() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        // Enable contradiction detection with a low cosine threshold.
+        config.tier.contradiction_cosine_threshold = Some(0.5);
+        config.tier.contradiction_text_threshold = 0.4; // texts must be < 40% similar
+        config.tier.contradiction_weaken_factor = 0.5;
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+
+        // Old memory: a FALSE claim. Text mentions the topic word "rust" but
+        // otherwise uses vocabulary disjoint from the correction so the Jaccard
+        // similarity stays below the threshold — a contradiction, not a refinement.
+        //   A tokens: {rust, requires, manual, compilation, before, execution}
+        //   B tokens: {rust, executes, source, code, through, interpretation, directly}
+        //   intersection = {rust} → Jaccard = 1/12 ≈ 0.083 < 0.4.
+        engine
+            .insert(
+                "old_claim",
+                "Rust requires manual compilation before execution",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+        // New memory: the CORRECTION (same topic, opposing claim).
+        engine
+            .insert(
+                "new_correction",
+                "Rust executes source code through interpretation directly",
+                &[0.9f32, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.5,
+                &["rust".to_string()],
+            )
+            .unwrap();
+
+        let created = engine.check_contradictions().unwrap();
+        assert!(
+            created >= 1,
+            "should create at least one Contradicts edge, got {created}"
+        );
+
+        let graph = engine.graph.read();
+        let graph = graph.graph();
+        assert!(
+            graph.contradiction_count() >= 1,
+            "graph should have Contradicts edges"
+        );
+        let corrected = graph.contradicted_by("old_claim");
+        assert!(
+            corrected.contains(&"new_correction".to_string()),
+            "old_claim should be contradicted by new_correction, got {corrected:?}"
+        );
+    }
+
+    #[test]
+    fn check_contradictions_disabled_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+        engine
+            .insert(
+                "old",
+                "Rust gc",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+        engine
+            .insert(
+                "new",
+                "Rust borrow",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+        let created = engine.check_contradictions().unwrap();
+        assert_eq!(
+            created, 0,
+            "contradiction should be disabled when threshold is None"
+        );
+    }
+
+    #[test]
+    fn check_contradictions_skips_high_text_overlap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        config.tier.contradiction_cosine_threshold = Some(0.5);
+        config.tier.contradiction_text_threshold = 0.3; // low threshold = harder to be a contradiction
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        // Two memories with same text (high Jaccard) — should NOT be a contradiction.
+        engine
+            .insert(
+                "old",
+                "Rust is safe fast",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+        engine
+            .insert(
+                "new",
+                "Rust is safe fast",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+        let created = engine.check_contradictions().unwrap();
+        assert_eq!(
+            created, 0,
+            "high text overlap should not be a contradiction"
+        );
     }
 
     #[test]

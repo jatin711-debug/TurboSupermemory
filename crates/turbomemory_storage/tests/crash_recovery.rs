@@ -15,6 +15,7 @@ fn test_config(dim: usize, hot_capacity: usize, warm_capacity: usize) -> StoreCo
         level0_factor: 2,
         ef_construction: 100,
         search_list_size: 32,
+        cognitive_alpha: 1.0,
         outlier_count: 0,
         initial_capacity: 1024,
         tier: TierConfig {
@@ -39,6 +40,10 @@ fn test_config(dim: usize, hot_capacity: usize, warm_capacity: usize) -> StoreCo
             max_concepts: 5,
             refinement_cosine_threshold: None,
             refinement_max_pairs_per_cycle: 1024,
+            contradiction_cosine_threshold: None,
+            contradiction_text_threshold: 0.3,
+            contradiction_weaken_factor: 0.5,
+            contradiction_max_pairs_per_cycle: 1024,
         },
         optimizer_budget: OptimizerBudget::default(),
         auto_consolidation_interval: None,
