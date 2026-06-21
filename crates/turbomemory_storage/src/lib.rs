@@ -7,6 +7,7 @@ pub mod metadata_store;
 pub mod optimizer;
 pub mod payload_index;
 pub mod record;
+pub mod scope_index;
 pub mod segment_holder;
 pub mod segments;
 pub mod text_index;

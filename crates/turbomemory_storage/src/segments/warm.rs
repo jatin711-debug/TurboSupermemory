@@ -312,6 +312,7 @@ mod tests {
                 last_accessed: 0,
                 tier: Tier::Warm,
                 payload: None,
+                scope: None,
             },
         )
     }
@@ -404,6 +405,7 @@ mod tests {
                         last_accessed: 0,
                         tier: Tier::Warm,
                         payload: None,
+                        scope: None,
                     },
                 )
             })

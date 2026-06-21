@@ -1,7 +1,8 @@
 //! In-memory episodic-semantic graph with learnable edge weights.
 
+use crate::extract::ConceptVocabulary;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NodeId {
@@ -106,6 +107,14 @@ pub struct GraphStats {
     pub abstraction_count: usize,
 }
 
+/// Result of an online concept-vocabulary evolution pass.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct VocabularyEvolutionStats {
+    pub merged: usize,
+    pub suppressed: usize,
+    pub examined_pairs: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub enum ConceptKind {
     #[default]
@@ -143,6 +152,17 @@ pub struct MemoryGraph {
     /// so (a,b) and (b,a) share a single counter.
     #[serde(default)]
     co_occurrence: BTreeMap<String, usize>,
+    /// Shared concept vocabulary that canonicalizes surface forms. Aliases
+    /// discovered by online vocabulary evolution are stored here so future
+    /// inserts map synonyms ("coding") to a single canonical concept node
+    /// ("programming").
+    #[serde(default)]
+    vocab: ConceptVocabulary,
+    /// Concepts that have been suppressed as over-general hubs. Their
+    /// outgoing association edges are not expanded during spreading
+    /// activation, preventing them from drowning out more specific concepts.
+    #[serde(default)]
+    suppressed_concepts: BTreeSet<String>,
 }
 
 impl MemoryGraph {
@@ -182,14 +202,14 @@ impl MemoryGraph {
             },
         );
 
-        // Normalize concepts to lowercase and dedup, so "Rust" and "rust"
-        // share a single concept node. This is critical for the graph to
-        // accumulate a coherent concept vocabulary regardless of caller
-        // casing conventions.
+        // Normalize concepts to lowercase, canonicalize through the learned
+        // vocabulary, and dedup. This ensures "Rust" / "rust" share a node
+        // and that aliases discovered by online vocabulary evolution (e.g.
+        // "coding" -> "programming") map to the canonical concept node.
         let mut normalized: Vec<String> = Vec::with_capacity(concepts.len());
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for concept in concepts {
-            let norm = concept.to_lowercase();
+            let norm = self.vocab.resolve(concept);
             if !norm.is_empty() && seen.insert(norm.clone()) {
                 normalized.push(norm);
             }
@@ -682,6 +702,348 @@ impl MemoryGraph {
         }
     }
 
+    /// Access the learned concept vocabulary.
+    pub fn vocab(&self) -> &ConceptVocabulary {
+        &self.vocab
+    }
+
+    /// Mutable access to the learned concept vocabulary.
+    pub fn vocab_mut(&mut self) -> &mut ConceptVocabulary {
+        &mut self.vocab
+    }
+
+    /// Returns true if the concept has been suppressed as an over-general hub.
+    pub fn is_concept_suppressed(&self, concept: &str) -> bool {
+        self.suppressed_concepts.contains(&concept.to_lowercase())
+    }
+
+    /// Number of currently suppressed concepts.
+    pub fn suppressed_concept_count(&self) -> usize {
+        self.suppressed_concepts.len()
+    }
+
+    /// Online concept vocabulary evolution: merge similar concept nodes and
+    /// suppress over-general hubs.
+    ///
+    /// *Merge.* Two base concepts (not abstraction parents) are merged when the
+    /// Jaccard overlap of their associated memory sets is >= `overlap_threshold`.
+    /// The higher-degree concept survives as the canonical node; the loser is
+    /// removed and recorded as an alias in the vocabulary.
+    ///
+    /// *Suppress.* Base concepts whose degree exceeds `hub_fraction *
+    /// memory_count` are marked as suppressed. Their outgoing association edges
+    /// are not expanded during spreading activation, preventing them from
+    /// drowning more specific concepts.
+    ///
+    /// Work is bounded by `max_pairs`: at most this many merge operations are
+    /// performed in a single pass. Returns counts of merged and newly-suppressed
+    /// concepts.
+    pub fn evolve_vocabulary(
+        &mut self,
+        overlap_threshold: f32,
+        hub_fraction: f32,
+        max_pairs: usize,
+    ) -> VocabularyEvolutionStats {
+        if max_pairs == 0 {
+            return VocabularyEvolutionStats::default();
+        }
+        let threshold = overlap_threshold.clamp(0.0, 1.0);
+
+        // Build base-concept -> memory set, and pairwise co-occurrence counts.
+        let mut concept_memories: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+        let mut co_occurrence: BTreeMap<String, usize> = BTreeMap::new();
+
+        let memory_ids: Vec<String> = self
+            .iter_memory_nodes()
+            .map(|(k, _)| k.strip_prefix("mem:").unwrap_or(k).to_string())
+            .collect();
+        for id in &memory_ids {
+            let key = NodeId::memory(id).as_str();
+            let mut concepts: Vec<String> = self
+                .neighbors(&key)
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Association)
+                .filter_map(|e| match &e.target {
+                    NodeId::Concept(c) if !c.contains('+') => Some(c.clone()),
+                    _ => None,
+                })
+                .collect();
+            concepts.sort();
+            for c in &concepts {
+                concept_memories
+                    .entry(c.clone())
+                    .or_default()
+                    .insert(id.clone());
+            }
+            for i in 0..concepts.len() {
+                for j in (i + 1)..concepts.len() {
+                    let a = &concepts[i];
+                    let b = &concepts[j];
+                    let pair_key = if a <= b {
+                        format!("concept:{a}\u{0}concept:{b}")
+                    } else {
+                        format!("concept:{b}\u{0}concept:{a}")
+                    };
+                    *co_occurrence.entry(pair_key).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // Score candidate pairs by Jaccard overlap.
+        let mut candidates: Vec<(String, String, f32)> = Vec::new();
+        for (pair_key, &count) in &co_occurrence {
+            let mut parts = pair_key.splitn(2, '\u{0}');
+            let a_key = parts.next().unwrap_or_default().to_string();
+            let b_key = parts.next().unwrap_or_default().to_string();
+            let a = a_key.strip_prefix("concept:").unwrap_or(&a_key).to_string();
+            let b = b_key.strip_prefix("concept:").unwrap_or(&b_key).to_string();
+            let a_set = concept_memories.get(&a).map(|s| s.len()).unwrap_or(0);
+            let b_set = concept_memories.get(&b).map(|s| s.len()).unwrap_or(0);
+            let union = a_set + b_set - count;
+            if union == 0 {
+                continue;
+            }
+            let overlap = count as f32 / union as f32;
+            if overlap >= threshold {
+                candidates.push((a, b, overlap));
+            }
+        }
+        candidates.sort_by(|a, b| {
+            b.2.partial_cmp(&a.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+                .then(a.1.cmp(&b.1))
+        });
+
+        let mut merged = 0usize;
+        for (a, b, _) in &candidates {
+            if merged >= max_pairs {
+                break;
+            }
+            let a_canon = self.vocab.resolve(a);
+            let b_canon = self.vocab.resolve(b);
+            if a_canon == b_canon {
+                continue;
+            }
+            let a_deg = self.concept_degree(&a_canon);
+            let b_deg = self.concept_degree(&b_canon);
+            let (canonical, alias) = if a_deg > b_deg || (a_deg == b_deg && a_canon < b_canon) {
+                (a_canon, b_canon)
+            } else {
+                (b_canon, a_canon)
+            };
+            if self.merge_concept_node(&alias, &canonical) {
+                merged += 1;
+            }
+        }
+
+        // Suppress over-general hubs.
+        let suppressed_before = self.suppressed_concepts.len();
+        if hub_fraction > 0.0 {
+            let memory_count = self.memory_count().max(1);
+            let hub_threshold = (memory_count as f32 * hub_fraction).max(2.0) as usize;
+            let base_concepts: Vec<String> = self
+                .nodes
+                .values()
+                .filter_map(|n| match &n.id {
+                    NodeId::Concept(c) if !c.contains('+') => Some(c.clone()),
+                    _ => None,
+                })
+                .collect();
+            for c in base_concepts {
+                if self.concept_degree(&c) > hub_threshold {
+                    self.suppressed_concepts.insert(c);
+                }
+            }
+        }
+        let suppressed = self.suppressed_concepts.len() - suppressed_before;
+
+        // Rebuild co-occurrence counters so future abstraction building is
+        // consistent with the merged vocabulary.
+        self.rebuild_co_occurrence();
+
+        VocabularyEvolutionStats {
+            merged,
+            suppressed,
+            examined_pairs: candidates.len(),
+        }
+    }
+
+    /// Merge `alias` into `canonical`: redirect all edges touching the alias
+    /// node to the canonical node, remove the alias node, and record the
+    /// alias mapping in the vocabulary. Returns true if the alias node existed.
+    fn merge_concept_node(&mut self, alias: &str, canonical: &str) -> bool {
+        let alias_key = NodeId::concept(alias).as_str();
+        let canon_key = NodeId::concept(canonical).as_str();
+        if !self.nodes.contains_key(&alias_key) {
+            return false;
+        }
+        if !self.nodes.contains_key(&canon_key) {
+            // Canonical does not exist; just rename the alias node in place.
+            if let Some(node) = self.nodes.remove(&alias_key) {
+                let new_node = Node {
+                    id: NodeId::concept(canonical),
+                    text: canonical.to_string(),
+                    base_importance_factor: node.base_importance_factor,
+                };
+                self.nodes.insert(canon_key.clone(), new_node);
+                for edge in &mut self.edges {
+                    if edge.source.as_str() == alias_key {
+                        edge.source = NodeId::concept(canonical);
+                    }
+                    if edge.target.as_str() == alias_key {
+                        edge.target = NodeId::concept(canonical);
+                    }
+                }
+                self.rebuild_adjacency();
+                self.vocab.add_alias(alias, canonical);
+                self.suppressed_concepts.remove(alias);
+            }
+            return true;
+        }
+
+        // Collect edges incident on the alias node before mutating the edge list.
+        let outgoing: Vec<Edge> = self
+            .adjacency
+            .get(&alias_key)
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|&i| self.edges[i].clone())
+            .collect();
+        let incoming: Vec<Edge> = self
+            .edges
+            .iter()
+            .filter(|e| e.target.as_str() == alias_key)
+            .cloned()
+            .collect();
+
+        for edge in outgoing {
+            match (&edge.source, &edge.target, edge.kind) {
+                (NodeId::Concept(_), NodeId::Memory(mem), EdgeKind::Association) => {
+                    self.ensure_edge(
+                        NodeId::concept(canonical),
+                        NodeId::memory(mem),
+                        EdgeKind::Association,
+                        edge.weight,
+                        edge.last_reinforced_at,
+                    );
+                }
+                (NodeId::Concept(_), NodeId::Concept(parent), EdgeKind::Abstraction) => {
+                    self.ensure_edge(
+                        NodeId::concept(canonical),
+                        NodeId::concept(parent),
+                        EdgeKind::Abstraction,
+                        edge.weight,
+                        edge.last_reinforced_at,
+                    );
+                }
+                _ => {}
+            }
+        }
+        for edge in incoming {
+            match (&edge.source, &edge.target, edge.kind) {
+                (NodeId::Memory(mem), NodeId::Concept(_), EdgeKind::Association) => {
+                    self.ensure_edge(
+                        NodeId::memory(mem),
+                        NodeId::concept(canonical),
+                        EdgeKind::Association,
+                        edge.weight,
+                        edge.last_reinforced_at,
+                    );
+                }
+                (NodeId::Concept(parent), NodeId::Concept(_), EdgeKind::Abstraction) => {
+                    self.ensure_edge(
+                        NodeId::concept(parent),
+                        NodeId::concept(canonical),
+                        EdgeKind::Abstraction,
+                        edge.weight,
+                        edge.last_reinforced_at,
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        self.nodes.remove(&alias_key);
+        self.edges
+            .retain(|e| e.source.as_str() != alias_key && e.target.as_str() != alias_key);
+        self.rebuild_adjacency();
+        self.vocab.add_alias(alias, canonical);
+        self.suppressed_concepts.remove(alias);
+        true
+    }
+
+    /// Add an edge or strengthen an existing edge between `source` and `target`.
+    /// If an edge of the same kind already exists, keep the larger weight and
+    /// the more recent reinforcement timestamp.
+    fn ensure_edge(
+        &mut self,
+        source: NodeId,
+        target: NodeId,
+        kind: EdgeKind,
+        weight: f32,
+        last_reinforced_at: u64,
+    ) {
+        let source_key = source.as_str();
+        let target_key = target.as_str();
+        let existing = self.adjacency.get(&source_key).and_then(|idxs| {
+            idxs.iter().copied().find(|&i| {
+                self.edges[i].kind == kind && self.edges[i].target.as_str() == target_key
+            })
+        });
+        if let Some(i) = existing {
+            let e = &mut self.edges[i];
+            e.weight = e.weight.max(weight);
+            e.last_reinforced_at = e.last_reinforced_at.max(last_reinforced_at);
+        } else {
+            let idx = self.edges.len();
+            self.edges.push(Edge {
+                source,
+                target,
+                kind,
+                weight,
+                last_reinforced_at,
+            });
+            self.adjacency.entry(source_key).or_default().push(idx);
+        }
+    }
+
+    /// Rebuild co-occurrence counters from the current graph. Called after
+    /// vocabulary merges so abstraction building stays consistent.
+    fn rebuild_co_occurrence(&mut self) {
+        self.co_occurrence.clear();
+        let memory_ids: Vec<String> = self
+            .iter_memory_nodes()
+            .map(|(k, _)| k.strip_prefix("mem:").unwrap_or(k).to_string())
+            .collect();
+        for id in &memory_ids {
+            let key = NodeId::memory(id).as_str();
+            let mut concepts: Vec<String> = self
+                .neighbors(&key)
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Association)
+                .filter_map(|e| match &e.target {
+                    NodeId::Concept(c) if !c.contains('+') => Some(c.clone()),
+                    _ => None,
+                })
+                .collect();
+            concepts.sort();
+            for i in 0..concepts.len() {
+                for j in (i + 1)..concepts.len() {
+                    let a = &concepts[i];
+                    let b = &concepts[j];
+                    let pair_key = if a <= b {
+                        format!("concept:{a}\u{0}concept:{b}")
+                    } else {
+                        format!("concept:{b}\u{0}concept:{a}")
+                    };
+                    *self.co_occurrence.entry(pair_key).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
     /// Create a `Refines` edge from an older memory to a newer memory that
     /// refines/superseds it. Direction: `old_id → new_id`.
     ///
@@ -849,6 +1211,7 @@ impl MemoryGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::activation::{SpreadingActivation, SpreadingConfig};
 
     #[test]
     fn graph_adds_nodes_and_edges() {
@@ -1412,5 +1775,112 @@ mod tests {
     fn reweight_memory_unknown_id_returns_false() {
         let mut g = MemoryGraph::new();
         assert!(!g.reweight_memory("nope", 2.0));
+    }
+
+    #[test]
+    fn evolve_vocabulary_merges_overlapping_concepts() {
+        let mut g = MemoryGraph::new();
+        // "coding" and "programming" appear on the exact same two memories,
+        // so their Jaccard overlap is 1.0. "rust" only appears on one of
+        // those memories, so it should not be merged.
+        g.add_memory(
+            "m1",
+            "coding programming",
+            &["coding".into(), "programming".into()],
+        );
+        g.add_memory(
+            "m2",
+            "coding programming rust",
+            &["coding".into(), "programming".into(), "rust".into()],
+        );
+        let stats = g.evolve_vocabulary(0.9, 0.0, 1024);
+        assert_eq!(stats.merged, 1, "expected one merge, got {stats:?}");
+        // The survivor should be the higher-degree concept ("coding" and
+        // "programming" both have degree 2; tie-break is lexical).
+        let survivor = if "coding" < "programming" {
+            "coding"
+        } else {
+            "programming"
+        };
+        let loser = if survivor == "coding" {
+            "programming"
+        } else {
+            "coding"
+        };
+        assert!(g.nodes().contains_key(&NodeId::concept(survivor).as_str()));
+        assert!(g.nodes().contains_key(&NodeId::concept("rust").as_str()));
+        assert!(!g.nodes().contains_key(&NodeId::concept(loser).as_str()));
+        // Future resolves of the loser should map to the survivor.
+        assert_eq!(g.vocab().resolve(loser), survivor);
+    }
+
+    #[test]
+    fn evolve_vocabulary_suppresses_hub_concepts() {
+        let mut g = MemoryGraph::new();
+        // 4 memories total. "system" attaches to 3 of them, which is > 10%
+        // (hub threshold = max(4 * 0.1, 2) = 2).
+        g.add_memory("m1", "a", &["system".into(), "alpha".into()]);
+        g.add_memory("m2", "b", &["system".into(), "beta".into()]);
+        g.add_memory("m3", "c", &["system".into(), "gamma".into()]);
+        g.add_memory("m4", "d", &["delta".into()]);
+        let stats = g.evolve_vocabulary(1.0, 0.1, 1024);
+        assert_eq!(stats.merged, 0);
+        assert_eq!(stats.suppressed, 1, "expected one hub suppression");
+        assert!(g.is_concept_suppressed("system"));
+        assert!(!g.is_concept_suppressed("alpha"));
+    }
+
+    #[test]
+    fn evolve_vocabulary_does_nothing_when_disabled() {
+        let mut g = MemoryGraph::new();
+        g.add_memory("m1", "a", &["coding".into()]);
+        g.add_memory("m2", "b", &["programming".into()]);
+        let stats = g.evolve_vocabulary(0.5, 0.1, 0);
+        assert_eq!(stats.merged, 0);
+        assert_eq!(stats.suppressed, 0);
+    }
+
+    #[test]
+    fn suppressed_concept_does_not_expand() {
+        let mut g = MemoryGraph::new();
+        // Add m2 first so the temporal edge points m2 -> m1, not m1 -> m2.
+        // Otherwise the query seed on m1 would reach m2 through the temporal
+        // chain regardless of concept suppression.
+        g.add_memory(
+            "m2",
+            "programming python",
+            &["programming".into(), "python".into()],
+        );
+        g.add_memory(
+            "m1",
+            "rust programming",
+            &["rust".into(), "programming".into()],
+        );
+        // Suppress "programming" so it no longer bridges rust and python.
+        g.evolve_vocabulary(1.0, 0.0, 1024);
+        g.suppressed_concepts.insert("programming".into());
+
+        let sa = SpreadingActivation::new(g, SpreadingConfig::default());
+        // Query that hits m1 should not be able to reach m2 through the
+        // suppressed "programming" hub.
+        let results = sa.search("rust", &[("m1".into(), 0.9)], 5);
+        assert!(results.is_some());
+        let ids: Vec<String> = results.unwrap().into_iter().map(|(id, _)| id).collect();
+        assert!(ids.contains(&"m1".to_string()));
+        assert!(!ids.contains(&"m2".to_string()));
+    }
+
+    #[test]
+    fn vocab_and_suppressed_survive_json_roundtrip() {
+        let mut g = MemoryGraph::new();
+        g.add_memory("m1", "coding", &["coding".into()]);
+        g.add_memory("m2", "programming", &["programming".into()]);
+        g.vocab_mut().add_alias("programming", "coding");
+        g.suppressed_concepts.insert("coding".into());
+
+        let json = g.to_json();
+        let restored = MemoryGraph::from_json(&json).expect("roundtrip");
+        assert_eq!(restored.vocab().resolve("programming"), "coding");
+        assert!(restored.is_concept_suppressed("coding"));
     }
 }

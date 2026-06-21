@@ -249,6 +249,22 @@ pub struct TierConfig {
     /// above this. Default 4.0 — matches the dynamic range of the
     /// `importance_factor` sqrt curve (importance 4.0 -> factor 2.0).
     pub importance_ceiling: f32,
+    /// Enable online concept vocabulary evolution. When true, each
+    /// consolidation pass merges concept nodes whose associated memory sets
+    /// overlap strongly and suppresses over-general hub concepts. `false`
+    /// (default) keeps concepts exactly as extracted — backward-compatible.
+    pub concept_evolution_enabled: bool,
+    /// Jaccard-overlap threshold for merging two concept nodes. Two concepts
+    /// are merged when `|shared memories| / |union of memories| >= threshold`.
+    /// Default 0.7. Only used when `concept_evolution_enabled` is true.
+    pub concept_merge_overlap_threshold: f32,
+    /// Fraction of total memories above which a base concept is considered an
+    /// over-general hub and is suppressed. Default 0.1 (10% of memories).
+    /// Only used when `concept_evolution_enabled` is true.
+    pub concept_hub_degree_fraction: f32,
+    /// Maximum number of concept-merge operations per consolidation cycle.
+    /// Default 1024.
+    pub concept_evolution_max_pairs_per_cycle: usize,
 }
 
 impl TierConfig {
@@ -313,6 +329,12 @@ impl TierConfig {
         importance_access_weight: 0.6,
         importance_floor: 0.1,
         importance_ceiling: 4.0,
+        // Online concept vocabulary evolution: disabled by default to preserve
+        // the exact extracted concepts and existing benchmarks.
+        concept_evolution_enabled: false,
+        concept_merge_overlap_threshold: 0.7,
+        concept_hub_degree_fraction: 0.1,
+        concept_evolution_max_pairs_per_cycle: 1024,
     };
 
     /// Recommended thresholds for a given vector dimension.

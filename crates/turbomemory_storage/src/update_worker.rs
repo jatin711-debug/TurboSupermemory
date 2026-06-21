@@ -12,6 +12,7 @@
 use crate::metadata_store::MetadataStore;
 use crate::payload_index::PayloadIndex;
 use crate::record::{PointOffset, Record};
+use crate::scope_index::ScopeIndex;
 use crate::segment_holder::SegmentHolder;
 use crate::text_index::TextIndex;
 use crate::vector_store::VectorStore;
@@ -32,6 +33,7 @@ pub(crate) struct IndexApplier {
     pub graph: Arc<RwLock<SpreadingActivation>>,
     pub id_index: Arc<RwLock<AHashMap<Arc<str>, PointOffset>>>,
     pub payload_index: Arc<RwLock<PayloadIndex>>,
+    pub scope_index: Arc<RwLock<ScopeIndex>>,
     pub text_index: Arc<TextIndex>,
 }
 
@@ -48,6 +50,7 @@ impl IndexApplier {
         {
             let mut idx = self.id_index.write();
             let mut pidx = self.payload_index.write();
+            let mut sidx = self.scope_index.write();
             let text_docs: Vec<(PointOffset, &str)> = records
                 .iter()
                 .map(|(offset, rec)| (*offset, rec.text.as_str()))
@@ -55,6 +58,7 @@ impl IndexApplier {
             for (offset, rec) in records {
                 idx.insert(Arc::from(rec.id.as_str()), *offset);
                 pidx.add(*offset, rec.payload.as_deref())?;
+                sidx.add(*offset, rec.scope.as_deref());
             }
             self.text_index.add_batch(&text_docs)?;
         }

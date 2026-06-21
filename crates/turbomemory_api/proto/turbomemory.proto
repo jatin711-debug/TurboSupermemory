@@ -29,6 +29,7 @@ message InsertRequest {
   float importance = 4;
   repeated string concepts = 5;
   optional string payload = 6;
+  optional string scope = 7;
 }
 
 message InsertResponse {
@@ -42,6 +43,7 @@ message InsertBatchRequest {
   repeated float scores = 4;
   repeated StringList concepts = 5;
   repeated string payloads = 6;
+  repeated string scopes = 7;
 }
 
 message Embedding {
@@ -71,6 +73,7 @@ message UpdateRequest {
   float importance = 4;
   repeated string concepts = 5;
   optional string payload = 6;
+  optional string scope = 7;
 }
 
 message UpdateResponse {
@@ -124,12 +127,14 @@ message SearchRequest {
   repeated float query_embedding = 2;
   uint32 top_k = 3;
   optional Filter filter = 4;
+  optional string scope = 5;
 }
 
 message SearchAnnRequest {
   repeated float query_embedding = 1;
   uint32 top_k = 2;
   optional Filter filter = 3;
+  optional string scope = 4;
 }
 
 message SearchResponse {

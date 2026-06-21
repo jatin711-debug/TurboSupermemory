@@ -21,4 +21,6 @@ pub use extract::{
     extract_concepts, extract_concepts_with_config, merge_concepts, merge_concepts_with_config,
     text_jaccard_similarity, ConceptVocabulary, ExtractorConfig,
 };
-pub use graph::{ConceptKind, Edge, EdgeKind, GraphStats, MemoryGraph, Node, NodeId};
+pub use graph::{
+    ConceptKind, Edge, EdgeKind, GraphStats, MemoryGraph, Node, NodeId, VocabularyEvolutionStats,
+};

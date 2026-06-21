@@ -6,8 +6,9 @@
 use numpy::PyUntypedArrayMethods;
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use turbomemory_graph::{CognitiveCompressor, CompressedCognitiveState, DeterministicCompressor};
 use turbomemory_storage::config::{QuantizerKind, StoreConfig};
 use turbomemory_storage::engine::StorageEngine;
 
@@ -239,7 +240,11 @@ impl PyMemoryEngine {
         importance_learning_rate=None,
         importance_access_weight=None,
         importance_floor=None,
-        importance_ceiling=None
+        importance_ceiling=None,
+        concept_evolution_enabled=None,
+        concept_merge_overlap_threshold=None,
+        concept_hub_degree_fraction=None,
+        concept_evolution_max_pairs_per_cycle=None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -285,6 +290,10 @@ impl PyMemoryEngine {
         importance_access_weight: Option<f32>,
         importance_floor: Option<f32>,
         importance_ceiling: Option<f32>,
+        concept_evolution_enabled: Option<bool>,
+        concept_merge_overlap_threshold: Option<f32>,
+        concept_hub_degree_fraction: Option<f32>,
+        concept_evolution_max_pairs_per_cycle: Option<usize>,
     ) -> PyResult<Self> {
         let mut config = StoreConfig::default_for_dimension(dimension);
         if let Some(me) = max_edges {
@@ -463,13 +472,42 @@ impl PyMemoryEngine {
         if let Some(ce) = importance_ceiling {
             config.tier.importance_ceiling = ce;
         }
+        // - concept_evolution_enabled: enable online vocabulary evolution.
+        //   When true, consolidation merges similar concept nodes and
+        //   suppresses over-general hub concepts. false (default) preserves
+        //   exact extracted concepts.
+        // - concept_merge_overlap_threshold: Jaccard overlap of associated
+        //   memory sets required to merge two concepts. Default 0.7.
+        // - concept_hub_degree_fraction: fraction of total memories above
+        //   which a base concept is suppressed as a hub. Default 0.1.
+        // - concept_evolution_max_pairs_per_cycle: max merge ops per pass.
+        if let Some(on) = concept_evolution_enabled {
+            config.tier.concept_evolution_enabled = on;
+        }
+        if let Some(th) = concept_merge_overlap_threshold {
+            config.tier.concept_merge_overlap_threshold = th.clamp(0.0, 1.0);
+        }
+        if let Some(f) = concept_hub_degree_fraction {
+            config.tier.concept_hub_degree_fraction = f.max(0.0);
+        }
+        if let Some(mp) = concept_evolution_max_pairs_per_cycle {
+            config.tier.concept_evolution_max_pairs_per_cycle = mp;
+        }
 
         let inner = StorageEngine::open(db_path, config).map_err(storage_err)?;
         Ok(Self { inner })
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (id, text, embedding, importance_score, concepts, payload=None))]
+    #[pyo3(signature = (
+        id,
+        text,
+        embedding,
+        importance_score,
+        concepts,
+        payload=None,
+        scope=None
+    ))]
     fn insert(
         &self,
         py: Python<'_>,
@@ -479,19 +517,28 @@ impl PyMemoryEngine {
         importance_score: f32,
         concepts: Vec<String>,
         payload: Option<String>,
+        scope: Option<String>,
     ) -> PyResult<bool> {
         let emb_input = extract_f32_input(embedding)?;
         let emb = emb_input.as_slice();
         let payload = parse_payload(payload)?;
         py.allow_threads(|| {
             self.inner
-                .insert_with_payload(id, text, emb, importance_score, &concepts, payload)
+                .insert_with_payload(id, text, emb, importance_score, &concepts, payload, scope)
                 .map_err(storage_err)
         })
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (ids, texts, embeddings, scores, concepts, payloads=None))]
+    #[pyo3(signature = (
+        ids,
+        texts,
+        embeddings,
+        scores,
+        concepts,
+        payloads=None,
+        scopes=None
+    ))]
     fn insert_batch(
         &self,
         py: Python<'_>,
@@ -501,6 +548,7 @@ impl PyMemoryEngine {
         scores: Vec<f32>,
         concepts: Vec<Vec<String>>,
         payloads: Option<Vec<String>>,
+        scopes: Option<Vec<String>>,
     ) -> PyResult<usize> {
         let matrix = extract_f32_matrix(embeddings)?;
         let rows = matrix.rows();
@@ -511,48 +559,58 @@ impl PyMemoryEngine {
                 .collect::<PyResult<_>>()?,
             None => Vec::new(),
         };
+        let scopes: Vec<Option<String>> = match scopes {
+            Some(list) => list.into_iter().map(Some).collect(),
+            None => Vec::new(),
+        };
         py.allow_threads(|| {
             self.inner
-                .insert_batch_with_payload(&ids, &texts, &rows, &scores, &concepts, &payloads)
+                .insert_batch_with_payload(
+                    &ids, &texts, &rows, &scores, &concepts, &payloads, &scopes,
+                )
                 .map_err(storage_err)
         })
     }
 
-    #[pyo3(signature = (query_embedding, top_k, search_list_size=None))]
+    #[pyo3(signature = (query_embedding, top_k, search_list_size=None, scope=None))]
     fn search_ann(
         &self,
         py: Python<'_>,
         query_embedding: &Bound<'_, PyAny>,
         top_k: usize,
         search_list_size: Option<usize>,
+        scope: Option<String>,
     ) -> PyResult<Vec<(String, f32)>> {
         let q_input = extract_f32_input(query_embedding)?;
         let q = q_input.as_slice();
+        let scope_ref = scope.as_deref();
         py.allow_threads(|| {
             self.inner
-                .search_ann_with_ef(q, top_k, search_list_size)
+                .search_ann_scoped(q, top_k, search_list_size, scope_ref)
                 .map_err(storage_err)
         })
     }
 
-    #[pyo3(signature = (query_embedding, top_k, search_list_size=None))]
+    #[pyo3(signature = (query_embedding, top_k, search_list_size=None, scope=None))]
     fn search_ann_candidates(
         &self,
         py: Python<'_>,
         query_embedding: &Bound<'_, PyAny>,
         top_k: usize,
         search_list_size: Option<usize>,
+        scope: Option<String>,
     ) -> PyResult<Vec<(String, f32)>> {
         let q_input = extract_f32_input(query_embedding)?;
         let q = q_input.as_slice();
+        let scope_ref = scope.as_deref();
         py.allow_threads(|| {
             self.inner
-                .search_ann_candidates_with_ef(q, top_k, search_list_size)
+                .search_ann_scoped(q, top_k, search_list_size, scope_ref)
                 .map_err(storage_err)
         })
     }
 
-    #[pyo3(signature = (query_text, query_embedding, top_k, search_list_size=None))]
+    #[pyo3(signature = (query_text, query_embedding, top_k, search_list_size=None, scope=None))]
     fn search(
         &self,
         py: Python<'_>,
@@ -560,12 +618,14 @@ impl PyMemoryEngine {
         query_embedding: &Bound<'_, PyAny>,
         top_k: usize,
         search_list_size: Option<usize>,
+        scope: Option<String>,
     ) -> PyResult<Option<Vec<(String, f32)>>> {
         let q_input = extract_f32_input(query_embedding)?;
         let q = q_input.as_slice();
+        let scope_ref = scope.as_deref();
         py.allow_threads(|| {
             self.inner
-                .search_with_ef(query_text, q, top_k, search_list_size)
+                .search_scoped_with_ef(query_text, q, top_k, search_list_size, scope_ref)
                 .map_err(storage_err)
         })
     }
@@ -581,6 +641,35 @@ impl PyMemoryEngine {
                 .step_session(user_input, assistant_response)
                 .map_err(storage_err)
         })
+    }
+
+    /// Install a Python callable as the cognitive compressor for
+    /// `step_session`. The callable receives three positional string arguments:
+    /// `(current_ccs_json, user_input, assistant_response)` and must return a
+    /// JSON string representing a `CompressedCognitiveState` (the same schema
+    /// `step_session` emits). If the callable raises or returns invalid JSON,
+    /// the engine falls back to the deterministic compressor for that turn so
+    /// the working memory is never corrupted.
+    ///
+    /// Example:
+    /// ```python
+    /// def my_compressor(ccs_json, user_input, assistant_response):
+    ///     return json.dumps({
+    ///         "turn_count": json.loads(ccs_json).get("turn_count", 0) + 1,
+    ///         "last_user_input": user_input,
+    ///         "last_assistant_response": assistant_response,
+    ///         "facts": [f"User asked: {user_input}"],
+    ///         "topics": ["ai"],
+    ///     })
+    ///
+    /// engine.set_llm_compressor(my_compressor)
+    /// ```
+    fn set_llm_compressor(&self, callable: Py<PyAny>) -> PyResult<()> {
+        let compressor = Arc::new(PythonCompressor {
+            callable: Mutex::new(callable),
+        });
+        self.inner.set_compressor(compressor);
+        Ok(())
     }
 
     fn trigger_consolidation(&self, py: Python<'_>) -> PyResult<(usize, usize, usize)> {
@@ -608,6 +697,13 @@ impl PyMemoryEngine {
     /// independently.
     fn recompute_importance(&self, py: Python<'_>) -> PyResult<usize> {
         py.allow_threads(|| self.inner.recompute_importance().map_err(storage_err))
+    }
+
+    /// Run one pass of online concept vocabulary evolution, returning
+    /// `(merged, newly_suppressed, examined_pairs)`. No-op `(0, 0, 0)` unless
+    /// `concept_evolution_enabled` is true.
+    fn evolve_concept_vocabulary(&self, py: Python<'_>) -> PyResult<(usize, usize, usize)> {
+        py.allow_threads(|| self.inner.evolve_concept_vocabulary().map_err(storage_err))
     }
 
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
@@ -704,7 +800,7 @@ impl PyMemoryEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (id, text, embedding, importance_score, concepts, payload=None))]
+    #[pyo3(signature = (id, text, embedding, importance_score, concepts, payload=None, scope=None))]
     fn update(
         &self,
         py: Python<'_>,
@@ -714,13 +810,14 @@ impl PyMemoryEngine {
         importance_score: f32,
         concepts: Vec<String>,
         payload: Option<String>,
+        scope: Option<String>,
     ) -> PyResult<bool> {
         let emb_input = extract_f32_input(embedding)?;
         let emb = emb_input.as_slice();
         let payload = parse_payload(payload)?;
         py.allow_threads(|| {
             self.inner
-                .update_with_payload(id, text, emb, importance_score, &concepts, payload)
+                .update_with_payload(id, text, emb, importance_score, &concepts, payload, scope)
                 .map_err(storage_err)
         })
     }
@@ -743,6 +840,48 @@ impl PyMemoryEngine {
         _traceback: &Bound<'py, PyAny>,
     ) -> PyResult<()> {
         self.close(py)
+    }
+}
+
+/// A `CognitiveCompressor` backed by a Python callable. The callable is
+/// invoked with the GIL re-acquired for each compression call; a Mutex makes
+/// the wrapper `Sync` as required by the trait. Errors from Python or from
+/// parsing the returned JSON fall back to the deterministic compressor so a
+/// misbehaving callback cannot corrupt the working-memory state.
+struct PythonCompressor {
+    callable: Mutex<Py<PyAny>>,
+}
+
+impl CognitiveCompressor for PythonCompressor {
+    fn compress(
+        &self,
+        ccs: &CompressedCognitiveState,
+        user_input: &str,
+        assistant_response: &str,
+    ) -> CompressedCognitiveState {
+        let ccs_json = ccs.to_json();
+        let result = Python::with_gil(|py| {
+            let callable = self
+                .callable
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("compressor lock poisoned: {e}")))?;
+            let args = (ccs_json, user_input, assistant_response);
+            let output = callable.call1(py, args)?;
+            let json_str: String = output.extract(py)?;
+            Ok::<_, PyErr>(json_str)
+        });
+
+        let json_str = match result {
+            Ok(s) => s,
+            Err(_) => {
+                return DeterministicCompressor.compress(ccs, user_input, assistant_response);
+            }
+        };
+
+        match serde_json::from_str::<CompressedCognitiveState>(&json_str) {
+            Ok(parsed) => parsed,
+            Err(_) => DeterministicCompressor.compress(ccs, user_input, assistant_response),
+        }
     }
 }
 

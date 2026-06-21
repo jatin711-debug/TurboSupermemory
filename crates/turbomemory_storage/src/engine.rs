@@ -16,6 +16,7 @@ use crate::metadata_store::MetadataStore;
 use crate::optimizer::BackgroundOptimizer;
 use crate::payload_index::{Filter, PayloadIndex};
 use crate::record::{MetaRecord, PointOffset, Record};
+use crate::scope_index::ScopeIndex;
 use crate::segment_holder::{SegmentHolder, SegmentSnapshot};
 use crate::text_index::TextIndex;
 use crate::update_worker::UpdateWorker;
@@ -61,6 +62,7 @@ pub struct StorageEngine {
     compressor: Arc<RwLock<Arc<dyn CognitiveCompressor>>>,
     id_index: Arc<RwLock<AHashMap<Arc<str>, PointOffset>>>,
     payload_index: Arc<RwLock<PayloadIndex>>,
+    scope_index: Arc<RwLock<ScopeIndex>>,
     text_index: Arc<TextIndex>,
     wal: Arc<Mutex<Wal>>,
     optimizer: Arc<BackgroundOptimizer>,
@@ -81,6 +83,7 @@ impl Clone for StorageEngine {
             compressor: self.compressor.clone(),
             id_index: self.id_index.clone(),
             payload_index: self.payload_index.clone(),
+            scope_index: self.scope_index.clone(),
             text_index: self.text_index.clone(),
             wal: self.wal.clone(),
             optimizer: self.optimizer.clone(),
@@ -179,6 +182,15 @@ impl StorageEngine {
         let payload_index = Arc::new(RwLock::new(PayloadIndex::from_meta_records_iter(
             records_meta.iter().map(|(o, m)| (*o, m)),
         )));
+
+        // Rebuild the scope index from the metadata snapshot.
+        let scope_index = Arc::new(RwLock::new(ScopeIndex::new()));
+        {
+            let mut sidx = scope_index.write();
+            for (offset, meta_rec) in &records_meta {
+                sidx.add(*offset, meta_rec.scope.as_deref());
+            }
+        }
 
         // Rebuild the full-text index from the metadata snapshot.
         let text_index = Arc::new(TextIndex::open(db_path.join("text_index"))?);
@@ -304,6 +316,7 @@ impl StorageEngine {
                 graph: graph.clone(),
                 id_index: id_index.clone(),
                 payload_index: payload_index.clone(),
+                scope_index: scope_index.clone(),
                 text_index: text_index.clone(),
             });
             let update_worker = UpdateWorker::new(applier, 1024);
@@ -318,6 +331,7 @@ impl StorageEngine {
                 compressor,
                 id_index,
                 payload_index,
+                scope_index,
                 text_index,
                 wal: Arc::new(Mutex::new(wal)),
                 optimizer: Arc::new(optimizer),
@@ -335,9 +349,10 @@ impl StorageEngine {
         importance: f32,
         concepts: &[String],
     ) -> crate::Result<bool> {
-        self.insert_with_payload(id, text, embedding, importance, concepts, None)
+        self.insert_with_payload(id, text, embedding, importance, concepts, None, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_with_payload(
         &self,
         id: &str,
@@ -346,6 +361,7 @@ impl StorageEngine {
         importance: f32,
         concepts: &[String],
         payload: Option<String>,
+        scope: Option<String>,
     ) -> crate::Result<bool> {
         validate_dimension(embedding, self.config.dimension)?;
         if self.id_index.read().contains_key(id) {
@@ -357,7 +373,8 @@ impl StorageEngine {
         // text. If the caller already provided >= max_concepts, their tags
         // are used as-is. If max_concepts is 0, auto-extraction is disabled.
         let extractor_config = self.config.tier.extractor_config();
-        let concepts = merge_concepts_with_config(concepts, text, &extractor_config, None);
+        let vocab = self.graph.read().vocab().clone();
+        let concepts = merge_concepts_with_config(concepts, text, &extractor_config, Some(&vocab));
         let offset = self.meta.allocate_offset();
         let seq = self.meta.allocate_seq();
         let record = Record {
@@ -372,6 +389,7 @@ impl StorageEngine {
             last_accessed: 0,
             tier: crate::config::Tier::Hot,
             payload,
+            scope,
         };
 
         // 1. Persist the embedding to the mmap-backed vector store first.
@@ -400,9 +418,10 @@ impl StorageEngine {
         concepts: &[Vec<String>],
     ) -> crate::Result<usize> {
         let refs: Vec<&[f32]> = embeddings.iter().map(|v| v.as_slice()).collect();
-        self.insert_batch_with_payload(ids, texts, &refs, importances, concepts, &[])
+        self.insert_batch_with_payload(ids, texts, &refs, importances, concepts, &[], &[])
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_batch_with_payload(
         &self,
         ids: &[String],
@@ -411,6 +430,7 @@ impl StorageEngine {
         importances: &[f32],
         concepts: &[Vec<String>],
         payloads: &[Option<String>],
+        scopes: &[Option<String>],
     ) -> crate::Result<usize> {
         let n = ids.len();
         if n == 0 {
@@ -421,6 +441,7 @@ impl StorageEngine {
             || importances.len() < n
             || concepts.len() < n
             || (!payloads.is_empty() && payloads.len() < n)
+            || (!scopes.is_empty() && scopes.len() < n)
         {
             return Err(StorageError::InvalidArgument(
                 "batch arrays have mismatched lengths".into(),
@@ -444,6 +465,11 @@ impl StorageEngine {
         }
         drop(idx);
 
+        // Snapshot the current vocabulary so all records in the batch are
+        // canonicalized consistently (even if another thread evolves the
+        // vocabulary while this batch is being prepared).
+        let vocab = self.graph.read().vocab().clone();
+
         let mut records: Vec<(PointOffset, Record)> = Vec::with_capacity(indices.len());
         for &i in &indices {
             let mut emb = embeddings[i].to_vec();
@@ -455,10 +481,19 @@ impl StorageEngine {
             } else {
                 payloads[i].clone()
             };
+            let scope = if scopes.is_empty() {
+                None
+            } else {
+                scopes[i].clone()
+            };
             // Augment caller-supplied concepts with auto-extracted ones.
             let extractor_config = self.config.tier.extractor_config();
-            let concepts =
-                merge_concepts_with_config(&concepts[i], &texts[i], &extractor_config, None);
+            let concepts = merge_concepts_with_config(
+                &concepts[i],
+                &texts[i],
+                &extractor_config,
+                Some(&vocab),
+            );
             let record = Record {
                 id: ids[i].clone(),
                 text: texts[i].clone(),
@@ -471,6 +506,7 @@ impl StorageEngine {
                 last_accessed: 0,
                 tier: crate::config::Tier::Hot,
                 payload,
+                scope,
             };
             records.push((offset, record));
         }
@@ -524,11 +560,15 @@ impl StorageEngine {
             wal.append(&WalOp::Delete { offset })?;
         }
 
-        // 2. Remove from payload and text indexes while we still know the old values.
+        // 2. Remove from payload, text, and scope indexes while we still know
+        //    the old values.
         if let Ok(Some(meta_rec)) = self.meta.get(offset) {
             self.payload_index
                 .write()
                 .remove(offset, meta_rec.payload.as_deref());
+            self.scope_index
+                .write()
+                .remove(offset, meta_rec.scope.as_deref());
             self.text_index.remove(offset)?;
         }
 
@@ -536,7 +576,7 @@ impl StorageEngine {
         self.meta.remove(offset)?;
         self.id_index.write().remove(id);
 
-        // 3. Remove from cognitive graph.
+        // 4. Remove from cognitive graph.
         {
             let mut graph = self.graph.write();
             graph.remove_memory(id);
@@ -559,7 +599,7 @@ impl StorageEngine {
         importance: f32,
         concepts: &[String],
     ) -> crate::Result<bool> {
-        self.update_with_payload(id, text, embedding, importance, concepts, None)
+        self.update_with_payload(id, text, embedding, importance, concepts, None, None)
     }
 
     /// Return the JSON payload attached to a record, if any.
@@ -575,6 +615,7 @@ impl StorageEngine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_with_payload(
         &self,
         id: &str,
@@ -583,12 +624,13 @@ impl StorageEngine {
         importance: f32,
         concepts: &[String],
         payload: Option<String>,
+        scope: Option<String>,
     ) -> crate::Result<bool> {
         if !self.id_index.read().contains_key(id) {
             return Ok(false);
         }
         self.delete_by_id(id)?;
-        self.insert_with_payload(id, text, embedding, importance, concepts, payload)?;
+        self.insert_with_payload(id, text, embedding, importance, concepts, payload, scope)?;
         Ok(true)
     }
 
@@ -606,7 +648,19 @@ impl StorageEngine {
         top_k: usize,
         ef: Option<usize>,
     ) -> crate::Result<Vec<(String, f32)>> {
-        let candidates = self.search_ann_candidates_with_ef(query_embedding, top_k, ef)?;
+        self.search_ann_scoped(query_embedding, top_k, ef, None)
+    }
+
+    /// ANN search restricted to a single agent scope (plus global records).
+    pub fn search_ann_scoped(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+        ef: Option<usize>,
+        scope: Option<&str>,
+    ) -> crate::Result<Vec<(String, f32)>> {
+        let candidates =
+            self.search_ann_candidates_filtered_with_ef(query_embedding, top_k, None, ef, scope)?;
         Ok(candidates)
     }
 
@@ -624,7 +678,7 @@ impl StorageEngine {
         top_k: usize,
         ef: Option<usize>,
     ) -> crate::Result<Vec<(String, f32)>> {
-        self.search_ann_candidates_filtered_with_ef(query_embedding, top_k, None, ef)
+        self.search_ann_candidates_filtered_with_ef(query_embedding, top_k, None, ef, None)
     }
 
     /// Filtered ANN candidate search.
@@ -637,7 +691,7 @@ impl StorageEngine {
         top_k: usize,
         filter: Option<&Filter>,
     ) -> crate::Result<Vec<(String, f32)>> {
-        self.search_ann_candidates_filtered_with_ef(query_embedding, top_k, filter, None)
+        self.search_ann_candidates_filtered_with_ef(query_embedding, top_k, filter, None, None)
     }
 
     pub fn search_ann_candidates_filtered_with_ef(
@@ -646,12 +700,20 @@ impl StorageEngine {
         top_k: usize,
         filter: Option<&Filter>,
         ef: Option<usize>,
+        scope: Option<&str>,
     ) -> crate::Result<Vec<(String, f32)>> {
         validate_dimension(query_embedding, self.config.dimension)?;
-        let allowed_offsets = match filter {
+        let mut allowed_offsets = match filter {
             Some(f) => Some(self.evaluate_filter(f)?),
             None => None,
         };
+        if let Some(s) = scope {
+            let scope_bitmap = self.scope_index.read().query(Some(s));
+            allowed_offsets = Some(match allowed_offsets {
+                Some(existing) => existing & scope_bitmap,
+                None => scope_bitmap,
+            });
+        }
         if self.record_count() <= EXACT_FALLBACK_THRESHOLD {
             let results = match &allowed_offsets {
                 Some(bitmap) => self.exact_top_k_filtered(query_embedding, top_k, bitmap),
@@ -715,6 +777,29 @@ impl StorageEngine {
         self.search_with_ef(query_text, query_embedding, top_k, None)
     }
 
+    /// Cognitive search restricted to a single agent scope (plus global records).
+    pub fn search_scoped(
+        &self,
+        query_text: &str,
+        query_embedding: &[f32],
+        top_k: usize,
+        scope: Option<&str>,
+    ) -> crate::Result<Option<Vec<(String, f32)>>> {
+        self.search_scoped_with_ef(query_text, query_embedding, top_k, None, scope)
+    }
+
+    /// Cognitive search with an explicit `ef` and optional agent scope.
+    pub fn search_scoped_with_ef(
+        &self,
+        query_text: &str,
+        query_embedding: &[f32],
+        top_k: usize,
+        ef: Option<usize>,
+        scope: Option<&str>,
+    ) -> crate::Result<Option<Vec<(String, f32)>>> {
+        self.search_with_ef_scoped(query_text, query_embedding, top_k, ef, scope)
+    }
+
     /// Hydrate graph results with embeddings and fuse the graph activation
     /// score with the cosine similarity to produce the final ranking.
     ///
@@ -766,8 +851,26 @@ impl StorageEngine {
         top_k: usize,
         ef: Option<usize>,
     ) -> crate::Result<Option<Vec<(String, f32)>>> {
+        self.search_with_ef_scoped(query_text, query_embedding, top_k, ef, None)
+    }
+
+    fn search_with_ef_scoped(
+        &self,
+        query_text: &str,
+        query_embedding: &[f32],
+        top_k: usize,
+        ef: Option<usize>,
+        scope: Option<&str>,
+    ) -> crate::Result<Option<Vec<(String, f32)>>> {
         validate_dimension(query_embedding, self.config.dimension)?;
-        let seeds = self.search_ann_candidates_with_ef(query_embedding, top_k.max(10), ef)?;
+        let seeds = self.search_ann_candidates_filtered_with_ef(
+            query_embedding,
+            top_k.max(10),
+            None,
+            ef,
+            scope,
+        )?;
+
         let graph = self.graph.read();
         // Request more candidates from the graph than the final top_k so
         // that memories reached through multi-hop traversal (abstraction
@@ -821,12 +924,26 @@ impl StorageEngine {
         filter: &Filter,
         ef: Option<usize>,
     ) -> crate::Result<Option<Vec<(String, f32)>>> {
+        self.search_filtered_with_scope(query_text, query_embedding, top_k, filter, ef, None)
+    }
+
+    /// Cognitive search with both a payload filter and an agent scope.
+    pub fn search_filtered_with_scope(
+        &self,
+        query_text: &str,
+        query_embedding: &[f32],
+        top_k: usize,
+        filter: &Filter,
+        ef: Option<usize>,
+        scope: Option<&str>,
+    ) -> crate::Result<Option<Vec<(String, f32)>>> {
         validate_dimension(query_embedding, self.config.dimension)?;
         let seeds = self.search_ann_candidates_filtered_with_ef(
             query_embedding,
             top_k.max(10),
             Some(filter),
             ef,
+            scope,
         )?;
         let graph = self.graph.read();
         let graph_k = (top_k * 3).max(top_k + 5);
@@ -1032,6 +1149,10 @@ impl StorageEngine {
                 graph.build_abstractions(abstraction_threshold);
             }
         }
+
+        // Online concept vocabulary evolution: merge similar concept nodes
+        // and suppress over-general hubs. Opt-in (no-op when disabled).
+        self.evolve_concept_vocabulary()?;
 
         self.save_graph()?;
         Ok((sealed, compacted, promoted))
@@ -1661,6 +1782,42 @@ impl StorageEngine {
         Ok(changed)
     }
 
+    /// Run one pass of online concept vocabulary evolution.
+    ///
+    /// Merges concept nodes whose associated memory sets overlap strongly
+    /// (Jaccard >= `concept_merge_overlap_threshold`) and suppresses base
+    /// concepts whose degree exceeds `concept_hub_degree_fraction` of all
+    /// memories. Work is capped by `concept_evolution_max_pairs_per_cycle`.
+    ///
+    /// Returns `(merged, newly_suppressed, examined_pairs)`. No-op when
+    /// `concept_evolution_enabled` is false.
+    /// Run one pass of online concept vocabulary evolution.
+    ///
+    /// Merges concept nodes whose associated memory sets overlap strongly
+    /// (Jaccard >= `concept_merge_overlap_threshold`) and suppresses base
+    /// concepts whose degree exceeds `concept_hub_degree_fraction` of all
+    /// memories. Work is capped by `concept_evolution_max_pairs_per_cycle`.
+    ///
+    /// Returns `(merged, newly_suppressed, examined_pairs)`. No-op when
+    /// `concept_evolution_enabled` is false.
+    pub fn evolve_concept_vocabulary(&self) -> crate::Result<(usize, usize, usize)> {
+        let tier = &self.config.tier;
+        if !tier.concept_evolution_enabled {
+            return Ok((0, 0, 0));
+        }
+        let overlap = tier.concept_merge_overlap_threshold.clamp(0.0, 1.0);
+        let hub = tier.concept_hub_degree_fraction.max(0.0);
+        let max_pairs = tier.concept_evolution_max_pairs_per_cycle;
+        let stats = {
+            let mut graph = self.graph.write();
+            graph.evolve_vocabulary(overlap, hub, max_pairs)
+        };
+        if stats.merged > 0 || stats.suppressed > 0 {
+            self.save_graph()?;
+        }
+        Ok((stats.merged, stats.suppressed, stats.examined_pairs))
+    }
+
     pub fn flush(&self) -> crate::Result<()> {
         // 1. Build any pending plain segments so the durable snapshot captures
         //    them as persisted HNSW / quantized segments rather than in-memory
@@ -1886,6 +2043,7 @@ mod tests {
                 concept_max_ngram_len: 1,
                 concept_min_ngram_freq: 1,
                 concept_enable_pmi: true,
+                ..TierConfig::default()
             },
             optimizer_budget: crate::config::OptimizerBudget::default(),
             auto_consolidation_interval: None,
@@ -1943,6 +2101,7 @@ mod tests {
                 concept_max_ngram_len: 1,
                 concept_min_ngram_freq: 1,
                 concept_enable_pmi: true,
+                ..TierConfig::default()
             },
             optimizer_budget: crate::config::OptimizerBudget::default(),
             auto_consolidation_interval: None,
@@ -2874,6 +3033,7 @@ mod tests {
                 1.0,
                 &[],
                 Some(payload.clone()),
+                None,
             )
             .unwrap();
 
@@ -2910,6 +3070,7 @@ mod tests {
                     1.0,
                     &[],
                     Some(payload.to_string()),
+                    None,
                 )
                 .unwrap();
         }
@@ -2968,6 +3129,7 @@ mod tests {
                         1.0,
                         &[],
                         Some(payload.to_string()),
+                        None,
                     )
                     .unwrap();
             }
@@ -3163,5 +3325,114 @@ mod tests {
             low_recall,
             high_recall
         );
+    }
+
+    #[test]
+    fn scoped_search_isolates_agent_memories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+
+        // Global memory: visible to all scopes.
+        engine
+            .insert_with_payload(
+                "global_mem",
+                "global knowledge",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &[],
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Agent A private memory.
+        engine
+            .insert_with_payload(
+                "agent_a_mem",
+                "agent a secret",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &[],
+                None,
+                Some("agent_a".into()),
+            )
+            .unwrap();
+
+        // Agent B private memory.
+        engine
+            .insert_with_payload(
+                "agent_b_mem",
+                "agent b secret",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &[],
+                None,
+                Some("agent_b".into()),
+            )
+            .unwrap();
+
+        let q = &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+        // Global search sees all three records.
+        let global_results: Vec<String> = engine
+            .search_ann_scoped(q, 10, None, None)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(global_results.len(), 3);
+
+        // Agent A search sees global + agent A, but not agent B.
+        let a_results: Vec<String> = engine
+            .search_ann_scoped(q, 10, None, Some("agent_a"))
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(a_results.contains(&"global_mem".to_string()));
+        assert!(a_results.contains(&"agent_a_mem".to_string()));
+        assert!(!a_results.contains(&"agent_b_mem".to_string()));
+
+        // Agent B search sees global + agent B, but not agent A.
+        let b_results: Vec<String> = engine
+            .search_ann_scoped(q, 10, None, Some("agent_b"))
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(b_results.contains(&"global_mem".to_string()));
+        assert!(!b_results.contains(&"agent_a_mem".to_string()));
+        assert!(b_results.contains(&"agent_b_mem".to_string()));
+    }
+
+    #[test]
+    fn scoped_search_survives_replay() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+            engine
+                .insert_with_payload(
+                    "scoped_mem",
+                    "scoped",
+                    &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    1.0,
+                    &[],
+                    None,
+                    Some("agent_x".into()),
+                )
+                .unwrap();
+            engine.flush_vectors().unwrap();
+            engine.flush_wal().unwrap();
+        }
+
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+        let q = &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let results: Vec<String> = engine
+            .search_ann_scoped(q, 10, None, Some("agent_x"))
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(results, vec!["scoped_mem".to_string()]);
     }
 }

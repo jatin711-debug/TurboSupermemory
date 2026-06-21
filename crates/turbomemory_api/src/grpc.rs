@@ -35,6 +35,7 @@ impl Memory for MemoryService {
                 req.importance,
                 &req.concepts,
                 req.payload,
+                req.scope,
             )
             .map_err(ApiError::from)?;
         Ok(Response::new(InsertResponse { success }))
@@ -55,9 +56,22 @@ impl Memory for MemoryService {
         } else {
             req.payloads.into_iter().map(Some).collect()
         };
+        let scopes: Vec<Option<String>> = if req.scopes.is_empty() {
+            Vec::new()
+        } else {
+            req.scopes.into_iter().map(Some).collect()
+        };
         let count = self
             .engine()
-            .insert_batch_with_payload(&ids, &texts, &emb_refs, &req.scores, &concepts, &payloads)
+            .insert_batch_with_payload(
+                &ids,
+                &texts,
+                &emb_refs,
+                &req.scores,
+                &concepts,
+                &payloads,
+                &scopes,
+            )
             .map_err(ApiError::from)?;
         Ok(Response::new(InsertBatchResponse {
             count: count as u32,
@@ -90,6 +104,7 @@ impl Memory for MemoryService {
                 req.importance,
                 &req.concepts,
                 req.payload,
+                req.scope,
             )
             .map_err(ApiError::from)?;
         Ok(Response::new(UpdateResponse { success }))
@@ -118,19 +133,27 @@ impl Memory for MemoryService {
     ) -> Result<Response<SearchResponse>, Status> {
         let req = request.into_inner();
         let filter = pb_filter_to_storage(req.filter.as_ref())?;
+        let scope = req.scope.as_deref();
         let maybe = match filter {
             Some(f) => self
                 .engine()
-                .search_filtered(
+                .search_filtered_with_scope(
                     &req.query_text,
                     &req.query_embedding,
                     req.top_k as usize,
                     &f,
+                    None,
+                    scope,
                 )
                 .map_err(ApiError::from)?,
             None => self
                 .engine()
-                .search(&req.query_text, &req.query_embedding, req.top_k as usize)
+                .search_scoped(
+                    &req.query_text,
+                    &req.query_embedding,
+                    req.top_k as usize,
+                    scope,
+                )
                 .map_err(ApiError::from)?,
         };
         if let Some(results) = maybe {
@@ -152,14 +175,21 @@ impl Memory for MemoryService {
     ) -> Result<Response<SearchResponse>, Status> {
         let req = request.into_inner();
         let filter = pb_filter_to_storage(req.filter.as_ref())?;
+        let scope = req.scope.as_deref();
         let results = match filter {
             Some(f) => self
                 .engine()
-                .search_ann_filtered(&req.query_embedding, req.top_k as usize, &f)
+                .search_ann_candidates_filtered_with_ef(
+                    &req.query_embedding,
+                    req.top_k as usize,
+                    Some(&f),
+                    None,
+                    scope,
+                )
                 .map_err(ApiError::from)?,
             None => self
                 .engine()
-                .search_ann(&req.query_embedding, req.top_k as usize)
+                .search_ann_scoped(&req.query_embedding, req.top_k as usize, None, scope)
                 .map_err(ApiError::from)?,
         };
         Ok(Response::new(SearchResponse {

@@ -13,6 +13,103 @@
 
 ---
 
+## Recently Completed — 2026-06-21 (per-agent memory scoping — C4, LLM compressor integration test — C6)
+
+Shipped the last two Stage 1 cognitive-layer roadmap items together:
+per-agent memory scoping (multi-agent isolation) and an end-to-end LLM
+compressor integration test. With these, **Stage 1 — Cognitive Deepening is
+complete** (C1–C8 done).
+
+- **Per-agent memory scoping (C4).**
+  - Added an optional `scope: Option<String>` field to `Record` /
+    `MetaRecord` (`#[serde(default)]` for backward-compatible reload).
+  - Created `ScopeIndex` (`scope_index.rs`) with a global bitmap plus
+    per-scope bitmaps; scoped queries return matching-scope records **plus**
+    global/shared records.
+  - Wired `scope` through `StorageEngine` insert/update/delete, WAL replay,
+    and every search path (`search_ann`, `search`, and filtered variants).
+  - Exposed `scope` in Python bindings (`insert`, `insert_batch`, `update`,
+    `search`, `search_ann`, `search_ann_candidates`), gRPC/REST proto,
+    `grpc.rs`, and `rest.rs`.
+  - Added Rust unit tests for scoped isolation and WAL-replay survival.
+- **LLM compressor integration test (C6).**
+  - Added `StorageEngine::set_compressor` and Python `set_llm_compressor(callable)`.
+  - `PythonCompressor` implements the existing `CognitiveCompressor` trait,
+    forwarding `(current_ccs_json, user_input, assistant_response)` to the
+    Python callable and falling back to the deterministic compressor if the
+    callable raises or returns invalid JSON.
+  - `verify.py` now includes a mock-LLM test that proves `step_session` uses
+    the installed callable and preserves the returned CCS schema.
+
+Validated together with the C8/C3 changes: `cargo fmt --all --check` clean;
+`cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo test
+--workspace --exclude turbomemory_python` = **165 passed / 0 failed** (core 29
++ graph 65 + storage 68 + crash_recovery 3); `make verify` E2E pass including
+new scope + LLM-compressor assertions; `python cognitive_benchmark.py
+--dimension 64 --distractors 0` = 4/4 wins; `python cognitive_benchmark.py`
+(768-dim, 1000 distractors) = 3/4 wins; `python audit_recall.py` pass.
+
+**Stage 1 — Cognitive Deepening is complete (C1–C8 done). Next focus: Stage 2
+structural scaling to 1M × 4k, starting with 0.1 collection sharding.**
+
+## Recently Completed — 2026-06-21 (online concept vocabulary evolution — C3)
+
+Shipped the third cognitive-layer evolution primitive: online concept
+vocabulary evolution. The graph now learns which surface forms are synonyms,
+collapses them into a single canonical concept node, and suppresses
+over-general hub concepts so they don't drown out more specific ones.
+Resolves roadmap item **C3**.
+
+- **`ConceptVocabulary` persistence (`extract.rs`).** The alias canonicalizer
+  from C8 now derives `Serialize`/`Deserialize` so learned aliases survive
+  graph JSON snapshots across restarts.
+- **`MemoryGraph` evolution (`graph.rs`).**
+  - Added `vocab: ConceptVocabulary` and `suppressed_concepts: BTreeSet<String>`
+    fields (both `#[serde(default)]` for backward compatibility).
+  - `add_memory_with_importance` now canonicalizes concepts through the learned
+    vocabulary before creating nodes/edges, so aliases discovered by evolution
+    are automatically applied to future inserts.
+  - `evolve_vocabulary(overlap_threshold, hub_fraction, max_pairs)` runs an
+    online pass:
+    - Builds base-concept → memory-set index and pairwise co-occurrence counts.
+    - Scores candidate pairs by Jaccard overlap of associated memory sets.
+    - Merges the lower-degree concept into the higher-degree concept,
+      redirects `Association` and `Abstraction` edges, records the alias in
+      `ConceptVocabulary`, and rebuilds `co_occurrence`.
+    - Suppresses base concepts whose degree exceeds
+      `hub_fraction * memory_count`.
+  - New helpers: `merge_concept_node`, `ensure_edge`, `rebuild_co_occurrence`.
+- **`SpreadingActivation` hub suppression (`activation.rs`).** Suppressed
+  concepts no longer expand to their neighbors during spreading activation,
+  preventing over-general terms ("system", "memory") from drowning specific
+  concepts.
+- **Config + Python exposure (`config.rs`, `lib.rs`).** Four opt-in kwargs on
+  `MemoryEngine`, all disabled by default to preserve existing benchmarks:
+  `concept_evolution_enabled`, `concept_merge_overlap_threshold`,
+  `concept_hub_degree_fraction`, `concept_evolution_max_pairs_per_cycle`.
+  New method `evolve_concept_vocabulary()` returns
+  `(merged, newly_suppressed, examined_pairs)`.
+- **Engine integration (`engine.rs`).** `StorageEngine` snapshots the graph
+  vocabulary before extracting concepts on insert, calls
+  `evolve_vocabulary` during consolidation when enabled, and persists the
+  updated graph.
+- **Tests.** Added 5 graph unit tests: overlapping-concept merge, hub
+  suppression, disabled no-op, suppressed concept does not expand, and
+  JSON roundtrip of vocab + suppressed set. C8 already added 11 extraction
+  tests; graph test count grew from 60 to 65.
+
+Validated: `cargo fmt --all --check` clean; `cargo clippy --workspace
+--all-targets -- -D warnings` clean; `cargo test --workspace --exclude
+turbomemory_python` = **160 passed / 0 failed** (core 29 + graph 65 +
+storage 63 + crash_recovery 3); `make build-python` + `python verify.py`
+E2E pass; `python cognitive_benchmark.py --dimension 64 --distractors 0`
+= 4/4 wins (toy regression preserved); `python cognitive_benchmark.py`
+(768-dim, 1000 distractors) = 3/4 wins; `python audit_recall.py` pass.
+
+
+
+---
+
 ## Recently Completed — 2026-06-21 (real-embedding cognitive benchmark — C5)
 
 Scaled the cognitive benchmark from the toy regime (64-dim, ~10 memories) to
@@ -373,9 +470,9 @@ These are prerequisites. Without them, later optimizations are local fixes.
 
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
-| 0.1 | **Shard the collection** into N independent `Shard` instances | `crates/turbomemory_storage/src/shard.rs` (new) | Pending | Each shard owns its own `VectorStore`, `SegmentHolder`, `MetadataStore`, WAL, optimizers, graph shard. Default `num_shards = clamp(num_cpus / 4, 2, 16)`. Route by `id` hash or explicit partition key. Qdrant model: `lib/collection/src/shards/`. |
-| 0.2 | **Replace global `RwLock<SegmentHolder>` with lock-free segment list** | `crates/turbomemory_storage/src/segment_holder.rs` | Done | Done (2026-06-19 audit). `ArcSwap<SegmentSnapshot>` (`segment_holder.rs:208`); searches read the published snapshot via `snapshot_handle()`, mutations publish a new `Arc`. Single-node, never blocks on swap. |
-| 0.3 | **Add collection abstraction above `StorageEngine`** | `crates/turbomemory_storage/src/collection.rs` (new) | Pending | One `Collection` = many `Shard`s. Python `MemoryEngine` opens a collection directory. Required for sharding and config per collection. |
+| 0.1 | **Shard the collection** into N independent `Shard` instances | `crates/turbomemory_storage/src/shard.rs` (new) | In Progress | Each shard owns its own `VectorStore`, `SegmentHolder`, `MetadataStore`, WAL, optimizers, graph shard. Default `num_shards = clamp(num_cpus / 4, 2, 16)`. Route by `id` hash or explicit partition key. Qdrant model: `lib/collection/src/shards/`. |
+| 0.2 | **Replace global `RwLock<SegmentHolder>` with lock-free segment list** | `crates/turbomemory_storage/src/segment_holder.rs` | Done | Done (2026-06-19 audit). `ArcSwap<SegmentSnapshot>` (`segment_holder.rs:208`); searches read the published snapshot via `snapshot_handle()`, mutations publish a new `Arc`. Single-node, never blocks on swap. Replicated per-shard in 0.1. |
+| 0.3 | **Add collection abstraction above `StorageEngine`** | `crates/turbomemory_storage/src/collection.rs` (new) | In Progress | One `Collection` = many `Shard`s. Python `MemoryEngine` opens a collection directory. Required for sharding and config per collection. |
 | 0.4 | **Move metadata out of single in-memory `HashMap`** | `crates/turbomemory_storage/src/metadata_store.rs` | Pending | Use per-segment metadata files (Qdrant: `segment.json` + mmap id_tracker) or a paged metadata store. Keep hot cache, spill cold records to mmap. Target: < 20% of working set in RAM. |
 | 0.5 | **Introduce per-shard update worker pool** | `crates/turbomemory_storage/src/update_worker.rs` | In Progress | A single batched update worker exists (`update_worker.rs`, `IndexApplier` + crossbeam channel; all writes serialize through `apply_batch`). The **per-shard pool** (one worker per shard) still depends on sharding (0.1) and is pending. |
 | 0.6 | **Separate read / write / optimize / flush thread pools** | `crates/turbomemory_storage/src/runtime.rs` (new) | Pending | CPU-bound search pool, IO-bound pool, optimizer pool, flush pool. Adaptive switching when CPU > 90% (Qdrant `AdaptiveSearchHandle`). |
@@ -517,10 +614,10 @@ that make TSM a *memory engine* rather than a vector DB with a graph on top.
 |---|---|---|---|---|
 | C1 | **Contradiction detection** | `crates/turbomemory_graph/src/graph.rs`, `engine.rs` | Done | Done (2026-06-20). `EdgeKind::Contradicts` (old→new); `add_contradiction` creates the edge + weakens the old memory's outgoing edges by `contradiction_weaken_factor`. `check_contradictions()` runs on consolidation: a pair is a contradiction when cosine >= `contradiction_cosine_threshold` AND shares a concept AND text Jaccard < `contradiction_text_threshold` (the dissimilarity signal that distinguishes contradiction from refinement). Spreading activation traverses `Contradicts` edges so the correction surfaces. 4 Python kwargs added; benchmark scenario 4 proves it flips the ranking (correction rank 1 cognitive vs rank 2 ANN). |
 | C2 | **Automatic importance scoring** | `crates/turbomemory_storage/src/engine.rs` | Done | Done (2026-06-20). `StorageEngine::recompute_importance()` runs on consolidation (opt-in via `importance_auto_scoring`): blends normalized access_score + concept-degree into a target importance, moves current importance `importance_learning_rate` toward it, clamps to `[floor, ceiling]`, writes back to metadata, and syncs the graph via new `MemoryGraph::reweight_memory` (which preserves learned reinforcement using a stored `base_importance_factor` per memory node). Runs before dedup/eviction so recomputed importance participates in tiebreaking. 5 config fields + Python kwargs + `recompute_importance()` method; 6 new tests. |
-| C3 | **Online concept vocabulary evolution** | `crates/turbomemory_graph/src/graph.rs` | Pending | Concepts are currently extracted per-text in isolation. Over time, similar concept nodes ("programming", "coding", "code") should be merged into a single canonical concept. Over-general concepts ("system") that connect to too many memories should be split or suppressed. This keeps the graph coherent as it accumulates thousands of concepts. |
-| C4 | **Per-agent memory scoping** | `crates/turbomemory_storage/src/engine.rs`, `config.rs` | Pending | Namespace isolation for multi-agent use: each agent gets its own memory scope (a prefix or collection key). An agent can read its own memories and optionally shared/global memories. This is the "AI agents, assistants, applications, and autonomous systems" use case from the vision — each agent has a persistent memory that grows with it. |
+| C3 | **Online concept vocabulary evolution** | `crates/turbomemory_graph/src/graph.rs`, `extract.rs`, `activation.rs`, `engine.rs`, `config.rs`, `lib.rs` | Done | Done (2026-06-21). `ConceptVocabulary` now persists in graph snapshots. `MemoryGraph::evolve_vocabulary(overlap_threshold, hub_fraction, max_pairs)` merges synonymous base concepts by Jaccard overlap of associated memory sets (higher-degree concept survives) and suppresses over-general hubs whose degree exceeds `hub_fraction * memory_count`. `SpreadingActivation` skips suppressed concepts during propagation. Engine snapshots vocabulary before insert canonicalization and runs evolution during consolidation when `concept_evolution_enabled=true`. 4 opt-in Python kwargs + `evolve_concept_vocabulary()` method. 5 new graph tests. |
+| C4 | **Per-agent memory scoping** | `crates/turbomemory_storage/src/engine.rs`, `scope_index.rs`, `record.rs`, `wal.rs`, `update_worker.rs`, `lib.rs`; `crates/turbomemory_api/proto/turbomemory.proto`, `grpc.rs`, `rest.rs` | Done | Done (2026-06-21). Optional `scope` field on records; `ScopeIndex` returns matching-scope + global records. Wired through insert/update/delete, WAL replay, ANN search, cognitive search, payload-filtered search, Python bindings, gRPC, and REST. 2 new storage tests; covered in `verify.py`. |
 | C5 | **Real-embedding cognitive benchmark** | `cognitive_benchmark.py` | Done | Done (2026-06-21). Benchmark now runs at realistic scale by default: 768-dim embeddings with 1000 clustered distractor memories per scenario (the original toy regime is still available via `--dimension 64 --distractors 0`). Scale result: cognitive layer wins **3/4 scenarios** at 768-dim/1000-distractors — refinement, reinforcement, and contradiction surfacing all find memories plain ANN misses entirely (rank 99). Abstraction traversal does NOT scale to 1000 distractors (top-k dominated by cosinely-nearby distractors before the multi-hop path surfaces); honest signal that abstraction needs hub-suppression/frontier tuning at scale. Toy regime still wins 4/4 (backward-compatible). |
-| C6 | **LLM compressor integration test** | `verify.py` or new script | Pending | The `LlmCompressor` trait + closure-based impl is shipped but untested with a real LLM. Write an integration test that calls a real model (or a mock with realistic JSON output) to validate the CCS compression loop end-to-end. |
+| C6 | **LLM compressor integration test** | `crates/turbomemory_python/src/lib.rs`, `crates/turbomemory_graph/src/ccs.rs`, `verify.py` | Done | Done (2026-06-21). `StorageEngine::set_compressor` + Python `set_llm_compressor(callable)` install a Python-callable-backed compressor. The callable receives `(ccs_json, user_input, assistant_response)` and returns a CCS JSON string; invalid output falls back to the deterministic compressor. End-to-end assertion added to `verify.py` using a mock LLM. |
 | C7 | **Graph introspection API** | `crates/turbomemory_python/src/lib.rs` | Done | Done (2026-06-20). Five read-only Python methods: `graph_stats()`, `get_concepts()` → list[(concept, degree)], `get_memory_concepts(id)`, `get_refinements(id)`, `get_contradictions(id)`. Backed by `MemoryGraph::memory_concepts`/`concept_count`/`stats()` (returns `GraphStats`) and `StorageEngine::read_graph()` (hands out a read guard). Tuple/list-of-tuples return shape matches existing binding style; unknown ids return empty lists. |
 | C8 | **Streaming concept extraction** | `crates/turbomemory_graph/src/extract.rs` | Done | Done (2026-06-21). `extract.rs` rewritten with `ExtractorConfig` supporting unigram/bigram/trigram extraction + PMI scoring, subsumption suppression, and a `ConceptVocabulary` alias canonicalizer. Default remains unigram-only for backward compatibility; n-grams enabled via `concept_max_ngram_len`/`concept_min_ngram_freq`/`concept_enable_pmi` kwargs. Embedding-based matching to existing graph concepts is left for C3 (online vocabulary evolution) where the engine has access to the graph and vector store. |
 
@@ -599,16 +696,16 @@ that make TSM a *memory engine* rather than a vector DB with a graph on top.
 ### Stage 1 — Deepen the cognitive layer (the differentiator)
 1. **C8** — Streaming concept extraction ✅ Done.
 2. **C3** — Online concept vocabulary evolution.
-3. **C4** — Per-agent memory scoping (multi-agent).
-4. **C6** — LLM compressor integration test.
+3. **C4** — Per-agent memory scoping (multi-agent) ✅ Done.
+4. **C6** — LLM compressor integration test ✅ Done.
 
 > **C1 (Contradiction detection) — Done (2026-06-20).**
 > **C7 (Graph introspection API) — Done (2026-06-20).**
 > **C2 (Automatic importance scoring) — Done (2026-06-20).**
 > **C5 (Real-embedding cognitive benchmark) — Done (2026-06-21).** See Recently Completed.
 
-### Stage 2 — Unlock 1M × 4k structurally (production scaling)
-1. **0.1–0.3** — Shard collection, collection abstraction.
+### Stage 2 — Unlock 1M × 4k structurally (production scaling) 🚧 In Progress
+1. **0.1–0.3** — Shard collection, collection abstraction. **Current focus.**
 2. **0.4** — Paged metadata store (the single biggest 1M blocker).
 3. **1.3, 1.11** — Rotating WAL, pipeline insert.
 4. **2.6, 2.8** — VacuumOptimizer (reclaim deleted slots), temp-dir build.
@@ -695,3 +792,7 @@ The execution order now puts **cognitive deepening (Stage 1)** before
 **structural scaling (Stage 2)**. The rationale: a memory engine that
 *thinks* at 100k beats a vector DB that's fast at 1M but doesn't think.
 Prove the cognition works at scale (C5), then scale the architecture.
+
+**Current status:** Stage 1 complete (C1–C8 done). Stage 2 in progress;
+0.1 (collection sharding) and 0.3 (`Collection` abstraction) are the active
+items.

@@ -177,6 +177,14 @@ impl SpreadingActivation {
                 if *energy <= 0.0 {
                     continue;
                 }
+                // Suppressed hub concepts do not expand to their memories,
+                // preventing over-general terms from drowning out specific ones.
+                if key.starts_with("concept:") {
+                    let concept = key.strip_prefix("concept:").unwrap_or("");
+                    if self.graph.is_concept_suppressed(concept) {
+                        continue;
+                    }
+                }
                 for edge in self.graph.neighbors(key) {
                     if edge.kind == EdgeKind::Temporal && edge.weight < 0.0 {
                         continue;
@@ -278,6 +286,28 @@ impl SpreadingActivation {
 
     pub fn graph(&self) -> &MemoryGraph {
         &self.graph
+    }
+
+    /// Access the learned concept vocabulary.
+    pub fn vocab(&self) -> &crate::extract::ConceptVocabulary {
+        self.graph.vocab()
+    }
+
+    /// Mutable access to the learned concept vocabulary.
+    pub fn vocab_mut(&mut self) -> &mut crate::extract::ConceptVocabulary {
+        self.graph.vocab_mut()
+    }
+
+    /// Evolve the concept vocabulary: merge synonyms and suppress over-general
+    /// hubs. See [`MemoryGraph::evolve_vocabulary`].
+    pub fn evolve_vocabulary(
+        &mut self,
+        overlap_threshold: f32,
+        hub_fraction: f32,
+        max_pairs: usize,
+    ) -> crate::graph::VocabularyEvolutionStats {
+        self.graph
+            .evolve_vocabulary(overlap_threshold, hub_fraction, max_pairs)
     }
 
     pub fn graph_mut(&mut self) -> &mut MemoryGraph {

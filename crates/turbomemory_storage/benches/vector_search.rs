@@ -47,6 +47,7 @@ fn bench_config(dim: usize, hot_capacity: usize, warm_capacity: usize) -> StoreC
             concept_max_ngram_len: 1,
             concept_min_ngram_freq: 1,
             concept_enable_pmi: true,
+            ..TierConfig::default()
         },
         optimizer_budget: OptimizerBudget::default(),
         auto_consolidation_interval: None,

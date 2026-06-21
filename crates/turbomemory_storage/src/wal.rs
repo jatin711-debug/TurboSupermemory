@@ -219,6 +219,7 @@ mod tests {
             last_accessed: 0,
             tier: Tier::Hot,
             payload: None,
+            scope: None,
         }
     }
 

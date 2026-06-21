@@ -27,6 +27,12 @@ pub struct Record {
     /// Stored as a raw string so it can be serialized by non-self-describing
     /// codecs such as bincode.
     pub payload: Option<String>,
+    /// Optional agent/memory scope. `None` means global/shared memory.
+    /// Scoped searches return records matching the requested scope AND
+    /// global records, enabling per-agent memory isolation while preserving
+    /// a shared knowledge base.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 impl Record {
@@ -58,6 +64,9 @@ pub struct MetaRecord {
     /// Stored as a raw string so it can be serialized by non-self-describing
     /// codecs such as bincode.
     pub payload: Option<String>,
+    /// Optional agent/memory scope. `None` means global/shared memory.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 impl MetaRecord {
@@ -75,6 +84,7 @@ impl MetaRecord {
             last_accessed: self.last_accessed,
             tier: self.tier,
             payload: self.payload.clone(),
+            scope: self.scope.clone(),
         }
     }
 }
@@ -92,6 +102,7 @@ impl From<&Record> for MetaRecord {
             last_accessed: rec.last_accessed,
             tier: rec.tier,
             payload: rec.payload.clone(),
+            scope: rec.scope.clone(),
         }
     }
 }

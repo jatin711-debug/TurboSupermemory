@@ -3,7 +3,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-155%20passing-brightgreen.svg)](#validation)
+[![Tests](https://img.shields.io/badge/tests-165%20passing-brightgreen.svg)](#validation)
 
 **A memory engine for AI agents — written in Rust, embeddable from Python.**
 
@@ -32,6 +32,8 @@ TSM's graph adds the signals a vector index throws away:
 | **Contradiction detection** *(belief revision)* | A newer memory that *opposes* an older one (same topic, low text overlap) creates a `Contradicts` edge and weakens the discredited memory. | The correction surfaces above the false claim — without erasing history. |
 | **Automatic importance scoring** | Retrieval patterns + graph connectivity continuously raise what matters and decay what doesn't. | Self-organizing memory. No manual importance tagging. |
 | **Graph introspection** | `graph_stats()`, `get_concepts()`, `get_memory_concepts()`, `get_refinements()`, `get_contradictions()`. | "What does the agent actually know?" — debuggable, not a black box. |
+| **Online vocabulary evolution** | Merges synonymous concept nodes ("coding" → "programming") and suppresses over-general hubs ("system"). | The concept graph stays coherent as it accumulates thousands of surface forms. |
+| **Per-agent memory scoping** | Records can be tagged with an agent `scope`; scoped searches return that agent's memories plus global/shared memories. | Multiple agents, assistants, or applications can share one engine while isolating private memories. |
 | **Pluggable CCS compressor** | A bounded working-memory state with a deterministic compressor; an LLM compressor swaps in at runtime. | Keeps a coherent rolling summary without unbounded context growth. |
 
 Every cognitive feature is **opt-in and off by default**, so TSM behaves like a plain tiered vector store until you turn the brain on.
@@ -128,6 +130,43 @@ engine.close()
 
 For high-throughput ingest, use `insert_batch(ids, texts, embeddings, scores, concepts)` to amortize the Python↔Rust boundary. Contiguous `float32` numpy arrays are borrowed zero-copy.
 
+### Per-agent memory scoping
+
+Records can be tagged with a `scope`. Scoped searches return records in that
+scope plus global (un-scoped) records, so multiple agents can share one engine
+while keeping private memories isolated.
+
+```python
+engine.insert(id="shared_1", text="Shared knowledge", embedding=emb, importance_score=1.0)
+engine.insert(id="agent_a_1", text="Agent A private note", embedding=emb, importance_score=1.0, scope="agent_a")
+
+# Agent A sees shared + agent_a memories, but not agent_b memories.
+results = engine.search_ann(query_emb, top_k=10, scope="agent_a")
+```
+
+### Plugging in an LLM compressor
+
+The working-memory compressor can be replaced at runtime with any Python
+callable that accepts `(current_ccs_json, user_input, assistant_response)` and
+returns a `CompressedCognitiveState` JSON string:
+
+```python
+import json
+
+def my_compressor(ccs_json, user_input, assistant_response):
+    prior = json.loads(ccs_json) if ccs_json else {}
+    return json.dumps({
+        "turn_count": prior.get("turn_count", 0) + 1,
+        "last_user_input": user_input,
+        "last_assistant_response": assistant_response,
+        "facts": [f"User asked: {user_input}"],
+        "topics": ["ai"],
+    })
+
+engine.set_llm_compressor(my_compressor)
+engine.step_session("Hello!", "Hi, how can I help?")
+```
+
 ---
 
 ## Developer Guide
@@ -165,11 +204,11 @@ The full verification matrix passes on the current `main`:
 |---|---|
 | `cargo fmt --all --check` | clean |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
-| `cargo test --workspace --exclude turbomemory_python` | **144 passed / 0 failed** |
+| `cargo test --workspace --exclude turbomemory_python` | **165 passed / 0 failed** |
 | `python verify.py` (E2E) | all pass |
 | `python cognitive_benchmark.py` | **4/4 cognitive scenarios won** |
 
-Test breakdown: core 29 · graph 60 · storage 63 · crash-recovery 3.
+Test breakdown: core 29 · graph 65 · storage 68 · crash-recovery 3.
 
 ---
 
@@ -207,7 +246,7 @@ TSM tracks a detailed engineering roadmap in [`TODO.md`](./TODO.md). The near-te
 - ✅ **Core engine** — durable storage, HNSW + exact fallback, tiered Hot/Warm/Cold segments, quantization, cognitive graph, CCS.
 - ✅ **Cognitive layer** — concept extraction, learnable edges, reinforcement/decay, abstraction hierarchy, refinement, contradiction detection, automatic importance scoring, graph introspection API.
 - ✅ **Production patterns** — lock-free segment snapshots, parallel multi-segment search, multi-threaded HNSW build, zero-copy numpy ingest, bounded eviction + semantic dedup.
-- ✅ **Cognitive deepening** — real-embedding benchmark, online concept-vocabulary evolution, per-agent memory scoping, streaming/n-gram concept extraction.
+- ✅ **Cognitive deepening** — real-embedding benchmark, online concept-vocabulary evolution, per-agent memory scoping, streaming/n-gram concept extraction, LLM compressor integration.
 - 🔜 **Scaling to 1M × 4k** — sharding, paged metadata store, rotating WAL, vacuum optimizer.
 - 🔜 **Operations** — tracing, metrics, auth/CORS, Docker, cross-platform builds.
 

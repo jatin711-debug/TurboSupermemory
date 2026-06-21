@@ -269,7 +269,7 @@ impl ExtractorConfig {
 /// currently supports explicit alias mappings (e.g. "coding" → "programming");
 /// embedding-based matching can be layered on top by higher-level code that
 /// has access to concept embeddings.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ConceptVocabulary {
     aliases: HashMap<String, String>,
 }

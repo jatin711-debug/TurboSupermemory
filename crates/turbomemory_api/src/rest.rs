@@ -24,6 +24,8 @@ struct InsertReq {
     concepts: Vec<String>,
     #[serde(default)]
     payload: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -42,6 +44,8 @@ struct InsertBatchReq {
     concepts: Vec<Vec<String>>,
     #[serde(default)]
     payloads: Vec<String>,
+    #[serde(default)]
+    scopes: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -70,6 +74,8 @@ struct UpdateReq {
     concepts: Vec<String>,
     #[serde(default)]
     payload: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -96,6 +102,8 @@ struct SearchReq {
     top_k: usize,
     #[serde(default)]
     filter: serde_json::Value,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -104,6 +112,8 @@ struct SearchAnnReq {
     top_k: usize,
     #[serde(default)]
     filter: serde_json::Value,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -146,6 +156,7 @@ async fn insert(
         req.importance,
         &req.concepts,
         req.payload,
+        req.scope,
     )?;
     Ok(Json(InsertResp { success }))
 }
@@ -159,6 +170,11 @@ async fn insert_batch(
     } else {
         req.payloads.into_iter().map(Some).collect()
     };
+    let scopes: Vec<Option<String>> = if req.scopes.is_empty() {
+        Vec::new()
+    } else {
+        req.scopes.into_iter().map(Some).collect()
+    };
     let emb_refs: Vec<&[f32]> = req.embeddings.iter().map(|v| v.as_slice()).collect();
     let count = service.engine().insert_batch_with_payload(
         &req.ids,
@@ -167,6 +183,7 @@ async fn insert_batch(
         &req.scores,
         &req.concepts,
         &payloads,
+        &scopes,
     )?;
     Ok(Json(InsertBatchResp { count }))
 }
@@ -190,6 +207,7 @@ async fn update(
         req.importance,
         &req.concepts,
         req.payload,
+        req.scope,
     )?;
     Ok(Json(UpdateResp { success }))
 }
@@ -215,16 +233,22 @@ async fn search(
     Json(req): Json<SearchReq>,
 ) -> Result<Json<SearchResp>, ApiError> {
     let filter = json_filter_to_storage(req.filter)?;
+    let scope = req.scope.as_deref();
     let maybe = match filter {
-        Some(f) => service.engine().search_filtered(
+        Some(f) => service.engine().search_filtered_with_scope(
             &req.query_text,
             &req.query_embedding,
             req.top_k,
             &f,
+            None,
+            scope,
         )?,
-        None => service
-            .engine()
-            .search(&req.query_text, &req.query_embedding, req.top_k)?,
+        None => service.engine().search_scoped(
+            &req.query_text,
+            &req.query_embedding,
+            req.top_k,
+            scope,
+        )?,
     };
     if let Some(results) = maybe {
         Ok(Json(SearchResp {
@@ -244,13 +268,18 @@ async fn search_ann(
     Json(req): Json<SearchAnnReq>,
 ) -> Result<Json<SearchResp>, ApiError> {
     let filter = json_filter_to_storage(req.filter)?;
+    let scope = req.scope.as_deref();
     let results = match filter {
-        Some(f) => service
-            .engine()
-            .search_ann_filtered(&req.query_embedding, req.top_k, &f)?,
+        Some(f) => service.engine().search_ann_candidates_filtered_with_ef(
+            &req.query_embedding,
+            req.top_k,
+            Some(&f),
+            None,
+            scope,
+        )?,
         None => service
             .engine()
-            .search_ann(&req.query_embedding, req.top_k)?,
+            .search_ann_scoped(&req.query_embedding, req.top_k, None, scope)?,
     };
     Ok(Json(SearchResp {
         results: map_results(results),

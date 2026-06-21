@@ -10,6 +10,7 @@ Supports CLI overrides for library and database paths.
 import os
 import sys
 import shutil
+import json
 import logging
 import argparse
 import numpy as np
@@ -208,6 +209,84 @@ def run_verification(db_path_arg):
     sealed, compacted, promoted = engine.trigger_consolidation()
     logger.info(f"Consolidation complete: sealed={sealed}, compacted={compacted}, promoted={promoted}.")
     logger.info("Consolidation merge test passed.")
+
+    # 5. Test per-agent memory scoping (C4)
+    logger.info("Step 5: Testing Per-Agent Memory Scoping (C4)...")
+    scope_db = os.path.join(current_dir, "test_db_scope")
+    if os.path.exists(scope_db):
+        shutil.rmtree(scope_db)
+    scope_engine = turbomemory.MemoryEngine(
+        db_path=scope_db,
+        dimension=dimension,
+        max_edges=3,
+        search_list_size=5,
+        outlier_count=0,
+    )
+    scope_engine.insert(
+        id="global_mem",
+        text="shared knowledge",
+        embedding=np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        importance_score=1.0,
+        concepts=[],
+    )
+    scope_engine.insert(
+        id="agent_a_mem",
+        text="agent a secret",
+        embedding=np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        importance_score=1.0,
+        concepts=[],
+        scope="agent_a",
+    )
+    scope_engine.insert(
+        id="agent_b_mem",
+        text="agent b secret",
+        embedding=np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        importance_score=1.0,
+        concepts=[],
+        scope="agent_b",
+    )
+    q = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+    global_results = [r[0] for r in scope_engine.search_ann(q, top_k=10)]
+    assert set(global_results) == {"global_mem", "agent_a_mem", "agent_b_mem"}, global_results
+
+    a_results = [r[0] for r in scope_engine.search_ann(q, top_k=10, scope="agent_a")]
+    assert "global_mem" in a_results
+    assert "agent_a_mem" in a_results
+    assert "agent_b_mem" not in a_results
+
+    b_results = [r[0] for r in scope_engine.search_ann(q, top_k=10, scope="agent_b")]
+    assert "global_mem" in b_results
+    assert "agent_a_mem" not in b_results
+    assert "agent_b_mem" in b_results
+    logger.info("Per-agent memory scoping test passed.")
+
+    # 6. Test LLM-backed cognitive compressor (C6)
+    logger.info("Step 6: Testing LLM Cognitive Compressor (C6)...")
+    called = {"times": 0}
+
+    def mock_compressor(ccs_json, user_input, assistant_response):
+        called["times"] += 1
+        prior_turns = json.loads(ccs_json).get("turn_count", 0) if ccs_json else 0
+        return json.dumps({
+            "turn_count": prior_turns + 1,
+            "last_user_input": user_input,
+            "last_assistant_response": assistant_response,
+            "facts": [f"compressed: {user_input}"],
+            "topics": ["llm"],
+        })
+
+    engine.set_llm_compressor(mock_compressor)
+    llm_ccs = engine.step_session(
+        user_input="What is Rust?",
+        assistant_response="Rust is a systems language.",
+    )
+    assert called["times"] == 1, "LLM compressor was not invoked"
+    parsed = json.loads(llm_ccs)
+    assert parsed["last_user_input"] == "What is Rust?"
+    assert parsed["facts"] == ["compressed: What is Rust?"]
+    assert "llm" in parsed["topics"]
+    logger.info("LLM cognitive compressor test passed.")
 
     logger.info("=========================================================================")
     logger.info("All end-to-end integration and verification tests PASSED successfully!")
