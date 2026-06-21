@@ -13,6 +13,47 @@
 
 ---
 
+## Recently Completed — 2026-06-21 (real-embedding cognitive benchmark — C5)
+
+Scaled the cognitive benchmark from the toy regime (64-dim, ~10 memories) to
+realistic text-embedding scale (768-dim, 1000+ clustered memories per
+scenario) to validate that the cognitive layer generalizes beyond toy data.
+Resolves roadmap item **C5**.
+
+- **Realistic embedding generation.** Added `make_clustered_vec` /
+  `make_cluster_center` helpers that generate unit-norm vectors drawn from
+  topic clusters with tight intra-cluster spread (jitter 0.15–0.20) — the
+  same manifold-with-local-structure distribution `benchmark.py` uses, which
+  models real text embeddings far better than near-orthogonal Gaussians.
+- **Distractor injector.** `inject_distractors(tsm, dim, n)` fills the graph
+  with `n` noise memories drawn from a bank of 20 diverse topic clusters
+  (weather, jazz, volcanoes, compilers, …), each with unrelated concepts and
+  modest importance. This makes retrieval face real competition: the target
+  memory must surface through the cognitive graph despite hundreds/thousands
+  of competing memories, many with non-trivial cosine to the query.
+- **Adaptive top_k for abstraction.** Scenario 1 scales `top_k` with the
+  distractor population so the multi-hop abstraction target has room to
+  surface; ANN uses the same `top_k` for a fair comparison.
+- **Two regimes.** The default is now realistic scale (768-dim, 1000
+  distractors). The original toy regime is preserved via
+  `--dimension 64 --distractors 0`.
+
+**Scale result (768-dim, 1000 distractors): cognitive layer wins 3/4
+scenarios.** Refinement surfacing, reinforcement boosting, and contradiction
+surfacing all WIN — the cognitive layer finds memories that plain ANN misses
+*entirely* (rank 99 at top_k 5–20). Abstraction traversal does NOT scale to
+1000 distractors: the top-k is dominated by cosinely-nearby distractors
+before the multi-hop abstraction path can surface the target. This is honest
+signal that the abstraction feature needs hub-suppression / frontier tuning
+at scale — a future tuning task, not a correctness bug. The toy regime
+(64-dim, 0 distractors) still wins 4/4 (backward-compatible).
+
+Validated: `python cognitive_benchmark.py` (default scale) = 3/4 won;
+`python cognitive_benchmark.py --dimension 64 --distractors 0` = 4/4 won
+(toy regression preserved).
+
+---
+
 ## Recently Completed — 2026-06-20 (graph introspection API — C7, auto-importance — C2)
 
 Shipped two more cognitive-layer features: a read-only **graph introspection
@@ -466,10 +507,11 @@ At 4k dimensions, distance compute is the bottleneck. We need SIMD, batched kern
 
 ## Phase 7 — Cognitive Layer Deepening
 
-The cognitive layer is the differentiator. It is 85% done (concept extraction,
-learnable edges, reinforcement, decay, abstraction, refinement, CCS
-compressor, score fusion). These are the remaining items that make TSM a
-*memory engine* rather than a vector DB with a graph on top.
+The cognitive layer is the differentiator. The core is done and validated at
+realistic scale (concept extraction, learnable edges, reinforcement/decay,
+abstraction, refinement, contradiction detection, auto-importance, CCS
+compressor, score fusion, introspection API). These are the remaining items
+that make TSM a *memory engine* rather than a vector DB with a graph on top.
 
 | # | Fix | Location(s) | Status | Notes |
 |---|---|---|---|---|
@@ -477,7 +519,7 @@ compressor, score fusion). These are the remaining items that make TSM a
 | C2 | **Automatic importance scoring** | `crates/turbomemory_storage/src/engine.rs` | Done | Done (2026-06-20). `StorageEngine::recompute_importance()` runs on consolidation (opt-in via `importance_auto_scoring`): blends normalized access_score + concept-degree into a target importance, moves current importance `importance_learning_rate` toward it, clamps to `[floor, ceiling]`, writes back to metadata, and syncs the graph via new `MemoryGraph::reweight_memory` (which preserves learned reinforcement using a stored `base_importance_factor` per memory node). Runs before dedup/eviction so recomputed importance participates in tiebreaking. 5 config fields + Python kwargs + `recompute_importance()` method; 6 new tests. |
 | C3 | **Online concept vocabulary evolution** | `crates/turbomemory_graph/src/graph.rs` | Pending | Concepts are currently extracted per-text in isolation. Over time, similar concept nodes ("programming", "coding", "code") should be merged into a single canonical concept. Over-general concepts ("system") that connect to too many memories should be split or suppressed. This keeps the graph coherent as it accumulates thousands of concepts. |
 | C4 | **Per-agent memory scoping** | `crates/turbomemory_storage/src/engine.rs`, `config.rs` | Pending | Namespace isolation for multi-agent use: each agent gets its own memory scope (a prefix or collection key). An agent can read its own memories and optionally shared/global memories. This is the "AI agents, assistants, applications, and autonomous systems" use case from the vision — each agent has a persistent memory that grows with it. |
-| C5 | **Real-embedding cognitive benchmark** | `cognitive_benchmark.py` | Pending | The current cognitive benchmark uses random 64-dim vectors with 10 memories. Expand to 1000+ memories with realistic 768-dim embeddings (clustered, like real text embeddings) to validate that the cognitive layer scales beyond toy scenarios. |
+| C5 | **Real-embedding cognitive benchmark** | `cognitive_benchmark.py` | Done | Done (2026-06-21). Benchmark now runs at realistic scale by default: 768-dim embeddings with 1000 clustered distractor memories per scenario (the original toy regime is still available via `--dimension 64 --distractors 0`). Scale result: cognitive layer wins **3/4 scenarios** at 768-dim/1000-distractors — refinement, reinforcement, and contradiction surfacing all find memories plain ANN misses entirely (rank 99). Abstraction traversal does NOT scale to 1000 distractors (top-k dominated by cosinely-nearby distractors before the multi-hop path surfaces); honest signal that abstraction needs hub-suppression/frontier tuning at scale. Toy regime still wins 4/4 (backward-compatible). |
 | C6 | **LLM compressor integration test** | `verify.py` or new script | Pending | The `LlmCompressor` trait + closure-based impl is shipped but untested with a real LLM. Write an integration test that calls a real model (or a mock with realistic JSON output) to validate the CCS compression loop end-to-end. |
 | C7 | **Graph introspection API** | `crates/turbomemory_python/src/lib.rs` | Done | Done (2026-06-20). Five read-only Python methods: `graph_stats()`, `get_concepts()` → list[(concept, degree)], `get_memory_concepts(id)`, `get_refinements(id)`, `get_contradictions(id)`. Backed by `MemoryGraph::memory_concepts`/`concept_count`/`stats()` (returns `GraphStats`) and `StorageEngine::read_graph()` (hands out a read guard). Tuple/list-of-tuples return shape matches existing binding style; unknown ids return empty lists. |
 | C8 | **Streaming concept extraction** | `crates/turbomemory_graph/src/extract.rs` | Pending | The current extractor is keyword-based (stopword filtering + TF). Upgrade to n-gram extraction (catch "memory safety" as a single concept, not two separate ones) and optionally embedding-based concept matching (map new concepts to existing similar ones). |
@@ -555,15 +597,15 @@ compressor, score fusion). These are the remaining items that make TSM a
 ## Suggested Execution Order
 
 ### Stage 1 — Deepen the cognitive layer (the differentiator)
-1. **C5** — Real-embedding cognitive benchmark (validate the cognitive layer at scale).
-2. **C3** — Online concept vocabulary evolution.
-3. **C4** — Per-agent memory scoping (multi-agent).
-4. **C6** — LLM compressor integration test.
-5. **C8** — Streaming concept extraction (n-gram + embedding-based).
+1. **C3** — Online concept vocabulary evolution.
+2. **C4** — Per-agent memory scoping (multi-agent).
+3. **C6** — LLM compressor integration test.
+4. **C8** — Streaming concept extraction (n-gram + embedding-based).
 
 > **C1 (Contradiction detection) — Done (2026-06-20).**
 > **C7 (Graph introspection API) — Done (2026-06-20).**
-> **C2 (Automatic importance scoring) — Done (2026-06-20).** See Recently Completed.
+> **C2 (Automatic importance scoring) — Done (2026-06-20).**
+> **C5 (Real-embedding cognitive benchmark) — Done (2026-06-21).** See Recently Completed.
 
 ### Stage 2 — Unlock 1M × 4k structurally (production scaling)
 1. **0.1–0.3** — Shard collection, collection abstraction.
@@ -598,7 +640,7 @@ The following are relevant but lower priority:
 
 - ~~Cognitive graph durable persistence~~ — **Done (2026-06-19).**
 - ~~Graph merge/forget policies~~ — **Mostly done (2026-06-19/20).** Reinforce, decay, abstraction, dedup, refinement, score fusion all shipped. Remaining: contradiction detection (→ C1), multi-agent scoping (→ C4).
-- ~~Cognitive recall benchmark~~ — **Done (2026-06-20).** `cognitive_benchmark.py` proves 3/3 cognitive scenarios beat plain ANN. Future: real-embedding benchmark (→ C5).
+- ~~Cognitive recall benchmark~~ — **Done (2026-06-20), scaled 2026-06-21 (C5).** `cognitive_benchmark.py` runs at realistic scale (768-dim, 1000 distractors): 3/4 cognitive scenarios beat plain ANN (refinement, reinforcement, contradiction surfacing find memories ANN misses entirely at rank 99). Abstraction traversal needs hub-suppression tuning to scale.
 - **Sparse vectors** — not planned for near-term. Dense vectors + concept extraction cover the memory-engine use case.
 - **Advanced full-text index tuning** — Tantivy works well; revisit only if FTS at scale becomes a bottleneck.
 
