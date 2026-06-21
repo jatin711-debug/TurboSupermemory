@@ -720,6 +720,13 @@ impl PyMemoryEngine {
         Ok(py.allow_threads(|| self.inner.record_count()))
     }
 
+    /// Returns True if the engine is using GPU acceleration for distance
+    /// computation. This is determined at runtime based on CUDA availability.
+    #[getter]
+    fn gpu_accelerated(&self) -> bool {
+        self.inner.is_gpu_accelerated()
+    }
+
     // ---- Graph introspection API (C7) -------------------------------------
     // Read-only views over the learned cognitive graph. Each method acquires
     // a read lock on the graph for the minimum work needed, collects into

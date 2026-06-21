@@ -3,23 +3,28 @@
 # Requires:
 #   - Rust 1.75+ (tested on 1.96)
 #   - Python 3.12 with development libraries (adjust PYO3_PYTHON if needed)
+#   - Optional: CUDA toolkit for GPU acceleration (set FEATURES=cuda)
 
 PYO3_PYTHON ?= C:\Users\User\AppData\Local\Programs\Python\Python312\python.exe
 PYTHON      ?= $(PYO3_PYTHON)
+FEATURES    ?= 
+
+# Build flags: add --features cuda if FEATURES=cuda
+CARGO_FEATURES := $(if $(FEATURES),--features $(FEATURES),)
 
 .PHONY: build build-python build-api test verify audit benchmark clippy fmt clean api-server
 
 build:
-	cargo build --workspace
+	export PYO3_PYTHON="$(PYO3_PYTHON)" && cargo build --workspace $(CARGO_FEATURES)
 
 build-python:
-	export PYO3_PYTHON="$(PYO3_PYTHON)" && cargo build --release --package turbomemory_python
+	export PYO3_PYTHON="$(PYO3_PYTHON)" && cargo build --release --package turbomemory_python $(CARGO_FEATURES)
 
 build-api:
-	export PYO3_PYTHON="$(PYO3_PYTHON)" && cargo build --release --package turbomemory_api --bin turbomemory-server
+	export PYO3_PYTHON="$(PYO3_PYTHON)" && cargo build --release --package turbomemory_api --bin turbomemory-server $(CARGO_FEATURES)
 
 test:
-	export PYO3_PYTHON="$(PYO3_PYTHON)" && cargo test --workspace
+	export PYO3_PYTHON="$(PYO3_PYTHON)" && cargo test --workspace $(CARGO_FEATURES)
 
 verify: build-python
 	cp target/release/turbomemory.dll turbomemory.pyd
@@ -34,7 +39,7 @@ benchmark: build-python
 	$(PYTHON) benchmark.py --tsm-only
 
 clippy:
-	export PYO3_PYTHON="$(PYO3_PYTHON)" && cargo clippy --workspace --all-targets -- -D warnings
+	export PYO3_PYTHON="$(PYO3_PYTHON)" && cargo clippy --workspace --all-targets $(CARGO_FEATURES) -- -D warnings
 
 fmt:
 	cargo fmt --all

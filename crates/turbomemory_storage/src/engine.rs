@@ -68,6 +68,9 @@ pub struct StorageEngine {
     optimizer: Arc<BackgroundOptimizer>,
     update_worker: Arc<UpdateWorker>,
     access_counters: Arc<AccessCounters>,
+    /// Optional GPU backend for accelerated distance computation.
+    /// Initialized lazily on first use; CPU fallback if CUDA unavailable.
+    gpu: Arc<Mutex<Option<Arc<dyn turbomemory_gpu::GpuBackend>>>>,
 }
 
 impl Clone for StorageEngine {
@@ -89,6 +92,7 @@ impl Clone for StorageEngine {
             optimizer: self.optimizer.clone(),
             update_worker: self.update_worker.clone(),
             access_counters: self.access_counters.clone(),
+            gpu: self.gpu.clone(),
         }
     }
 }
@@ -337,8 +341,25 @@ impl StorageEngine {
                 optimizer: Arc::new(optimizer),
                 update_worker: Arc::new(update_worker),
                 access_counters,
+                gpu: Arc::new(Mutex::new(None)),
             }
         }))
+    }
+
+    /// Lazily initialize the GPU backend if not already done.
+    /// Returns the backend, or CPU fallback if CUDA is unavailable.
+    fn gpu_backend(&self) -> Arc<dyn turbomemory_gpu::GpuBackend> {
+        let mut gpu = self.gpu.lock();
+        if gpu.is_none() {
+            let backend = turbomemory_gpu::init_backend();
+            *gpu = Some(backend);
+        }
+        gpu.as_ref().unwrap().clone()
+    }
+
+    /// Check if the GPU backend is actually GPU-accelerated (not CPU fallback).
+    pub fn is_gpu_accelerated(&self) -> bool {
+        turbomemory_gpu::is_gpu_accelerated(&self.gpu_backend())
     }
 
     pub fn insert(
@@ -725,12 +746,14 @@ impl StorageEngine {
             return Ok(results);
         }
         let snapshot = self.segment_snapshot.load_full();
-        let scored = snapshot.search(
+        let gpu = self.gpu_backend();
+        let scored = snapshot.search_gpu(
             query_embedding,
             top_k,
             ef,
             &self.vectors,
             allowed_offsets.as_ref(),
+            Some(&gpu),
         )?;
         let mut results = Vec::with_capacity(scored.len());
         for c in scored {

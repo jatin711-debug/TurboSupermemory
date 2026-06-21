@@ -169,6 +169,45 @@ flowchart TD
     Pack --> Out["Durable Quantized Vector Structure"]
 ```
 
+### 4.6 Quantization Pipeline Overview
+
+```mermaid
+flowchart TD
+    subgraph Input["Input: Raw f32 Vector"]
+        Vec["x ∈ R^d (e.g., 768-dim)"]
+    end
+    
+    subgraph Preprocessing["Preprocessing"]
+        Normalize["L2 Normalize"]
+        FWHT["Fast Walsh-Hadamard Transform"]
+        Scale["Scale by 1/√d"]
+    end
+    
+    subgraph Quantization["Quantization by Tier"]
+        Scalar["ScalarQuantizer: 8-bit (Warm)"]
+        Sign["SignQuantizer: 1-bit (Cold)"]
+        TurboMSE["TurboQuantMSE: b-bit (Cold/Warm)"]
+        TurboProd["TurboQuantProd: b-bit + QJL (Warm)"]
+    end
+    
+    subgraph Output["Output: Encoded Bytes"]
+        Warm["Warm: ~d bytes (4x compression)"]
+        Cold["Cold: ~d/32 bytes (32x compression)"]
+    end
+    
+    Vec --> Normalize
+    Normalize --> FWHT
+    FWHT --> Scale
+    Scale --> Scalar
+    Scale --> Sign
+    Scale --> TurboMSE
+    Scale --> TurboProd
+    Scalar --> Warm
+    Sign --> Cold
+    TurboMSE --> Cold
+    TurboProd --> Warm
+```
+
 ---
 
 ## 5. Quantized Search & Lookup Tables (LUT)
@@ -206,3 +245,103 @@ For 1-bit sign-quantized search, the engine builds a query-specific lookup table
    \text{Score} = \sum_{\text{byte\_idx}} \text{LUT}[\text{byte\_idx}][\text{encoded}[\text{byte\_idx}]]
    \]
    This completely bypasses bit manipulation, achieving millions of vector comparisons per second per CPU core.
+
+---
+
+## 6. SIMD Dispatch Architecture
+
+The core uses runtime CPU feature detection to dispatch to the optimal SIMD implementation:
+
+```mermaid
+flowchart TD
+    Query["Query Vector"] --> Detect["CPU Feature Detection"]
+    Detect --"AVX2 + FMA"--> AVX2["AVX2 Path: 256-bit registers, FMA"]
+    Detect --"SSE4.1"--> SSE["SSE Path: 128-bit registers"]
+    Detect --"NEON"--> NEON["NEON Path: ARM 128-bit"]
+    Detect --"None"--> Scalar["Scalar Fallback"]
+    
+    AVX2 --> Compute["Distance Computation"]
+    SSE --> Compute
+    NEON --> Compute
+    Scalar --> Compute
+    Compute --> Result["Similarity Scores"]
+```
+
+### 6.1 Feature Detection Hierarchy
+
+| Priority | Feature | Registers | Operations per Instruction | Target CPUs |
+|---|---|---|---|---|
+| 1 | AVX2 + FMA | 256-bit (8 floats) | 8 FMA ops | Intel Haswell+, AMD Zen+ |
+| 2 | SSE4.1 | 128-bit (4 floats) | 4 ops | Intel Core 2+, older AMD |
+| 3 | NEON | 128-bit (4 floats) | 4 ops | Apple Silicon, ARM servers |
+| 4 | Scalar | 64-bit (1 float) | 1 op | Generic fallback |
+
+### 6.2 Batched Kernel Unrolling
+
+For maximum throughput, the core implements batched distance kernels with 4-vector unrolling:
+
+```rust
+// Process 4 vectors simultaneously using AVX2
+for chunk in vectors.chunks_exact(4) {
+    let (dot0, dot1, dot2, dot3) = dot_and_nb_x4_avx2(query, chunk);
+    // Accumulate 4 results per iteration
+}
+```
+
+This amortizes the cost of loading the query vector across 4 distance computations, achieving near-peak memory bandwidth utilization.
+
+---
+
+## 7. Quantization vs Accuracy Trade-offs
+
+| Quantizer | Bits | Compression | Recall@10 (768-dim) | Speed | Use Case |
+|---|---|---|---|---|---|
+| FP32 (baseline) | 32 | 1x | 100% | Baseline | Hot tier, reranking |
+| Scalar 8-bit | 8 | 4x | ~95% | Fast | Warm tier default |
+| TurboQuant Prod | 4 | 8x | ~92% | Fast | Warm tier alternative |
+| TurboQuant MSE | 2 | 16x | ~85% | Very Fast | Cold tier alternative |
+| Sign 1-bit | 1 | 32x | ~71% | Fastest | Cold tier default |
+
+*Note: Recall figures are approximate and depend on dataset characteristics. Clustered embeddings (realistic text) show higher recall than random Gaussian data.*
+
+---
+
+## 8. Integration with Storage Tiers
+
+```mermaid
+graph LR
+    subgraph VectorStore["VectorStore (FP32)"]
+        Full["Full-precision vectors"]
+    end
+    
+    subgraph WarmTier["Warm Tier"]
+        Scalar8["Scalar 8-bit"]
+        TurboProd["TurboQuant Prod"]
+    end
+    
+    subgraph ColdTier["Cold Tier"]
+        Sign1["Sign 1-bit"]
+        TurboMSE["TurboQuant MSE"]
+    end
+    
+    subgraph Search["Search Path"]
+        Query["Query"]
+        LUT["Build Query LUT"]
+        Scan["Quantized Scan"]
+        Rerank["FP32 Rerank from VectorStore"]
+    end
+    
+    Full --"quantize on seal"--> Scalar8
+    Full --"quantize on seal"--> TurboProd
+    Full --"quantize on seal"--> Sign1
+    Full --"quantize on seal"--> TurboMSE
+    
+    Query --> LUT
+    LUT --> Scan
+    Scalar8 --> Scan
+    TurboProd --> Scan
+    Sign1 --> Scan
+    TurboMSE --> Scan
+    Scan --"top-k candidates"--> Rerank
+    Full --> Rerank
+```

@@ -1,6 +1,7 @@
 //! Tiered vector segments.
 
 pub mod cold;
+pub mod gpu_hnsw_index;
 pub mod hot;
 pub mod mmap_array;
 pub mod sealed_hot;
@@ -16,6 +17,7 @@ use ahash::AHashSet;
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 use std::path::Path;
+use std::sync::Arc;
 use turbomemory_core::{cosine_similarity_batch, validate_dimension};
 
 pub use cold::ColdSegment;
@@ -45,17 +47,29 @@ pub const MIN_RERANK_SHORTLIST: usize = 64;
 /// dimension recovers them: empirically ~16x at 768-dim lifts recall from
 /// ~77% to ~92% at n=10k without touching the HNSW beam width.
 ///
-/// Growth is sqrt-shaped (sub-linear) to avoid exploding rerank cost at very
-/// high dimension: 8x at 128-dim, ~14x at 384-dim, ~20x at 768-dim, ~32x at
-/// 2048-dim.
+/// For dimensions up to 256, sqrt scaling is sufficient. For high dimension
+/// (384+) we switch to linear scaling because quantization noise accumulates
+/// across coordinates and the true-neighbor gap becomes comparable to the
+/// noise floor — a much larger shortlist is needed to ensure true neighbors
+/// survive the quantized candidate selection.
+///
+/// Examples: 8x at 128-dim, ~14x at 384-dim, ~48x at 768-dim, ~128x at 2048-dim.
 pub fn rerank_oversample(dim: usize) -> usize {
-    let base = RERANK_OVERSAMPLE as f64;
-    // sqrt scaling: factor = 8 * sqrt(dim / 128).
-    let factor = base * ((dim as f64) / 128.0).sqrt();
+    let base = RERANK_OVERSAMPLE as f64; // 8
+    let factor = if dim <= 256 {
+        // Sub-linear (sqrt) scaling for low-dim: noise is manageable.
+        base * ((dim as f64) / 128.0).sqrt()
+    } else {
+        // Linear scaling for high-dim: quantization noise dominates.
+        // factor = 8 * (dim / 128) = dim / 16.
+        base * (dim as f64) / 128.0
+    };
     let raw = factor.round() as usize;
-    // Clamp to a sane range so tiny dims still oversample and huge dims
-    // don't rerank the whole segment.
-    raw.clamp(8, 64)
+    // Clamp: 8 minimum, 512 maximum. The 512 cap is for very high dimensions
+    // (e.g. 4096-dim would request 256x) to avoid reranking thousands of
+    // candidates per segment while still being far more aggressive than the
+    // old 64x cap that lost true neighbors at 50k x 768.
+    raw.clamp(8, 512)
 }
 
 /// A scored point returned by a segment search.
@@ -168,7 +182,43 @@ pub fn exact_search_over_offsets(
     offsets: &[PointOffset],
     tier: Tier,
 ) -> crate::Result<Vec<ScoredPoint>> {
+    exact_search_over_offsets_gpu(query, top_k, vectors, offsets, tier, None)
+}
+
+/// GPU-accelerated exact brute-force search over a specific set of offsets.
+///
+/// If `gpu` is provided and the segment is large enough to justify GPU
+/// transfer overhead, vectors are uploaded to GPU and scored with cuBLAS.
+/// Otherwise falls back to CPU SIMD batch scoring.
+pub fn exact_search_over_offsets_gpu(
+    query: &[f32],
+    top_k: usize,
+    vectors: &VectorStore,
+    offsets: &[PointOffset],
+    tier: Tier,
+    gpu: Option<&Arc<dyn turbomemory_gpu::GpuBackend>>,
+) -> crate::Result<Vec<ScoredPoint>> {
     validate_dimension(query, vectors.dimension())?;
+
+    // Only use GPU for sufficiently large segments to amortize transfer overhead.
+    // Threshold: ~1,000 vectors at 768-dim = ~3 MiB of data.
+    const GPU_THRESHOLD: usize = 1024;
+    let use_gpu = gpu.map(|g| {
+        turbomemory_gpu::is_gpu_accelerated(g) && offsets.len() >= GPU_THRESHOLD
+    }).unwrap_or(false);
+
+    if use_gpu {
+        if let Some(backend) = gpu {
+            match gpu_exact_search(query, top_k, vectors, offsets, tier, backend) {
+                Ok(results) => return Ok(results),
+                Err(e) => {
+                    log::warn!("GPU exact search failed ({}), falling back to CPU", e);
+                }
+            }
+        }
+    }
+
+    // CPU fallback path
     let view = vectors.read_view();
 
     const CHUNK: usize = 64;
@@ -191,6 +241,53 @@ pub fn exact_search_over_offsets(
         }
     }
     drop(view);
+
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    scored.truncate(top_k);
+    Ok(scored)
+}
+
+/// GPU-accelerated exact search using cuBLAS batched dot product.
+fn gpu_exact_search(
+    query: &[f32],
+    top_k: usize,
+    vectors: &VectorStore,
+    offsets: &[PointOffset],
+    tier: Tier,
+    backend: &Arc<dyn turbomemory_gpu::GpuBackend>,
+) -> turbomemory_gpu::Result<Vec<ScoredPoint>> {
+    let dim = vectors.dimension();
+    let view = vectors.read_view();
+
+    // Collect vectors into a contiguous flat buffer for GPU upload
+    let mut flat_vectors: Vec<f32> = Vec::with_capacity(offsets.len() * dim);
+    let mut valid_offsets: Vec<PointOffset> = Vec::with_capacity(offsets.len());
+    for &offset in offsets {
+        if let Some(v) = view.get(offset) {
+            flat_vectors.extend_from_slice(v);
+            valid_offsets.push(offset);
+        }
+    }
+    drop(view);
+
+    if valid_offsets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Upload to GPU and compute batched cosine similarity
+    let device_buf = backend.upload_vectors(&flat_vectors, dim)?;
+    let scores = backend.batch_cosine_similarity(query, &device_buf)?;
+
+    // Build scored points
+    let mut scored: Vec<ScoredPoint> = valid_offsets
+        .into_iter()
+        .zip(scores)
+        .map(|(offset, score)| ScoredPoint { offset, score, tier })
+        .collect();
 
     scored.sort_by(|a, b| {
         b.score
@@ -319,10 +416,10 @@ mod tests {
         // Mid dim grows sub-linearly.
         let d384 = rerank_oversample(384);
         assert!((9..32).contains(&d384), "384-dim oversample = {d384}");
-        // 768-dim (the regression case): ~20x.
+        // 768-dim (the regression case): linear scaling gives 48x.
         let d768 = rerank_oversample(768);
-        assert!((16..=32).contains(&d768), "768-dim oversample = {d768}");
-        // Very high dim clamps at 64.
-        assert_eq!(rerank_oversample(8192), 64);
+        assert!((40..=60).contains(&d768), "768-dim oversample = {d768}");
+        // Very high dim clamps at 512 (updated cap).
+        assert_eq!(rerank_oversample(8192), 512);
     }
 }

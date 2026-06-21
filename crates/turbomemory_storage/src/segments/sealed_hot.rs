@@ -7,6 +7,7 @@
 
 use crate::config::{Flusher, StoreConfig, Tier};
 use crate::record::{PointOffset, Record};
+use crate::segments::gpu_hnsw_index::GpuHnswIndex;
 use crate::segments::vector_index::{VectorIndex, VectorIndexManifest};
 use crate::segments::{ScoredPoint, VectorSegment};
 use crate::vector_store::VectorStore;
@@ -38,6 +39,7 @@ impl SealedHotSegment {
     }
 
     /// Bulk-build a sealed segment from `(offset, vector)` pairs.
+    /// Uses GPU HNSW if CUDA is available and enabled, otherwise falls back to usearch.
     pub fn from_vectors(
         path: impl AsRef<Path>,
         config: &StoreConfig,
@@ -49,9 +51,29 @@ impl SealedHotSegment {
             ));
         }
         let path = path.as_ref().to_path_buf();
-        let index = Box::new(crate::segments::UsearchIndex::build(
+
+        // Try GPU HNSW first if CUDA feature is enabled
+        #[cfg(feature = "cuda")]
+        let index: Box<dyn VectorIndex> = {
+            match GpuHnswIndex::build(&path, config, vectors) {
+                Ok(gpu_index) => {
+                    log::info!("SealedHotSegment: using GPU HNSW index");
+                    Box::new(gpu_index)
+                }
+                Err(e) => {
+                    log::warn!("GPU HNSW build failed ({}), falling back to usearch", e);
+                    Box::new(crate::segments::UsearchIndex::build(
+                        &path, config, vectors,
+                    )?)
+                }
+            }
+        };
+
+        #[cfg(not(feature = "cuda"))]
+        let index: Box<dyn VectorIndex> = Box::new(crate::segments::UsearchIndex::build(
             &path, config, vectors,
         )?);
+
         let offsets = index.offsets().to_vec();
 
         Ok(Self {
@@ -76,6 +98,11 @@ impl SealedHotSegment {
 
         let index: Box<dyn VectorIndex> = match manifest.index_type.as_str() {
             "usearch" => Box::new(crate::segments::UsearchIndex::open(&path, config)?),
+            "gpu_hnsw" => {
+                // GPU HNSW indices need vectors to rebuild; load as usearch for now
+                log::warn!("GPU HNSW index reload not yet implemented, treating as usearch");
+                Box::new(crate::segments::UsearchIndex::open(&path, config)?)
+            }
             other => {
                 return Err(StorageError::InvalidArgument(format!(
                     "unsupported sealed hot index type: {other}"

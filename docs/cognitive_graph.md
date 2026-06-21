@@ -31,9 +31,9 @@ graph LR
 ### 1.2 Edge Types and Cognitive Semantics
 * **`Association`**: Bi-directional links between memories and their constituent concepts. Built automatically via concept extraction.
 * **`Temporal`**: Directed links connecting chronologically adjacent memories. Enables temporal context recall ("what happened next?").
-* **`Abstraction`**: Direct hierarchy between concepts (e.g., `rust` $\rightarrow$ `programming language`). Built through concept co-occurrence analysis.
-* **`Refines`**: Directed link from an older memory to a newer memory (Old $\rightarrow$ New). Used when an agent updates its understanding of a specific topic. The older memory remains in the graph (preserving history), but activation flows to the newer refinement.
-* **`Contradicts`**: Directed link from an older memory to a newer correction (Old $\rightarrow$ New). Similar to `Refines` for energy propagation, but the older memory's outgoing association edges are weakened by `contradiction_weaken_factor` (default `0.5`), causing it to fade from standard queries over time.
+* **`Abstraction`**: Direct hierarchy between concepts (e.g., `rust` → `programming language`). Built through concept co-occurrence analysis.
+* **`Refines`**: Directed link from an older memory to a newer memory (Old → New). Used when an agent updates its understanding of a specific topic. The older memory remains in the graph (preserving history), but activation flows to the newer refinement.
+* **`Contradicts`**: Directed link from an older memory to a newer correction (Old → New). Similar to `Refines` for energy propagation, but the older memory's outgoing association edges are weakened by `contradiction_weaken_factor` (default `0.5`), causing it to fade from standard queries over time.
 
 ---
 
@@ -64,7 +64,7 @@ If the condition is met, the query is rejected early (returns `None`). This prev
 For a configured number of iterations (typically 4):
 1. **Expansion**: Active nodes propagate energy to all neighbors:
    \[
-   \Delta E(Target) = E(Source) \cdot W_{\text{edge}} \cdot \text{decay\_factor}
+   \Delta E(\text{Target}) = E(\text{Source}) \cdot W_{\text{edge}} \cdot \text{decay\_factor}
    \]
 2. **Refines / Contradicts Priority**: Energy flows forward along `Refines` and `Contradicts` edges, channeling retrieval towards the latest factual states.
 3. **Frontier Truncation**: To prevent activation from blowing up (which happens when touching high-degree "hub" concepts), only the top `max_frontier` (default `1,000`) highest-energy nodes are kept at each iteration.
@@ -162,3 +162,113 @@ To prevent memory bloat and automate retention, the engine implements automatic 
   \]
 * **Edge Reweighting**: When importance is updated, the memory's associated edges are rescaled in [`MemoryGraph::reweight_memory`](file:///d:/personal-projects/TurboSuperMemory/crates/turbomemory_graph/src/graph.rs) relative to its `base_importance_factor`, preserving any extra weights gained from retrieval reinforcement.
 * **Eviction**: Memories whose importance decays below `importance_floor` are marked for eviction, freeing up index space.
+
+---
+
+## 7. Complete Cognitive Retrieval Pipeline
+
+The following diagram shows the full end-to-end cognitive retrieval pipeline, from query ingestion to final result ranking:
+
+```mermaid
+flowchart TD
+    subgraph Input["Query Input"]
+        QueryText["Text: 'Rust concurrency bug fix'"]
+        QueryVec["Vector: embedding(query)"]
+    end
+    
+    subgraph ANN_Search["ANN Search (Vector Space)"]
+        Parallel["Parallel Segment Search"]
+        Hot["Hot: exact scan"]
+        Sealed["SealedHot: HNSW walk"]
+        Warm["Warm: 8-bit LUT scan"]
+        Cold["Cold: 1-bit popcount"]
+        Rerank["Full FP32 Rerank"]
+    end
+    
+    subgraph Lexical["Lexical Search"]
+        BM25["BM25 keyword scoring"]
+        Tokenize["Tokenize & stopword filter"]
+    end
+    
+    subgraph Graph["Cognitive Graph Processing"]
+        Seed["Dual-trigger seeding"]
+        FOK{"FOK Gate: peak >= threshold?"}
+        Spread["Spreading Activation"]
+        Refine["Traverse Refines edges"]
+        Contradict["Traverse Contradicts edges"]
+        Temporal["Traverse Temporal edges"]
+        Abstract["Traverse Abstraction edges"]
+        HubSuppress["Hub Suppression"]
+    end
+    
+    subgraph Output["Result Assembly"]
+        Fusion["Score Fusion: α·cosine + (1-α)·activation"]
+        Sort["Sort by final score"]
+        Results["Top K Results"]
+    end
+    
+    QueryText --> Tokenize
+    QueryVec --> Parallel
+    Tokenize --> BM25
+    Parallel --> Hot
+    Parallel --> Sealed
+    Parallel --> Warm
+    Parallel --> Cold
+    Hot --> Rerank
+    Sealed --> Rerank
+    Warm --> Rerank
+    Cold --> Rerank
+    Rerank --> Seed
+    BM25 --> Seed
+    Seed --> FOK
+    FOK --"No"--> ReturnNone["Return None"]
+    FOK --"Yes"--> Spread
+    Spread --> Refine
+    Spread --> Contradict
+    Spread --> Temporal
+    Spread --> Abstract
+    Refine --> HubSuppress
+    Contradict --> HubSuppress
+    Temporal --> HubSuppress
+    Abstract --> HubSuppress
+    HubSuppress --> Fusion
+    Fusion --> Sort
+    Sort --> Results
+```
+
+---
+
+## 8. Graph Introspection API
+
+The cognitive graph exposes a read-only introspection API for debugging and "what does the AI know" views:
+
+| Method | Returns | Description |
+|---|---|---|
+| `graph_stats()` | `(node_count, edge_count, memory_count, concept_count, ...)` | High-level graph statistics |
+| `get_concepts()` | `list[(concept, degree)]` | All concepts sorted by degree |
+| `get_memory_concepts(id)` | `list[str]` | Concepts attached to a memory |
+| `get_refinements(id)` | `list[(id, weight)]` | Memories that refine this one |
+| `get_contradictions(id)` | `list[(id, weight)]` | Memories that contradict this one |
+
+---
+
+## 9. Memory Lifecycle in the Graph
+
+```mermaid
+stateDiagram-v2
+    [*] --> Inserted: "add_memory_with_importance"
+    Inserted --> Reinforced: "reinforce() on retrieval"
+    Reinforced --> Decayed: "decay_edges() over time"
+    Decayed --> Evicted: "importance < floor"
+    Inserted --> Refined: "check_refinements()"
+    Refined --> Inserted: "Refines edge created"
+    Inserted --> Contradicted: "check_contradictions()"
+    Contradicted --> Inserted: "Contradicts edge + weaken"
+    Evicted --> [*]: "delete from graph"
+    
+    note right of Reinforced
+        Edges strengthened by 1.5x on first recall,
+        up to 8.0x max. Decay erodes learned portion
+        with exponential half-life.
+    end note
+```

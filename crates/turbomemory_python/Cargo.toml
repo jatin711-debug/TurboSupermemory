@@ -7,6 +7,10 @@ edition = "2021"
 name = "turbomemory"
 crate-type = ["cdylib"]
 
+[features]
+default = []
+cuda = ["turbomemory_storage/cuda"]
+
 [dependencies]
 turbomemory_core = { path = "../turbomemory_core" }
 turbomemory_storage = { path = "../turbomemory_storage" }

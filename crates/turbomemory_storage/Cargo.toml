@@ -3,9 +3,14 @@ name = "turbomemory_storage"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+cuda = ["turbomemory_gpu/cuda"]
+
 [dependencies]
 turbomemory_core = { path = "../turbomemory_core" }
 turbomemory_graph = { path = "../turbomemory_graph" }
+turbomemory_gpu = { path = "../turbomemory_gpu" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

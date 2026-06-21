@@ -66,6 +66,43 @@ A custom Python function can be injected into the Rust engine to act as the work
 * The callback receives `(current_ccs_json, user_input, assistant_response)` and returns the updated `new_ccs_json`.
 * If the Python callable fails or raises an error, the engine catches it and falls back to the deterministic Rust compressor.
 
+### 1.4 GPU Acceleration Property
+
+The Python bindings expose a read-only property `gpu_accelerated` on the `MemoryEngine` class to indicate whether GPU acceleration is active:
+
+```python
+from turbomemory import MemoryEngine
+
+engine = MemoryEngine(dimension=768, db_path="./my_db")
+print(f"GPU Accelerated: {engine.gpu_accelerated}")
+# True if compiled with cuda feature AND CUDA device detected at runtime
+# False otherwise (CPU-only fallback)
+```
+
+This property reflects the runtime state of the GPU backend:
+- **Compile-time**: The `cuda` feature must be enabled (`make build-python FEATURES=cuda`).
+- **Runtime**: A CUDA-capable device must be available and successfully initialized.
+- **Fallback**: If either condition is not met, all operations transparently use CPU paths.
+
+### 1.5 Batch Search API (GPU-Ready)
+
+The Python bindings support batch matrix search, which is the ideal shape for GPU acceleration:
+
+```python
+import numpy as np
+from turbomemory import MemoryEngine
+
+engine = MemoryEngine(dimension=768)
+# ... insert records ...
+
+# Batch query: matrix of shape (num_queries, dimension)
+queries = np.random.randn(100, 768).astype(np.float32)
+results = engine.search_ann_batch(queries, top_k=10)
+# results is a list of list of (id, score) tuples
+```
+
+Batch search releases the GIL and dispatches to the Rust engine, which can use GPU batched distance compute when available. Single-query search (`search_ann`) uses CPU paths by default (GPU upload overhead dominates for single queries).
+
 ---
 
 ## 2. API Server Architecture

@@ -5,6 +5,7 @@ members = [
     "crates/turbomemory_graph",
     "crates/turbomemory_python",
     "crates/turbomemory_api",
+    "crates/turbomemory_gpu",
 ]
 resolver = "2"
 
@@ -42,6 +43,9 @@ numpy = "0.25"
 tonic = "0.12"
 prost = "0.13"
 axum = "0.7"
+# GPU support
+cudarc = { version = "0.19", features = ["cuda-12080"] }
+fastrand = "2"
 
 [profile.release]
 lto = true

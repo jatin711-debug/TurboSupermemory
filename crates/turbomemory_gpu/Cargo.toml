@@ -1,0 +1,26 @@
+[package]
+name = "turbomemory_gpu"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
+
+[dependencies]
+turbomemory_core = { path = "../turbomemory_core" }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+rayon = { workspace = true }
+ndarray = { workspace = true }
+# CUDA support - optional, enabled via 'cuda' feature
+cudarc = { workspace = true, optional = true }
+fastrand = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+# [[bench]]
+# name = "gpu_distance"
+# harness = false

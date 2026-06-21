@@ -25,14 +25,15 @@ graph TD
   - `payload_index: Arc<RwLock<PayloadIndex>>`
   - `scope_index: Arc<RwLock<ScopeIndex>>`
   - `wal: Arc<Mutex<Wal>>`
+  - `gpu: Arc<Mutex<Option<Arc<dyn GpuBackend>>>>` (lazy-initialized GPU backend)
 
 ### Lock Compatibility Matrix
 
-| Operation / Resource | `segments` Lock | `graph` Lock | `id_index` Lock | `wal` Lock |
-|---|---|---|---|---|
-| **Search (Read Path)** | None (Lock-free `arc_swap`) | Read Lock (Shared) | Read Lock (Shared) | None |
-| **Insert / Update (Write Path)** | Write Lock (Exclusive) | Write Lock (Exclusive) | Write Lock (Exclusive) | Mutex (Exclusive Append) |
-| **Consolidation / Optimize** | Write Lock (Exclusive Swap) | Write Lock (Exclusive) | Read/Write Lock | Mutex (Exclusive Flush/Truncate) |
+| Operation / Resource | `segments` Lock | `graph` Lock | `id_index` Lock | `wal` Lock | `gpu` Lock |
+|---|---|---|---|---|---|
+| **Search (Read Path)** | None (Lock-free `arc_swap`) | Read Lock (Shared) | Read Lock (Shared) | None | None (GPU ops are lock-free after init) |
+| **Insert / Update (Write Path)** | Write Lock (Exclusive) | Write Lock (Exclusive) | Write Lock (Exclusive) | Mutex (Exclusive Append) | None (GPU not used on write) |
+| **Consolidation / Optimize** | Write Lock (Exclusive Swap) | Write Lock (Exclusive) | Read/Write Lock | Mutex (Exclusive Flush/Truncate) | None (GPU build uses owned data) |
 
 ---
 
@@ -130,24 +131,84 @@ stateDiagram-v2
 ### 5.1 Hot Segment
 * New insertions land here.
 * Searches perform a fast brute-force dot product of the query against the memory slice.
+* **GPU Acceleration**: When the `cuda` feature is enabled and a CUDA device is available, `SegmentSnapshot::search_gpu()` uses cuBLAS `sgemv` for batched exact scan over Hot segment offsets, falling back to CPU SIMD on any error.
 
 ### 5.2 SealedHot Segment
 * Once the Hot capacity (e.g., 10,000 records) is reached, the Hot segment is sealed.
-* A background thread builds a `usearch` HNSW (Hierarchical Navigable Small World) index. Usearch is a header-only HNSW library. The index file is written to `segments/sealed_hot/`.
+* A background thread builds an HNSW (Hierarchical Navigable Small World) index. Two implementations are available:
+  - **`usearch` HNSW** (default CPU path): Header-only HNSW library. Index file written to `segments/sealed_hot/`.
+  - **`CudaAnnIndex` HNSW** (GPU path, `cuda` feature): Custom CUDA HNSW implementation. For small N (≤4096), uses GPU brute-force all-pairs; for large N, uses random-projection bucketing + local search + probabilistic hierarchical layer construction. Transparently falls back to `usearch` on CUDA error.
 
 ### 5.3 Warm Segment
 * Compresses embeddings to 8-bit integers using `ScalarQuantizer` or `TurboQuantProdQuantizer`.
 * Computes similarity using LUTs and AVX2-accelerated math directly on quantized bytes, then reranks the top candidates with full floats.
+* **GPU Rerank**: When `cuda` feature is enabled, quantized tier candidate reranking can use GPU batched exact scan via `exact_search_over_offsets_gpu()`.
 
 ### 5.4 Cold Segment
 * Compresses embeddings to 1-bit representations using `SignQuantizer` or `TurboQuantMseQuantizer`.
 * Computes similarity using bitwise XOR and popcount lookups (extremely compact).
+* **GPU Rerank**: Same GPU rerank path as Warm tier when `cuda` feature is enabled.
 
 ---
 
-## 6. Background Consolidation and Optimizer
+## 6. GPU Acceleration in Storage Engine
+
+The `StorageEngine` integrates GPU acceleration through a lazy-initialized, trait-based backend:
+
+```mermaid
+graph TD
+    subgraph StorageEngine["StorageEngine"]
+        gpu_field["gpu: Arc<Mutex<Option<Arc<dyn GpuBackend>>>>"]
+        gpu_backend["gpu_backend() -> Option<Arc<dyn GpuBackend>>"]
+        is_gpu["is_gpu_accelerated() -> bool"]
+    end
+    
+    subgraph GpuBackend_Trait["GpuBackend Trait"]
+        init["init() -> Result<Self>"]
+        upload["upload_vectors(vectors) -> GpuBuffer"]
+        batch_dot["batch_dot(query, vectors) -> Vec<f32>"]
+        exact_topk["exact_topk(query, vectors, k) -> Vec<(idx, score)>"]
+        build_hnsw["build_hnsw(vectors) -> GpuHnswIndex"]
+    end
+    
+    subgraph CudaBackend_Impl["CudaBackend (cuda feature)"]
+        cudarc["cudarc: CudaContext + CudaBlas"]
+        sgemv["cuBLAS sgemv: vectors^T × query"]
+        cuda_ann["CudaAnnIndex: custom HNSW"]
+    end
+    
+    subgraph CpuFallback_Impl["CpuFallback"]
+        unavailable["Always returns GpuUnavailable"]
+    end
+    
+    gpu_field --> gpu_backend
+    gpu_backend --> GpuBackend_Trait
+    GpuBackend_Trait --> CudaBackend_Impl
+    GpuBackend_Trait --> CpuFallback_Impl
+```
+
+### 6.1 GPU-Accelerated Search Paths
+
+When `cuda` feature is enabled and a CUDA device is detected:
+
+1. **Hot Segment Exact Scan**: `SegmentSnapshot::search_gpu()` uploads the query and candidate offset vectors to GPU, computes batched cosine similarity via cuBLAS `sgemv`, and returns top-k results.
+2. **Quantized Tier Rerank**: After quantized LUT scan produces candidates, `gpu_rerank_candidates()` can optionally rerank using GPU exact distance compute.
+3. **HNSW Build**: `SealedHotSegment::from_vectors()` attempts `GpuHnswIndex::build()` first; on any error, transparently falls back to CPU `UsearchIndex::build()`.
+
+### 6.2 Transparent Fallback
+
+Every GPU path implements silent CPU fallback:
+- **CUDA unavailable** (no driver, no device): `CpuFallback` returns `GpuUnavailable` on `init()`.
+- **Out of GPU memory**: `CudaBackend` catches allocation errors and propagates them as fallback triggers.
+- **Kernel errors**: Any CUDA API error triggers fallback to the equivalent CPU path.
+- **Runtime detection**: `is_gpu_accelerated()` checks both feature flag AND device availability at runtime.
+
+---
+
+## 7. Background Consolidation and Optimizer
 
 The [`BackgroundOptimizer`](file:///d:/personal-projects/TurboSuperMemory/crates/turbomemory_storage/src/optimizer.rs) runs continuously as a worker thread:
 * **Consolidation**: Merges fragmented small segments into larger ones to keep search parallelization balanced.
 * **Tiering**: Promotes/demotes segments based on access frequency. Frequently accessed Cold records can be promoted back to Hot via `promote_hot` if configured.
 * **Vacuuming**: Deletes marked records from indices and rewrites segment tables to reclaim storage space.
+* **GPU HNSW Build**: When the `cuda` feature is enabled, the optimizer attempts GPU-accelerated HNSW construction for sealed segments. If the GPU path fails (OOM, CUDA error), it falls back to the standard CPU `usearch` build transparently. The build uses a `Weak<StorageEngine>` reference so the optimizer does not keep the engine alive if the engine is dropped.

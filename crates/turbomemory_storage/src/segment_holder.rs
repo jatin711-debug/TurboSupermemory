@@ -54,6 +54,19 @@ impl SegmentSnapshot {
         vectors: &VectorStore,
         allowed_offsets: Option<&RoaringBitmap>,
     ) -> crate::Result<Vec<ScoredPoint>> {
+        self.search_gpu(query, top_k, ef, vectors, allowed_offsets, None)
+    }
+
+    /// GPU-accelerated search with optional backend.
+    pub(crate) fn search_gpu(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        ef: Option<usize>,
+        vectors: &VectorStore,
+        allowed_offsets: Option<&RoaringBitmap>,
+        gpu: Option<&Arc<dyn turbomemory_gpu::GpuBackend>>,
+    ) -> crate::Result<Vec<ScoredPoint>> {
         // Use Qdrant-style ef semantics: floor the per-segment candidate pool at
         // the caller-provided `ef` (or the configured search list size), then
         // apply an over-fetch multiplier that grows with filter strictness and
@@ -112,54 +125,21 @@ impl SegmentSnapshot {
         };
 
         // Final rerank with full f32 embeddings from the vector store.
-        let view = vectors.read_view();
-        let reranked: Vec<ScoredPoint> = if candidates.len() >= 256 {
-            let chunks: Vec<&[ScoredPoint]> = candidates.chunks(64).collect();
-            chunks
-                .into_par_iter()
-                .flat_map(|chunk| {
-                    let mut pairs = Vec::with_capacity(chunk.len());
-                    for c in chunk {
-                        if let Some(v) = view.get(c.offset) {
-                            pairs.push((*c, v));
-                        }
+        // Use GPU for large rerank pools if available.
+        let reranked = if let Some(backend) = gpu {
+            if turbomemory_gpu::is_gpu_accelerated(backend) && candidates.len() >= 256 {
+                match gpu_rerank_candidates(query, &candidates, vectors, backend) {
+                    Ok(results) => results,
+                    Err(e) => {
+                        log::warn!("GPU rerank failed ({}), falling back to CPU", e);
+                        cpu_rerank_candidates(query, &candidates, vectors)
                     }
-                    let refs: Vec<&[f32]> = pairs.iter().map(|(_, v)| *v).collect();
-                    let scores = turbomemory_core::cosine_similarity_batch(query, &refs);
-                    pairs
-                        .into_iter()
-                        .zip(scores)
-                        .map(|((c, _), score)| ScoredPoint {
-                            offset: c.offset,
-                            score,
-                            tier: c.tier,
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect()
+                }
+            } else {
+                cpu_rerank_candidates(query, &candidates, vectors)
+            }
         } else {
-            candidates
-                .chunks(64)
-                .flat_map(|chunk| {
-                    let mut pairs = Vec::with_capacity(chunk.len());
-                    for c in chunk {
-                        if let Some(v) = view.get(c.offset) {
-                            pairs.push((c, v));
-                        }
-                    }
-                    let refs: Vec<&[f32]> = pairs.iter().map(|(_, v)| *v).collect();
-                    let scores = turbomemory_core::cosine_similarity_batch(query, &refs);
-                    pairs
-                        .into_iter()
-                        .zip(scores)
-                        .map(|((c, _), score)| ScoredPoint {
-                            offset: c.offset,
-                            score,
-                            tier: c.tier,
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect()
+            cpu_rerank_candidates(query, &candidates, vectors)
         };
 
         let mut reranked = reranked;
@@ -171,6 +151,107 @@ impl SegmentSnapshot {
         reranked.truncate(top_k);
         Ok(reranked)
     }
+}
+
+/// CPU rerank of candidate points with full f32 embeddings.
+fn cpu_rerank_candidates(
+    query: &[f32],
+    candidates: &[ScoredPoint],
+    vectors: &VectorStore,
+) -> Vec<ScoredPoint> {
+    let view = vectors.read_view();
+    let reranked: Vec<ScoredPoint> = if candidates.len() >= 256 {
+        let chunks: Vec<&[ScoredPoint]> = candidates.chunks(64).collect();
+        chunks
+            .into_par_iter()
+            .flat_map(|chunk| {
+                let mut pairs = Vec::with_capacity(chunk.len());
+                for c in chunk {
+                    if let Some(v) = view.get(c.offset) {
+                        pairs.push((*c, v));
+                    }
+                }
+                let refs: Vec<&[f32]> = pairs.iter().map(|(_, v)| *v).collect();
+                let scores = turbomemory_core::cosine_similarity_batch(query, &refs);
+                pairs
+                    .into_iter()
+                    .zip(scores)
+                    .map(|((c, _), score)| ScoredPoint {
+                        offset: c.offset,
+                        score,
+                        tier: c.tier,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    } else {
+        candidates
+            .chunks(64)
+            .flat_map(|chunk| {
+                let mut pairs = Vec::with_capacity(chunk.len());
+                for c in chunk {
+                    if let Some(v) = view.get(c.offset) {
+                        pairs.push((c, v));
+                    }
+                }
+                let refs: Vec<&[f32]> = pairs.iter().map(|(_, v)| *v).collect();
+                let scores = turbomemory_core::cosine_similarity_batch(query, &refs);
+                pairs
+                    .into_iter()
+                    .zip(scores)
+                    .map(|((c, _), score)| ScoredPoint {
+                        offset: c.offset,
+                        score,
+                        tier: c.tier,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+    reranked
+}
+
+/// GPU-accelerated rerank of candidate points with full f32 embeddings.
+fn gpu_rerank_candidates(
+    query: &[f32],
+    candidates: &[ScoredPoint],
+    vectors: &VectorStore,
+    backend: &Arc<dyn turbomemory_gpu::GpuBackend>,
+) -> turbomemory_gpu::Result<Vec<ScoredPoint>> {
+    let dim = vectors.dimension();
+    let view = vectors.read_view();
+
+    // Collect candidate vectors into a contiguous flat buffer
+    let mut flat_vectors: Vec<f32> = Vec::with_capacity(candidates.len() * dim);
+    let mut valid_candidates: Vec<ScoredPoint> = Vec::with_capacity(candidates.len());
+    for c in candidates {
+        if let Some(v) = view.get(c.offset) {
+            flat_vectors.extend_from_slice(v);
+            valid_candidates.push(*c);
+        }
+    }
+    drop(view);
+
+    if valid_candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Upload to GPU and compute batched cosine similarity
+    let device_buf = backend.upload_vectors(&flat_vectors, dim)?;
+    let scores = backend.batch_cosine_similarity(query, &device_buf)?;
+
+    // Build reranked points preserving tier info
+    let reranked: Vec<ScoredPoint> = valid_candidates
+        .into_iter()
+        .zip(scores)
+        .map(|(c, score)| ScoredPoint {
+            offset: c.offset,
+            score,
+            tier: c.tier,
+        })
+        .collect();
+
+    Ok(reranked)
 }
 
 /// Mutable, internally-locked set of non-Hot segment lists.
