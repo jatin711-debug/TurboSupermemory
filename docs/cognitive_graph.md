@@ -10,18 +10,18 @@ TurboSuperMemory models memory not as isolated vectors, but as an **Episodic-Sem
 
 ```mermaid
 graph LR
-    subgraph Concepts (Semantic)
-        C1[Concept: rust] -- Abstraction --> C2[Concept: programming]
-        C3[Concept: thread-safety]
+    subgraph Concepts["Concepts (Semantic)"]
+        C1["Concept: rust"] -- "Abstraction" --> C2["Concept: programming"]
+        C3["Concept: thread-safety"]
     end
-    subgraph Memories (Episodic)
-        M1["mem:1 (Old Bug)"] -- Refines --> M2["mem:2 (New Fix)"]
-        M1 -- Temporal --> M3["mem:3 (Log Output)"]
-        M2 -- Contradicts --> M4["mem:4 (Correction)"]
+    subgraph Memories["Memories (Episodic)"]
+        M1["mem:1 (Old Bug)"] -- "Refines" --> M2["mem:2 (New Fix)"]
+        M1 -- "Temporal" --> M3["mem:3 (Log Output)"]
+        M2 -- "Contradicts" --> M4["mem:4 (Correction)"]
     end
-    C1 -- Association --- M1
-    C1 -- Association --- M2
-    C3 -- Association --- M2
+    C1 -- "Association" --- M1
+    C1 -- "Association" --- M2
+    C3 -- "Association" --- M2
 ```
 
 ### 1.1 Nodes
@@ -69,19 +69,43 @@ For a configured number of iterations (typically 4):
 2. **Refines / Contradicts Priority**: Energy flows forward along `Refines` and `Contradicts` edges, channeling retrieval towards the latest factual states.
 3. **Frontier Truncation**: To prevent activation from blowing up (which happens when touching high-degree "hub" concepts), only the top `max_frontier` (default `1,000`) highest-energy nodes are kept at each iteration.
 
+#### Concrete Numerical Example of Spreading Activation
+
+Assume the user queries: *"Rust concurrency bug fix"* with `fok_threshold = 0.58`, `decay = 0.5`, `semantic_alpha = 1.0`, and `lexical_alpha = 0.6`.
+
+1. **Dual-Trigger Seeding**:
+   - `mem:1` ("Old concurrency bug in thread pool") matches the query vectors closely: Cosine Similarity = `0.8`, BM25 Score = `0.7`.
+     \[
+     E_0(\text{mem:1}) = (1.0 \cdot 0.8) + (0.6 \cdot 0.7) = 1.22
+     \]
+   - `mem:3` ("Detailed fix for thread-pool lock contention") matches poorly (lacks the word "Rust"): Cosine = `0.4`, BM25 = `0.0`.
+     \[
+     E_0(\text{mem:3}) = (1.0 \cdot 0.4) + 0.0 = 0.40
+     \]
+2. **FOK Gate Verification**:
+   - Peak seed energy is `1.22`. Since `1.22 >= 0.58`, the query is approved and propagation begins.
+3. **Iteration 1 (Propagation)**:
+   - `mem:1` has a `Refines` edge pointing to `mem:3` with weight `1.0`. It propagates energy:
+     \[
+     \Delta E(\text{mem:3}) = E(\text{mem:1}) \cdot W_{\text{refines}} \cdot \text{decay} = 1.22 \cdot 1.0 \cdot 0.5 = 0.61
+     \]
+   - `mem:3` accumulates energy: \(E_1(\text{mem:3}) = 0.40 \text{ (initial)} + 0.61 \text{ (propagated)} = 1.01\).
+4. **Final Retrieval**:
+   - `mem:3` (the correct bug fix) surfaces at the top of the search results with an energy score of `1.01` (despite starting with a weak direct vector match of `0.40`), outranking the outdated `mem:1`.
+
 ```mermaid
 flowchart TD
-    Start[Query Input] --> DualTrigger[Dual Trigger: ANN + BM25 Seeding]
-    DualTrigger --> FOK{Peak Energy >= fok_threshold?}
-    FOK -- No --> ExitNone[Return None]
-    FOK -- Yes --> PropLoop[Start Propagation Iteration]
-    PropLoop --> HubCheck{Is Concept a Suppressed Hub?}
-    HubCheck -- Yes --> SkipNode[Skip Expansion]
-    HubCheck -- No --> Expand[Propagate Energy to Neighbors: E * W * decay]
-    Expand --> Frontier[Limit Frontier to max_frontier Nodes]
-    Frontier --> LoopEnd{Completed Iterations?}
-    LoopEnd -- No --> PropLoop
-    LoopEnd -- Yes --> Fuse[Score Fusion with Cosine Similarity]
+    Start["Query Input"] --> DualTrigger["Dual Trigger: ANN + BM25 Seeding"]
+    DualTrigger --> FOK{"Peak Energy >= fok_threshold?"}
+    FOK -- "No" --> ExitNone["Return None"]
+    FOK -- "Yes" --> PropLoop["Start Propagation Iteration"]
+    PropLoop --> HubCheck{"Is Concept a Suppressed Hub?"}
+    HubCheck -- "Yes" --> SkipNode["Skip Expansion"]
+    HubCheck -- "No" --> Expand["Propagate Energy to Neighbors: E * W * decay"]
+    Expand --> Frontier["Limit Frontier to max_frontier Nodes"]
+    Frontier --> LoopEnd{"Completed Iterations?"}
+    LoopEnd -- "No" --> PropLoop
+    LoopEnd -- "Yes" --> Fuse["Score Fusion with Cosine Similarity"]
 ```
 
 ---

@@ -10,9 +10,9 @@ The Python bindings expose the underlying Rust engine to Python as a fast module
 
 ```mermaid
 graph LR
-    PyApp[Python Agent App] --> PyEngine[Bound MemoryEngine Class]
-    PyEngine -- Extract Numpy Arrays --> PyO3[PyO3 Bridge / numpy-rust]
-    PyO3 -- Release GIL --> RustEngine[StorageEngine Arc]
+    PyApp["Python Agent App"] --> PyEngine["Bound MemoryEngine Class"]
+    PyEngine -- "Extract Numpy Arrays" --> PyO3["PyO3 Bridge / numpy-rust"]
+    PyO3 -- "Release GIL" --> RustEngine["StorageEngine Arc"]
 ```
 
 ### 1.1 Zero-Copy NumPy Integration
@@ -29,6 +29,30 @@ py.allow_threads(|| {
 })
 ```
 This allows the Python interpreter to schedule other threads while the Rust CPU kernels run calculations (like quantization calibration, HNSW graph walks, or Rayon-based parallel scans).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant PyThread as "Python Main Thread"
+    participant PyO3 as "PyO3 Binding Layer"
+    participant RustCore as "Rust StorageEngine"
+    participant Rayon as "Rayon Thread Pool"
+
+    PyThread->>PyO3: Call insert_batch(embeddings)
+    Note over PyThread: GIL is HELD by Python
+    PyO3->>PyO3: extract_f32_matrix() (zero-copy view)
+    PyO3->>RustCore: py.allow_threads()
+    Note over PyThread: GIL is RELEASED
+    par Parallel Rust execution
+        RustCore->>Rayon: Dispatch search/quantization to threads
+        Rayon-->>RustCore: Join parallel chunks
+    and Python scheduling
+        Note over PyThread: Other Python threads can run concurrently!
+    end
+    RustCore-->>PyO3: Return Result
+    PyO3->>PyThread: Re-acquire GIL & return Python objects
+    Note over PyThread: GIL is HELD
+```
 
 ### 1.3 Exception Mapping
 Crate-level `StorageError` variants are mapped to standard Python exception types:
@@ -50,20 +74,20 @@ The gRPC and REST servers are built on top of a unified service layer, sharing a
 
 ```mermaid
 graph TD
-    subgraph Clients
-        RESTClient[HTTP REST Client]
-        gRPCClient[gRPC Client]
+    subgraph Clients["Clients"]
+        RESTClient["HTTP REST Client"]
+        gRPCClient["gRPC Client"]
     end
-    subgraph turbomemory_api Crate
-        Axum[Axum REST Server: HTTP/JSON]
-        Tonic[Tonic gRPC Server: HTTP/2 Protobuf]
-        Service[MemoryService Shared Layer]
+    subgraph turbomemory_api["turbomemory_api Crate"]
+        Axum["Axum REST Server: HTTP/JSON"]
+        Tonic["Tonic gRPC Server: HTTP/2 Protobuf"]
+        Service["MemoryService Shared Layer"]
     end
     RESTClient --> Axum
     gRPCClient --> Tonic
     Axum --> Service
     Tonic --> Service
-    Service --> RustCore[turbomemory_storage]
+    Service --> RustCore["turbomemory_storage"]
 ```
 
 ### 2.1 Shared Service Layer (`service.rs`)

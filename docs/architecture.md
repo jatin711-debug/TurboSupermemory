@@ -12,11 +12,11 @@ The codebase is organized as a Cargo workspace split into five specialized crate
 
 ```mermaid
 graph TD
-    api[turbomemory_api - gRPC/REST Service] --> storage[turbomemory_storage - Segment & Persistence Engine]
-    python[turbomemory_python - PyO3 Bindings] --> storage
-    storage --> graph[turbomemory_graph - Cognitive Reasoner & BM25]
-    storage --> core[turbomemory_core - SIMD Math & Quantization]
-    graph --> core
+    api["turbomemory_api - gRPC/REST Service"] --> storage["turbomemory_storage - Segment & Persistence Engine"]
+    python["turbomemory_python - PyO3 Bindings"] --> storage
+    storage --> graph_crate["turbomemory_graph - Cognitive Reasoner & BM25"]
+    storage --> core["turbomemory_core - SIMD Math & Quantization"]
+    graph_crate --> core
 ```
 
 * [**`turbomemory_core`**](file:///d:/personal-projects/TurboSuperMemory/docs/core_quantization.md): SIMD math kernels (AVX2/NEON), Fast Walsh-Hadamard Transform (FWHT) preconditioning, Lloyd-Max centroids, and quantization encoders (Scalar, Sign, TurboQuant).
@@ -71,17 +71,17 @@ sequenceDiagram
 ### 3.2 Read Path (Cognitive Retrieval)
 ```mermaid
 flowchart TD
-    Q[Query Input] --> ANN[Parallel Segment Search: Hot/SealedHot/Warm/Cold]
-    ANN --> Rerank[Full f32 Vector Rerank via VectorStore]
-    Q --> BM25[BM25 Lexical Score Trigger]
-    Rerank --> GraphTrigger[Assemble Seeds: Cosine Similarity]
+    Q["Query Input"] --> ANN["Parallel Segment Search: Hot/SealedHot/Warm/Cold"]
+    ANN --> Rerank["Full f32 Vector Rerank via VectorStore"]
+    Q --> BM25["BM25 Lexical Score Trigger"]
+    Rerank --> GraphTrigger["Assemble Seeds: Cosine Similarity"]
     BM25 --> GraphTrigger
-    GraphTrigger --> FOK{Peak Seed Energy >= fok_threshold?}
-    FOK -- No --> ReturnNone[Return None / Feeling-of-Knowing Gate Blocks]
-    FOK -- Yes --> Spreading[Spreading Activation Iterations]
-    Spreading -- Traverses Refines/Contradicts/Temporal --> FinalEnergy[Final Activation Scores]
-    FinalEnergy --> Fusion[Score Fusion: blended with Cosine Similarity]
-    Fusion --> Sort[Sort & Return Top K Results]
+    GraphTrigger --> FOK{"Peak Energy >= fok_threshold?"}
+    FOK -- "No" --> ReturnNone["Return None / Feeling-of-Knowing Gate Blocks"]
+    FOK -- "Yes" --> Spreading["Spreading Activation Iterations"]
+    Spreading -- "Traverses Refines/Contradicts/Temporal" --> FinalEnergy["Final Activation Scores"]
+    FinalEnergy --> Fusion["Score Fusion: blended with Cosine Similarity"]
+    Fusion --> Sort["Sort & Return Top K Results"]
 ```
 
 ---

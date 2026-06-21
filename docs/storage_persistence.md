@@ -10,11 +10,11 @@ This document provides a detailed technical overview of `turbomemory_storage` (l
 
 ```mermaid
 graph TD
-    Reader[Reader Thread] -- Atomic Read --> Snapshot[SegmentSnapshot Pointer]
-    Snapshot -- Read Guardless --> Segments[Active Segment Set]
-    Writer[Writer Thread] -- Acquire Write Lock --> SegsLock[SegmentHolder RwLock Write]
-    SegsLock -- Mutate & Clone --> NewSnapshot[New SegmentSnapshot]
-    NewSnapshot -- Atomic Pointer Swap --> Snapshot
+    Reader["Reader Thread"] -- "Atomic Read" --> Snapshot["SegmentSnapshot Pointer"]
+    Snapshot -- "Read Guardless" --> Segments["Active Segment Set"]
+    Writer["Writer Thread"] -- "Acquire Write Lock" --> SegsLock["SegmentHolder RwLock Write"]
+    SegsLock -- "Mutate & Clone" --> NewSnapshot["New SegmentSnapshot"]
+    NewSnapshot -- "Atomic Pointer Swap" --> Snapshot
 ```
 
 * **`arc_swap` Snapshots**: The active searchable segments are published atomically using `arc_swap::ArcSwap<SegmentSnapshot>`. Read paths (like searches) perform a lock-free pointer swap clone of the snapshot and scan the segments without holding any mutexes or read locks.
@@ -25,6 +25,14 @@ graph TD
   - `payload_index: Arc<RwLock<PayloadIndex>>`
   - `scope_index: Arc<RwLock<ScopeIndex>>`
   - `wal: Arc<Mutex<Wal>>`
+
+### Lock Compatibility Matrix
+
+| Operation / Resource | `segments` Lock | `graph` Lock | `id_index` Lock | `wal` Lock |
+|---|---|---|---|---|
+| **Search (Read Path)** | None (Lock-free `arc_swap`) | Read Lock (Shared) | Read Lock (Shared) | None |
+| **Insert / Update (Write Path)** | Write Lock (Exclusive) | Write Lock (Exclusive) | Write Lock (Exclusive) | Mutex (Exclusive Append) |
+| **Consolidation / Optimize** | Write Lock (Exclusive Swap) | Write Lock (Exclusive) | Read/Write Lock | Mutex (Exclusive Flush/Truncate) |
 
 ---
 
@@ -64,16 +72,16 @@ TurboSuperMemory uses a tiered persistence model to balance write throughput wit
 
 ```mermaid
 sequenceDiagram
-    participant App as Client Application
-    participant VS as VectorStore (mmap)
-    participant WAL as Write-Ahead Log (disk)
-    participant Cache as Metadata Cache (RAM)
-    participant redb as redb Snapshot (lazy)
+    participant App as "Client Application"
+    participant VS as "VectorStore (mmap)"
+    participant WAL as "Write-Ahead Log (disk)"
+    participant Cache as "Metadata Cache (RAM)"
+    participant redb as "redb Snapshot (lazy)"
 
     App->>VS: Append float embedding
     App->>WAL: Append metadata (WalOp::Insert) & sync
     App->>Cache: Cache MetaRecord (in-memory)
-    Note over Client, redb: Transaction Complete
+    Note over App, redb: Transaction Complete
     Note over redb: On flush() or background consolidation
     Cache->>redb: Flush dirty MetaRecords to redb table
     WAL->>WAL: Truncate/reset WAL log
@@ -105,19 +113,19 @@ TurboSuperMemory employs four distinct tiers to optimize vector search speed, me
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Hot : Insert (In-memory, FP32)
-    Hot --> SealedHot : Hot capacity reached (HNSW Index build)
-    Hot --> Warm : Hot capacity reached (If size is small)
-    SealedHot --> Cold : Merge multiple segments
-    Warm --> Cold : Total Warm capacity reached (Quantize sign/MSE)
+    [*] --> Hot : "Insert (In-memory, FP32)"
+    Hot --> SealedHot : "Hot capacity reached (HNSW Index build)"
+    Hot --> Warm : "Hot capacity reached (If size is small)"
+    SealedHot --> Cold : "Merge multiple segments"
+    Warm --> Cold : "Total Warm capacity reached (Quantize sign/MSE)"
 ```
 
-| Tier | Mutability | Backing Storage | Search Execution |
-|---|---|---|---|
-| **Hot** | Read-Write | In-memory `Vec<PointOffset>` + `VectorStore` | Parallel Exact scan (SIMD batched) |
-| **SealedHot** | Read-Only | persisted `usearch` HNSW index file | HNSW graph walk. Low-selectivity filters fall back to exact scan. |
-| **Warm** | Read-Only | Quantized mmap data (scalar/TurboQuant prod) | Quantized LUT SIMD scan + full-f32 rerank. |
-| **Cold** | Read-Only | Quantized mmap data (sign/TurboQuant MSE) | Binary/quantized LUT SIMD scan + full-f32 rerank. |
+| Tier | Mutability | Quantization / Compression | Search Index Technology | Storage Type | Transition / Seal Trigger |
+|---|---|---|---|---|---|
+| **Hot** | Read-Write | FP32 (No compression) | In-memory `Vec<PointOffset>` + brute-force exact scan | Volatile RAM + mmap `vectors.bin` | Reaches capacity (e.g. `hot_capacity` = 10,000) |
+| **SealedHot** | Read-Only | FP32 (No compression) | `usearch` HNSW index graph walk (falls back to exact scan on filter selectivity < 1%) | Persisted disk file (`segments/sealed_hot/`) | Promoted to Warm/Cold or merged during background consolidations |
+| **Warm** | Read-Only | 8-bit Scalar or TurboQuant Product Quantizer (4x smaller) | SIMD-accelerated quantized Lookup Table (LUT) dot-product scan + top-k full FP32 reranking | Mmap array index file (`segments/warm/`) | Accumulated Warm records exceed `warm_capacity` |
+| **Cold** | Read-Only | 1-bit Sign or TurboQuant MSE Quantizer (32x smaller) | XOR + Popcount byte-level LUT index scan + top-k full FP32 reranking | Mmap array index file (`segments/cold/`) | Long-term archival; evicted if importance decays below floor |
 
 ### 5.1 Hot Segment
 * New insertions land here.

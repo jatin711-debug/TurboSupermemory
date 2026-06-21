@@ -10,15 +10,15 @@ The `turbomemory_core` crate is a pure-math crate. It has **no I/O, no concurren
 
 ```mermaid
 graph TD
-    A[turbomemory_core API] --> B[metrics.rs - SIMD Similarity]
-    A --> C[quantization.rs - Centroids & Interfaces]
-    A --> D[turbo_quant.rs - Advanced Quantizers]
-    A --> E[quantized_search.rs - LUT & Encoded Queries]
-    A --> F[metrics_quantized.rs - Low-level SIMD Kernels]
+    A["turbomemory_core API"] --> B["metrics.rs - SIMD Similarity"]
+    A --> C["quantization.rs - Centroids & Interfaces"]
+    A --> D["turbo_quant.rs - Advanced Quantizers"]
+    A --> E["quantized_search.rs - LUT & Encoded Queries"]
+    A --> F["metrics_quantized.rs - Low-level SIMD Kernels"]
     
-    B --> G[x86_64: AVX2/FMA/SSE]
-    B --> H[AArch64: NEON]
-    B --> I[Scalar Fallback]
+    B --> G["x86_64: AVX2/FMA/SSE"]
+    B --> H["AArch64: NEON"]
+    B --> I["Scalar Fallback"]
 ```
 
 ---
@@ -156,6 +156,18 @@ Extends the MSE quantizer to preserve the inner product (unbiased dot product es
   2. Computes the quantization residual: \(r = x - \text{decode}(q_{mse})\).
   3. Applies a Quantized Johnson-Lindenstrauss (QJL) random projection to the residual \(r\), storing a secondary 1-bit signature.
 * **Benefits**: The secondary signature provides correction factors that yield an unbiased estimator of dot products, which is crucial for high-accuracy cosine/dot-product retrieval.
+
+```mermaid
+flowchart TD
+    In["Input Vector x (d-dim f32)"] --> Norm["L2 Normalize: x_norm = ||x||, x_unit = x / x_norm"]
+    Norm --> Rot["Random Rotation (Precondition: Sign Flip + FWHT)"]
+    Rot --> LM["Lloyd-Max Quantization (MSE codes: b-bits per coordinate)"]
+    LM --> Residual["Compute Residual: r = x_unit - x_reconstructed"]
+    Residual --> QJL["Quantized Johnson-Lindenstrauss (1-bit signature)"]
+    LM --> Pack["Pack MSE Codes & Magnitude into bytes"]
+    QJL --> Pack
+    Pack --> Out["Durable Quantized Vector Structure"]
+```
 
 ---
 
