@@ -225,6 +225,9 @@ impl PyMemoryEngine {
         abstraction_co_occurrence_threshold=None,
         edge_decay_half_life_secs=None,
         max_concepts=None,
+        concept_max_ngram_len=None,
+        concept_min_ngram_freq=None,
+        concept_enable_pmi=None,
         refinement_cosine_threshold=None,
         refinement_max_pairs_per_cycle=None,
         cognitive_alpha=None,
@@ -267,6 +270,9 @@ impl PyMemoryEngine {
         abstraction_co_occurrence_threshold: Option<usize>,
         edge_decay_half_life_secs: Option<u64>,
         max_concepts: Option<usize>,
+        concept_max_ngram_len: Option<usize>,
+        concept_min_ngram_freq: Option<usize>,
+        concept_enable_pmi: Option<bool>,
         refinement_cosine_threshold: Option<f32>,
         refinement_max_pairs_per_cycle: Option<usize>,
         cognitive_alpha: Option<f32>,
@@ -384,6 +390,15 @@ impl PyMemoryEngine {
         //   consolidation. Default 1024.
         if let Some(mc) = max_concepts {
             config.tier.max_concepts = mc;
+        }
+        if let Some(n) = concept_max_ngram_len {
+            config.tier.concept_max_ngram_len = n.max(1);
+        }
+        if let Some(n) = concept_min_ngram_freq {
+            config.tier.concept_min_ngram_freq = n.max(1);
+        }
+        if let Some(on) = concept_enable_pmi {
+            config.tier.concept_enable_pmi = on;
         }
         config.tier.refinement_cosine_threshold = refinement_cosine_threshold;
         if let Some(rm) = refinement_max_pairs_per_cycle {

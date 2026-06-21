@@ -11,10 +11,12 @@
 //!    tokens.
 //! 3. Scores surviving tokens by term-frequency within the text (with a
 //!    small length bonus so longer, more specific tokens rank higher).
-//! 4. Returns the top-N tokens as concept strings.
-//!
-//! Multi-word concepts (e.g. "memory safety") are not extracted by this MVP;
-//! a future n-gram or embedding-similarity pass can layer on top.
+//! 4. Extracts n-grams (bigrams and trigrams by default when enabled) so
+//!    multi-word concepts like "memory safety" and "borrow checker" are
+//!    captured as single concepts instead of being split into unrelated
+//!    unigrams.
+//! 5. Optionally canonicalizes surface forms through a [`ConceptVocabulary`]
+//!    so synonyms ("programming" / "coding") map to a single concept node.
 
 use std::collections::HashMap;
 
@@ -210,55 +212,355 @@ const STOPWORDS: &[&str] = &[
     "may",
 ];
 
-/// Extract up to `max` concept strings from `text`.
+/// Configuration for the concept extractor.
 ///
-/// Concepts are lowercase single-word tokens ranked by term-frequency within
-/// the text, with a small length bonus. Stopwords, tokens shorter than 3
-/// characters, and pure-digit tokens are excluded. The returned concepts are
-/// deduplicated and ordered by descending score.
+/// The default configuration is intentionally conservative (unigrams only) so
+/// existing behavior and benchmarks are preserved. Enable `max_ngram_len > 1`
+/// to capture multi-word concepts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExtractorConfig {
+    /// Maximum number of concepts to return. `0` disables extraction.
+    pub max_concepts: usize,
+    /// Maximum n-gram length. `1` = unigrams only, `2` = unigrams + bigrams,
+    /// `3` = up to trigrams. Values above 3 are clamped to 3.
+    pub max_ngram_len: usize,
+    /// Minimum number of times an n-gram must appear to be considered. For
+    /// short memory texts this is typically 1.
+    pub min_ngram_freq: usize,
+    /// Whether to boost n-gram scores by pointwise mutual information. This
+    /// rewards collocations ("memory safety") over accidental adjacencies
+    /// ("the rust").
+    pub enable_pmi_scoring: bool,
+    /// Weight given to PMI in the n-gram score. Higher values make PMI more
+    /// influential relative to raw frequency.
+    pub pmi_weight: f32,
+}
+
+impl Default for ExtractorConfig {
+    fn default() -> Self {
+        Self {
+            max_concepts: 5,
+            max_ngram_len: 1,
+            min_ngram_freq: 1,
+            enable_pmi_scoring: true,
+            pmi_weight: 1.0,
+        }
+    }
+}
+
+impl ExtractorConfig {
+    /// A config tuned for richer concept extraction: unigrams + bigrams +
+    /// trigrams with PMI scoring.
+    pub fn ngram() -> Self {
+        Self {
+            max_ngram_len: 3,
+            ..Self::default()
+        }
+    }
+
+    fn effective_max_ngram_len(&self) -> usize {
+        self.max_ngram_len.clamp(1, 3)
+    }
+}
+
+/// A shared concept vocabulary that canonicalizes surface forms.
+///
+/// This is the foundation for online concept vocabulary evolution (C3). It
+/// currently supports explicit alias mappings (e.g. "coding" → "programming");
+/// embedding-based matching can be layered on top by higher-level code that
+/// has access to concept embeddings.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ConceptVocabulary {
+    aliases: HashMap<String, String>,
+}
+
+impl ConceptVocabulary {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Map a surface form `alias` to a canonical concept. Both are normalized
+    /// to lowercase.
+    pub fn add_alias(&mut self, alias: &str, canonical: &str) {
+        let canonical_norm = canonical.to_lowercase();
+        let alias_norm = alias.to_lowercase();
+        // If the canonical form itself is an alias of something else, resolve
+        // it so the chain collapses to the root.
+        let root = self
+            .aliases
+            .get(&canonical_norm)
+            .cloned()
+            .unwrap_or(canonical_norm);
+        self.aliases.insert(alias_norm, root);
+    }
+
+    /// Resolve a surface concept to its canonical form, if known.
+    /// Resolve a surface concept to its canonical form, if known.
+    ///
+    /// Follows alias chains (e.g. "coding" -> "programming" -> "software
+    /// engineering") and detects cycles.
+    pub fn resolve(&self, concept: &str) -> String {
+        let key = concept.to_lowercase();
+        let mut current = key;
+        let mut seen = std::collections::HashSet::new();
+        while let Some(next) = self.aliases.get(&current) {
+            if !seen.insert(next.clone()) {
+                break; // cycle detected
+            }
+            current = next.clone();
+        }
+        current
+    }
+
+    /// Returns true if `concept` has a known canonical alias.
+    pub fn is_alias(&self, concept: &str) -> bool {
+        self.aliases.contains_key(&concept.to_lowercase())
+    }
+
+    /// Iterate over known aliases.
+    pub fn aliases(&self) -> &HashMap<String, String> {
+        &self.aliases
+    }
+}
+
+/// Tokenize text into clean, filtered tokens.
+///
+/// Returns lowercase tokens with stopwords, short tokens (<3 chars), and
+/// pure-digit tokens removed.
+fn tokenize_filtered(text: &str) -> Vec<String> {
+    let stopwords: std::collections::HashSet<&str> = STOPWORDS.iter().copied().collect();
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter_map(|token| {
+            let t = token.trim();
+            if t.len() < 3 {
+                return None;
+            }
+            if t.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            if stopwords.contains(t) {
+                return None;
+            }
+            Some(t.to_string())
+        })
+        .collect()
+}
+
+/// Compute the word-set of a concept string.
+fn word_set(concept: &str) -> std::collections::HashSet<&str> {
+    concept.split_whitespace().collect()
+}
+
+/// Returns true if `candidate` is a strict subset of any already-selected
+/// concept. This prevents returning both "memory safety" and "memory".
+fn is_subsumed(candidate: &str, selected: &[String]) -> bool {
+    let cand_words = word_set(candidate);
+    if cand_words.len() <= 1 {
+        // A unigram is subsumed if it appears as a word in a selected n-gram.
+        let unigram = candidate;
+        for s in selected {
+            let s_words: Vec<&str> = s.split_whitespace().collect();
+            if s_words.len() > 1 && s_words.contains(&unigram) {
+                return true;
+            }
+        }
+        false
+    } else {
+        // An n-gram is subsumed only if all its words appear in a single
+        // selected concept (e.g. "memory safety guarantees" inside
+        // "memory safety guarantee"). We keep this conservative.
+        for s in selected {
+            let s_words = word_set(s);
+            if s_words.len() > cand_words.len() && cand_words.is_subset(&s_words) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Extract up to `config.max_concepts` concept strings from `text`.
+///
+/// Concepts are ranked by a composite score that combines term frequency,
+/// length specificity, and (for n-grams) pointwise mutual information. The
+/// returned concepts are deduplicated, subsumed unigrams are suppressed, and
+/// the list is ordered by descending score.
 ///
 /// Returns an empty `Vec` if `text` is empty or `max` is 0.
-pub fn extract_concepts(text: &str, max: usize) -> Vec<String> {
-    if max == 0 || text.trim().is_empty() {
+pub fn extract_concepts_with_config(text: &str, config: &ExtractorConfig) -> Vec<String> {
+    if config.max_concepts == 0 || text.trim().is_empty() {
         return Vec::new();
     }
 
-    // Build a stopword lookup. This is small (~170 entries) so a linear
-    // scan would be fine, but a HashSet is cleaner and handles the "is
-    // this a stopword?" check in O(1).
-    let stopwords: std::collections::HashSet<&str> = STOPWORDS.iter().copied().collect();
-
-    // Tokenize: lowercase, split on non-alphanumeric, filter by length and
-    // stopword status.
-    let mut tf: HashMap<String, f32> = HashMap::new();
-    for token in text.to_lowercase().split(|c: char| !c.is_alphanumeric()) {
-        let t = token.trim();
-        if t.len() < 3 {
-            continue;
-        }
-        // Skip pure-digit tokens (dates, numbers) — they are rarely useful
-        // concept labels.
-        if t.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        if stopwords.contains(t) {
-            continue;
-        }
-        // Score: term frequency + a small length bonus so that longer, more
-        // specific tokens ("concurrency") rank above shorter generic ones
-        // ("cpu") even at equal TF.
-        let len_bonus = (t.len() as f32 - 3.0).max(0.0) * 0.1;
-        *tf.entry(t.to_string()).or_insert(0.0) += 1.0 + len_bonus;
+    let tokens = tokenize_filtered(text);
+    if tokens.is_empty() {
+        return Vec::new();
     }
 
-    let mut scored: Vec<(String, f32)> = tf.into_iter().collect();
+    let max_n = config.effective_max_ngram_len();
+    let min_freq = config.min_ngram_freq.max(1);
+
+    // Count unigrams and n-grams.
+    let mut unigram_counts: HashMap<String, usize> = HashMap::new();
+    let mut ngram_counts: Vec<HashMap<String, usize>> = (0..max_n.saturating_sub(1))
+        .map(|_| HashMap::new())
+        .collect();
+
+    for (i, t) in tokens.iter().enumerate() {
+        *unigram_counts.entry(t.clone()).or_insert(0) += 1;
+        for n in 2..=max_n {
+            if i + n > tokens.len() {
+                break;
+            }
+            let ngram = tokens[i..i + n].join(" ");
+            *ngram_counts[n - 2].entry(ngram).or_insert(0) += 1;
+        }
+    }
+
+    let total_tokens = tokens.len() as f32;
+
+    // Build scored candidates.
+    let mut candidates: Vec<(String, f32)> = Vec::new();
+
+    // Unigrams.
+    for (term, count) in &unigram_counts {
+        if *count < min_freq {
+            continue;
+        }
+        let len_bonus = (term.len() as f32 - 3.0).max(0.0) * 0.1;
+        let score = *count as f32 + len_bonus;
+        candidates.push((term.clone(), score));
+    }
+
+    // N-grams.
+    for (n_minus_2, counts) in ngram_counts.iter().enumerate() {
+        let n = n_minus_2 + 2;
+        for (ngram, count) in counts {
+            if *count < min_freq {
+                continue;
+            }
+            let words: Vec<&str> = ngram.split_whitespace().collect();
+            if words.len() != n {
+                continue;
+            }
+
+            let mut base_score = *count as f32 * n as f32;
+            // Small length bonus for specificity.
+            base_score += (ngram.len() as f32 - 3.0).max(0.0) * 0.03;
+
+            let pmi_bonus = if config.enable_pmi_scoring {
+                let joint_prob = *count as f32 / (tokens.len().saturating_sub(n - 1)) as f32;
+                let mut independent_prob = 1.0f32;
+                for w in &words {
+                    let unigram_count = *unigram_counts.get(*w).unwrap_or(&0) as f32;
+                    if unigram_count > 0.0 {
+                        independent_prob *= unigram_count / total_tokens;
+                    } else {
+                        independent_prob = 0.0;
+                        break;
+                    }
+                }
+                if independent_prob > 0.0 && joint_prob > 0.0 {
+                    let pmi = (joint_prob / independent_prob).ln();
+                    (pmi * config.pmi_weight).max(0.0)
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+
+            candidates.push((ngram.clone(), base_score + pmi_bonus));
+        }
+    }
+
     // Sort by descending score, then alphabetically for determinism.
-    scored.sort_by(|a, b| {
+    candidates.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.0.cmp(&b.0))
     });
-    scored.into_iter().take(max).map(|(s, _)| s).collect()
+
+    // Greedy selection with subsumption suppression.
+    let mut selected: Vec<String> = Vec::with_capacity(config.max_concepts);
+    for (concept, _) in candidates {
+        if selected.len() >= config.max_concepts {
+            break;
+        }
+        if is_subsumed(&concept, &selected) {
+            continue;
+        }
+        selected.push(concept);
+    }
+
+    selected
+}
+
+/// Extract up to `max` concept strings from `text` using the default
+/// unigram-only configuration.
+///
+/// This is the backward-compatible API used by the rest of the engine.
+pub fn extract_concepts(text: &str, max: usize) -> Vec<String> {
+    let config = ExtractorConfig {
+        max_concepts: max,
+        ..ExtractorConfig::default()
+    };
+    extract_concepts_with_config(text, &config)
+}
+
+/// Merge caller-supplied concepts with extracted concepts using a configurable
+/// extractor and optional vocabulary canonicalization.
+///
+/// Caller concepts are normalized to lowercase and kept first. Extracted
+/// concepts fill the remaining slots up to `max`. Each extracted concept is
+/// canonicalized through `vocab` if provided.
+pub fn merge_concepts_with_config(
+    caller_concepts: &[String],
+    text: &str,
+    config: &ExtractorConfig,
+    vocab: Option<&ConceptVocabulary>,
+) -> Vec<String> {
+    let max = config.max_concepts;
+    let mut result: Vec<String> = Vec::with_capacity(max);
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let resolve = |c: &str| -> String {
+        match vocab {
+            Some(v) => v.resolve(c),
+            None => c.to_lowercase(),
+        }
+    };
+
+    // Caller concepts first, normalized and canonicalized.
+    for c in caller_concepts {
+        let norm = resolve(c);
+        if !norm.is_empty() && seen.insert(norm.clone()) {
+            result.push(norm);
+        }
+        if result.len() >= max {
+            return result;
+        }
+    }
+
+    // Fill the remaining slots with extracted concepts.
+    let mut extract_config = *config;
+    extract_config.max_concepts = max.saturating_sub(result.len());
+    if extract_config.max_concepts > 0 {
+        // Over-fetch so canonicalization/dedup still leaves enough candidates.
+        extract_config.max_concepts *= 2;
+        for c in extract_concepts_with_config(text, &extract_config) {
+            let canon = resolve(&c);
+            if seen.insert(canon.clone()) {
+                result.push(canon);
+            }
+            if result.len() >= max {
+                break;
+            }
+        }
+    }
+
+    result
 }
 
 /// Merge caller-supplied concepts with extracted concepts.
@@ -270,34 +572,11 @@ pub fn extract_concepts(text: &str, max: usize) -> Vec<String> {
 ///
 /// All concepts are normalized to lowercase and deduplicated.
 pub fn merge_concepts(caller_concepts: &[String], text: &str, max: usize) -> Vec<String> {
-    let mut result: Vec<String> = Vec::with_capacity(max);
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    // Caller concepts first, normalized to lowercase.
-    for c in caller_concepts {
-        let norm = c.to_lowercase();
-        if !norm.is_empty() && seen.insert(norm.clone()) {
-            result.push(norm);
-        }
-        if result.len() >= max {
-            return result;
-        }
-    }
-
-    // Fill the remaining slots with extracted concepts.
-    let remaining = max.saturating_sub(result.len());
-    if remaining > 0 {
-        for c in extract_concepts(text, remaining * 2) {
-            if seen.insert(c.clone()) {
-                result.push(c);
-            }
-            if result.len() >= max {
-                break;
-            }
-        }
-    }
-
-    result
+    let config = ExtractorConfig {
+        max_concepts: max,
+        ..ExtractorConfig::default()
+    };
+    merge_concepts_with_config(caller_concepts, text, &config, None)
 }
 
 /// Compute Jaccard similarity between the token sets of two texts.
@@ -439,5 +718,188 @@ mod tests {
         let merged = merge_concepts(&caller, "rust is safe", 5);
         let rust_count = merged.iter().filter(|c| *c == "rust").count();
         assert_eq!(rust_count, 1, "rust should appear exactly once");
+    }
+
+    // ------------------------------------------------------------------
+    // N-gram extraction tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn ngram_extracts_multi_word_concepts() {
+        let text = "Rust is known for memory safety and concurrency safety";
+        let config = ExtractorConfig {
+            max_concepts: 5,
+            max_ngram_len: 2,
+            min_ngram_freq: 1,
+            enable_pmi_scoring: true,
+            pmi_weight: 1.0,
+        };
+        let concepts = extract_concepts_with_config(text, &config);
+        assert!(
+            concepts.contains(&"memory safety".to_string()),
+            "expected bigram 'memory safety', got {:?}",
+            concepts
+        );
+    }
+
+    #[test]
+    fn ngram_suppresses_subsumed_unigrams() {
+        let text = "memory safety guarantees prevent bugs";
+        let config = ExtractorConfig {
+            max_concepts: 3,
+            max_ngram_len: 2,
+            min_ngram_freq: 1,
+            enable_pmi_scoring: false,
+            pmi_weight: 0.0,
+        };
+        let concepts = extract_concepts_with_config(text, &config);
+        // "memory safety" should beat the separate "memory" and "safety".
+        assert!(concepts.contains(&"memory safety".to_string()));
+        assert!(
+            !concepts.contains(&"memory".to_string()),
+            "'memory' should be subsumed by 'memory safety'"
+        );
+        assert!(
+            !concepts.contains(&"safety".to_string()),
+            "'safety' should be subsumed by 'memory safety'"
+        );
+    }
+
+    #[test]
+    fn ngram_prefers_high_pmi_collocations() {
+        // "deep learning" is a real collocation; "learning models" is weaker.
+        let text = "deep learning models use deep learning layers";
+        let config = ExtractorConfig {
+            max_concepts: 2,
+            max_ngram_len: 2,
+            min_ngram_freq: 1,
+            enable_pmi_scoring: true,
+            pmi_weight: 2.0,
+        };
+        let concepts = extract_concepts_with_config(text, &config);
+        assert_eq!(concepts[0], "deep learning");
+    }
+
+    #[test]
+    fn trigram_extraction_works() {
+        let text = "the rust borrow checker enforces memory safety rules";
+        let config = ExtractorConfig {
+            max_concepts: 3,
+            max_ngram_len: 3,
+            min_ngram_freq: 1,
+            enable_pmi_scoring: false,
+            pmi_weight: 0.0,
+        };
+        let concepts = extract_concepts_with_config(text, &config);
+        // With max_ngram_len=3 the top concepts are trigrams because they
+        // receive a length multiplier. Verify at least one expected trigram
+        // is present.
+        let expected = [
+            "rust borrow checker",
+            "borrow checker enforces",
+            "checker enforces memory",
+            "enforces memory safety",
+        ];
+        assert!(
+            expected.iter().any(|e| concepts.contains(&e.to_string())),
+            "expected a borrow-checker or memory-safety trigram, got {:?}",
+            concepts
+        );
+    }
+
+    #[test]
+    fn ngram_disabled_by_default() {
+        let text = "memory safety is important";
+        let concepts = extract_concepts(text, 5);
+        assert!(!concepts.contains(&"memory safety".to_string()));
+        assert!(concepts.contains(&"memory".to_string()));
+        assert!(concepts.contains(&"safety".to_string()));
+    }
+
+    #[test]
+    fn min_ngram_freq_filters_rare_ngrams() {
+        let text = "memory safety once and memory safety twice";
+        let config = ExtractorConfig {
+            max_concepts: 5,
+            max_ngram_len: 2,
+            min_ngram_freq: 2,
+            enable_pmi_scoring: false,
+            pmi_weight: 0.0,
+        };
+        let concepts = extract_concepts_with_config(text, &config);
+        assert!(concepts.contains(&"memory safety".to_string()));
+        // "safety once" appears once and should be filtered.
+        assert!(!concepts.contains(&"safety once".to_string()));
+    }
+
+    // ------------------------------------------------------------------
+    // Concept vocabulary tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn vocabulary_canonicalizes_aliases() {
+        let mut vocab = ConceptVocabulary::new();
+        vocab.add_alias("coding", "programming");
+        vocab.add_alias("coding", "programming"); // idempotent
+        assert_eq!(vocab.resolve("coding"), "programming");
+        assert_eq!(vocab.resolve("programming"), "programming");
+    }
+
+    #[test]
+    fn vocabulary_resolves_chains() {
+        let mut vocab = ConceptVocabulary::new();
+        vocab.add_alias("coding", "programming");
+        vocab.add_alias("programming", "software engineering");
+        assert_eq!(vocab.resolve("coding"), "software engineering");
+    }
+
+    #[test]
+    fn merge_uses_vocabulary() {
+        let mut vocab = ConceptVocabulary::new();
+        vocab.add_alias("coding", "programming");
+        let caller = vec!["coding".to_string()];
+        let config = ExtractorConfig::default();
+        let merged =
+            merge_concepts_with_config(&caller, "Rust programming language", &config, Some(&vocab));
+        assert_eq!(merged[0], "programming");
+    }
+
+    #[test]
+    fn extracted_concepts_are_canonicalized() {
+        let mut vocab = ConceptVocabulary::new();
+        vocab.add_alias("safety", "security");
+        let config = ExtractorConfig {
+            max_concepts: 5,
+            ..ExtractorConfig::default()
+        };
+        let merged =
+            merge_concepts_with_config(&[], "memory safety guarantees", &config, Some(&vocab));
+        assert!(merged.contains(&"security".to_string()));
+        assert!(!merged.contains(&"safety".to_string()));
+    }
+
+    #[test]
+    fn jaccard_distinguishes_same_and_different_content() {
+        let sim_same = text_jaccard_similarity(
+            "Rust memory safety guarantees",
+            "Rust memory safety guarantees",
+        );
+        assert!(
+            sim_same > 0.99,
+            "identical texts should have ~1.0 Jaccard: {sim_same}"
+        );
+
+        let sim_diff = text_jaccard_similarity(
+            "Rust memory safety guarantees",
+            "Rust ownership borrow checker",
+        );
+        assert!(
+            sim_diff < 0.3,
+            "different texts should have low Jaccard: {sim_diff}"
+        );
+        assert!(
+            sim_diff < sim_same,
+            "different texts should have lower Jaccard than identical: {sim_diff} < {sim_same}"
+        );
     }
 }

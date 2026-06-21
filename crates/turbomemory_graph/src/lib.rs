@@ -17,5 +17,8 @@ pub use ccs::{
     step_session, step_session_with_compressor, CognitiveCompressor, CompressedCognitiveState,
     DeterministicCompressor, LlmCompressor,
 };
-pub use extract::{extract_concepts, merge_concepts, text_jaccard_similarity};
+pub use extract::{
+    extract_concepts, extract_concepts_with_config, merge_concepts, merge_concepts_with_config,
+    text_jaccard_similarity, ConceptVocabulary, ExtractorConfig,
+};
 pub use graph::{ConceptKind, Edge, EdgeKind, GraphStats, MemoryGraph, Node, NodeId};

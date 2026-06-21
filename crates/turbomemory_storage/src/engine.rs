@@ -30,8 +30,9 @@ use std::path::Path;
 use std::sync::Arc;
 use turbomemory_core::{cosine_similarity, normalize, validate_dimension};
 use turbomemory_graph::{
-    merge_concepts, step_session_with_compressor, CognitiveCompressor, CompressedCognitiveState,
-    DeterministicCompressor, MemoryGraph, SpreadingActivation, SpreadingConfig,
+    merge_concepts_with_config, step_session_with_compressor, CognitiveCompressor,
+    CompressedCognitiveState, DeterministicCompressor, MemoryGraph, SpreadingActivation,
+    SpreadingConfig,
 };
 
 /// For small collections an exact scan is deterministic and higher-recall than
@@ -355,7 +356,8 @@ impl StorageEngine {
         // Augment caller-supplied concepts with auto-extracted ones from the
         // text. If the caller already provided >= max_concepts, their tags
         // are used as-is. If max_concepts is 0, auto-extraction is disabled.
-        let concepts = merge_concepts(concepts, text, self.config.tier.max_concepts);
+        let extractor_config = self.config.tier.extractor_config();
+        let concepts = merge_concepts_with_config(concepts, text, &extractor_config, None);
         let offset = self.meta.allocate_offset();
         let seq = self.meta.allocate_seq();
         let record = Record {
@@ -443,7 +445,6 @@ impl StorageEngine {
         drop(idx);
 
         let mut records: Vec<(PointOffset, Record)> = Vec::with_capacity(indices.len());
-        let max_concepts = self.config.tier.max_concepts;
         for &i in &indices {
             let mut emb = embeddings[i].to_vec();
             normalize(&mut emb)?;
@@ -455,7 +456,9 @@ impl StorageEngine {
                 payloads[i].clone()
             };
             // Augment caller-supplied concepts with auto-extracted ones.
-            let concepts = merge_concepts(&concepts[i], &texts[i], max_concepts);
+            let extractor_config = self.config.tier.extractor_config();
+            let concepts =
+                merge_concepts_with_config(&concepts[i], &texts[i], &extractor_config, None);
             let record = Record {
                 id: ids[i].clone(),
                 text: texts[i].clone(),
@@ -1880,6 +1883,9 @@ mod tests {
                 importance_access_weight: 0.6,
                 importance_floor: 0.1,
                 importance_ceiling: 4.0,
+                concept_max_ngram_len: 1,
+                concept_min_ngram_freq: 1,
+                concept_enable_pmi: true,
             },
             optimizer_budget: crate::config::OptimizerBudget::default(),
             auto_consolidation_interval: None,
@@ -1934,6 +1940,9 @@ mod tests {
                 importance_access_weight: 0.6,
                 importance_floor: 0.1,
                 importance_ceiling: 4.0,
+                concept_max_ngram_len: 1,
+                concept_min_ngram_freq: 1,
+                concept_enable_pmi: true,
             },
             optimizer_budget: crate::config::OptimizerBudget::default(),
             auto_consolidation_interval: None,

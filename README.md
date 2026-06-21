@@ -3,7 +3,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-144%20passing-brightgreen.svg)](#validation)
+[![Tests](https://img.shields.io/badge/tests-155%20passing-brightgreen.svg)](#validation)
 
 **A memory engine for AI agents — written in Rust, embeddable from Python.**
 
@@ -25,7 +25,7 @@ TSM's graph adds the signals a vector index throws away:
 
 | Feature | What it does | Why it matters |
 |---|---|---|
-| **Concept extraction** | Auto-derives concept tags from record text (stopword filtering + TF ranking). | The graph works turnkey — callers don't have to hand-tag concepts. |
+| **Concept extraction** | Auto-derives concept tags from record text, including multi-word n-grams ("memory safety", "borrow checker") with PMI collocation scoring. | The graph works turnkey — callers don't have to hand-tag concepts. |
 | **Learnable edges** | Edge weights derive from importance, strengthen on retrieval (rehearsal), and decay over time. | Retrieval itself is the learning signal. Frequently recalled memories get easier to recall. |
 | **Abstraction hierarchy** | Co-occurring concepts (`rust` + `safety`) spawn a parent node. | A query hitting one concept can reach memories of a sibling concept. |
 | **Refinement** *(belief update)* | A newer memory on the same topic (high text overlap) links to the older one via a `Refines` edge. | The current version of a fact surfaces; the old one is preserved, not deleted. |
@@ -94,6 +94,8 @@ engine = turbomemory.MemoryEngine(
     refinement_cosine_threshold=0.85,    # link newer memories that refine older ones
     contradiction_cosine_threshold=0.75, # detect + weaken contradicted beliefs
     cognitive_alpha=0.5,                 # blend cosine with graph activation
+    max_concepts=5,                      # concepts per memory
+    concept_max_ngram_len=2,             # extract bigrams like "memory safety"
 )
 
 engine.insert(
@@ -167,7 +169,7 @@ The full verification matrix passes on the current `main`:
 | `python verify.py` (E2E) | all pass |
 | `python cognitive_benchmark.py` | **4/4 cognitive scenarios won** |
 
-Test breakdown: core 29 · graph 49 · storage 63 · crash-recovery 3.
+Test breakdown: core 29 · graph 60 · storage 63 · crash-recovery 3.
 
 ---
 
@@ -205,7 +207,7 @@ TSM tracks a detailed engineering roadmap in [`TODO.md`](./TODO.md). The near-te
 - ✅ **Core engine** — durable storage, HNSW + exact fallback, tiered Hot/Warm/Cold segments, quantization, cognitive graph, CCS.
 - ✅ **Cognitive layer** — concept extraction, learnable edges, reinforcement/decay, abstraction hierarchy, refinement, contradiction detection, automatic importance scoring, graph introspection API.
 - ✅ **Production patterns** — lock-free segment snapshots, parallel multi-segment search, multi-threaded HNSW build, zero-copy numpy ingest, bounded eviction + semantic dedup.
-- 🔜 **Cognitive deepening** — real-embedding benchmark, online concept-vocabulary evolution, per-agent memory scoping, streaming/n-gram concept extraction.
+- ✅ **Cognitive deepening** — real-embedding benchmark, online concept-vocabulary evolution, per-agent memory scoping, streaming/n-gram concept extraction.
 - 🔜 **Scaling to 1M × 4k** — sharding, paged metadata store, rotating WAL, vacuum optimizer.
 - 🔜 **Operations** — tracing, metrics, auth/CORS, Docker, cross-platform builds.
 

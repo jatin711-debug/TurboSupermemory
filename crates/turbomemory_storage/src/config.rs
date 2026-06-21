@@ -3,7 +3,7 @@
 use std::time::Duration;
 use turbomemory_core::quantization::{ScalarQuantizer, SignQuantizer, VectorQuantizer};
 use turbomemory_core::turbo_quant::{TurboQuantMseQuantizer, TurboQuantProdQuantizer};
-use turbomemory_graph::SpreadingConfig;
+use turbomemory_graph::{ExtractorConfig, SpreadingConfig};
 
 /// Which quantizer a tier uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -176,6 +176,18 @@ pub struct TierConfig {
     /// Set to `0` to disable auto-extraction entirely (caller must always
     /// supply concepts). Default is `5`.
     pub max_concepts: usize,
+    /// Maximum n-gram length used by the concept extractor. `1` extracts only
+    /// single-word concepts (backward-compatible default). `2` adds bigrams,
+    /// `3` adds trigrams. Higher values capture multi-word concepts like
+    /// "memory safety" but consume concept slots.
+    pub concept_max_ngram_len: usize,
+    /// Minimum number of times an n-gram must appear before it can be
+    /// extracted. For short memory texts the default is 1.
+    pub concept_min_ngram_freq: usize,
+    /// Whether to boost n-gram scores using pointwise mutual information.
+    /// PMI rewards genuine collocations ("memory safety") over accidental
+    /// adjacencies.
+    pub concept_enable_pmi: bool,
     /// Cosine-similarity threshold for memory refinement (belief revision).
     /// When `Some(t)` (e.g. 0.85), consolidation creates `Refines` edges
     /// from older memories to newer memories that are semantically close
@@ -272,6 +284,12 @@ impl TierConfig {
         // Auto-extract up to 5 concepts from record text when the caller
         // provides fewer than that. Set to 0 to require explicit concepts.
         max_concepts: 5,
+        // N-gram extraction is disabled by default (unigrams only) to preserve
+        // existing behavior and benchmarks. Set to 2 or 3 to capture
+        // multi-word concepts like "memory safety".
+        concept_max_ngram_len: 1,
+        concept_min_ngram_freq: 1,
+        concept_enable_pmi: true,
         // Memory refinement (belief revision): opt-in. When enabled, the
         // engine creates Refines edges from older memories to newer ones
         // that are about the same topic, so retrieval surfaces the most
@@ -349,6 +367,17 @@ impl TierConfig {
         // Always at least one hot segment worth of records, and never less
         // than 2 to avoid degenerate single-vector merges.
         self.merge_max_records.max(self.hot_capacity).max(2)
+    }
+
+    /// Build the graph-layer extractor configuration from tier settings.
+    pub fn extractor_config(&self) -> ExtractorConfig {
+        ExtractorConfig {
+            max_concepts: self.max_concepts,
+            max_ngram_len: self.concept_max_ngram_len,
+            min_ngram_freq: self.concept_min_ngram_freq,
+            enable_pmi_scoring: self.concept_enable_pmi,
+            pmi_weight: 1.0,
+        }
     }
 }
 

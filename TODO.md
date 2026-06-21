@@ -522,7 +522,7 @@ that make TSM a *memory engine* rather than a vector DB with a graph on top.
 | C5 | **Real-embedding cognitive benchmark** | `cognitive_benchmark.py` | Done | Done (2026-06-21). Benchmark now runs at realistic scale by default: 768-dim embeddings with 1000 clustered distractor memories per scenario (the original toy regime is still available via `--dimension 64 --distractors 0`). Scale result: cognitive layer wins **3/4 scenarios** at 768-dim/1000-distractors — refinement, reinforcement, and contradiction surfacing all find memories plain ANN misses entirely (rank 99). Abstraction traversal does NOT scale to 1000 distractors (top-k dominated by cosinely-nearby distractors before the multi-hop path surfaces); honest signal that abstraction needs hub-suppression/frontier tuning at scale. Toy regime still wins 4/4 (backward-compatible). |
 | C6 | **LLM compressor integration test** | `verify.py` or new script | Pending | The `LlmCompressor` trait + closure-based impl is shipped but untested with a real LLM. Write an integration test that calls a real model (or a mock with realistic JSON output) to validate the CCS compression loop end-to-end. |
 | C7 | **Graph introspection API** | `crates/turbomemory_python/src/lib.rs` | Done | Done (2026-06-20). Five read-only Python methods: `graph_stats()`, `get_concepts()` → list[(concept, degree)], `get_memory_concepts(id)`, `get_refinements(id)`, `get_contradictions(id)`. Backed by `MemoryGraph::memory_concepts`/`concept_count`/`stats()` (returns `GraphStats`) and `StorageEngine::read_graph()` (hands out a read guard). Tuple/list-of-tuples return shape matches existing binding style; unknown ids return empty lists. |
-| C8 | **Streaming concept extraction** | `crates/turbomemory_graph/src/extract.rs` | Pending | The current extractor is keyword-based (stopword filtering + TF). Upgrade to n-gram extraction (catch "memory safety" as a single concept, not two separate ones) and optionally embedding-based concept matching (map new concepts to existing similar ones). |
+| C8 | **Streaming concept extraction** | `crates/turbomemory_graph/src/extract.rs` | Done | Done (2026-06-21). `extract.rs` rewritten with `ExtractorConfig` supporting unigram/bigram/trigram extraction + PMI scoring, subsumption suppression, and a `ConceptVocabulary` alias canonicalizer. Default remains unigram-only for backward compatibility; n-grams enabled via `concept_max_ngram_len`/`concept_min_ngram_freq`/`concept_enable_pmi` kwargs. Embedding-based matching to existing graph concepts is left for C3 (online vocabulary evolution) where the engine has access to the graph and vector store. |
 
 ---
 
@@ -597,10 +597,10 @@ that make TSM a *memory engine* rather than a vector DB with a graph on top.
 ## Suggested Execution Order
 
 ### Stage 1 — Deepen the cognitive layer (the differentiator)
-1. **C3** — Online concept vocabulary evolution.
-2. **C4** — Per-agent memory scoping (multi-agent).
-3. **C6** — LLM compressor integration test.
-4. **C8** — Streaming concept extraction (n-gram + embedding-based).
+1. **C8** — Streaming concept extraction ✅ Done.
+2. **C3** — Online concept vocabulary evolution.
+3. **C4** — Per-agent memory scoping (multi-agent).
+4. **C6** — LLM compressor integration test.
 
 > **C1 (Contradiction detection) — Done (2026-06-20).**
 > **C7 (Graph introspection API) — Done (2026-06-20).**
