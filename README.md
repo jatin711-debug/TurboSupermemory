@@ -76,6 +76,17 @@ Because search is dispatched **per segment** and each sealed segment carries a b
 
 **Compressed Cognitive State (CCS).** A bounded, schema-governed working-memory state updated each turn. Ships with a deterministic compressor; an LLM-based compressor can be plugged in via a trait.
 
+### Recall characteristics
+
+HNSW recall after consolidation depends strongly on dimension. `MemoryEngine`'s defaults scale the graph density (`M`) and beam width (`ef`) with dimension so you get good recall out of the box without tuning: at 768-dim the defaults are `M=48`, `ef_construction=400`, `ef=256` (vs `M=16`/`ef=100` at low dim). Measured recall@5 on 64-cluster synthetic embeddings (a realistic stand-in for text embeddings):
+
+| N | Dim | Default `ef` | Recall@5 | `ef=512` |
+|--:|--:|--:|--:|--:|
+| 20,000 | 768 | 256 | ~89% | ~98% |
+| 50,000 | 768 | 256 | ~66% | ~87% |
+
+High-dimensional ANN is fundamentally harder at large N (near-orthogonal vectors, noise-level cosine gaps between the true top-k and the rest). If you need higher recall at scale, raise `ef` per query — it's the single biggest lever. Reproduce with `python benchmark.py` or `python diagnose.py`.
+
 ---
 
 ## Quickstart (Python)
@@ -87,8 +98,10 @@ import turbomemory
 engine = turbomemory.MemoryEngine(
     db_path="./test_db",
     dimension=768,
-    max_edges=16,
-    search_list_size=100,
+    # HNSW params (M, ef_construction, ef) scale automatically with dimension.
+    # At 768-dim the defaults pick a denser graph (M=48) and wider beam
+    # (ef=256) than low-dim — omit max_edges/search_list_size unless you have
+    # a reason to override.
     outlier_count=0,
     auto_consolidation_secs=60,  # 0 disables the background worker
     # Cognitive-layer knobs (all opt-in, off by default):

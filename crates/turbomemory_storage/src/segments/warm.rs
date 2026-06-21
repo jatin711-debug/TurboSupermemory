@@ -224,8 +224,9 @@ impl VectorSegment for WarmSegment {
         // quantization noise reshuffles the tiny cosine gaps between
         // near-orthogonal high-dim vectors, so a true top-k neighbor can land
         // outside the quantized top-k. Rerank can only recover neighbors that
-        // survive this shortlist, so widen it before scoring with full f32.
-        let shortlist = (top_k.saturating_mul(crate::segments::RERANK_OVERSAMPLE))
+        // survive this shortlist, so widen it (scaled by dimension) before
+        // scoring with full f32.
+        let shortlist = (top_k.saturating_mul(crate::segments::rerank_oversample(self.dim)))
             .max(crate::segments::MIN_RERANK_SHORTLIST);
         let candidates = crate::segments::top_k_minheap(candidates.into_iter(), shortlist);
         let view = vectors.read_view();

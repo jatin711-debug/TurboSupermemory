@@ -465,8 +465,42 @@ impl StoreConfig {
 
     /// Sensible defaults scaled for the given vector dimension.
     pub fn default_for_dimension(dimension: usize) -> Self {
+        // HNSW build parameters scale with dimension. At low dimension a sparse
+        // graph (M=16) with light construction (ef=100) recall is fine because
+        // vectors are well-separated. At high dimension (768+) vectors are
+        // near-orthogonal and the true top-k is separated by noise-level cosine
+        // gaps, so the graph must be denser (higher M) and construction must
+        // explore more candidates (higher ef_construction) or recall collapses
+        // to ~20-35% regardless of search ef. Empirically at 768-dim/20k:
+        //   M=16/efc=100 -> 36%,  M=32/efc=200 -> 73%,  M=48/efc=400 -> 90%.
+        // We scale sub-linearly to avoid exploding build time/memory at very
+        // high dim. M: 16 (<=128) -> 32 (384) -> 48 (>=768). ef_construction
+        // tracks M*8-ish, floored at the search list size.
+        let max_edges = match dimension {
+            0..=128 => 16,
+            129..=384 => 32,
+            _ => 48,
+        };
+        let ef_construction = match dimension {
+            0..=128 => 100,
+            129..=384 => 200,
+            _ => 400,
+        };
+        // Search ef floor (search_list_size). High-dim HNSW graphs are denser
+        // and the true top-k is separated by noise-level cosine gaps, so the
+        // search beam must be wider or recall collapses even with a good build.
+        // At 768-dim a floor of 256 lifts 50k recall from ~42% to ~66%+ at the
+        // default ef; callers can still raise it per-query via `ef`.
+        let search_list_size = match dimension {
+            0..=128 => 100,
+            129..=384 => 150,
+            _ => 256,
+        };
         Self {
             dimension,
+            max_edges,
+            ef_construction,
+            search_list_size,
             tier: TierConfig::scaled_for_dimension(dimension),
             ..Self::default()
         }
@@ -542,5 +576,23 @@ mod tests {
         assert_eq!(config.max_edges, 32);
         assert_eq!(config.search_list_size, 200);
         assert_eq!(config.tier, TierConfig::scaled_for_dimension(256));
+    }
+
+    #[test]
+    fn hnsw_params_scale_with_dimension() {
+        // Low dim: sparse graph is fine (vectors well-separated).
+        let low = StoreConfig::default_for_dimension(64);
+        assert_eq!(low.max_edges, 16);
+        assert_eq!(low.ef_construction, 100);
+        // Mid dim.
+        let mid = StoreConfig::default_for_dimension(384);
+        assert_eq!(mid.max_edges, 32);
+        assert_eq!(mid.ef_construction, 200);
+        // High dim (768, the regression case): dense graph + thorough build
+        // + wider search beam.
+        let high = StoreConfig::default_for_dimension(768);
+        assert_eq!(high.max_edges, 48);
+        assert_eq!(high.ef_construction, 400);
+        assert_eq!(high.search_list_size, 256);
     }
 }
