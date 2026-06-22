@@ -160,6 +160,10 @@ install_python_deps() {
     
     source "${SCRIPT_DIR}/.venv/bin/activate"
     
+    # Ensure pip is up to date first
+    python -m pip install --upgrade pip --break-system-packages 2>/dev/null || \
+    python -m pip install --upgrade pip --user 2>/dev/null || true
+    
     # Core dependencies
     pip install \
         torch torchvision torchaudio \
@@ -199,8 +203,9 @@ build_tsm() {
     
     cd "${SCRIPT_DIR}"
     
-    # Set PyO3 Python path
+    # Set PyO3 Python path to use the venv
     export PYO3_PYTHON="${SCRIPT_DIR}/.venv/bin/python"
+    export PYTHON="${SCRIPT_DIR}/.venv/bin/python"
     
     # Build with GPU support
     log_info "Building TSM with GPU support..."

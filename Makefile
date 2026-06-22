@@ -5,8 +5,30 @@
 #   - Python 3.12 with development libraries (adjust PYO3_PYTHON if needed)
 #   - Optional: CUDA toolkit for GPU acceleration (set FEATURES=cuda)
 
-PYO3_PYTHON ?= C:\Users\User\AppData\Local\Programs\Python\Python312\python.exe
-PYTHON      ?= $(PYO3_PYTHON)
+# Auto-detect OS for Python path
+ifeq ($(OS),Windows_NT)
+    PYO3_PYTHON ?= C:\Users\User\AppData\Local\Programs\Python\Python312\python.exe
+    PYTHON ?= $(PYO3_PYTHON)
+    EXE_EXT := .exe
+    DLL_EXT := .dll
+    PYD_EXT := .pyd
+else
+    UNAME_S := $(shell uname -s)
+    ifeq ($(UNAME_S),Linux)
+        PYO3_PYTHON ?= $(shell which python3 2>/dev/null || which python 2>/dev/null || echo /usr/bin/python3)
+        PYTHON ?= $(PYO3_PYTHON)
+        EXE_EXT :=
+        DLL_EXT := .so
+        PYD_EXT := .so
+    else ifeq ($(UNAME_S),Darwin)
+        PYO3_PYTHON ?= $(shell which python3 2>/dev/null || which python 2>/dev/null || echo /usr/bin/python3)
+        PYTHON ?= $(PYO3_PYTHON)
+        EXE_EXT :=
+        DLL_EXT := .dylib
+        PYD_EXT := .so
+    endif
+endif
+
 FEATURES    ?= 
 
 # Build flags: add --features cuda if FEATURES=cuda
@@ -27,27 +49,27 @@ test:
 	export PYO3_PYTHON="$(PYO3_PYTHON)" && cargo test --workspace $(CARGO_FEATURES)
 
 verify: build-python
-	cp target/release/turbomemory.dll turbomemory.pyd
+	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
 	$(PYTHON) benchmarks/verify.py
 
 audit: build-python
-	cp target/release/turbomemory.dll turbomemory.pyd
+	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
 	$(PYTHON) benchmarks/audit_recall.py
 
 benchmark: build-python
-	cp target/release/turbomemory.dll turbomemory.pyd
+	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
 	$(PYTHON) benchmarks/benchmark.py --tsm-only
 
 benchmark-gpu: build-python
-	cp target/release/turbomemory.dll turbomemory.pyd
+	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
 	$(PYTHON) benchmarks/benchmark_gpu.py
 
 cognitive-benchmark: build-python
-	cp target/release/turbomemory.dll turbomemory.pyd
+	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
 	$(PYTHON) benchmarks/cognitive_benchmark.py
 
 batch-test: build-python
-	cp target/release/turbomemory.dll turbomemory.pyd
+	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
 	$(PYTHON) benchmarks/test_batch_search.py
 
 clippy:
@@ -58,29 +80,29 @@ fmt:
 
 clean:
 	cargo clean
-	rm -f turbomemory.pyd
+	rm -f turbomemory$(PYD_EXT)
 
 api-server: build-api
 	export TURBO_DB_PATH=./turbo_db && \
 	export TURBO_DIMENSION=768 && \
 	export TURBO_GRPC_ADDR=0.0.0.0:50051 && \
 	export TURBO_REST_ADDR=0.0.0.0:8080 && \
-	./target/release/turbomemory-server.exe
+	./target/release/turbomemory-server$(EXE_EXT)
 
 # Cognitive evaluation benchmarks (LongMemEval, LoCoMo)
 download-eval-data:
 	$(PYTHON) benchmarks/cognitive_eval/datasets/download.py
 
 longmemeval: build-python
-	cp target/release/turbomemory.dll turbomemory.pyd
+	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
 	$(PYTHON) benchmarks/cognitive_eval/run_longmemeval.py --quick
 
 locomoco: build-python
-	cp target/release/turbomemory.dll turbomemory.pyd
+	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
 	$(PYTHON) benchmarks/cognitive_eval/run_locomo.py --quick
 
 compare: build-python
-	cp target/release/turbomemory.dll turbomemory.pyd
+	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
 	$(PYTHON) benchmarks/cognitive_eval/run_comparison.py --quick --output benchmarks/cognitive_eval/results/
 
 report:
