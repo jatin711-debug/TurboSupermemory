@@ -68,7 +68,7 @@ class TSMAdapter:
         embedding_model: str = "BAAI/bge-large-en-v1.5",
         extractor: str = "mock",
         extractor_model: str = "llama3.2:3b",
-        cognitive_features: bool = True,
+        cognitive_features: bool = False,  # Disabled by default for benchmarks
         dimension: Optional[int] = None,
         **kwargs,
     ):
@@ -79,7 +79,7 @@ class TSMAdapter:
             embedding_model: SentenceTransformer model name for embeddings
             extractor: Fact extractor to use ("ollama", "mock")
             extractor_model: Ollama model name (if using Ollama)
-            cognitive_features: Enable cognitive layer features
+            cognitive_features: Enable cognitive layer features (slow, for production only)
             dimension: Embedding dimension (auto-detected if None)
         """
         self.db_path = db_path
@@ -154,7 +154,7 @@ class TSMAdapter:
         # Counter for unique IDs
         self._insert_counter = 0
     
-    def add(self, messages: List[Dict], user_id: Optional[str] = None, batch: bool = True) -> None:
+    def add(self, messages: List[Dict], user_id: Optional[str] = None, batch: bool = True) -> Dict:
         """Add conversation messages to memory (Mem0-compatible API).
         
         Args:
@@ -164,7 +164,13 @@ class TSMAdapter:
                 - timestamp: ISO timestamp string
             user_id: Optional user/conversation ID for scoping
             batch: Whether to use batch embedding (faster, more memory)
+            
+        Returns:
+            Dict with timing breakdown for profiling
         """
+        import time
+        total_start = time.perf_counter()
+        
         # Normalize messages to dicts
         msg_dicts = []
         for msg in messages:
@@ -178,6 +184,7 @@ class TSMAdapter:
                 msg_dicts.append(msg)
         
         # Extract all facts first
+        extract_start = time.perf_counter()
         context = []
         all_facts = []
         fact_metadata = []
@@ -197,15 +204,22 @@ class TSMAdapter:
                     'timestamp': msg.get("timestamp", ""),
                     'content': content,
                 })
+        extract_time = (time.perf_counter() - extract_start) * 1000
         
         # Batch embed all facts
+        embed_start = time.perf_counter()
         if all_facts:
             if batch and len(all_facts) > 1:
                 embeddings = self.model.encode(all_facts)
             else:
                 embeddings = np.vstack([self.model.encode(f) for f in all_facts])
-            
-            # Insert all facts
+        else:
+            embeddings = np.array([])
+        embed_time = (time.perf_counter() - embed_start) * 1000
+        
+        # Insert all facts into TSM
+        insert_start = time.perf_counter()
+        if len(embeddings) > 0:
             for i, (fact, meta) in enumerate(zip(all_facts, fact_metadata)):
                 self._insert_counter += 1
                 memory_id = f"{user_id}_{self._insert_counter}" if user_id else f"mem_{self._insert_counter}"
@@ -224,6 +238,22 @@ class TSMAdapter:
                     }),
                     scope=user_id,
                 )
+        insert_time = (time.perf_counter() - insert_start) * 1000
+        total_time = (time.perf_counter() - total_start) * 1000
+        
+        # Log timing breakdown
+        logger.info("  Add() timing: extract=%.1fms (%.1fms/fact), embed=%.1fms (%.1fms/fact), insert=%.1fms, total=%.1fms",
+                    extract_time, extract_time / max(len(all_facts), 1),
+                    embed_time, embed_time / max(len(all_facts), 1),
+                    insert_time, total_time)
+        
+        return {
+            "num_facts": len(all_facts),
+            "extract_ms": extract_time,
+            "embed_ms": embed_time,
+            "insert_ms": insert_time,
+            "total_ms": total_time,
+        }
     
     def search(self, query: str, user_id: Optional[str] = None, top_k: int = 3, use_cognitive: bool = False) -> List[Dict]:
         """Search memories (Mem0-compatible API).

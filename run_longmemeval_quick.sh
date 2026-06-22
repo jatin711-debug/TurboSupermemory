@@ -1,11 +1,14 @@
 #!/bin/bash
 # Run LongMemEval quick benchmark (50 conversations)
+# NOTE: Cognitive features are DISABLED - using ANN only for fast benchmarking
+#       Use --cognitive flag for production-quality cognitive search
 
 set -e
 
 echo "=========================================="
 echo "  LongMemEval Quick Benchmark"
 echo "  (50 conversations, ~5-10 min)"
+echo "  Cognitive: DISABLED (ANN only)"
 echo "=========================================="
 
 source .venv/bin/activate
@@ -29,3 +32,6 @@ python benchmarks/cognitive_eval/run_longmemeval.py \
 echo ""
 echo "Benchmark complete! Results saved to:"
 echo "  benchmarks/cognitive_eval/results/"
+echo ""
+echo "NOTE: This benchmark uses ANN search (fast). For cognitive search comparison,"
+echo "      use: python benchmarks/cognitive_eval/run_longmemeval.py --compare-cognitive"

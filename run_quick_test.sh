@@ -1,11 +1,14 @@
 #!/bin/bash
 # Quick test script for TurboSuperMemory
 # Tests basic functionality with 5 items
+# NOTE: Cognitive features are DISABLED for benchmarks (ANN only)
+#       Use --cognitive flag for production-quality search (slower)
 
 set -e
 
 echo "=========================================="
-echo "  TurboSuperMemory Quick Test"
+echo "  TurboSuperMemory Quick Test (ANN only)"
+echo "  Cognitive: DISABLED for speed"
 echo "=========================================="
 
 source .venv/bin/activate
@@ -31,7 +34,7 @@ for i in range(5):
         payload={'index': i}
     )
 
-print('Searching...')
+print('Searching with ANN (fast)...')
 query = np.random.randn(384).astype(np.float32)
 query = query / np.linalg.norm(query)
 results = engine.search(query=query.tolist(), top_k=3)
@@ -42,6 +45,9 @@ for r in results:
 
 engine.close()
 print('Quick test PASSED!')
+print('')
+print('NOTE: This test uses ANN search (fast). For cognitive search (slower but smarter),')
+print('      use use_cognitive=True in adapter or --cognitive flag in benchmarks.')
 "
 
 echo ""

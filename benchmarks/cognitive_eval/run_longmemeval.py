@@ -59,6 +59,16 @@ def run_benchmark(
     all_metrics = []
     latencies = []
     
+    # Per-step timing tracking
+    step_times = {
+        "fact_extraction": [],
+        "embedding": [],
+        "tsm_insert": [],
+        "consolidation": [],
+        "search": [],
+        "total_per_conversation": [],
+    }
+    
     if quick:
         conversations = conversations[:quick_n]
         logger.info("QUICK MODE: Evaluating %d/%d conversations", quick_n, len(conversations))
@@ -67,26 +77,50 @@ def run_benchmark(
     logger.info("Processing %d conversations with %d total queries", len(conversations), total_queries)
     
     for i, conversation in enumerate(conversations):
+        conv_start = time.perf_counter()
         logger.info("Conversation %d/%d: %s (%d messages, %d queries)",
                     i + 1, len(conversations), conversation.conv_id,
                     len(conversation.messages), len(conversation.queries))
         
-        # Ingest all messages
-        adapter.add(conversation.messages, user_id=conversation.conv_id)
+        # Ingest all messages with timing breakdown
+        ingest_start = time.perf_counter()
+        add_result = adapter.add(conversation.messages, user_id=conversation.conv_id)
+        ingest_time = (time.perf_counter() - ingest_start) * 1000
         
         # Trigger consolidation after ingestion (for TSM)
+        consolidation_time = 0
         if hasattr(adapter, 'trigger_consolidation'):
+            consolidation_start = time.perf_counter()
             adapter.trigger_consolidation()
+            consolidation_time = (time.perf_counter() - consolidation_start) * 1000
+        
+        conv_total = (time.perf_counter() - conv_start) * 1000
+        step_times["total_per_conversation"].append(conv_total)
+        
+        # Log detailed breakdown from adapter.add()
+        if isinstance(add_result, dict):
+            logger.info("  → Facts: %d | Extract: %.1fms | Embed: %.1fms (%.1fms/fact) | Insert: %.1fms | Consolidation: %.1fms | Total: %.1fms",
+                        add_result.get('num_facts', 0),
+                        add_result.get('extract_ms', 0),
+                        add_result.get('embed_ms', 0),
+                        add_result.get('embed_ms', 0) / max(add_result.get('num_facts', 1), 1),
+                        add_result.get('insert_ms', 0),
+                        consolidation_time,
+                        conv_total)
+        else:
+            logger.info("  → Ingest: %.1fms (%.1fms/msg), Consolidation: %.1fms, Total: %.1fms",
+                        ingest_time, ingest_time / max(len(conversation.messages), 1), 
+                        consolidation_time, conv_total)
         
         # Evaluate each query
         for query in conversation.queries:
-            start = time.perf_counter()
+            search_start = time.perf_counter()
             # Use direct ANN for fast retrieval (not cognitive graph)
             results = adapter.search(query.query_text, user_id=conversation.conv_id, top_k=top_k, use_cognitive=False)
-            end = time.perf_counter()
+            search_time = (time.perf_counter() - search_start) * 1000
             
-            latency_ms = (end - start) * 1000
-            latencies.append(latency_ms)
+            latencies.append(search_time)
+            step_times["search"].append(search_time)
             
             # Extract text from results for evaluation
             retrieved_texts = [r.get("text", r.get("content", "")) for r in results]
@@ -115,7 +149,7 @@ def run_benchmark(
                 "recall_at_10": 1.0 if has_hit else 0.0,
                 "mrr": 1.0 / first_hit if has_hit else 0.0,
                 "hit_rate_at_3": 1.0 if has_hit and hit_at_k[0] < 3 else 0.0,
-                "latency_ms": latency_ms,
+                "latency_ms": search_time,
                 "num_results": len(results),
             }
             all_metrics.append(metrics)
@@ -124,6 +158,22 @@ def run_benchmark(
     if not all_metrics:
         logger.warning("No metrics computed!")
         return {}
+    
+    # Print timing breakdown
+    print("\n" + "=" * 70)
+    print("PER-STEP TIMING BREAKDOWN")
+    print("=" * 70)
+    print(f"\nConversation ingestion (total):")
+    print(f"  Mean per conversation: {np.mean(step_times['total_per_conversation']):.1f}ms")
+    print(f"  Total for {len(conversations)} conversations: {np.sum(step_times['total_per_conversation']):.1f}ms")
+    
+    print(f"\nSearch latency:")
+    print(f"  Mean: {np.mean(step_times['search']):.2f}ms")
+    print(f"  P50:  {np.percentile(step_times['search'], 50):.2f}ms")
+    print(f"  P95:  {np.percentile(step_times['search'], 95):.2f}ms")
+    print(f"  P99:  {np.percentile(step_times['search'], 99):.2f}ms")
+    
+    print("\n" + "=" * 70)
     
     result = {
         "num_conversations": len(conversations),
@@ -138,6 +188,10 @@ def run_benchmark(
             "p50": float(np.percentile(latencies, 50)),
             "p95": float(np.percentile(latencies, 95)),
             "p99": float(np.percentile(latencies, 99)),
+        },
+        "step_times": {
+            "ingestion_ms": float(np.sum(step_times["total_per_conversation"])),
+            "search_mean_ms": float(np.mean(step_times["search"])),
         },
         "raw_metrics": all_metrics,
     }
@@ -279,13 +333,14 @@ def main():
             else:
                 model_name = args.embedding_model
             
-            logger.info("Initializing TSM adapter with model=%s, extractor=%s",
+            logger.info("Initializing TSM adapter with model=%s, extractor=%s (cognitive=OFF for benchmarks)",
                         model_name, args.extractor)
             adapter = TSMAdapter(
                 db_path=db_path,
                 embedding_model=model_name,
                 extractor=args.extractor,
                 batch_size=args.batch_size,
+                cognitive_features=False,  # Disabled for benchmarks - ANN only
             )
         else:
             from cognitive_eval.adapters.mem0_adapter import Mem0Adapter

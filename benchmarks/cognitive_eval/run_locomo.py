@@ -293,13 +293,14 @@ def main():
         else:
             model_name = args.embedding_model
         
-        logger.info("Initializing TSM adapter with model=%s, extractor=%s",
+        logger.info("Initializing TSM adapter with model=%s, extractor=%s (cognitive=OFF for benchmarks)",
                     model_name, args.extractor)
         adapter = TSMAdapter(
             db_path=db_path,
             embedding_model=model_name,
             extractor=args.extractor,
             batch_size=args.batch_size,
+            cognitive_features=False,  # Disabled for benchmarks - ANN only
         )
         else:
             from cognitive_eval.adapters.mem0_adapter import Mem0Adapter
