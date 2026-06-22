@@ -151,6 +151,122 @@ impl SegmentSnapshot {
         reranked.truncate(top_k);
         Ok(reranked)
     }
+
+    /// Batched search over the snapshot for M queries at once. Per-query HNSW
+    /// traversal runs on CPU (where it's fast for single queries); the
+    /// candidate rerank is batched into ONE `gemm` call via
+    /// [`gpu_rerank_candidates_batch`] when a GPU backend is supplied, which is
+    /// where the GPU genuinely beats CPU. Falls back to per-query CPU rerank
+    /// when no GPU is available.
+    ///
+    /// Returns `m` result lists, each truncated to `top_k`, sorted by score desc.
+    pub(crate) fn search_gpu_batch(
+        &self,
+        queries: &[&[f32]],
+        top_k: usize,
+        ef: Option<usize>,
+        vectors: &VectorStore,
+        allowed_offsets: Option<&RoaringBitmap>,
+        gpu: Option<&Arc<dyn turbomemory_gpu::GpuBackend>>,
+    ) -> crate::Result<Vec<Vec<ScoredPoint>>> {
+        let m = queries.len();
+        if m == 0 {
+            return Ok(Vec::new());
+        }
+        // Single query: defer to the established single-query path.
+        if m == 1 {
+            let r = self.search_gpu(queries[0], top_k, ef, vectors, allowed_offsets, gpu)?;
+            return Ok(vec![r]);
+        }
+
+        // Compute the per-segment candidate pool width once (same logic as
+        // search_gpu, independent of the query).
+        let base_ef = ef.unwrap_or(self.config.search_list_size);
+        let base_multiplier = if allowed_offsets.is_some() { 8 } else { 4 };
+        let segment_count = self.segments.len().max(1);
+        let selectivity = allowed_offsets
+            .map(|b| {
+                let total = self.point_count().max(1);
+                (b.len() as usize as f32) / (total as f32)
+            })
+            .unwrap_or(1.0f32);
+        let multiplier = if selectivity < 0.01 {
+            base_multiplier
+        } else {
+            let selectivity_factor = (1.0f32 / selectivity.sqrt()).clamp(1.0f32, 16.0f32);
+            let segment_factor =
+                (1.0f32 + (segment_count.saturating_sub(1)) as f32 * 0.25f32).clamp(1.0f32, 2.5f32);
+            (base_multiplier as f32 * selectivity_factor * segment_factor) as usize
+        };
+        let pool_k = top_k
+            .saturating_mul(multiplier)
+            .min(top_k.saturating_mul(48))
+            .max(base_ef);
+
+        let segments = self.segments.clone();
+
+        // Per-query: run CPU HNSW search across all segments and merge, giving
+        // each query its own candidate list. Queries are independent, so this
+        // parallelizes across queries (and within, across segments).
+        let per_query_candidates: Vec<Vec<ScoredPoint>> = queries
+            .iter()
+            .map(|q| -> crate::Result<Vec<ScoredPoint>> {
+                let lists: Vec<Vec<ScoredPoint>> = if segments.len() <= 1 {
+                    segments
+                        .iter()
+                        .map(|seg| seg.read().search(q, pool_k, vectors, allowed_offsets))
+                        .collect::<crate::Result<Vec<_>>>()?
+                } else {
+                    segments
+                        .par_iter()
+                        .map(|seg| seg.read().search(q, pool_k, vectors, allowed_offsets))
+                        .collect::<crate::Result<Vec<_>>>()?
+                };
+                Ok(if lists.len() >= 4 && pool_k >= 64 {
+                    kway_merge_topk(&lists, pool_k)
+                } else {
+                    merge_candidates(lists, pool_k)
+                })
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+
+        // Batched rerank. GPU path needs a meaningful candidate union to be
+        // worth the upload; otherwise fall back to per-query CPU rerank.
+        let use_gpu = gpu
+            .map(turbomemory_gpu::is_gpu_accelerated)
+            .unwrap_or(false);
+        let total_candidates: usize = per_query_candidates.iter().map(|c| c.len()).sum();
+        if use_gpu && total_candidates >= 256 {
+            if let Some(backend) = gpu {
+                match gpu_rerank_candidates_batch(
+                    queries,
+                    &per_query_candidates,
+                    top_k,
+                    vectors,
+                    backend,
+                ) {
+                    Ok(results) => return Ok(results),
+                    Err(e) => {
+                        log::warn!("GPU batch rerank failed ({}), falling back to CPU", e);
+                    }
+                }
+            }
+        }
+
+        // CPU fallback: per-query rerank + truncate.
+        let mut results: Vec<Vec<ScoredPoint>> = Vec::with_capacity(m);
+        for (q, cands) in queries.iter().zip(per_query_candidates.iter()) {
+            let mut reranked = cpu_rerank_candidates(q, cands, vectors);
+            reranked.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            reranked.truncate(top_k);
+            results.push(reranked);
+        }
+        Ok(results)
+    }
 }
 
 /// CPU rerank of candidate points with full f32 embeddings.
@@ -250,8 +366,99 @@ fn gpu_rerank_candidates(
             tier: c.tier,
         })
         .collect();
-
     Ok(reranked)
+}
+
+/// Batched GPU rerank for M queries at once. This is where the GPU genuinely
+/// wins over CPU: M queries × N candidate vectors are scored in a SINGLE
+/// `gemm` call (via `batch_cosine_similarity_matrix`) instead of M separate
+/// `gemv` calls, amortizing kernel-launch and host→device upload overhead.
+///
+/// To do that with per-query candidate lists (which may differ), we build the
+/// UNION of candidate offsets across all queries, upload it once, score every
+/// query against the whole union (M × union_size gemm), then each query keeps
+/// only its own candidates and truncates to `top_k`. When queries' candidate
+/// sets overlap (common for clustered query batches) this also avoids
+/// re-uploading/re-scoring the same vectors.
+fn gpu_rerank_candidates_batch(
+    queries: &[&[f32]],
+    per_query_candidates: &[Vec<ScoredPoint>],
+    top_k: usize,
+    vectors: &VectorStore,
+    backend: &Arc<dyn turbomemory_gpu::GpuBackend>,
+) -> turbomemory_gpu::Result<Vec<Vec<ScoredPoint>>> {
+    use std::collections::HashMap;
+
+    let dim = vectors.dimension();
+    let m = queries.len();
+    debug_assert_eq!(per_query_candidates.len(), m);
+
+    // 1. Build the union of candidate offsets, deduplicated.
+    let mut union_offsets: Vec<PointOffset> = Vec::new();
+    let mut offset_to_union_idx: HashMap<PointOffset, usize> = HashMap::new();
+    for cands in per_query_candidates {
+        for c in cands {
+            if offset_to_union_idx
+                .insert(c.offset, union_offsets.len())
+                .is_some()
+            {
+                // already present
+                continue;
+            }
+            union_offsets.push(c.offset);
+        }
+    }
+    if union_offsets.is_empty() {
+        return Ok((0..m).map(|_| Vec::new()).collect());
+    }
+
+    // 2. Gather union vectors into one flat buffer and upload once.
+    let view = vectors.read_view();
+    let n = union_offsets.len();
+    let mut flat_vectors: Vec<f32> = Vec::with_capacity(n * dim);
+    for &off in &union_offsets {
+        if let Some(v) = view.get(off) {
+            flat_vectors.extend_from_slice(v);
+        } else {
+            // missing vector — zero-fill to keep indexing intact
+            flat_vectors.extend(std::iter::repeat_n(0.0f32, dim));
+        }
+    }
+    drop(view);
+
+    // 3. Flatten the M queries into one M×dim buffer.
+    let mut flat_queries: Vec<f32> = Vec::with_capacity(m * dim);
+    for q in queries {
+        flat_queries.extend_from_slice(q);
+    }
+
+    // 4. ONE gemm: M queries × N union vectors → M·N row-major scores.
+    let device_buf = backend.upload_vectors(&flat_vectors, dim)?;
+    let scores = backend.batch_cosine_similarity_matrix(&flat_queries, m, &device_buf)?;
+
+    // 5. For each query, select its own candidates' scores, sort, truncate.
+    let mut results: Vec<Vec<ScoredPoint>> = Vec::with_capacity(m);
+    for (qi, cands) in per_query_candidates.iter().enumerate() {
+        let mut scored: Vec<ScoredPoint> = cands
+            .iter()
+            .map(|c| {
+                let uidx = offset_to_union_idx[&c.offset];
+                ScoredPoint {
+                    offset: c.offset,
+                    score: scores[qi * n + uidx],
+                    tier: c.tier,
+                }
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored.truncate(top_k);
+        results.push(scored);
+    }
+    Ok(results)
 }
 
 /// Mutable, internally-locked set of non-Hot segment lists.
@@ -530,6 +737,27 @@ impl SegmentHolder {
         self.snapshot
             .load_full()
             .search(query, top_k, ef, vectors, allowed_offsets)
+    }
+
+    /// Batched search for M queries. See `SegmentSnapshot::search_gpu_batch`.
+    #[allow(dead_code)]
+    pub(crate) fn search_gpu_batch(
+        &self,
+        queries: &[&[f32]],
+        top_k: usize,
+        ef: Option<usize>,
+        vectors: &VectorStore,
+        allowed_offsets: Option<&RoaringBitmap>,
+        gpu: Option<&Arc<dyn turbomemory_gpu::GpuBackend>>,
+    ) -> crate::Result<Vec<Vec<ScoredPoint>>> {
+        self.snapshot.load_full().search_gpu_batch(
+            queries,
+            top_k,
+            ef,
+            vectors,
+            allowed_offsets,
+            gpu,
+        )
     }
 
     /// Move the current Hot segment into the `sealing_plain` queue and create a

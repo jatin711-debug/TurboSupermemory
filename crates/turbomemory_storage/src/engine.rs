@@ -765,6 +765,83 @@ impl StorageEngine {
         Ok(results)
     }
 
+    /// Batched ANN search for M queries. Runs each query's HNSW traversal on
+    /// CPU, then reranks all queries' candidate lists in a single GPU `gemm`
+    /// when CUDA is available (`search_gpu_batch`), which is the workload
+    /// where GPU genuinely beats CPU. Returns one result list per query, each
+    /// sorted by score desc and truncated to `top_k`.
+    ///
+    /// Filter and scope apply identically to every query in the batch.
+    pub fn search_ann_batch(
+        &self,
+        queries: &[&[f32]],
+        top_k: usize,
+        ef: Option<usize>,
+        filter: Option<&Filter>,
+        scope: Option<&str>,
+    ) -> crate::Result<Vec<Vec<(String, f32)>>> {
+        let m = queries.len();
+        if m == 0 {
+            return Ok(Vec::new());
+        }
+        for q in queries {
+            validate_dimension(q, self.config.dimension)?;
+        }
+        let mut allowed_offsets = match filter {
+            Some(f) => Some(self.evaluate_filter(f)?),
+            None => None,
+        };
+        if let Some(s) = scope {
+            let scope_bitmap = self.scope_index.read().query(Some(s));
+            allowed_offsets = Some(match allowed_offsets {
+                Some(existing) => existing & scope_bitmap,
+                None => scope_bitmap,
+            });
+        }
+
+        // Small collection: batch the exact scan (per-query, but cheap).
+        if self.record_count() <= EXACT_FALLBACK_THRESHOLD {
+            let mut out = Vec::with_capacity(m);
+            for q in queries {
+                let results = match &allowed_offsets {
+                    Some(bitmap) => self.exact_top_k_filtered(q, top_k, bitmap),
+                    None => self.exact_top_k(q, top_k),
+                };
+                for (id, _) in &results {
+                    self.bump_access_by_id(id);
+                }
+                out.push(results);
+            }
+            return Ok(out);
+        }
+
+        // Large collection: batched snapshot search (GPU gemm rerank).
+        let snapshot = self.segment_snapshot.load_full();
+        let gpu = self.gpu_backend();
+        let batch_scored = snapshot.search_gpu_batch(
+            queries,
+            top_k,
+            ef,
+            &self.vectors,
+            allowed_offsets.as_ref(),
+            Some(&gpu),
+        )?;
+
+        // Map offsets → ids per query and bump access counters.
+        let mut out = Vec::with_capacity(m);
+        for scored in batch_scored {
+            let mut results = Vec::with_capacity(scored.len());
+            for c in scored {
+                if let Some(meta_rec) = self.meta.get(c.offset)? {
+                    self.bump_access(c.offset);
+                    results.push((meta_rec.id, c.score));
+                }
+            }
+            out.push(results);
+        }
+        Ok(out)
+    }
+
     fn exact_top_k(&self, query: &[f32], top_k: usize) -> Vec<(String, f32)> {
         self.exact_top_k_filtered(query, top_k, &RoaringBitmap::new())
     }
@@ -3348,6 +3425,72 @@ mod tests {
             low_recall,
             high_recall
         );
+    }
+
+    #[test]
+    fn search_ann_batch_matches_single_query() {
+        // Batch search must return the same results as running each query
+        // individually. Exercises the batched rerank path (CPU fallback here;
+        // the gemm path is validated on-GPU separately).
+        use rand::Rng;
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::open(tmp.path(), hnsw_test_config(32)).unwrap();
+        let dim = 32;
+        let n = 600;
+        let mut rng = rand::thread_rng();
+        for i in 0..n {
+            let mut v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>() - 0.5).collect();
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter_mut().for_each(|x| *x /= norm.max(1e-8));
+            engine
+                .insert(&format!("mem_{i}"), &format!("text {i}"), &v, 1.0, &[])
+                .unwrap();
+        }
+        engine.trigger_consolidation().unwrap();
+
+        // 8 random queries.
+        let queries: Vec<Vec<f32>> = (0..8)
+            .map(|_| {
+                let mut v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>() - 0.5).collect();
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                v.iter_mut().for_each(|x| *x /= norm.max(1e-8));
+                v
+            })
+            .collect();
+
+        // Per-query results.
+        let single: Vec<Vec<(String, f32)>> = queries
+            .iter()
+            .map(|q| engine.search_ann_with_ef(q, 5, Some(200)).unwrap())
+            .collect();
+
+        // Batch results.
+        let q_refs: Vec<&[f32]> = queries.iter().map(|q| q.as_slice()).collect();
+        let batch = engine
+            .search_ann_batch(&q_refs, 5, Some(200), None, None)
+            .unwrap();
+
+        assert_eq!(
+            batch.len(),
+            single.len(),
+            "batch should return one list per query"
+        );
+        for (i, (b, s)) in batch.iter().zip(single.iter()).enumerate() {
+            let b_ids: Vec<&str> = b.iter().map(|(id, _)| id.as_str()).collect();
+            let s_ids: Vec<&str> = s.iter().map(|(id, _)| id.as_str()).collect();
+            assert_eq!(
+                b_ids, s_ids,
+                "query {i}: batch results must match single-query results"
+            );
+        }
+    }
+
+    #[test]
+    fn search_ann_batch_empty_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+        let batch = engine.search_ann_batch(&[], 5, None, None, None).unwrap();
+        assert!(batch.is_empty(), "empty batch should return empty");
     }
 
     #[test]

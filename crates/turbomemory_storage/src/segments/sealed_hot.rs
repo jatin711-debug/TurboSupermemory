@@ -7,7 +7,6 @@
 
 use crate::config::{Flusher, StoreConfig, Tier};
 use crate::record::{PointOffset, Record};
-use crate::segments::gpu_hnsw_index::GpuHnswIndex;
 use crate::segments::vector_index::{VectorIndex, VectorIndexManifest};
 use crate::segments::{ScoredPoint, VectorSegment};
 use crate::vector_store::VectorStore;
@@ -104,8 +103,9 @@ impl SealedHotSegment {
                 log::warn!("GPU HNSW index reload: rewriting manifest to usearch");
                 let mut usearch_manifest = manifest;
                 usearch_manifest.index_type = "usearch".into();
-                let manifest_json = serde_json::to_vec(&usearch_manifest)
-                    .map_err(|e| StorageError::InvalidArgument(format!("manifest serialization failed: {e}")))?;
+                let manifest_json = serde_json::to_vec(&usearch_manifest).map_err(|e| {
+                    StorageError::InvalidArgument(format!("manifest serialization failed: {e}"))
+                })?;
                 std::fs::write(path.join(MANIFEST_FILE), &manifest_json)?;
                 Box::new(crate::segments::UsearchIndex::open(&path, config)?)
             }

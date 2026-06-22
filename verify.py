@@ -288,6 +288,18 @@ def run_verification(db_path_arg):
     assert "llm" in parsed["topics"]
     logger.info("LLM cognitive compressor test passed.")
 
+    # 7. Test batch ANN search
+    logger.info("Step 7: Testing Batch ANN Search...")
+    batch_queries = np.array([
+        [0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],  # Close to mem_1
+        [0.1, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],  # Close to mem_2
+    ], dtype=np.float32)
+    batch_results = engine.search_ann_batch(batch_queries, top_k=2)
+    assert len(batch_results) == 2, f"Expected 2 result lists, got {len(batch_results)}"
+    assert batch_results[0][0][0] == "mem_1", f"Expected mem_1 for query 0, got: {batch_results[0][0][0]}"
+    assert batch_results[1][0][0] == "mem_2", f"Expected mem_2 for query 1, got: {batch_results[1][0][0]}"
+    logger.info("Batch ANN search test passed.")
+
     logger.info("=========================================================================")
     logger.info("All end-to-end integration and verification tests PASSED successfully!")
     logger.info("=========================================================================")

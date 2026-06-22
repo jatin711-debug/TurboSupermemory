@@ -591,6 +591,33 @@ impl PyMemoryEngine {
         })
     }
 
+    /// Batched ANN search for many queries at once. Accepts a 2-D `float32`
+    /// array of shape `(num_queries, dimension)` (or a list of 1-D arrays) and
+    /// returns `list[list[(id, score)]]` — one result list per query.
+    ///
+    /// When the `cuda` feature is enabled and a GPU is present, the candidate
+    /// rerank runs as a single cuBLAS `gemm` (M queries × N candidate vectors)
+    /// — the one workload where GPU genuinely beats CPU. Per-query HNSW
+    /// traversal stays on CPU.
+    #[pyo3(signature = (queries, top_k, search_list_size=None, scope=None))]
+    fn search_ann_batch(
+        &self,
+        py: Python<'_>,
+        queries: &Bound<'_, PyAny>,
+        top_k: usize,
+        search_list_size: Option<usize>,
+        scope: Option<String>,
+    ) -> PyResult<Vec<Vec<(String, f32)>>> {
+        let matrix = extract_f32_matrix(queries)?;
+        let rows = matrix.rows();
+        let scope_ref = scope.as_deref();
+        py.allow_threads(|| {
+            self.inner
+                .search_ann_batch(&rows, top_k, search_list_size, None, scope_ref)
+                .map_err(storage_err)
+        })
+    }
+
     #[pyo3(signature = (query_embedding, top_k, search_list_size=None, scope=None))]
     fn search_ann_candidates(
         &self,

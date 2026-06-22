@@ -21,6 +21,7 @@ const MANIFEST_FILE: &str = "manifest.json";
 /// GPU-accelerated HNSW index using `turbomemory_gpu`.
 pub struct GpuHnswIndex {
     dim: usize,
+    #[allow(dead_code)]
     search_list_size: usize,
     path: PathBuf,
     offsets: Vec<PointOffset>,
@@ -54,15 +55,17 @@ impl GpuHnswIndex {
         // not persisted across restarts).
         #[cfg(feature = "cuda")]
         let (gpu_index, fallback) = {
-            let fallback = crate::segments::UsearchIndex::build(
-                &path, config, vectors)?;
+            let fallback = crate::segments::UsearchIndex::build(&path, config, vectors)?;
             let flat_vectors: Vec<f32> = vectors
                 .iter()
                 .flat_map(|(_, v)| v.iter().copied())
                 .collect();
             match try_build_gpu(&flat_vectors, vectors.len(), dim, config) {
                 Ok(index) => {
-                    log::info!("GPU HNSW: successfully built index for {} vectors", vectors.len());
+                    log::info!(
+                        "GPU HNSW: successfully built index for {} vectors",
+                        vectors.len()
+                    );
                     (Some(index), Some(fallback))
                 }
                 Err(e) => {
@@ -73,12 +76,11 @@ impl GpuHnswIndex {
         };
 
         #[cfg(not(feature = "cuda"))]
-        let (gpu_index, fallback): (
+        let (_gpu_index, fallback): (
             Option<turbomemory_gpu::CudaAnnIndex>,
             Option<crate::segments::UsearchIndex>,
         ) = {
-            let fallback = crate::segments::UsearchIndex::build(
-                &path, config, vectors)?;
+            let fallback = crate::segments::UsearchIndex::build(&path, config, vectors)?;
             (None, Some(fallback))
         };
 
@@ -94,8 +96,9 @@ impl GpuHnswIndex {
             dimension: dim,
             offsets: offsets.clone(),
         };
-        let manifest_json = serde_json::to_vec(&manifest)
-            .map_err(|e| StorageError::InvalidArgument(format!("manifest serialization failed: {e}")))?;
+        let manifest_json = serde_json::to_vec(&manifest).map_err(|e| {
+            StorageError::InvalidArgument(format!("manifest serialization failed: {e}"))
+        })?;
         std::fs::write(path.join(MANIFEST_FILE), &manifest_json)?;
 
         Ok(Self {
@@ -134,13 +137,7 @@ impl VectorIndex for GpuHnswIndex {
         if let Some(bitmap) = allowed_offsets {
             let selectivity = bitmap.len() as f32 / self.offsets.len() as f32;
             if selectivity < 0.05 {
-                return exact_search_over_offsets(
-                    query,
-                    top_k,
-                    vectors,
-                    &self.offsets,
-                    Tier::Hot,
-                );
+                return exact_search_over_offsets(query, top_k, vectors, &self.offsets, Tier::Hot);
             }
         }
 
@@ -150,9 +147,17 @@ impl VectorIndex for GpuHnswIndex {
             if let Some(ref gpu_index) = self.gpu_index {
                 // Initialize GPU backend
                 let backend = turbomemory_gpu::init_backend();
+                log::info!(
+                    "GpuHnswIndex::search: gpu_index present, backend accelerated={}",
+                    turbomemory_gpu::is_gpu_accelerated(&backend)
+                );
                 if turbomemory_gpu::is_gpu_accelerated(&backend) {
                     match backend.ann_search(gpu_index, query, top_k) {
                         Ok(results) => {
+                            log::info!(
+                                "GpuHnswIndex::search: GPU search returned {} results",
+                                results.len()
+                            );
                             let mut scored: Vec<ScoredPoint> = results
                                 .into_iter()
                                 .map(|(idx, score)| {
@@ -171,30 +176,34 @@ impl VectorIndex for GpuHnswIndex {
                             }
 
                             scored.sort_by(|a, b| {
-                                b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+                                b.score
+                                    .partial_cmp(&a.score)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
                             });
                             scored.truncate(top_k);
                             return Ok(scored);
                         }
                         Err(e) => {
-                            log::warn!("GPU HNSW search failed ({}), falling back", e);
+                            log::warn!("GPU HNSW search failed ({}), falling back to usearch", e);
                         }
                     }
+                } else {
+                    log::info!("GpuHnswIndex::search: GPU backend not accelerated, falling back");
                 }
+            } else {
+                log::info!("GpuHnswIndex::search: no gpu_index, falling back");
             }
         }
 
         // Fallback to CPU index or exact scan
+        log::info!(
+            "GpuHnswIndex::search: using fallback, fallback present={}",
+            self.fallback.is_some()
+        );
         if let Some(ref fallback) = self.fallback {
             fallback.search(query, top_k, allowed_offsets, vectors)
         } else {
-            exact_search_over_offsets(
-                query,
-                top_k,
-                vectors,
-                &self.offsets,
-                Tier::Hot,
-            )
+            exact_search_over_offsets(query, top_k, vectors, &self.offsets, Tier::Hot)
         }
     }
 
@@ -211,7 +220,11 @@ impl VectorIndex for GpuHnswIndex {
         let gpu_bytes = self.gpu_index.as_ref().map(|i| i.memory_bytes).unwrap_or(0);
         #[cfg(not(feature = "cuda"))]
         let gpu_bytes = 0;
-        let fallback_bytes = self.fallback.as_ref().map(|i| i.memory_bytes()).unwrap_or(0);
+        let fallback_bytes = self
+            .fallback
+            .as_ref()
+            .map(|i| i.memory_bytes())
+            .unwrap_or(0);
         gpu_bytes + fallback_bytes + self.offsets.len() * std::mem::size_of::<PointOffset>()
     }
 
@@ -223,8 +236,9 @@ impl VectorIndex for GpuHnswIndex {
             dimension: self.dim,
             offsets: self.offsets.clone(),
         };
-        let manifest_json = serde_json::to_vec(&manifest)
-            .map_err(|e| StorageError::InvalidArgument(format!("manifest serialization failed: {e}")))?;
+        let manifest_json = serde_json::to_vec(&manifest).map_err(|e| {
+            StorageError::InvalidArgument(format!("manifest serialization failed: {e}"))
+        })?;
         std::fs::write(self.path.join(MANIFEST_FILE), &manifest_json)?;
         Ok(())
     }
@@ -259,7 +273,9 @@ fn try_build_gpu(
     index
         .as_any()
         .downcast_ref::<turbomemory_gpu::CudaAnnIndex>()
-        .ok_or_else(|| turbomemory_gpu::GpuError::InvalidArgument("Failed to downcast GPU index".into()))
+        .ok_or_else(|| {
+            turbomemory_gpu::GpuError::InvalidArgument("Failed to downcast GPU index".into())
+        })
         .map(|i| {
             // Clone the index data (vectors + layers)
             turbomemory_gpu::CudaAnnIndex {

@@ -203,9 +203,9 @@ pub fn exact_search_over_offsets_gpu(
     // Only use GPU for sufficiently large segments to amortize transfer overhead.
     // Threshold: ~1,000 vectors at 768-dim = ~3 MiB of data.
     const GPU_THRESHOLD: usize = 1024;
-    let use_gpu = gpu.map(|g| {
-        turbomemory_gpu::is_gpu_accelerated(g) && offsets.len() >= GPU_THRESHOLD
-    }).unwrap_or(false);
+    let use_gpu = gpu
+        .map(|g| turbomemory_gpu::is_gpu_accelerated(g) && offsets.len() >= GPU_THRESHOLD)
+        .unwrap_or(false);
 
     if use_gpu {
         if let Some(backend) = gpu {
@@ -286,7 +286,11 @@ fn gpu_exact_search(
     let mut scored: Vec<ScoredPoint> = valid_offsets
         .into_iter()
         .zip(scores)
-        .map(|(offset, score)| ScoredPoint { offset, score, tier })
+        .map(|(offset, score)| ScoredPoint {
+            offset,
+            score,
+            tier,
+        })
         .collect();
 
     scored.sort_by(|a, b| {

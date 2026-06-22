@@ -64,9 +64,24 @@ pub trait GpuBackend: Send + Sync {
     ) -> Result<Vec<f32>>;
 
     /// Compute batched dot product between one query and many vectors.
-    fn batch_dot_product(
+    fn batch_dot_product(&self, query: &[f32], device_vectors: &DeviceBuffer) -> Result<Vec<f32>>;
+
+    /// Compute batched cosine similarity between M queries and N vectors in a
+    /// single matrix multiply (cuBLAS `gemm` on CUDA). This is the GPU-native
+    /// batch path: M×N dot products in one kernel call, which is where the GPU
+    /// actually wins over CPU (per-query `gemv` loses to CPU SIMD due to
+    /// launch/upload overhead, but one `gemm` saturates the GPU).
+    ///
+    /// - `queries` is a flat `m × dim` row-major slice of `m` query vectors.
+    /// - `device_vectors` holds `n` pre-normalized vectors of `dim` each
+    ///   (uploaded via [`upload_vectors`]).
+    /// - Returns `m * n` scores, row-major (query-major): `scores[i*n + j]` is
+    ///   the similarity between query `i` and vector `j`. For pre-normalized
+    ///   vectors (as in TSM), dot product == cosine similarity.
+    fn batch_cosine_similarity_matrix(
         &self,
-        query: &[f32],
+        queries: &[f32],
+        m: usize,
         device_vectors: &DeviceBuffer,
     ) -> Result<Vec<f32>>;
 
@@ -115,6 +130,9 @@ impl DeviceBuffer {
     pub fn len(&self) -> usize {
         self.n
     }
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
     pub fn dim(&self) -> usize {
         self.dim
     }
@@ -126,6 +144,9 @@ impl DeviceBuffer {
 /// GPU-native approximate nearest neighbor index (opaque).
 pub trait GpuAnnIndex: Send + Sync {
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     fn dim(&self) -> usize;
     fn memory_bytes(&self) -> usize;
     /// Downcast to concrete type for backend-specific operations.
@@ -172,7 +193,10 @@ pub fn init_backend() -> Arc<dyn GpuBackend> {
                 return Arc::new(backend);
             }
             Err(e) => {
-                log::warn!("GPU: CUDA initialization failed ({}), using CPU fallback", e);
+                log::warn!(
+                    "GPU: CUDA initialization failed ({}), using CPU fallback",
+                    e
+                );
             }
         }
     }
@@ -219,7 +243,7 @@ mod cpu {
         fn upload_vectors(&self, vectors: &[f32], dim: usize) -> Result<DeviceBuffer> {
             // CPU fallback: just wrap the data, no actual GPU upload
             let n = vectors.len() / dim;
-            let bytes = vectors.len() * std::mem::size_of::<f32>();
+            let bytes = std::mem::size_of_val(vectors);
             Ok(DeviceBuffer {
                 n,
                 dim,
@@ -264,6 +288,32 @@ mod cpu {
             Ok(scores)
         }
 
+        fn batch_cosine_similarity_matrix(
+            &self,
+            queries: &[f32],
+            m: usize,
+            device_vectors: &DeviceBuffer,
+        ) -> Result<Vec<f32>> {
+            // CPU fallback: loop queries × vectors using the batched SIMD kernel.
+            // This keeps the batch API correct without a GPU, just slower than gemm.
+            let data = device_vectors
+                .inner
+                .downcast_ref::<Vec<f32>>()
+                .ok_or_else(|| GpuError::InvalidArgument("CPU fallback buffer mismatch".into()))?;
+            let n = device_vectors.n;
+            let dim = device_vectors.dim;
+            let mut scores = vec![0.0f32; m * n];
+            let vec_refs: Vec<&[f32]> = (0..n)
+                .map(|j| &data[j * dim..(j + 1) * dim] as &[f32])
+                .collect();
+            for i in 0..m {
+                let q = &queries[i * dim..(i + 1) * dim];
+                let row = cosine_similarity_batch(q, &vec_refs);
+                scores[i * n..(i + 1) * n].copy_from_slice(&row);
+            }
+            Ok(scores)
+        }
+
         fn build_ann_index(
             &self,
             _device_vectors: &DeviceBuffer,
@@ -271,7 +321,8 @@ mod cpu {
             _config: &AnnBuildConfig,
         ) -> Result<Box<dyn GpuAnnIndex>> {
             Err(GpuError::BackendNotCompiled(
-                "CPU fallback cannot build ANN index — use turbomemory_storage::UsearchIndex".into(),
+                "CPU fallback cannot build ANN index — use turbomemory_storage::UsearchIndex"
+                    .into(),
             ))
         }
 
@@ -295,7 +346,8 @@ mod cpu {
             _bits_per_dim: u8,
         ) -> Result<Vec<f32>> {
             Err(GpuError::BackendNotCompiled(
-                "CPU fallback cannot run quantized scan — use turbomemory_core::quantized_search".into(),
+                "CPU fallback cannot run quantized scan — use turbomemory_core::quantized_search"
+                    .into(),
             ))
         }
     }
@@ -307,7 +359,7 @@ mod cpu {
 #[cfg(feature = "cuda")]
 mod cuda {
     use super::*;
-    use cudarc::cublas::{CudaBlas, Gemv, GemvConfig};
+    use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, Gemv, GemvConfig};
     use cudarc::driver::{CudaContext, CudaSlice, DriverError};
     use std::sync::Mutex;
 
@@ -347,15 +399,14 @@ mod cuda {
         }
 
         fn cublas(&self) -> Result<std::sync::MutexGuard<'_, Option<CudaBlas>>> {
-            let mut guard = self.cublas.lock().map_err(|_| {
-                GpuError::KernelError("cublas mutex poisoned".into())
-            })?;
+            let mut guard = self
+                .cublas
+                .lock()
+                .map_err(|_| GpuError::KernelError("cublas mutex poisoned".into()))?;
             if guard.is_none() {
-                *guard = Some(
-                    CudaBlas::new(self.stream.clone()).map_err(|e| {
-                        GpuError::CudaNotAvailable(format!("Failed to create cuBLAS: {e}"))
-                    })?,
-                );
+                *guard = Some(CudaBlas::new(self.stream.clone()).map_err(|e| {
+                    GpuError::CudaNotAvailable(format!("Failed to create cuBLAS: {e}"))
+                })?);
             }
             Ok(guard)
         }
@@ -386,21 +437,18 @@ mod cuda {
             self.total_mem
         }
 
-        fn upload_vectors(
-            &self,
-            vectors: &[f32],
-            dim: usize,
-        ) -> Result<DeviceBuffer> {
+        fn upload_vectors(&self, vectors: &[f32], dim: usize) -> Result<DeviceBuffer> {
             let n = vectors.len() / dim;
-            let bytes = vectors.len() * std::mem::size_of::<f32>();
+            let bytes = std::mem::size_of_val(vectors);
             self.check_memory(bytes)?;
 
-            let slice: CudaSlice<f32> = self.stream.clone_htod(vectors).map_err(|_e| {
-                GpuError::OutOfMemory {
-                    need_mb: bytes / (1024 * 1024),
-                    have_mb: self.total_mem / (1024 * 1024),
-                }
-            })?;
+            let slice: CudaSlice<f32> =
+                self.stream
+                    .clone_htod(vectors)
+                    .map_err(|_e| GpuError::OutOfMemory {
+                        need_mb: bytes / (1024 * 1024),
+                        have_mb: self.total_mem / (1024 * 1024),
+                    })?;
 
             Ok(DeviceBuffer {
                 n,
@@ -424,9 +472,10 @@ mod cuda {
             let dim = device_vectors.dim;
 
             // Upload query to device
-            let query_dev: CudaSlice<f32> = self.stream.clone_htod(query).map_err(|e| {
-                GpuError::KernelError(format!("Failed to upload query: {e}"))
-            })?;
+            let query_dev: CudaSlice<f32> = self
+                .stream
+                .clone_htod(query)
+                .map_err(|e| GpuError::KernelError(format!("Failed to upload query: {e}")))?;
 
             // Allocate output buffer
             let mut scores_dev: CudaSlice<f32> = self.stream.alloc_zeros(n).map_err(|e| {
@@ -439,36 +488,39 @@ mod cuda {
             // A is dim×n (vectors transposed), x is dim, y is n
             {
                 let cublas_guard = self.cublas()?;
-                let cublas = cublas_guard.as_ref().ok_or_else(|| {
-                    GpuError::CudaNotAvailable("cuBLAS not initialized".into())
-                })?;
+                let cublas = cublas_guard
+                    .as_ref()
+                    .ok_or_else(|| GpuError::CudaNotAvailable("cuBLAS not initialized".into()))?;
 
                 // For cosine similarity, we need normalized vectors
                 // Simplified: assume vectors are pre-normalized (as in TSM)
                 // Then cosine similarity = dot product
                 unsafe {
-                    cublas.gemv(
-                        GemvConfig {
-                            trans: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T,
-                            m: dim as i32,
-                            n: n as i32,
-                            alpha: 1.0f32,
-                            lda: dim as i32,
-                            incx: 1,
-                            beta: 0.0f32,
-                            incy: 1,
-                        },
-                        &wrapper.slice,
-                        &query_dev,
-                        &mut scores_dev,
-                    ).map_err(|e| GpuError::KernelError(format!("cuBLAS gemv failed: {e}")))?;
+                    cublas
+                        .gemv(
+                            GemvConfig {
+                                trans: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T,
+                                m: dim as i32,
+                                n: n as i32,
+                                alpha: 1.0f32,
+                                lda: dim as i32,
+                                incx: 1,
+                                beta: 0.0f32,
+                                incy: 1,
+                            },
+                            &wrapper.slice,
+                            &query_dev,
+                            &mut scores_dev,
+                        )
+                        .map_err(|e| GpuError::KernelError(format!("cuBLAS gemv failed: {e}")))?;
                 }
             }
 
             // Download scores
-            let scores = self.stream.clone_dtoh(&scores_dev).map_err(|e| {
-                GpuError::KernelError(format!("Failed to download scores: {e}"))
-            })?;
+            let scores = self
+                .stream
+                .clone_dtoh(&scores_dev)
+                .map_err(|e| GpuError::KernelError(format!("Failed to download scores: {e}")))?;
 
             Ok(scores)
         }
@@ -480,6 +532,86 @@ mod cuda {
         ) -> Result<Vec<f32>> {
             // Same as cosine similarity for pre-normalized vectors
             self.batch_cosine_similarity(query, device_vectors)
+        }
+
+        fn batch_cosine_similarity_matrix(
+            &self,
+            queries: &[f32],
+            m: usize,
+            device_vectors: &DeviceBuffer,
+        ) -> Result<Vec<f32>> {
+            // cuBLAS gemm: C = Q · V^T, where Q is M×dim and V is N×dim
+            // (both pre-normalized, so dot == cosine).
+            //
+            // cuBLAS is column-major. Our row-major M×dim query buffer is a
+            // dim×M column-major matrix Q_cb (lda = dim); transpose it (OP_T)
+            // to get the M×dim A operand. Our row-major N×dim device buffer is
+            // a dim×N column-major matrix V_cb (ldb = dim); use OP_N so B is
+            // dim×N. Then C = A·B is M×N, stored column-major as ldc = M.
+            let wrapper = device_vectors
+                .inner
+                .downcast_ref::<CudaBufferWrapper>()
+                .ok_or_else(|| GpuError::InvalidArgument("CUDA buffer mismatch".into()))?;
+
+            let n = device_vectors.n;
+            let dim = device_vectors.dim;
+            if m == 0 || n == 0 {
+                return Ok(Vec::new());
+            }
+
+            // Upload the M×dim query matrix (one host->device copy for all queries).
+            let queries_dev: CudaSlice<f32> = self.stream.clone_htod(queries).map_err(|e| {
+                GpuError::KernelError(format!("Failed to upload query matrix: {e}"))
+            })?;
+
+            // Output M×N scores (column-major: column j has all M query scores
+            // against vector j; ldc = M rows).
+            let mut scores_dev: CudaSlice<f32> = self.stream.alloc_zeros(m * n).map_err(|e| {
+                GpuError::KernelError(format!("Failed to allocate scores matrix: {e}"))
+            })?;
+
+            {
+                let cublas_guard = self.cublas()?;
+                let cublas = cublas_guard
+                    .as_ref()
+                    .ok_or_else(|| GpuError::CudaNotAvailable("cuBLAS not initialized".into()))?;
+
+                // C(m×n) = Q(m×k) · V^T(k×n), with k = dim.
+                unsafe {
+                    cublas
+                        .gemm(
+                            GemmConfig {
+                                transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T, // Q_cb^T -> M×dim
+                                transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N, // V_cb -> dim×N
+                                m: m as i32,
+                                n: n as i32,
+                                k: dim as i32,
+                                alpha: 1.0f32,
+                                lda: dim as i32, // leading dim of Q_cb (dim×M storage)
+                                ldb: dim as i32, // leading dim of V_cb (dim×N storage)
+                                beta: 0.0f32,
+                                ldc: m as i32, // leading dim of C (M×N storage)
+                            },
+                            &queries_dev,
+                            &wrapper.slice,
+                            &mut scores_dev,
+                        )
+                        .map_err(|e| GpuError::KernelError(format!("cuBLAS gemm failed: {e}")))?;
+                }
+            }
+
+            // Download M×N column-major scores, then transpose to row-major
+            // (query-major: scores[i*n + j] = query i vs vector j).
+            let col_major = self.stream.clone_dtoh(&scores_dev).map_err(|e| {
+                GpuError::KernelError(format!("Failed to download scores matrix: {e}"))
+            })?;
+            let mut row_major = vec![0.0f32; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    row_major[i * n + j] = col_major[j * m + i];
+                }
+            }
+            Ok(row_major)
         }
 
         fn build_ann_index(
@@ -497,34 +629,31 @@ mod cuda {
             let n = device_vectors.n;
             log::info!("GPU HNSW: building index for {} vectors of dim {}", n, dim);
 
-            let index = gpu_hnsw_build::build_hnsw_on_gpu(
-                self,
-                &wrapper.slice,
-                n,
-                dim,
-                config,
-            )?;
+            let index = gpu_hnsw_build::build_hnsw_on_gpu(self, &wrapper.slice, n, dim, config)?;
 
             Ok(Box::new(index))
         }
 
         fn ann_search(
             &self,
-            index: &dyn GpuAnnIndex,
-            query: &[f32],
-            top_k: usize,
+            _index: &dyn GpuAnnIndex,
+            _query: &[f32],
+            _top_k: usize,
         ) -> Result<Vec<(usize, f32)>> {
-            let cuda_index = index
-                .as_any()
-                .downcast_ref::<CudaAnnIndex>()
-                .ok_or_else(|| GpuError::InvalidArgument("CUDA ANN index mismatch".into()))?;
-
-            gpu_hnsw_build::search_hnsw_on_gpu(
-                self,
-                cuda_index,
-                query,
-                top_k,
-            )
+            // GPU-native HNSW search is intentionally not implemented. The
+            // previous `search_hnsw_on_gpu` ran on the CPU (over the CPU-
+            // resident `CudaAnnIndex.vectors`) with a greedy hill-climbing
+            // algorithm that has poor recall, so it was neither GPU-
+            // accelerated nor correct. Search is delegated to the usearch
+            // fallback index persisted alongside the GPU-built index; the GPU
+            // accelerates search via the batched `gemm` rerank path
+            // (`batch_cosine_similarity_matrix`) instead, which is the one
+            // workload where the GPU actually beats CPU.
+            Err(GpuError::BackendNotCompiled(
+                "GPU HNSW search is not implemented — use the usearch fallback \
+                 or the batched gemm rerank path"
+                    .into(),
+            ))
         }
 
         fn quantized_scan(
@@ -581,8 +710,8 @@ mod cuda {
     mod gpu_hnsw_build {
         use super::*;
         use cudarc::driver::CudaSlice;
-        use std::collections::BinaryHeap;
         use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
 
         /// Build an HNSW index on GPU.
         ///
@@ -604,17 +733,25 @@ mod cuda {
 
             // For small collections, use brute-force all-pairs on GPU
             // For large collections, use batched approach
-            let vectors = backend.stream.clone_dtoh(device_vectors).map_err(|e| {
-                GpuError::KernelError(format!("Failed to download vectors: {e}"))
-            })?;
+            let vectors = backend
+                .stream
+                .clone_dtoh(device_vectors)
+                .map_err(|e| GpuError::KernelError(format!("Failed to download vectors: {e}")))?;
 
             // Build base layer (level 0) using GPU-accelerated neighbor selection
-            let base_layer = if n <= 4096 {
-                // Small: brute force all-pairs on GPU
+            // Brute-force all-pairs on GPU is fast and exact for collections up to ~20K
+            // vectors. Beyond that, we fall back to usearch (which has a proven HNSW
+            // implementation) rather than using a buggy GPU approximation.
+            let base_layer = if n <= 20000 {
+                // Small/medium: brute force all-pairs on GPU — fast and correct
                 build_base_layer_brute_force(backend, &vectors, n, dim, max_edges)?
             } else {
-                // Large: use random projection + local search
-                build_base_layer_large(backend, &vectors, n, dim, max_edges, ef_construction)?
+                // Large: usearch fallback is more reliable than GPU approximations
+                return Err(GpuError::InvalidArgument(format!(
+                    "GPU HNSW build for {} vectors exceeds 20K brute-force threshold; \
+                             use usearch fallback instead",
+                    n
+                )));
             };
 
             // Build upper layers by probabilistic decay
@@ -660,8 +797,13 @@ mod cuda {
                 elapsed.as_secs_f64()
             );
 
-            let memory_bytes = layers.iter()
-                .map(|l| l.iter().map(|v| v.capacity() * std::mem::size_of::<usize>()).sum::<usize>())
+            let memory_bytes = layers
+                .iter()
+                .map(|l| {
+                    l.iter()
+                        .map(|v| v.capacity() * std::mem::size_of::<usize>())
+                        .sum::<usize>()
+                })
                 .sum::<usize>()
                 + vectors.len() * std::mem::size_of::<f32>();
 
@@ -691,8 +833,7 @@ mod cuda {
                 let batch_n = batch_end - batch_start;
 
                 // Upload batch vectors to GPU
-                let batch_vectors: Vec<f32> = vectors[batch_start * dim..batch_end * dim]
-                    .to_vec();
+                let batch_vectors: Vec<f32> = vectors[batch_start * dim..batch_end * dim].to_vec();
                 let device_buf = backend.upload_vectors(&batch_vectors, dim)?;
 
                 // For each node in the collection, compute distance to batch
@@ -760,111 +901,6 @@ mod cuda {
             Ok(neighbors)
         }
 
-        /// Build base layer for large collections using random projection + local search.
-        fn build_base_layer_large(
-            backend: &CudaBackend,
-            vectors: &[f32],
-            n: usize,
-            dim: usize,
-            max_edges: usize,
-            ef_construction: usize,
-        ) -> Result<Vec<Vec<usize>>> {
-            // For large N, use a simplified approach:
-            // 1. Divide into random buckets using random projection
-            // 2. Build dense graphs within each bucket
-            // 3. Connect buckets via gateway nodes
-            let num_buckets = (n / ef_construction).max(1).min(n);
-            let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); num_buckets];
-            let mut rng = fastrand::Rng::new();
-
-            // Random projection assignment
-            for i in 0..n {
-                let bucket = rng.usize(0..num_buckets);
-                buckets[bucket].push(i);
-            }
-
-            let mut neighbors: Vec<Vec<usize>> = vec![Vec::new(); n];
-
-            // Build edges within each bucket
-            for bucket in &buckets {
-                if bucket.len() <= 1 {
-                    continue;
-                }
-
-                // Extract bucket vectors
-                let bucket_vectors: Vec<f32> = bucket
-                    .iter()
-                    .flat_map(|&idx| vectors[idx * dim..(idx + 1) * dim].iter().copied())
-                    .collect();
-
-                let bucket_n = bucket.len();
-                let device_buf = backend.upload_vectors(&bucket_vectors, dim)?;
-
-                // For each node in bucket, find neighbors within bucket
-                for (i, &global_i) in bucket.iter().enumerate() {
-                    let query = &vectors[global_i * dim..(global_i + 1) * dim];
-                    let scores = backend.batch_cosine_similarity(query, &device_buf)?;
-
-                    let mut top: Vec<(usize, f32)> = scores
-                        .iter()
-                        .enumerate()
-                        .take(bucket_n)
-                        .map(|(j, &s)| (bucket[j], s))
-                        .filter(|&(j, _)| j != global_i)
-                        .collect();
-
-                    top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                    top.truncate(max_edges);
-
-                    for (j, _) in top {
-                        if !neighbors[global_i].contains(&j) {
-                            neighbors[global_i].push(j);
-                        }
-                    }
-                }
-            }
-
-            // Connect buckets: for each bucket, find closest nodes in other buckets
-            // Sample a few nodes from each bucket as "gateways"
-            let gateways: Vec<usize> = buckets
-                .iter()
-                .filter(|b| !b.is_empty())
-                .map(|b| b[rng.usize(0..b.len())])
-                .collect();
-
-            if gateways.len() > 1 {
-                let gateway_vectors: Vec<f32> = gateways
-                    .iter()
-                    .flat_map(|&idx| vectors[idx * dim..(idx + 1) * dim].iter().copied())
-                    .collect();
-
-                let device_buf = backend.upload_vectors(&gateway_vectors, dim)?;
-
-                for (i, &global_i) in gateways.iter().enumerate() {
-                    let query = &vectors[global_i * dim..(global_i + 1) * dim];
-                    let scores = backend.batch_cosine_similarity(query, &device_buf)?;
-
-                    let mut top: Vec<(usize, f32)> = scores
-                        .iter()
-                        .enumerate()
-                        .map(|(j, &s)| (gateways[j], s))
-                        .filter(|&(j, _)| j != global_i)
-                        .collect();
-
-                    top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                    top.truncate(max_edges.min(4)); // Fewer gateway edges
-
-                    for (j, _) in top {
-                        if !neighbors[global_i].contains(&j) {
-                            neighbors[global_i].push(j);
-                        }
-                    }
-                }
-            }
-
-            Ok(neighbors)
-        }
-
         /// Build an upper level using brute force on a subset of nodes.
         fn build_level_brute_force(
             backend: &CudaBackend,
@@ -909,128 +945,6 @@ mod cuda {
 
             Ok(neighbors)
         }
-
-        /// Search the GPU HNSW index.
-        /// Uses a proper greedy beam search algorithm.
-        pub fn search_hnsw_on_gpu(
-            _backend: &CudaBackend,
-            index: &CudaAnnIndex,
-            query: &[f32],
-            top_k: usize,
-        ) -> Result<Vec<(usize, f32)>> {
-            let n = index.n;
-            let dim = index.dim;
-            let ef = top_k.max(64); // Minimum search beam
-
-            if index.layers.is_empty() {
-                // No layers - brute force search
-                let mut results: Vec<(usize, f32)> = (0..n)
-                    .map(|i| {
-                        let vec = &index.vectors[i * dim..(i + 1) * dim];
-                        let score = turbomemory_core::cosine_similarity(query, vec);
-                        (i, score)
-                    })
-                    .collect();
-                results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                results.truncate(top_k);
-                return Ok(results);
-            }
-
-            // Helper: compare f32 for max-heap (we want highest scores first)
-            // Use a simple negation for ordering since all scores are in [-1, 1]
-            fn score_key(score: f32) -> u32 {
-                // Map [-1, 1] to [0, u32::MAX] for consistent ordering
-                // Higher score -> lower key (for min-heap with Reverse)
-                let normalized = ((score + 1.0) / 2.0).clamp(0.0, 1.0);
-                (normalized * u32::MAX as f32) as u32
-            }
-
-            // Start from top layer, find entry point
-            let mut entry_point = 0usize;
-            for level in (0..index.layers.len()).rev() {
-                let layer = &index.layers[level];
-                if layer.is_empty() || layer.len() <= entry_point {
-                    continue;
-                }
-
-                // Greedy search at this level: find the closest node to the query
-                let mut current = entry_point;
-                let current_vec = &index.vectors[current * dim..(current + 1) * dim];
-                let mut best_score = turbomemory_core::cosine_similarity(query, current_vec);
-                
-                loop {
-                    let mut improved = false;
-                    for &neighbor in &layer[current] {
-                        if neighbor >= n {
-                            continue;
-                        }
-                        let neighbor_vec = &index.vectors[neighbor * dim..(neighbor + 1) * dim];
-                        let neighbor_score = turbomemory_core::cosine_similarity(query, neighbor_vec);
-                        if neighbor_score > best_score {
-                            best_score = neighbor_score;
-                            current = neighbor;
-                            improved = true;
-                        }
-                    }
-                    if !improved {
-                        break;
-                    }
-                }
-
-                entry_point = current;
-            }
-
-            // Final search at base layer with beam width
-            let base_layer = &index.layers[0];
-            if base_layer.is_empty() {
-                // Fallback to brute force if no base layer
-                let mut results: Vec<(usize, f32)> = (0..n)
-                    .map(|i| {
-                        let vec = &index.vectors[i * dim..(i + 1) * dim];
-                        let score = turbomemory_core::cosine_similarity(query, vec);
-                        (i, score)
-                    })
-                    .collect();
-                results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                results.truncate(top_k);
-                return Ok(results);
-            }
-
-            // Beam search at base layer
-            let mut visited = std::collections::HashSet::new();
-            let mut candidates: std::collections::BinaryHeap<Reverse<(u32, usize)>> = std::collections::BinaryHeap::new();
-            let mut results: Vec<(usize, f32)> = Vec::new();
-
-            let entry_vec = &index.vectors[entry_point * dim..(entry_point + 1) * dim];
-            let entry_score = turbomemory_core::cosine_similarity(query, entry_vec);
-            candidates.push(Reverse((score_key(entry_score), entry_point)));
-            visited.insert(entry_point);
-
-            while let Some(Reverse((_key, node))) = candidates.pop() {
-                if results.len() >= ef {
-                    break;
-                }
-                if node >= n || node >= base_layer.len() {
-                    continue;
-                }
-                let node_vec = &index.vectors[node * dim..(node + 1) * dim];
-                let score = turbomemory_core::cosine_similarity(query, node_vec);
-                results.push((node, score));
-
-                for &neighbor in &base_layer[node] {
-                    if neighbor < n && visited.insert(neighbor) {
-                        let neighbor_vec = &index.vectors[neighbor * dim..(neighbor + 1) * dim];
-                        let neighbor_score = turbomemory_core::cosine_similarity(query, neighbor_vec);
-                        candidates.push(Reverse((score_key(neighbor_score), neighbor)));
-                    }
-                }
-            }
-
-            // Sort by score descending and return top_k
-            results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            results.truncate(top_k);
-            Ok(results)
-        }
     }
 }
 
@@ -1056,4 +970,4 @@ mod cuda {
 // Re-export unconditionally so downstream code can name both types
 // regardless of feature flags. Without `cuda` they are non-constructible
 // stubs; with `cuda` they are the real implementations.
-pub use cuda::{CudaBackend, CudaAnnIndex};
+pub use cuda::{CudaAnnIndex, CudaBackend};
