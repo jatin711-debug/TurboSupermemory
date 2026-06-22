@@ -12,9 +12,9 @@ set -euo pipefail
 #   ./setup.sh
 #
 # Requirements:
-#   - Ubuntu 22.04+ (or compatible Debian-based distro)
+#   - Ubuntu 22.04+ or 24.04 (Noble) - or compatible Debian-based distro
 #   - NVIDIA GPU with CUDA 12.x
-#   - 24GB+ VRAM recommended for full benchmarks
+#   - 16GB+ VRAM for full benchmarks (8GB+ for quick tests)
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -78,7 +78,16 @@ setup_cuda() {
     fi
     
     log_info "Installing CUDA ${CUDA_VERSION}..."
-    wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+    
+    # Detect Ubuntu version for correct CUDA repo
+    UBUNTU_CODENAME=$(lsb_release -cs 2>/dev/null || echo "ubuntu2204")
+    if [[ "$UBUNTU_CODENAME" == "noble" ]]; then
+        UBUNTU_REPO="ubuntu2404"
+    else
+        UBUNTU_REPO="ubuntu2204"
+    fi
+    
+    wget https://developer.download.nvidia.com/compute/cuda/repos/${UBUNTU_REPO}/x86_64/cuda-keyring_1.1-1_all.deb
     dpkg -i cuda-keyring_1.1-1_all.deb
     apt-get update
     apt-get install -y cuda-toolkit-${CUDA_VERSION//./-}
@@ -123,12 +132,12 @@ setup_python() {
     add-apt-repository ppa:deadsnakes/ppa -y
     apt-get update
     
-    # Install Python 3.12
+    # Install Python 3.12 (distutils is deprecated in 24.04, use venv instead)
     apt-get install -y \
         python${PYTHON_VERSION} \
         python${PYTHON_VERSION}-dev \
         python${PYTHON_VERSION}-venv \
-        python${PYTHON_VERSION}-distutils
+        python3-distutils || true  # Fallback for older Ubuntu versions
     
     # Create virtual environment
     VENV_PATH="${SCRIPT_DIR}/.venv"
