@@ -25,7 +25,7 @@ fi
 
 # Run benchmark
 python benchmarks/cognitive_eval/run_longmemeval.py \
-    --data-dir data/longmemeval \
+    --data-dir benchmarks/cognitive_eval/data/longmemeval \
     --output benchmarks/cognitive_eval/results/
 
 echo ""
