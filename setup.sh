@@ -143,8 +143,10 @@ setup_python() {
     python${PYTHON_VERSION} -m venv "${VENV_PATH}"
     source "${VENV_PATH}/bin/activate"
     
-    # Upgrade pip
-    pip install --upgrade pip setuptools wheel
+    # Upgrade pip (handle system-managed packages on Ubuntu 24.04)
+    pip install --upgrade pip setuptools wheel --break-system-packages 2>/dev/null || \
+    pip install --upgrade pip setuptools wheel --user 2>/dev/null || \
+    log_warn "Could not upgrade pip - using system version"
     
     log_success "Python ${PYTHON_VERSION} virtual environment created at ${VENV_PATH}"
 }
