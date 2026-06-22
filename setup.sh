@@ -136,8 +136,7 @@ setup_python() {
     apt-get install -y \
         python${PYTHON_VERSION} \
         python${PYTHON_VERSION}-dev \
-        python${PYTHON_VERSION}-venv \
-        python3-distutils || true  # Fallback for older Ubuntu versions
+        python${PYTHON_VERSION}-venv
     
     # Create virtual environment
     VENV_PATH="${SCRIPT_DIR}/.venv"
