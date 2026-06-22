@@ -28,11 +28,12 @@ except ImportError:
 def setup_environment():
     """Locates and copies the compiled Rust library to the target Python extension path."""
     current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(current_dir)
     is_windows = sys.platform.startswith("win")
     is_macos = sys.platform.startswith("darwin")
     
     ext_suffix = ".pyd" if is_windows else ".so"
-    pyd_path = os.path.join(current_dir, f"turbomemory{ext_suffix}")
+    pyd_path = os.path.join(project_root, f"turbomemory{ext_suffix}")
 
     lib_prefix = "" if is_windows else "lib"
     lib_suffix = ".dll" if is_windows else (".dylib" if is_macos else ".so")
@@ -41,8 +42,8 @@ def setup_environment():
     # Prefer release builds for benchmarking. Only fall back to debug if a
     # release artifact is not present.
     dll_candidates = [
-        os.path.join(current_dir, "target", "release", lib_filename),
-        os.path.join(current_dir, "target", "debug", lib_filename),
+        os.path.join(project_root, "target", "release", lib_filename),
+        os.path.join(project_root, "target", "debug", lib_filename),
     ]
 
     resolved_dll_path = None

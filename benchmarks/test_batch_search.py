@@ -19,15 +19,16 @@ logger = logging.getLogger("BatchSearchTest")
 def setup_module():
     """Import turbomemory extension."""
     current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(current_dir)
     ext = ".pyd" if sys.platform.startswith("win") else ".so"
-    pyd_path = os.path.join(current_dir, f"turbomemory{ext}")
+    pyd_path = os.path.join(project_root, f"turbomemory{ext}")
     if not os.path.exists(pyd_path):
         # Try to find and copy from target
         lib_prefix = "" if sys.platform.startswith("win") else "lib"
         lib_suffix = ".dll" if sys.platform.startswith("win") else ext
         candidates = [
-            os.path.join(current_dir, "target", "release", f"{lib_prefix}turbomemory{lib_suffix}"),
-            os.path.join(current_dir, "target", "debug", f"{lib_prefix}turbomemory{lib_suffix}"),
+            os.path.join(project_root, "target", "release", f"{lib_prefix}turbomemory{lib_suffix}"),
+            os.path.join(project_root, "target", "debug", f"{lib_prefix}turbomemory{lib_suffix}"),
         ]
         for src in candidates:
             if os.path.exists(src):
@@ -35,6 +36,9 @@ def setup_module():
                 logger.info(f"Copied {src} -> {pyd_path}")
                 break
 
+    # Add project root to path so turbomemory.pyd can be found
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
     import turbomemory
     return turbomemory
 

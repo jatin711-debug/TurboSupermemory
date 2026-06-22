@@ -76,15 +76,16 @@ logger = logging.getLogger("CognitiveBenchmark")
 def setup_extension():
     """Locate and load the compiled turbomemory extension."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(script_dir)
     ext = ".pyd" if sys.platform.startswith("win") else ".so"
-    pyd = os.path.join(script_dir, f"turbomemory{ext}")
-    dll = os.path.join(script_dir, "target", "release", "turbomemory.dll")
+    pyd = os.path.join(project_root, f"turbomemory{ext}")
+    dll = os.path.join(project_root, "target", "release", "turbomemory.dll")
     if sys.platform.startswith("win") and os.path.exists(dll) and not os.path.exists(pyd):
         shutil.copy2(dll, pyd)
     if not os.path.exists(pyd):
         logger.error("turbomemory extension not found at %s. Run 'make build-python' first.", pyd)
         sys.exit(1)
-    sys.path.insert(0, script_dir)
+    sys.path.insert(0, project_root)
     import turbomemory
     return turbomemory
 

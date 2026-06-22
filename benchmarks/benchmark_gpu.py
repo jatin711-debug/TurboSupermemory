@@ -21,15 +21,16 @@ import numpy as np
 # Setup environment (same as benchmark.py)
 def setup_environment():
     current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(current_dir)
     is_windows = sys.platform.startswith("win")
     ext_suffix = ".pyd" if is_windows else ".so"
-    pyd_path = os.path.join(current_dir, f"turbomemory{ext_suffix}")
+    pyd_path = os.path.join(project_root, f"turbomemory{ext_suffix}")
     lib_prefix = "" if is_windows else "lib"
     lib_suffix = ".dll" if is_windows else (".dylib" if sys.platform.startswith("darwin") else ".so")
     lib_filename = f"{lib_prefix}turbomemory{lib_suffix}"
     dll_candidates = [
-        os.path.join(current_dir, "target", "release", lib_filename),
-        os.path.join(current_dir, "target", "debug", lib_filename),
+        os.path.join(project_root, "target", "release", lib_filename),
+        os.path.join(project_root, "target", "debug", lib_filename),
     ]
     resolved = None
     for c in dll_candidates:

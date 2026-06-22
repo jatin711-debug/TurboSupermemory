@@ -40,7 +40,7 @@ TSM's graph adds the signals a vector index throws away:
 
 Every cognitive feature is **opt-in and off by default**, so TSM behaves like a plain tiered vector store until you turn the brain on.
 
-A dedicated benchmark exercises exactly the cases where the correct memory is *not* the nearest neighbor — abstraction traversal, refinement surfacing, reinforcement boosting, and contradiction surfacing. The cognitive layer wins **4 of 4** of these scenarios against plain ANN. Run it yourself: `python cognitive_benchmark.py`.
+A dedicated benchmark exercises exactly the cases where the correct memory is *not* the nearest neighbor — abstraction traversal, refinement surfacing, reinforcement boosting, and contradiction surfacing. The cognitive layer wins **4 of 4** of these scenarios against plain ANN. Run it yourself: `python benchmarks/cognitive_benchmark.py`.
 
 ---
 
@@ -99,7 +99,7 @@ HNSW recall after consolidation depends strongly on dimension. `MemoryEngine`'s 
 | 20,000 | 768 | 256 | ~89% | ~98% |
 | 50,000 | 768 | 256 | ~66% | ~87% |
 
-High-dimensional ANN is fundamentally harder at large N (near-orthogonal vectors, noise-level cosine gaps between the true top-k and the rest). If you need higher recall at scale, raise `ef` per query — it's the single biggest lever. Reproduce with `python benchmark.py` or `python diagnose.py`.
+High-dimensional ANN is fundamentally harder at large N (near-orthogonal vectors, noise-level cosine gaps between the true top-k and the rest). If you need higher recall at scale, raise `ef` per query — it's the single biggest lever. Reproduce with `python benchmarks/benchmark.py` or `python benchmarks/diagnose.py`.
 
 **GPU-accelerated benchmarks** (with `cuda` feature, RTX 3050 4GB):
 
@@ -109,7 +109,7 @@ High-dimensional ANN is fundamentally harder at large N (near-orthogonal vectors
 | 50,000 | 768 | ~18s | ~4s | **4.5×** |
 | 100,000 | 768 | ~45s | ~9s | **5×** |
 
-Run GPU benchmarks: `python benchmark_gpu.py --scale 100k --dimension 768`
+Run GPU benchmarks: `python benchmarks/benchmark_gpu.py --scale 100k --dimension 768`
 
 ---
 
@@ -227,9 +227,12 @@ engine.step_session("Hello!", "Hi, how can I help?")
 make test            # cargo test --workspace
 make build-python    # produces target/release/turbomemory.dll
 make build-python FEATURES=cuda  # build with GPU acceleration (requires CUDA)
-make verify          # end-to-end integration checks
-make audit           # recall + restart-correctness audit
-make benchmark       # performance suite
+make verify          # end-to-end integration checks (benchmarks/verify.py)
+make audit           # recall + restart-correctness audit (benchmarks/audit_recall.py)
+make benchmark       # performance suite (benchmarks/benchmark.py --tsm-only)
+make benchmark-gpu   # GPU performance suite (benchmarks/benchmark_gpu.py)
+make cognitive-benchmark  # cognitive-layer scenarios (benchmarks/cognitive_benchmark.py)
+make batch-test      # batch search correctness (benchmarks/test_batch_search.py)
 make build-api       # builds the gRPC + REST server binary
 ```
 
@@ -248,9 +251,9 @@ The full verification matrix passes on the current `main`:
 | `cargo fmt --all --check` | clean |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | `cargo test --workspace --exclude turbomemory_python` | **165 passed / 0 failed** |
-| `python verify.py` (E2E) | all pass |
-| `python cognitive_benchmark.py` | **4/4 cognitive scenarios won** |
-| `python benchmark_gpu.py --scale 100k` (GPU, RTX 3050) | **5× HNSW build speedup** |
+| `python benchmarks/verify.py` (E2E) | all pass |
+| `python benchmarks/cognitive_benchmark.py` | **4/4 cognitive scenarios won** |
+| `python benchmarks/benchmark_gpu.py --scale 100k` (GPU, RTX 3050) | **5× HNSW build speedup** |
 
 Test breakdown: core 29 · graph 65 · storage 68 · crash-recovery 3.
 
@@ -261,17 +264,19 @@ Test breakdown: core 29 · graph 65 · storage 68 · crash-recovery 3.
 ```text
 ├── ResearchPapers/           # Reference arXiv papers
 ├── assets/img_2.png          # Architecture diagram
+├── benchmarks/               # Test and benchmark scripts
+│   ├── verify.py             # E2E integration tests
+│   ├── audit_recall.py       # Recall + restart-correctness audit
+│   ├── benchmark.py          # Performance benchmarking harness
+│   ├── benchmark_gpu.py      # GPU performance benchmarking (requires cuda feature)
+│   ├── cognitive_benchmark.py # Cognitive-layer retrieval scenarios
+│   └── test_batch_search.py  # Batch search correctness tests
 ├── crates/
 │   ├── turbomemory_core/      # Vector math, FWHT, Lloyd-Max, quantization, LUT search
 │   ├── turbomemory_storage/   # Tiered StorageEngine, mmap segments, WAL, consolidation
 │   ├── turbomemory_graph/     # BM25, spreading activation, FOK gate, CCS, memory evolution
 │   ├── turbomemory_python/    # PyO3 MemoryEngine bindings
 │   └── turbomemory_api/       # gRPC (tonic) + REST (axum) servers
-├── verify.py                 # E2E integration tests
-├── audit_recall.py           # Recall + restart-correctness audit
-├── benchmark.py              # Performance benchmarking harness
-├── benchmark_gpu.py          # GPU performance benchmarking (requires cuda feature)
-├── cognitive_benchmark.py    # Cognitive-layer retrieval scenarios
 ├── Makefile
 └── Cargo.toml                # Workspace manifest
 ```

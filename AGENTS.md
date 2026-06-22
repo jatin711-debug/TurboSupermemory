@@ -82,9 +82,12 @@ Produces `target/release/turbomemory.dll`; the verify/audit/benchmark scripts co
 ### End-to-End Verification
 
 ```bash
-make verify       # build-python + copy DLL + python verify.py
-make audit        # build-python + copy DLL + python audit_recall.py
-make benchmark    # build-python + copy DLL + python benchmark.py --tsm-only
+make verify       # build-python + copy DLL + python benchmarks/verify.py
+make audit        # build-python + copy DLL + python benchmarks/audit_recall.py
+make benchmark    # build-python + copy DLL + python benchmarks/benchmark.py --tsm-only
+make benchmark-gpu # build-python + copy DLL + python benchmarks/benchmark_gpu.py
+make cognitive-benchmark # build-python + copy DLL + python benchmarks/cognitive_benchmark.py
+make batch-test   # build-python + copy DLL + python benchmarks/test_batch_search.py
 ```
 
 ### API Server

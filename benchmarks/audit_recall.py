@@ -11,7 +11,7 @@ import shutil
 import time
 import numpy as np
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DLL = os.path.join(ROOT, "target", "release", "turbomemory.dll")
 PYD = os.path.join(ROOT, "turbomemory.pyd")
 

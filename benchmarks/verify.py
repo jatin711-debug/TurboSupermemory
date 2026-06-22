@@ -51,13 +51,15 @@ def parse_args():
 def setup_environment(dll_path_arg, pyd_path_arg):
     """Locates and copies the compiled Rust library to the target Python extension path."""
     current_dir = os.path.dirname(os.path.abspath(__file__))
+    # Project root is one level up from benchmarks/
+    project_root = os.path.dirname(current_dir)
     
     # 1. Determine extension file suffix based on platform
     is_windows = sys.platform.startswith("win")
     is_macos = sys.platform.startswith("darwin")
     
     ext_suffix = ".pyd" if is_windows else ".so"
-    pyd_path = pyd_path_arg or os.path.join(current_dir, f"turbomemory{ext_suffix}")
+    pyd_path = pyd_path_arg or os.path.join(project_root, f"turbomemory{ext_suffix}")
 
     # 2. Determine target binary names
     lib_prefix = "" if is_windows else "lib"
@@ -70,9 +72,10 @@ def setup_environment(dll_path_arg, pyd_path_arg):
         dll_candidates.append(dll_path_arg)
     else:
         # Prefer release builds for verification; fall back to debug.
+        # Look in project root's target directory
         dll_candidates.extend([
-            os.path.join(current_dir, "target", "release", lib_filename),
-            os.path.join(current_dir, "target", "debug", lib_filename),
+            os.path.join(project_root, "target", "release", lib_filename),
+            os.path.join(project_root, "target", "debug", lib_filename),
         ])
 
     # Find first existing candidate
@@ -108,6 +111,10 @@ def run_verification(db_path_arg):
     
     # Try importing the compiled module
     try:
+        # Add project root to path so turbomemory.pyd can be found
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
         import turbomemory
         logger.info("Successfully imported turbomemory library.")
     except ImportError as e:
@@ -116,7 +123,8 @@ def run_verification(db_path_arg):
 
     # Database directory setup
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    db_dir = db_path_arg or os.path.join(current_dir, "test_db")
+    project_root = os.path.dirname(current_dir)
+    db_dir = db_path_arg or os.path.join(project_root, "test_db")
     if os.path.exists(db_dir):
         try:
             shutil.rmtree(db_dir)
