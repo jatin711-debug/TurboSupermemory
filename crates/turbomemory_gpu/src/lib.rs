@@ -365,6 +365,7 @@ mod cuda {
 
     /// CUDA GPU backend using cudarc.
     pub struct CudaBackend {
+        #[allow(dead_code)]
         ctx: Arc<CudaContext>,
         stream: Arc<cudarc::driver::CudaStream>,
         total_mem: usize,
@@ -729,7 +730,7 @@ mod cuda {
         ) -> Result<CudaAnnIndex> {
             let start = std::time::Instant::now();
             let max_edges = config.max_edges;
-            let ef_construction = config.ef_construction;
+            let _ef_construction = config.ef_construction;
 
             // For small collections, use brute-force all-pairs on GPU
             // For large collections, use batched approach

@@ -7,6 +7,8 @@
 
 use crate::config::{Flusher, StoreConfig, Tier};
 use crate::record::{PointOffset, Record};
+#[cfg(feature = "cuda")]
+use crate::segments::gpu_hnsw_index::GpuHnswIndex;
 use crate::segments::vector_index::{VectorIndex, VectorIndexManifest};
 use crate::segments::{ScoredPoint, VectorSegment};
 use crate::vector_store::VectorStore;

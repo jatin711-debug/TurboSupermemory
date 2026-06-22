@@ -248,7 +248,7 @@ impl VectorIndex for GpuHnswIndex {
 #[cfg(feature = "cuda")]
 fn try_build_gpu(
     flat_vectors: &[f32],
-    n: usize,
+    _n: usize,
     dim: usize,
     config: &StoreConfig,
 ) -> Result<turbomemory_gpu::CudaAnnIndex, turbomemory_gpu::GpuError> {
