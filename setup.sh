@@ -52,6 +52,7 @@ setup_system() {
         pkg-config \
         libssl-dev \
         libffi-dev \
+        protobuf-compiler \
         python3-dev \
         python3-pip \
         python3-venv \
