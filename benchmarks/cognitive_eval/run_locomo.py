@@ -26,7 +26,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cognitive_eval.adapters.tsm_adapter import TSMAdapter
-from cognitive_eval.datasets.locomo import load_locomo
+from cognitive_eval.benchmark_datasets.locomo import load_locomo
 from cognitive_eval.metrics.recall import (
     average_precision,
     hit_rate_at_k,
@@ -278,7 +278,7 @@ def main():
         dataset = load_locomo(args.data_dir)
     except FileNotFoundError as e:
         logger.error("Dataset not found: %s", e)
-        logger.info("Run: python benchmarks/cognitive_eval/datasets/download.py")
+        logger.info("Run: python benchmarks/cognitive_eval/benchmark_datasets/download.py")
         sys.exit(1)
     
     logger.info("Dataset loaded: %d sessions, %d queries", len(dataset.sessions), len(dataset.queries))

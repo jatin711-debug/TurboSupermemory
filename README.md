@@ -222,7 +222,7 @@ TSM is validated against real-world memory benchmarks:
 Run benchmarks:
 ```bash
 # Download datasets
-python benchmarks/cognitive_eval/datasets/download.py --dataset all
+python benchmarks/cognitive_eval/benchmark_datasets/download.py --dataset all
 
 # LongMemEval (quick: 5 conversations, ~5 min; full: 500 conversations, ~2-3 hours)
 python benchmarks/cognitive_eval/run_longmemeval.py --quick --quick-n 5

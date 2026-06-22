@@ -32,7 +32,7 @@ Tests temporal reasoning — retrieving current vs past facts correctly from mul
 
 ```bash
 # Download LongMemEval and LoCoMo datasets
-python benchmarks/cognitive_eval/datasets/download.py --dataset all
+python benchmarks/cognitive_eval/benchmark_datasets/download.py --dataset all
 ```
 
 ### 2. Run LongMemEval Benchmark

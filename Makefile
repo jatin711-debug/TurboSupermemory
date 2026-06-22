@@ -91,7 +91,7 @@ api-server: build-api
 
 # Cognitive evaluation benchmarks (LongMemEval, LoCoMo)
 download-eval-data:
-	$(PYTHON) benchmarks/cognitive_eval/datasets/download.py
+	$(PYTHON) benchmarks/cognitive_eval/benchmark_datasets/download.py
 
 longmemeval: build-python
 	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true

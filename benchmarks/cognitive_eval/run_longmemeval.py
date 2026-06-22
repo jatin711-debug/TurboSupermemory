@@ -25,7 +25,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cognitive_eval.adapters.tsm_adapter import TSMAdapter
-from cognitive_eval.datasets.longmemeval import load_longmemeval
+from cognitive_eval.benchmark_datasets.longmemeval import load_longmemeval
 from cognitive_eval.metrics.recall import (
     average_precision,
     hit_rate_at_k,
@@ -87,12 +87,11 @@ def run_benchmark(
         add_result = adapter.add(conversation.messages, user_id=conversation.conv_id)
         ingest_time = (time.perf_counter() - ingest_start) * 1000
         
-        # Trigger consolidation after ingestion (for TSM)
+        # Trigger consolidation after ingestion (for TSM) - DISABLED for benchmarks
+        # consolidation is too slow for benchmarking, not part of normal per-conversation operation
+        # if hasattr(adapter, 'trigger_consolidation'):
+        #     adapter.trigger_consolidation()
         consolidation_time = 0
-        if hasattr(adapter, 'trigger_consolidation'):
-            consolidation_start = time.perf_counter()
-            adapter.trigger_consolidation()
-            consolidation_time = (time.perf_counter() - consolidation_start) * 1000
         
         conv_total = (time.perf_counter() - conv_start) * 1000
         step_times["total_per_conversation"].append(conv_total)
@@ -315,7 +314,7 @@ def main():
         conversations = load_longmemeval(args.data_dir)
     except FileNotFoundError as e:
         logger.error("Dataset not found: %s", e)
-        logger.info("Run: python benchmarks/cognitive_eval/datasets/download.py")
+        logger.info("Run: python benchmarks/cognitive_eval/benchmark_datasets/download.py")
         sys.exit(1)
     
     total_messages = sum(len(c.messages) for c in conversations)

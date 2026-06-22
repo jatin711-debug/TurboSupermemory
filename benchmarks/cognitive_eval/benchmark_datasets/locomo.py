@@ -178,7 +178,7 @@ def load_locomo(data_dir: Optional[Union[str, Path]] = None) -> LoCoMoDataset:
 
     raise FileNotFoundError(
         f"No LoCoMo data found in {data_dir}. "
-        "Run 'python datasets/download.py' first."
+        "Run 'python benchmarks/cognitive_eval/benchmark_datasets/download.py' first."
     )
 
 

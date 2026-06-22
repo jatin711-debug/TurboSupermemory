@@ -22,8 +22,8 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cognitive_eval.adapters.tsm_adapter import TSMAdapter
-from cognitive_eval.datasets.longmemeval import LongMemEvalDataset
-from cognitive_eval.datasets.locomo import LoCoMoDataset
+from cognitive_eval.benchmark_datasets.longmemeval import LongMemEvalDataset
+from cognitive_eval.benchmark_datasets.locomo import LoCoMoDataset
 from cognitive_eval.run_longmemeval import run_benchmark as run_longmemeval
 from cognitive_eval.run_locomo import run_benchmark as run_locomo
 
@@ -67,14 +67,14 @@ def run_comparison(
             "longmemeval": longmemeval.get_statistics(),
         }
     except FileNotFoundError:
-        logger.error("LongMemEval dataset not found. Run: python -m cognitive_eval.datasets.download")
+        logger.error("LongMemEval dataset not found. Run: python -m cognitive_eval.benchmark_datasets.download")
         longmemeval = None
     
     try:
         locomoco.load()
         results["datasets"]["locomo"] = locomoco.get_statistics()
     except FileNotFoundError:
-        logger.error("LoCoMo dataset not found. Run: python -m cognitive_eval.datasets.download")
+        logger.error("LoCoMo dataset not found. Run: python -m cognitive_eval.benchmark_datasets.download")
         locomoco = None
     
     if not longmemeval and not locomoco:

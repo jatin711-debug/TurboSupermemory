@@ -192,7 +192,7 @@ def load_longmemeval(data_dir: Optional[Union[str, Path]] = None) -> List[Conver
 
     raise FileNotFoundError(
         f"No LongMemEval data found in {data_dir}. "
-        "Run 'python datasets/download.py' first."
+        "Run 'python benchmarks/cognitive_eval/benchmark_datasets/download.py' first."
     )
 
 
