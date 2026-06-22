@@ -85,6 +85,9 @@ class TSMAdapter:
         self.db_path = db_path
         self.embedding_model_name = embedding_model
         
+        # Store mapping of id -> text for retrieval
+        self._id_to_text = {}
+        
         # Load embedding model (with fallback for sentence-transformers issues)
         # We try sentence-transformers first, but on Windows it often fails
         # due to torchcodec/FFmpeg dependency issues
@@ -224,6 +227,8 @@ class TSMAdapter:
                 self._insert_counter += 1
                 memory_id = f"{user_id}_{self._insert_counter}" if user_id else f"mem_{self._insert_counter}"
                 
+                self._id_to_text[memory_id] = fact
+                
                 self.engine.insert(
                     id=memory_id,
                     text=fact,
@@ -296,10 +301,12 @@ class TSMAdapter:
         if not results:
             return []
         
+        # Return results with text content from our mapping
         return [
             {
                 "id": r[0],
                 "score": float(r[1]),
+                "text": self._id_to_text.get(r[0], ""),
             }
             for r in results
         ]

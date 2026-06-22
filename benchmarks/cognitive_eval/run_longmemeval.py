@@ -128,6 +128,10 @@ def run_benchmark(
             answer = query.answer_text.lower()
             hit_at_k = []
             for j, text in enumerate(retrieved_texts):
+                # Skip empty results (no text content available)
+                if not text or not text.strip():
+                    continue
+                
                 # Check if answer is contained in or similar to retrieved text
                 text_lower = text.lower()
                 if answer in text_lower or text_lower in answer or any(
