@@ -13,6 +13,54 @@
 
 ---
 
+## Recently Completed — 2026-06-22 (GPU HNSW recall fix, batch search API, 100K validation)
+
+Fixed GPU HNSW recall collapse at 5K+ vectors, shipped `search_ann_batch` Python API, and validated 100% recall at 100K × 1536 with CUDA enabled.
+
+- **GPU HNSW recall fix (`turbomemory_gpu/src/lib.rs`).**
+  - **Root cause:** `build_base_layer_large` used random-projection bucketing which produced incorrect neighbor graphs — recall collapsed from 100% to 0–20% at 5K+ vectors.
+  - **Fix:** Increased brute-force threshold from 4096 → **20,000 vectors**. GPU brute-force all-pairs is fast and exact for collections up to ~20K; beyond that, the engine falls back to the proven `usearch` HNSW implementation.
+  - **Removed:** `build_base_layer_large` (random projection + local search + gateway connections) entirely — it was neither correct nor necessary.
+  - **Results:**
+    - 10K vectors × 1536 dim: **99.4% recall@10**
+    - 20K vectors × 1536 dim: **99.7% recall@10**
+    - 100K vectors × 1536 dim: **100.0% recall@10**
+  - GPU build path now produces correct graphs up to 20K; usearch fallback handles larger segments reliably.
+
+- **Batch search API (`turbomemory_python/src/lib.rs`).**
+  - `search_ann_batch(queries, top_k, search_list_size=None, scope=None)` accepts a 2-D `float32` numpy array of shape `(num_queries, dimension)` and returns `list[list[(id, score)]]`.
+  - Zero-copy for C-contiguous numpy arrays; copies only for non-contiguous / wrong-dtype / list inputs.
+  - Releases GIL and dispatches to `StorageEngine::search_ann_batch` which can use GPU batched distance compute when available.
+  - Added to `verify.py` Step 7 and new `test_batch_search.py` harness.
+
+- **Batch search correctness tests (`test_batch_search.py`).**
+  - `test_batch_matches_single`: 20 queries, batch vs single-query — **0 mismatches**.
+  - `test_batch_with_consolidation`: 500 vectors, trigger consolidation, then batch search — all results valid.
+  - `test_batch_empty`: Empty batch returns empty list.
+
+- **Clippy clean for both cuda and non-cuda builds.**
+  - Added `is_empty()` to `DeviceBuffer` and `GpuAnnIndex` trait (clippy `len_without_is_empty`).
+  - Replaced manual slice size calculation with `std::mem::size_of_val()` (clippy `manual_slice_size_calculation`).
+  - Fixed redundant closure in `segment_holder.rs` (clippy `redundant_closure`).
+  - Prefixed unused `ef_construction` and `ctx` variables in cuda-gated code.
+  - Added `#[cfg(feature = "cuda")]` import for `GpuHnswIndex` in `sealed_hot.rs`.
+  - `cargo clippy --workspace --all-targets -- -D warnings` passes with and without `--features cuda`.
+
+- **100K × 1536 validation with CUDA.**
+  - Ingest: 0.15 ms/item
+  - Pure ANN search: ~27 ms/query
+  - Recall@10: **100.0%**
+  - GPU active: `gpu_accelerated = True`
+  - Verified: `search_ann_batch` matches `search_ann` bit-exact at 100K scale.
+
+- **Documentation update (`docs/bindings_api.md`).**
+  - Added GPU acceleration details: brute-force threshold (20K), cuBLAS gemm rerank path, per-query HNSW traversal on CPU.
+  - Documented batch search API and when GPU batching is beneficial.
+
+Validated: `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean (both cuda and non-cuda); `cargo test --workspace --exclude turbomemory_python` = **75 passed / 0 failed**; `make build-python FEATURES=cuda` builds; `python verify.py` E2E pass (7/7 steps); `python test_batch_search.py` pass (3/3 tests); `python audit_recall.py --num-items 100000 --dimension 1536` = 100.0% recall@10.
+
+---
+
 ## Recently Completed — 2026-06-21 (GPU acceleration — cuBLAS + custom CUDA HNSW build)
 
 Shipped a complete GPU acceleration layer behind the `cuda` feature flag,
@@ -681,7 +729,7 @@ that make TSM a *memory engine* rather than a vector DB with a graph on top.
 | 8.2 | **Streaming / chunked bulk insert** | `crates/turbomemory_python/src/lib.rs` | Pending | See 1.10. |
 | 8.3 | **Async Python API (`asyncio`)** | `crates/turbomemory_python/src/lib.rs` | Pending | Return awaitable futures for insert/search; release GIL. |
 | 8.4 | **Collection / shard config in Python** | `crates/turbomemory_python/src/lib.rs` | Pending | Expose `num_shards`, `indexing_threshold_kb`, `max_segment_size_kb`, quantization config. |
-| 8.5 | **Batch search API** | `crates/turbomemory_python/src/lib.rs` | Pending | Accept matrix of queries; return list of result lists. Enables GPU batching. |
+| 8.5 | **Batch search API** | `crates/turbomemory_python/src/lib.rs` | **Done** | Done (2026-06-22). `search_ann_batch(queries, top_k, search_list_size=None, scope=None)` accepts 2-D numpy matrix and returns `list[list[(id, score)]]`. Zero-copy for contiguous float32 arrays. GPU batched rerank via cuBLAS gemm when `cuda` feature is enabled. Validated at 100K × 1536 with 0 mismatches vs single-query. |
 | 8.6 | **Progress callbacks for build/optimize** | `crates/turbomemory_python/src/lib.rs` | Pending | Long seals/merges report progress. |
 | 8.7 | **Recall audit auto-tune helper** | `audit_recall.py` | Pending | Python helper to sample, measure recall, and raise `ef` until target is met. |
 
@@ -802,16 +850,15 @@ silently falls back to CPU on error (CUDA unavailable, OOM, kernel error).
 |---|---|---|---|---|
 | G1 | `turbomemory_gpu` crate with `GpuBackend` trait | `crates/turbomemory_gpu/` (new) | **Done** | `GpuBackend` trait with `init()`, `upload_vectors()`, `batch_dot()`, `exact_topk()`, `build_hnsw()`. `CudaBackend` and `CpuFallback` implementations. |
 | G2 | cuBLAS batched distance compute | `crates/turbomemory_gpu/src/lib.rs` | **Done** | cuBLAS `sgemv` for `vectors^T × query` (`CUBLAS_OP_T`). Used for GPU exact scan and rerank. |
-| G3 | CUDA HNSW build path | `crates/turbomemory_gpu/src/lib.rs` | **Done** | Custom `CudaAnnIndex`: brute-force all-pairs for small N (≤4096), random-projection bucketing + local search + hierarchical layers for large N. Integrated into `SealedHotSegment::from_vectors()`. |
+| G3 | CUDA HNSW build path | `crates/turbomemory_gpu/src/lib.rs` | **Done** | Custom `CudaAnnIndex`: brute-force all-pairs for N ≤ 20,000 (fast and exact on GPU). Beyond 20K, falls back to proven `usearch` HNSW. Threshold raised from 4096 → 20,000 after fixing random-projection bucketing bug (2026-06-22). Integrated into `SealedHotSegment::from_vectors()`. |
 | G4 | Vulkan compute HNSW build (Qdrant model) | `crates/turbomemory_gpu/src/vulkan/` | Future | `ash` + compute shaders. Cross-platform. Not yet implemented. |
 | G5 | cuVS / RAFT CAGRA index | `crates/turbomemory_gpu/src/cuda/cagra.rs` | Future | Fastest GPU ANN for batch search. Evaluated but not integrated; custom HNSW (G3) chosen for simpler fallback. |
 | G6 | GPU device manager + memory pool | `crates/turbomemory_gpu/src/` | **Partial** | Per-engine `Arc<Mutex<Option<Arc<dyn GpuBackend>>>>` lazy init. Pinned host buffers and explicit memory pool still future work. |
 
 **Strategy:** Search stays CPU for single-query latency (upload overhead dominates
 at small batch). GPU accelerates:
-1. **Exact scan / rerank** — Hot segment exact scan and quantized-tier candidate
-   rerank use cuBLAS when `cuda` feature is enabled.
-2. **HNSW build** — SealedHot segments try GPU HNSW first; fallback to usearch.
+1. **HNSW build** — SealedHot segments ≤20K vectors use GPU brute-force all-pairs (exact, fast); larger segments fall back to usearch HNSW.
+2. **Exact rerank** — Batch candidate rerank from multiple segments uses cuBLAS `sgemm` when the total candidate pool is ≥256 and GPU is available.
 
 Build command: `make build-python FEATURES=cuda`
 
@@ -855,5 +902,6 @@ The execution order now puts **cognitive deepening (Stage 1)** before
 Prove the cognition works at scale (C5), then scale the architecture.
 
 **Current status:** Stage 1 complete (C1–C8 done). GPU acceleration (G1–G3)
-shipped opt-in via `cuda` feature. Stage 2 in progress; 0.1 (collection sharding)
+shipped opt-in via `cuda` feature, with HNSW recall fix validated at 100K × 1536
+(100% recall@10). Stage 2 in progress; 0.1 (collection sharding)
 and 0.3 (`Collection` abstraction) are the active items.
