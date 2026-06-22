@@ -288,20 +288,20 @@ def main():
     
     try:
         if args.adapter == "tsm":
-        if args.lightweight:
-            model_name = "sentence-transformers/all-MiniLM-L6-v2"
-        else:
-            model_name = args.embedding_model
-        
-        logger.info("Initializing TSM adapter with model=%s, extractor=%s (cognitive=OFF for benchmarks)",
-                    model_name, args.extractor)
-        adapter = TSMAdapter(
-            db_path=db_path,
-            embedding_model=model_name,
-            extractor=args.extractor,
-            batch_size=args.batch_size,
-            cognitive_features=False,  # Disabled for benchmarks - ANN only
-        )
+            if args.lightweight:
+                model_name = "sentence-transformers/all-MiniLM-L6-v2"
+            else:
+                model_name = args.embedding_model
+            
+            logger.info("Initializing TSM adapter with model=%s, extractor=%s (cognitive=OFF for benchmarks)",
+                        model_name, args.extractor)
+            adapter = TSMAdapter(
+                db_path=db_path,
+                embedding_model=model_name,
+                extractor=args.extractor,
+                batch_size=args.batch_size,
+                cognitive_features=False,  # Disabled for benchmarks - ANN only
+            )
         else:
             from cognitive_eval.adapters.mem0_adapter import Mem0Adapter
             adapter = Mem0Adapter()

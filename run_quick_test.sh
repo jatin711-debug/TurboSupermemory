@@ -29,22 +29,24 @@ for i in range(5):
     embedding = embedding / np.linalg.norm(embedding)
     engine.insert(
         id=f'test_{i}',
-        embedding=embedding.tolist(),
         text=f'This is test item number {i}',
-        payload={'index': i}
+        embedding=embedding.tolist(),
+        importance_score=1.0,
+        concepts=[],
+        payload='{}'
     )
 
 print('Searching with ANN (fast)...')
 query = np.random.randn(384).astype(np.float32)
 query = query / np.linalg.norm(query)
 results = engine.search_ann(
-    query=query.tolist(),
-    top_k=3
+    query.tolist(),
+    3
 )
 
 print(f'Found {len(results)} results')
 for r in results:
-    print(f'  - {r[\"id\"]}: score={r[\"score\"]:.4f}')
+    print(f'  - {r[0]}: score={r[1]:.4f}')
 
 engine.close()
 print('Quick test PASSED!')
