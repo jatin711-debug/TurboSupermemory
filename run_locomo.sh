@@ -25,7 +25,7 @@ fi
 
 # Run benchmark
 python benchmarks/cognitive_eval/run_locomo.py \
-    --dataset data/locomo \
+    --data-dir data/locomo \
     --output benchmarks/cognitive_eval/results/ \
     --quick
 
