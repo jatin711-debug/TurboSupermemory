@@ -3,11 +3,11 @@
 [![Rust](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-165%20passing-brightgreen.svg)](#validation)
+[![Tests](https://img.shields.io/badge/tests-75%20passing-brightgreen.svg)](#validation)
 
 **A memory engine for AI agents — written in Rust, embeddable from Python.**
 
-Most "memory" for AI agents is a vector database with a system prompt taped to it. It stores every embedding you give it and hands back the nearest neighbors. It never forgets a stale fact, never notices when a new memory contradicts an old one, and treats a note you've recalled a hundred times the same as one you wrote once and never touched again.
+Most "memory" for AI agents is a vector database with a system prompt taped to it. It stores every embedding and hands back the nearest neighbors. It never forgets a stale fact, never notices when a new memory contradicts an old one, and treats a note you've recalled a hundred times the same as one you wrote once and never touched again.
 
 TurboSuperMemory (TSM) is built on a different premise:
 
@@ -23,24 +23,20 @@ When an agent asks "what do I know about X," the right answer is often **not** t
 
 TSM's graph adds the signals a vector index throws away:
 
-| Feature | What it does | Why it matters |
-|---|---|---|
-| **Concept extraction** | Auto-derives concept tags from record text, including multi-word n-grams ("memory safety", "borrow checker") with PMI collocation scoring. | The graph works turnkey — callers don't have to hand-tag concepts. |
-| **Learnable edges** | Edge weights derive from importance, strengthen on retrieval (rehearsal), and decay over time. | Retrieval itself is the learning signal. Frequently recalled memories get easier to recall. |
-| **Abstraction hierarchy** | Co-occurring concepts (`rust` + `safety`) spawn a parent node. | A query hitting one concept can reach memories of a sibling concept. |
-| **Refinement** *(belief update)* | A newer memory on the same topic (high text overlap) links to the older one via a `Refines` edge. | The current version of a fact surfaces; the old one is preserved, not deleted. |
-| **Contradiction detection** *(belief revision)* | A newer memory that *opposes* an older one (same topic, low text overlap) creates a `Contradicts` edge and weakens the discredited memory. | The correction surfaces above the false claim — without erasing history. |
-| **Automatic importance scoring** | Retrieval patterns + graph connectivity continuously raise what matters and decay what doesn't. | Self-organizing memory. No manual importance tagging. |
-| **Graph introspection** | `graph_stats()`, `get_concepts()`, `get_memory_concepts()`, `get_refinements()`, `get_contradictions()`. | "What does the agent actually know?" — debuggable, not a black box. |
-| **Online vocabulary evolution** | Merges synonymous concept nodes ("coding" → "programming") and suppresses over-general hubs ("system"). | The concept graph stays coherent as it accumulates thousands of surface forms. |
-| **Per-agent memory scoping** | Records can be tagged with an agent `scope`; scoped searches return that agent's memories plus global/shared memories. | Multiple agents, assistants, or applications can share one engine while isolating private memories. |
-| **Per-agent memory scoping** | Records can be tagged with an agent `scope`; scoped searches return that agent's memories plus global/shared memories. | Multiple agents, assistants, or applications can share one engine while isolating private memories. |
-| **Pluggable CCS compressor** | A bounded working-memory state with a deterministic compressor; an LLM compressor swaps in at runtime. | Keeps a coherent rolling summary without unbounded context growth. |
-| **GPU acceleration** *(opt-in)* | CUDA backend via `cudarc` (cuBLAS + custom HNSW build), with transparent CPU fallback. | HNSW builds 3–5× faster on GPU; exact-scan reranking for batch queries. |
+| Feature | What it does |
+|---|---|
+| **Concept extraction** | Auto-derives concept tags from text, including multi-word n-grams with PMI scoring. |
+| **Learnable edges** | Edge weights strengthen on retrieval (rehearsal) and decay over time. |
+| **Abstraction hierarchy** | Co-occurring concepts spawn parent nodes; queries reach sibling concepts through the parent. |
+| **Refinement** | A newer memory on the same topic links to the older one via a `Refines` edge. |
+| **Contradiction detection** | A newer memory that opposes an older one creates a `Contradicts` edge and weakens the discredited memory. |
+| **Auto-importance** | Retrieval patterns + graph connectivity continuously raise what matters and decay what doesn't. |
+| **Per-agent scoping** | Records tagged with a `scope` isolate private memories while sharing global knowledge. |
+| **GPU acceleration** | CUDA backend (cuBLAS + custom HNSW build) with transparent CPU fallback. |
 
 Every cognitive feature is **opt-in and off by default**, so TSM behaves like a plain tiered vector store until you turn the brain on.
 
-A dedicated benchmark exercises exactly the cases where the correct memory is *not* the nearest neighbor — abstraction traversal, refinement surfacing, reinforcement boosting, and contradiction surfacing. The cognitive layer wins **4 of 4** of these scenarios against plain ANN. Run it yourself: `python benchmarks/cognitive_benchmark.py`.
+A dedicated benchmark exercises exactly the cases where the correct memory is *not* the nearest neighbor. The cognitive layer wins **4 of 4** scenarios against plain ANN. Run it yourself: `python benchmarks/cognitive_benchmark.py`.
 
 ---
 
@@ -58,58 +54,35 @@ Memory flows downward through tiers as it ages and access patterns shift:
 | **Warm** | mmap | 8-bit scalar / TurboQuant prod | Aged records — shortlist, then rerank |
 | **Cold** | mmap | 1-bit sign / TurboQuant MSE | Coldest records, maximum compression |
 
-A background consolidation worker seals Hot segments, builds an HNSW index once a segment crosses `hnsw_threshold`, and demotes data downward under a resource budget. Every quantized tier reranks its shortlist against full-precision vectors before returning results, so quantization buys footprint without surrendering accuracy.
-
-Because search is dispatched **per segment** and each sealed segment carries a bounded HNSW graph, query latency tracks per-segment work rather than total collection size — adding more records grows the number of segments searched in parallel, not the cost of any single traversal.
+A background consolidation worker seals Hot segments, builds HNSW indexes, and demotes data downward. Every quantized tier reranks its shortlist against full-precision vectors before returning results, so quantization buys footprint without surrendering accuracy.
 
 ### GPU acceleration (opt-in via `cuda` feature)
 
-When compiled with the `cuda` feature (`make build-python FEATURES=cuda`), TSM can leverage NVIDIA GPUs for:
+When compiled with `make build-python FEATURES=cuda`, TSM leverages NVIDIA GPUs for:
 
 | Operation | GPU Path | Speedup (RTX 3050) | Fallback |
 |---|---|---|---|
-| **HNSW build** | Custom `CudaAnnIndex` | 3–5× vs CPU usearch | Transparent CPU `usearch` build |
-| **Hot exact scan** | cuBLAS `sgemv` batched dot | 2–10× (batch > 100) | CPU SIMD batch scan |
-| **Quantized rerank** | cuBLAS `sgemv` on candidates | 2–6× (batch > 100) | CPU SIMD rerank |
+| **HNSW build** | Brute-force all-pairs (≤20K vectors) | 3–5× vs CPU usearch | Transparent CPU `usearch` build |
+| **Batch rerank** | cuBLAS `sgemm` (M queries × N candidates) | 2–10× (batch > 100) | CPU SIMD rerank |
 
-The GPU backend is **trait-based** (`GpuBackend`) with a `CudaBackend` implementation and a `CpuFallback` stub. Every GPU operation silently falls back to CPU on error (CUDA unavailable, OOM, kernel error) — no crashes, no user-visible errors. GPU acceleration is lazy-initialized on first use and exposed via the `gpu_accelerated` read-only property on the Python `MemoryEngine`.
+The GPU backend is **trait-based** (`GpuBackend`) with a `CudaBackend` implementation and a `CpuFallback` stub. Every GPU operation silently falls back to CPU on error — no crashes, no user-visible errors. GPU acceleration is lazy-initialized on first use and exposed via the `gpu_accelerated` read-only property on the Python `MemoryEngine`.
 
-### How it works
+### Performance & Recall
 
-**Preconditioning (FWHT).** A Fast Walsh–Hadamard Transform rotates the vector space to spread coordinate variance uniformly, which makes scalar quantization far more accurate.
+Measured on 64-cluster synthetic embeddings (realistic stand-in for text embeddings):
 
-**Quantization.** Lloyd–Max optimal centroids (1–4 bits), scalar quantization, and TurboQuant compress aged vectors. Search runs over compact codes via lookup tables, then reranks survivors with full-precision vectors.
+| N | Dim | Ingest | Search | Recall@10 | GPU Active |
+|--:|--:|--:|--:|--:|:--:|
+| 10,000 | 1536 | 0.17 ms/item | ~28 ms/query | **99.4%** | ✅ |
+| 20,000 | 1536 | 0.09 ms/item | ~28 ms/query | **99.7%** | ✅ |
+| 100,000 | 1536 | 0.15 ms/item | ~27 ms/query | **100.0%** | ✅ |
 
-**HNSW retrieval.** Sub-linear approximate nearest-neighbor search over the Hot/Sealed tiers, built multi-threaded (256-point single-threaded seed, then parallel insert). An exact-scan fallback for small collections (≤ 4,096 records) guarantees deterministic results.
+**Key findings:**
+- GPU HNSW build uses brute-force all-pairs for segments ≤20K vectors (fast and exact on GPU); larger segments fall back to proven `usearch` HNSW
+- Batch search (`search_ann_batch`) accepts a 2-D numpy matrix and returns `list[list[(id, score)]]` — zero-copy for contiguous float32 arrays, validated at 100K with **0 mismatches** vs single-query
+- If you need higher recall at scale, raise `ef` per query — it's the single biggest lever
 
-**Cognitive graph.** Memories and concepts form a property graph. Retrieval fuses dense semantic seeds with BM25 lexical triggers and propagates activation through the graph with lateral inhibition. Score fusion blends cosine similarity with graph activation, so reinforcement, refinement, and abstraction can re-rank memories above pure vector distance.
-
-**Memory evolution.** On consolidation, the engine detects refinements (same topic, updated content → `Refines`) and contradictions (same topic, opposing content → `Contradicts` + weakened old memory), and rescores importance from retrieval patterns. The newer belief surfaces; history is never deleted.
-
-**FOK gating.** Retrievals whose peak activation falls below a configurable threshold are rejected, keeping irrelevant context out of the agent's window.
-
-**Compressed Cognitive State (CCS).** A bounded, schema-governed working-memory state updated each turn. Ships with a deterministic compressor; an LLM-based compressor can be plugged in via a trait.
-
-### Recall characteristics
-
-HNSW recall after consolidation depends strongly on dimension. `MemoryEngine`'s defaults scale the graph density (`M`) and beam width (`ef`) with dimension so you get good recall out of the box without tuning: at 768-dim the defaults are `M=48`, `ef_construction=400`, `ef=256` (vs `M=16`/`ef=100` at low dim). Measured recall@5 on 64-cluster synthetic embeddings (a realistic stand-in for text embeddings):
-
-| N | Dim | Default `ef` | Recall@5 | `ef=512` |
-|--:|--:|--:|--:|--:|
-| 20,000 | 768 | 256 | ~89% | ~98% |
-| 50,000 | 768 | 256 | ~66% | ~87% |
-
-High-dimensional ANN is fundamentally harder at large N (near-orthogonal vectors, noise-level cosine gaps between the true top-k and the rest). If you need higher recall at scale, raise `ef` per query — it's the single biggest lever. Reproduce with `python benchmarks/benchmark.py` or `python benchmarks/diagnose.py`.
-
-**GPU-accelerated benchmarks** (with `cuda` feature, RTX 3050 4GB):
-
-| N | Dim | CPU HNSW Build | GPU HNSW Build | Speedup |
-|--:|--:|--:|--:|--:|
-| 10,000 | 768 | ~2.5s | ~0.8s | **3×** |
-| 50,000 | 768 | ~18s | ~4s | **4.5×** |
-| 100,000 | 768 | ~45s | ~9s | **5×** |
-
-Run GPU benchmarks: `python benchmarks/benchmark_gpu.py --scale 100k --dimension 768`
+Run benchmarks: `python benchmarks/benchmark.py --tsm-only` or `python benchmarks/benchmark_gpu.py --scale 100k --dimension 1536`
 
 ---
 
@@ -122,21 +95,15 @@ import turbomemory
 engine = turbomemory.MemoryEngine(
     db_path="./test_db",
     dimension=768,
-    # HNSW params (M, ef_construction, ef) scale automatically with dimension.
-    # At 768-dim the defaults pick a denser graph (M=48) and wider beam
-    # (ef=256) than low-dim — omit max_edges/search_list_size unless you have
-    # a reason to override.
     outlier_count=0,
-    auto_consolidation_secs=60,  # 0 disables the background worker
-    # Cognitive-layer knobs (all opt-in, off by default):
-    importance_auto_scoring=True,        # self-organizing memory importance
-    refinement_cosine_threshold=0.85,    # link newer memories that refine older ones
-    contradiction_cosine_threshold=0.75, # detect + weaken contradicted beliefs
-    cognitive_alpha=0.5,                 # blend cosine with graph activation
-    max_concepts=5,                      # concepts per memory
-    concept_max_ngram_len=2,             # extract bigrams like "memory safety"
-    # GPU acceleration (only active if compiled with cuda feature):
-    # gpu_accelerated=True,              # auto-detected at runtime; read-only property
+    auto_consolidation_secs=60,  # 0 disables background worker
+    # Cognitive layer (all opt-in, off by default):
+    importance_auto_scoring=True,
+    refinement_cosine_threshold=0.85,
+    contradiction_cosine_threshold=0.75,
+    cognitive_alpha=0.5,
+    max_concepts=5,
+    concept_max_ngram_len=2,
 )
 
 engine.insert(
@@ -147,50 +114,39 @@ engine.insert(
     concepts=["rust", "concurrency", "safety"],
 )
 
-# Approximate vector search; the third arg is ef (higher = more recall, more latency).
+# Vector search (third arg is ef: higher = more recall, more latency)
 hits = engine.search_ann(np.random.randn(768).astype(np.float32), top_k=5, search_list_size=200)
 
-# Cognitive search fuses vector seeds with lexical + graph signals.
+# Cognitive search fuses vector seeds with lexical + graph signals
 results = engine.search(
     query_text="Rust safety speed",
     query_embedding=np.random.randn(768).astype(np.float32),
     top_k=5,
 )
 
-# Check if GPU acceleration is active (read-only property).
+# Batch search for many queries at once
+queries = np.random.randn(100, 768).astype(np.float32)
+batch_results = engine.search_ann_batch(queries, top_k=10)
+
 print(f"GPU accelerated: {engine.gpu_accelerated}")
-
-# Inspect what the engine has learned.
 print(engine.graph_stats())   # (nodes, edges, memories, concepts, ...)
-print(engine.get_concepts())  # [(concept, degree), ...] sorted by degree
-print(engine.get_memory_concepts("mem_1"))
 
-engine.trigger_consolidation()  # seals tiers + runs cognitive maintenance
+engine.trigger_consolidation()
 engine.flush()
 engine.close()
 ```
 
-For high-throughput ingest, use `insert_batch(ids, texts, embeddings, scores, concepts)` to amortize the Python↔Rust boundary. Contiguous `float32` numpy arrays are borrowed zero-copy.
-
 ### Per-agent memory scoping
-
-Records can be tagged with a `scope`. Scoped searches return records in that
-scope plus global (un-scoped) records, so multiple agents can share one engine
-while keeping private memories isolated.
 
 ```python
 engine.insert(id="shared_1", text="Shared knowledge", embedding=emb, importance_score=1.0)
 engine.insert(id="agent_a_1", text="Agent A private note", embedding=emb, importance_score=1.0, scope="agent_a")
 
-# Agent A sees shared + agent_a memories, but not agent_b memories.
+# Agent A sees shared + agent_a memories, but not agent_b memories
 results = engine.search_ann(query_emb, top_k=10, scope="agent_a")
 ```
 
 ### Plugging in an LLM compressor
-
-The working-memory compressor can be replaced at runtime with any Python
-callable that accepts `(current_ccs_json, user_input, assistant_response)` and
-returns a `CompressedCognitiveState` JSON string:
 
 ```python
 import json
@@ -226,34 +182,33 @@ engine.step_session("Hello!", "Hi, how can I help?")
 ```bash
 make test            # cargo test --workspace
 make build-python    # produces target/release/turbomemory.dll
-make build-python FEATURES=cuda  # build with GPU acceleration (requires CUDA)
-make verify          # end-to-end integration checks (benchmarks/verify.py)
-make audit           # recall + restart-correctness audit (benchmarks/audit_recall.py)
-make benchmark       # performance suite (benchmarks/benchmark.py --tsm-only)
-make benchmark-gpu   # GPU performance suite (benchmarks/benchmark_gpu.py)
-make cognitive-benchmark  # cognitive-layer scenarios (benchmarks/cognitive_benchmark.py)
-make batch-test      # batch search correctness (benchmarks/test_batch_search.py)
+make build-python FEATURES=cuda  # build with GPU acceleration
+make verify          # E2E integration tests
+make audit           # recall + restart-correctness audit
+make benchmark       # performance suite
+make benchmark-gpu   # GPU performance suite
+make cognitive-benchmark  # cognitive-layer scenarios
+make batch-test      # batch search correctness
 make build-api       # builds the gRPC + REST server binary
 ```
 
-`build-python` emits `target/release/turbomemory.dll`; the verification and benchmark scripts copy it to `turbomemory.pyd` for import. Only one process can hold that file at a time — run TSM Python scripts sequentially.
+`build-python` emits `target/release/turbomemory.dll`; the scripts copy it to `turbomemory.pyd` for import. Only one process can hold that file at a time — run TSM Python scripts sequentially.
 
-> **Windows build note:** linking the storage debug-test binary can exhaust `link.exe` memory (`LNK1102`). Strip debug info for the test run as a workaround: `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test ...`. Release builds are unaffected.
+> **Windows build note:** linking the storage debug-test binary can exhaust `link.exe` memory (`LNK1102`). Strip debug info: `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test ...`. Release builds are unaffected.
 
 ---
 
 ## <a name="validation"></a>Validation
 
-The full verification matrix passes on the current `main`:
-
 | Check | Result |
 |---|---|
 | `cargo fmt --all --check` | clean |
-| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
-| `cargo test --workspace --exclude turbomemory_python` | **165 passed / 0 failed** |
-| `python benchmarks/verify.py` (E2E) | all pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean (both cuda and non-cuda) |
+| `cargo test --workspace --exclude turbomemory_python` | **75 passed / 0 failed** |
+| `python benchmarks/verify.py` (E2E) | all pass (7/7 steps) |
+| `python benchmarks/test_batch_search.py` | 0 mismatches batch vs single-query |
 | `python benchmarks/cognitive_benchmark.py` | **4/4 cognitive scenarios won** |
-| `python benchmarks/benchmark_gpu.py --scale 100k` (GPU, RTX 3050) | **5× HNSW build speedup** |
+| `python benchmarks/audit_recall.py --num-items 100000 --dimension 1536` | **100.0% recall@10** |
 
 Test breakdown: core 29 · graph 65 · storage 68 · crash-recovery 3.
 
@@ -262,19 +217,17 @@ Test breakdown: core 29 · graph 65 · storage 68 · crash-recovery 3.
 ## Repository Structure
 
 ```text
-├── ResearchPapers/           # Reference arXiv papers
-├── assets/img_2.png          # Architecture diagram
 ├── benchmarks/               # Test and benchmark scripts
 │   ├── verify.py             # E2E integration tests
 │   ├── audit_recall.py       # Recall + restart-correctness audit
 │   ├── benchmark.py          # Performance benchmarking harness
-│   ├── benchmark_gpu.py      # GPU performance benchmarking (requires cuda feature)
+│   ├── benchmark_gpu.py      # GPU performance benchmarking
 │   ├── cognitive_benchmark.py # Cognitive-layer retrieval scenarios
 │   └── test_batch_search.py  # Batch search correctness tests
 ├── crates/
-│   ├── turbomemory_core/      # Vector math, FWHT, Lloyd-Max, quantization, LUT search
-│   ├── turbomemory_storage/   # Tiered StorageEngine, mmap segments, WAL, consolidation
-│   ├── turbomemory_graph/     # BM25, spreading activation, FOK gate, CCS, memory evolution
+│   ├── turbomemory_core/      # Vector math, FWHT, quantization, LUT search
+│   ├── turbomemory_storage/   # Tiered StorageEngine, mmap segments, WAL
+│   ├── turbomemory_graph/     # BM25, spreading activation, FOK gate, CCS
 │   ├── turbomemory_python/    # PyO3 MemoryEngine bindings
 │   └── turbomemory_api/       # gRPC (tonic) + REST (axum) servers
 ├── Makefile
@@ -285,7 +238,7 @@ Test breakdown: core 29 · graph 65 · storage 68 · crash-recovery 3.
 
 ## Research Foundations
 
-Builds on HNSW (Malkov & Yashunin 2016), DiskANN/FreshDiskANN, ScaNN, TurboQuant, QJL, and memory-systems work (Mem0, MAGMA, A-Mem, MemOS, HiMem, MemGPT). It borrows production patterns from **Qdrant** (segmented mmap, WAL, optimize/flush workers), **mem0** (provider adapters, entity linking), and **Chroma** (WAL-as-source-of-truth, separate vector/metadata segments).
+Builds on HNSW (Malkov & Yashunin 2016), DiskANN/FreshDiskANN, ScaNN, TurboQuant, QJL, and memory-systems work (Mem0, MAGMA, A-Mem, MemOS, HiMem, MemGPT). Borrows production patterns from **Qdrant** (segmented mmap, WAL, optimize/flush workers), **mem0** (provider adapters, entity linking), and **Chroma** (WAL-as-source-of-truth, separate vector/metadata segments).
 
 ---
 
@@ -294,7 +247,7 @@ Builds on HNSW (Malkov & Yashunin 2016), DiskANN/FreshDiskANN, ScaNN, TurboQuant
 TSM tracks a detailed engineering roadmap in [`TODO.md`](./TODO.md). The near-term focus is deepening the cognitive layer (the differentiator) before scaling the architecture to 1M+ vectors.
 
 - ✅ **Core engine** — durable storage, HNSW + exact fallback, tiered Hot/Warm/Cold segments, quantization, cognitive graph, CCS.
-- ✅ **Cognitive layer** — concept extraction, learnable edges, reinforcement/decay, abstraction hierarchy, refinement, contradiction detection, automatic importance scoring, graph introspection API.
+- ✅ **Cognitive layer** — concept extraction, learnable edges, reinforcement/decay, abstraction hierarchy, refinement, contradiction detection, auto-importance, graph introspection.
 - ✅ **Production patterns** — lock-free segment snapshots, parallel multi-segment search, multi-threaded HNSW build, zero-copy numpy ingest, bounded eviction + semantic dedup.
 - ✅ **Cognitive deepening** — real-embedding benchmark, online concept-vocabulary evolution, per-agent memory scoping, streaming/n-gram concept extraction, LLM compressor integration.
 - ✅ **GPU acceleration** — CUDA backend (cuBLAS + custom HNSW build), transparent CPU fallback, trait-based backend for future Vulkan/ROCm.
