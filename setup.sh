@@ -9,13 +9,25 @@ set -euo pipefail
 #
 # Usage:
 #   chmod +x setup.sh
-#   ./setup.sh
+#   ./setup.sh              # CPU-only build
+#   ./setup.sh --cuda       # Build with CUDA support
 #
 # Requirements:
 #   - Ubuntu 22.04+ or 24.04 (Noble) - or compatible Debian-based distro
 #   - NVIDIA GPU with CUDA 12.x
 #   - 16GB+ VRAM for full benchmarks (8GB+ for quick tests)
 # =============================================================================
+
+# Parse arguments
+USE_CUDA=false
+for arg in "$@"; do
+    case $arg in
+        --cuda)
+            USE_CUDA=true
+            shift
+            ;;
+    esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_NAME="turbosupermemory"
@@ -207,14 +219,15 @@ build_tsm() {
     export PYO3_PYTHON="${SCRIPT_DIR}/.venv/bin/python"
     export PYTHON="${SCRIPT_DIR}/.venv/bin/python"
     
-    # Build with GPU support
-    log_info "Building TSM with GPU support..."
-    cargo build --workspace --release --features cuda
-    
-    # Copy the Python extension
-    cp target/release/libturbomemory.so turbomemory.so 2>/dev/null || \
-    cp target/release/libturbomemory*.so turbomemory.so 2>/dev/null || \
-    true
+    # Build with or without CUDA
+    if [[ "$USE_CUDA" == true ]]; then
+        log_info "Building TSM with CUDA support..."
+        export FEATURES=cuda
+        make FEATURES=cuda build-python
+    else
+        log_info "Building TSM (CPU-only)..."
+        make build-python
+    fi
     
     log_success "TSM built successfully"
     
@@ -411,6 +424,7 @@ EOF
 main() {
     echo "======================================================================"
     echo "  TurboSuperMemory Cloud Setup"
+    echo "  CUDA: $([[ "$USE_CUDA" == true ]] && echo "ENABLED" || echo "disabled")"
     echo "======================================================================"
     echo ""
     
@@ -435,19 +449,24 @@ main() {
     echo ""
     echo "======================================================================"
     echo "  Setup Complete!"
+    echo "  CUDA: $([[ "$USE_CUDA" == true ]] && echo "ENABLED" || echo "disabled")"
     echo "======================================================================"
     echo ""
     echo "Next steps:"
     echo "  1. Quick test:     ./run_quick_test.sh"
     echo "  2. Full benchmark: ./run_longmemeval_full.sh"
     echo "  3. LoCoMo test:    ./run_locomo.sh"
-    echo "  4. Recall audit:     ./run_recall_audit.sh"
+    echo "  4. Recall audit:   ./run_recall_audit.sh"
     echo ""
     echo "To activate the environment:"
     echo "  source .venv/bin/activate"
     echo ""
     echo "To rebuild TSM after code changes:"
-    echo "  make build-python"
+    if [[ "$USE_CUDA" == true ]]; then
+        echo "  make FEATURES=cuda build-python"
+    else
+        echo "  make build-python"
+    fi
     echo ""
 }
 
