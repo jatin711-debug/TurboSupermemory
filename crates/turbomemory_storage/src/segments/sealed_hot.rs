@@ -99,8 +99,14 @@ impl SealedHotSegment {
         let index: Box<dyn VectorIndex> = match manifest.index_type.as_str() {
             "usearch" => Box::new(crate::segments::UsearchIndex::open(&path, config)?),
             "gpu_hnsw" => {
-                // GPU HNSW indices need vectors to rebuild; load as usearch for now
-                log::warn!("GPU HNSW index reload not yet implemented, treating as usearch");
+                // GPU HNSW indices are not persisted; rewrite manifest to usearch
+                // and load the underlying usearch index that was built as fallback
+                log::warn!("GPU HNSW index reload: rewriting manifest to usearch");
+                let mut usearch_manifest = manifest;
+                usearch_manifest.index_type = "usearch".into();
+                let manifest_json = serde_json::to_vec(&usearch_manifest)
+                    .map_err(|e| StorageError::InvalidArgument(format!("manifest serialization failed: {e}")))?;
+                std::fs::write(path.join(MANIFEST_FILE), &manifest_json)?;
                 Box::new(crate::segments::UsearchIndex::open(&path, config)?)
             }
             other => {

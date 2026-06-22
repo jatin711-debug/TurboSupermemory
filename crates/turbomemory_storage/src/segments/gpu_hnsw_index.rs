@@ -49,9 +49,13 @@ impl GpuHnswIndex {
         let dim = config.dimension;
         let offsets: Vec<PointOffset> = vectors.iter().map(|(o, _)| *o).collect();
 
-        // Try to build on GPU if CUDA feature is enabled
+        // Try to build on GPU if CUDA feature is enabled. We always also build
+        // a usearch fallback on disk for reload compatibility (GPU indices are
+        // not persisted across restarts).
         #[cfg(feature = "cuda")]
         let (gpu_index, fallback) = {
+            let fallback = crate::segments::UsearchIndex::build(
+                &path, config, vectors)?;
             let flat_vectors: Vec<f32> = vectors
                 .iter()
                 .flat_map(|(_, v)| v.iter().copied())
@@ -59,23 +63,29 @@ impl GpuHnswIndex {
             match try_build_gpu(&flat_vectors, vectors.len(), dim, config) {
                 Ok(index) => {
                     log::info!("GPU HNSW: successfully built index for {} vectors", vectors.len());
-                    (Some(index), None)
+                    (Some(index), Some(fallback))
                 }
                 Err(e) => {
-                    log::warn!("GPU HNSW build failed ({}), falling back to usearch", e);
-                    let fallback = crate::segments::UsearchIndex::build(
-                        &path, config, vectors)?;
+                    log::warn!("GPU HNSW build failed ({}), using usearch", e);
                     (None, Some(fallback))
                 }
             }
         };
 
         #[cfg(not(feature = "cuda"))]
-        let (gpu_index, fallback) = {
+        let (gpu_index, fallback): (
+            Option<turbomemory_gpu::CudaAnnIndex>,
+            Option<crate::segments::UsearchIndex>,
+        ) = {
             let fallback = crate::segments::UsearchIndex::build(
                 &path, config, vectors)?;
             (None, Some(fallback))
         };
+
+        // Use the fallback from the cfg block above. (Previously this
+        // unconditionally rebuilt the usearch index a second time, which
+        // shadowed the GPU build result and doubled the build cost.)
+        let fallback = fallback.unwrap();
 
         // Save manifest
         let manifest = VectorIndexManifest {
@@ -95,7 +105,7 @@ impl GpuHnswIndex {
             offsets,
             #[cfg(feature = "cuda")]
             gpu_index,
-            fallback,
+            fallback: Some(fallback),
         })
     }
 

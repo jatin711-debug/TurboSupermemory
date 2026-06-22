@@ -911,6 +911,7 @@ mod cuda {
         }
 
         /// Search the GPU HNSW index.
+        /// Uses a proper greedy beam search algorithm.
         pub fn search_hnsw_on_gpu(
             _backend: &CudaBackend,
             index: &CudaAnnIndex,
@@ -921,58 +922,81 @@ mod cuda {
             let dim = index.dim;
             let ef = top_k.max(64); // Minimum search beam
 
-            // Helper to compare f32 using to_bits for BinaryHeap
+            if index.layers.is_empty() {
+                // No layers - brute force search
+                let mut results: Vec<(usize, f32)> = (0..n)
+                    .map(|i| {
+                        let vec = &index.vectors[i * dim..(i + 1) * dim];
+                        let score = turbomemory_core::cosine_similarity(query, vec);
+                        (i, score)
+                    })
+                    .collect();
+                results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                results.truncate(top_k);
+                return Ok(results);
+            }
+
+            // Helper: compare f32 for max-heap (we want highest scores first)
+            // Use a simple negation for ordering since all scores are in [-1, 1]
             fn score_key(score: f32) -> u32 {
-                // Higher score = lower key for min-heap (we want max score)
-                // Reverse the bits so higher scores come first
-                score.to_bits() ^ 0x8000_0000
+                // Map [-1, 1] to [0, u32::MAX] for consistent ordering
+                // Higher score -> lower key (for min-heap with Reverse)
+                let normalized = ((score + 1.0) / 2.0).clamp(0.0, 1.0);
+                (normalized * u32::MAX as f32) as u32
             }
 
             // Start from top layer, find entry point
             let mut entry_point = 0usize;
             for level in (0..index.layers.len()).rev() {
                 let layer = &index.layers[level];
-                if layer.is_empty() {
+                if layer.is_empty() || layer.len() <= entry_point {
                     continue;
                 }
 
-                // Greedy search at this level
-                let mut visited = std::collections::HashSet::new();
-                let mut candidates: std::collections::BinaryHeap<Reverse<(u32, usize)>> = std::collections::BinaryHeap::new();
-
-                let entry_vec = &index.vectors[entry_point * dim..(entry_point + 1) * dim];
-                let entry_score = turbomemory_core::cosine_similarity(query, entry_vec);
-                candidates.push(Reverse((score_key(entry_score), entry_point)));
-                visited.insert(entry_point);
-
-                let mut best_score = entry_score;
-                let mut best = entry_point;
-
-                while let Some(Reverse((_key, node))) = candidates.pop() {
-                    let node_vec = &index.vectors[node * dim..(node + 1) * dim];
-                    let score = turbomemory_core::cosine_similarity(query, node_vec);
-                    if score < best_score {
-                        break; // Local minimum reached
-                    }
-
-                    for &neighbor in &layer[node] {
-                        if visited.insert(neighbor) {
-                            let neighbor_vec = &index.vectors[neighbor * dim..(neighbor + 1) * dim];
-                            let neighbor_score = turbomemory_core::cosine_similarity(query, neighbor_vec);
-                            if neighbor_score > best_score {
-                                best_score = neighbor_score;
-                                best = neighbor;
-                            }
-                            candidates.push(Reverse((score_key(neighbor_score), neighbor)));
+                // Greedy search at this level: find the closest node to the query
+                let mut current = entry_point;
+                let current_vec = &index.vectors[current * dim..(current + 1) * dim];
+                let mut best_score = turbomemory_core::cosine_similarity(query, current_vec);
+                
+                loop {
+                    let mut improved = false;
+                    for &neighbor in &layer[current] {
+                        if neighbor >= n {
+                            continue;
                         }
+                        let neighbor_vec = &index.vectors[neighbor * dim..(neighbor + 1) * dim];
+                        let neighbor_score = turbomemory_core::cosine_similarity(query, neighbor_vec);
+                        if neighbor_score > best_score {
+                            best_score = neighbor_score;
+                            current = neighbor;
+                            improved = true;
+                        }
+                    }
+                    if !improved {
+                        break;
                     }
                 }
 
-                entry_point = best;
+                entry_point = current;
             }
 
             // Final search at base layer with beam width
             let base_layer = &index.layers[0];
+            if base_layer.is_empty() {
+                // Fallback to brute force if no base layer
+                let mut results: Vec<(usize, f32)> = (0..n)
+                    .map(|i| {
+                        let vec = &index.vectors[i * dim..(i + 1) * dim];
+                        let score = turbomemory_core::cosine_similarity(query, vec);
+                        (i, score)
+                    })
+                    .collect();
+                results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                results.truncate(top_k);
+                return Ok(results);
+            }
+
+            // Beam search at base layer
             let mut visited = std::collections::HashSet::new();
             let mut candidates: std::collections::BinaryHeap<Reverse<(u32, usize)>> = std::collections::BinaryHeap::new();
             let mut results: Vec<(usize, f32)> = Vec::new();
@@ -986,12 +1010,15 @@ mod cuda {
                 if results.len() >= ef {
                     break;
                 }
+                if node >= n || node >= base_layer.len() {
+                    continue;
+                }
                 let node_vec = &index.vectors[node * dim..(node + 1) * dim];
                 let score = turbomemory_core::cosine_similarity(query, node_vec);
                 results.push((node, score));
 
                 for &neighbor in &base_layer[node] {
-                    if visited.insert(neighbor) {
+                    if neighbor < n && visited.insert(neighbor) {
                         let neighbor_vec = &index.vectors[neighbor * dim..(neighbor + 1) * dim];
                         let neighbor_score = turbomemory_core::cosine_similarity(query, neighbor_vec);
                         candidates.push(Reverse((score_key(neighbor_score), neighbor)));
@@ -1019,8 +1046,14 @@ mod cuda {
             ))
         }
     }
+
+    /// Stub GPU ANN index used when the `cuda` feature is disabled.
+    /// Cannot be constructed; exists only so downstream crates can name the
+    /// type unconditionally (e.g. `Option<CudaAnnIndex>`) without a cfg gate.
+    pub struct CudaAnnIndex;
 }
 
-// Re-export
-#[cfg(feature = "cuda")]
+// Re-export unconditionally so downstream code can name both types
+// regardless of feature flags. Without `cuda` they are non-constructible
+// stubs; with `cuda` they are the real implementations.
 pub use cuda::{CudaBackend, CudaAnnIndex};
