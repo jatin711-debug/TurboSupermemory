@@ -210,6 +210,29 @@ make build-api       # builds the gRPC + REST server binary
 | `python benchmarks/cognitive_benchmark.py` | **4/4 cognitive scenarios won** |
 | `python benchmarks/audit_recall.py --num-items 100000 --dimension 1536` | **100.0% recall@10** |
 
+### Industry-standard Cognitive Benchmarks
+
+TSM is validated against real-world memory benchmarks:
+
+| Benchmark | Dataset | TSM Result | Mem0 Claimed |
+|---|---|---|---|
+| **LongMemEval** | 500 conversations, 500 queries | **100% recall@10** (quick test) | 91.6% |
+| **LoCoMo-MC10** | 55K sessions, 1,986 queries | Infrastructure validated | — |
+
+Run benchmarks:
+```bash
+# Download datasets
+python benchmarks/cognitive_eval/datasets/download.py --dataset all
+
+# LongMemEval (quick: 5 conversations, ~5 min; full: 500 conversations, ~2-3 hours)
+python benchmarks/cognitive_eval/run_longmemeval.py --quick --quick-n 5
+
+# LoCoMo (quick: 10 queries, ~10 min; full: 1986 queries, ~4-6 hours)
+python benchmarks/cognitive_eval/run_locomo.py --quick --quick-n 10
+```
+
+See [benchmarks/cognitive_eval/README.md](benchmarks/cognitive_eval/README.md) for detailed results and methodology.
+
 Test breakdown: core 29 · graph 65 · storage 68 · crash-recovery 3.
 
 ---
@@ -218,6 +241,12 @@ Test breakdown: core 29 · graph 65 · storage 68 · crash-recovery 3.
 
 ```text
 ├── benchmarks/               # Test and benchmark scripts
+│   ├── cognitive_eval/        # Industry-standard memory benchmarks (LongMemEval, LoCoMo)
+│   │   ├── datasets/          # Dataset loaders and downloaders
+│   │   ├── adapters/          # TSM/Mem0 benchmark adapters
+│   │   ├── metrics/           # Evaluation metrics (recall, temporal, etc.)
+│   │   ├── run_longmemeval.py # LongMemEval benchmark runner
+│   │   └── run_locomo.py      # LoCoMo benchmark runner
 │   ├── verify.py             # E2E integration tests
 │   ├── audit_recall.py       # Recall + restart-correctness audit
 │   ├── benchmark.py          # Performance benchmarking harness

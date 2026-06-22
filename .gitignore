@@ -18,10 +18,21 @@ ENV/
 # --- Project Specific State ---
 /test_db/
 /turbomemory.pyd
-/ResearchPapers/
 /turbomemory.so
 /libturbomemory.so
 /libturbomemory.dylib
+/ResearchPapers/
+
+# --- Benchmark Results ---
+/results/
+*.json
+*.csv
+*.parquet
+
+# --- Cloud/Temp ---
+*.log
+*.tmp
+/tmp/
 
 # --- IDEs / Editors ---
 .vscode/

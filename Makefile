@@ -12,7 +12,7 @@ FEATURES    ?=
 # Build flags: add --features cuda if FEATURES=cuda
 CARGO_FEATURES := $(if $(FEATURES),--features $(FEATURES),)
 
-.PHONY: build build-python build-api test verify audit benchmark benchmark-gpu cognitive-benchmark batch-test clippy fmt clean api-server
+.PHONY: build build-python build-api test verify audit benchmark benchmark-gpu cognitive-benchmark batch-test clippy fmt clean api-server download-eval-data longmemeval locomoco compare report
 
 build:
 	export PYO3_PYTHON="$(PYO3_PYTHON)" && cargo build --workspace $(CARGO_FEATURES)
@@ -66,3 +66,22 @@ api-server: build-api
 	export TURBO_GRPC_ADDR=0.0.0.0:50051 && \
 	export TURBO_REST_ADDR=0.0.0.0:8080 && \
 	./target/release/turbomemory-server.exe
+
+# Cognitive evaluation benchmarks (LongMemEval, LoCoMo)
+download-eval-data:
+	$(PYTHON) benchmarks/cognitive_eval/datasets/download.py
+
+longmemeval: build-python
+	cp target/release/turbomemory.dll turbomemory.pyd
+	$(PYTHON) benchmarks/cognitive_eval/run_longmemeval.py --quick
+
+locomoco: build-python
+	cp target/release/turbomemory.dll turbomemory.pyd
+	$(PYTHON) benchmarks/cognitive_eval/run_locomo.py --quick
+
+compare: build-python
+	cp target/release/turbomemory.dll turbomemory.pyd
+	$(PYTHON) benchmarks/cognitive_eval/run_comparison.py --quick --output benchmarks/cognitive_eval/results/
+
+report:
+	$(PYTHON) benchmarks/cognitive_eval/report.py --input benchmarks/cognitive_eval/results/ --output benchmarks/cognitive_eval/results/report.md
