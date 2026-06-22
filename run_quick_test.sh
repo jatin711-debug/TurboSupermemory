@@ -27,7 +27,7 @@ print('Adding 5 test items...')
 for i in range(5):
     embedding = np.random.randn(384).astype(np.float32)
     embedding = embedding / np.linalg.norm(embedding)
-    engine.add(
+    engine.insert(
         id=f'test_{i}',
         embedding=embedding.tolist(),
         text=f'This is test item number {i}',
@@ -37,7 +37,10 @@ for i in range(5):
 print('Searching with ANN (fast)...')
 query = np.random.randn(384).astype(np.float32)
 query = query / np.linalg.norm(query)
-results = engine.search(query=query.tolist(), top_k=3)
+results = engine.search_ann(
+    query=query.tolist(),
+    top_k=3
+)
 
 print(f'Found {len(results)} results')
 for r in results:
