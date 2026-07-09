@@ -220,6 +220,21 @@ pub struct TierConfig {
     /// texts share less than 30% of their tokens, they're saying different
     /// things about the same topic.
     pub contradiction_text_threshold: f32,
+    /// Minimum Jaccard text similarity for a `Refines` edge. A refinement is a
+    /// *re-statement* of the same claim (updated content), so it shares
+    /// substantial text with the older memory. Pairs BELOW this floor are
+    /// rejected — this prevents demoting two *coexisting* facts about the same
+    /// topic (same concept, high cosine, but independent content). Default 0.25.
+    /// Set to 0.0 to disable the floor (legacy no-text-gate behavior).
+    pub refinement_text_threshold: f32,
+    /// Require an explicit opposition/negation marker ("actually", "instead",
+    /// "not", "no longer", …) in the newer memory before creating a
+    /// `Contradicts` edge. A genuine contradiction *opposes* the old claim; two
+    /// coexisting facts about the same topic do not. Lightweight precision gate
+    /// (bag-of-cues, not full NLI): favors precision and will miss marker-less
+    /// semantic contradictions. Default `true` (safe — only demote on explicit
+    /// opposition). Set `false` for the legacy behavior.
+    pub contradiction_require_opposition: bool,
     /// Factor by which the old (contradicted) memory's association edges
     /// are multiplied when a contradiction is detected. Default 0.5 —
     /// halve the edge weights so the old memory fades but is not invisible.
@@ -329,6 +344,8 @@ impl TierConfig {
         // None = disabled.
         contradiction_cosine_threshold: None,
         contradiction_text_threshold: 0.3,
+        refinement_text_threshold: 0.25,
+        contradiction_require_opposition: true,
         contradiction_weaken_factor: 0.5,
         supersession_demotion_factor: 0.4,
         contradiction_max_pairs_per_cycle: 1024,

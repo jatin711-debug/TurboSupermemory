@@ -326,6 +326,8 @@ mod tests {
                 refinement_max_pairs_per_cycle: 1024,
                 contradiction_cosine_threshold: None,
                 contradiction_text_threshold: 0.3,
+                refinement_text_threshold: 0.25,
+                contradiction_require_opposition: true,
                 contradiction_weaken_factor: 0.5,
                 contradiction_max_pairs_per_cycle: 1024,
                 importance_auto_scoring: false,

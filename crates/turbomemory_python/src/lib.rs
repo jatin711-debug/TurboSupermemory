@@ -232,6 +232,8 @@ impl PyMemoryEngine {
         cognitive_alpha=None,
         contradiction_cosine_threshold=None,
         contradiction_text_threshold=None,
+        refinement_text_threshold=None,
+        contradiction_require_opposition=None,
         contradiction_weaken_factor=None,
         supersession_demotion_factor=None,
         contradiction_max_pairs_per_cycle=None,
@@ -282,6 +284,8 @@ impl PyMemoryEngine {
         cognitive_alpha: Option<f32>,
         contradiction_cosine_threshold: Option<f32>,
         contradiction_text_threshold: Option<f32>,
+        refinement_text_threshold: Option<f32>,
+        contradiction_require_opposition: Option<bool>,
         contradiction_weaken_factor: Option<f32>,
         supersession_demotion_factor: Option<f32>,
         contradiction_max_pairs_per_cycle: Option<usize>,
@@ -448,6 +452,12 @@ impl PyMemoryEngine {
         config.tier.contradiction_cosine_threshold = contradiction_cosine_threshold;
         if let Some(tt) = contradiction_text_threshold {
             config.tier.contradiction_text_threshold = tt;
+        }
+        if let Some(rt) = refinement_text_threshold {
+            config.tier.refinement_text_threshold = rt.clamp(0.0, 1.0);
+        }
+        if let Some(ro) = contradiction_require_opposition {
+            config.tier.contradiction_require_opposition = ro;
         }
         if let Some(wf) = contradiction_weaken_factor {
             config.tier.contradiction_weaken_factor = wf;

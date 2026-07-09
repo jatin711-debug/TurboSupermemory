@@ -508,7 +508,7 @@ def scenario_contradiction_surfacing(tsm, dim, distractors=0):
     new_vec = make_close_vec(base_vec, 0.2, 602)
     tsm.insert(
         "new_correction",
-        "Python executes source code through interpretation directly",
+        "Python is not compiled; it actually runs through interpretation",
         new_vec,
         1.5,  # higher importance (the corrected belief)
         ["python"],

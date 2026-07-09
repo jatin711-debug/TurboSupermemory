@@ -191,9 +191,45 @@ def insert_distractors(tsm, dim, n, rng, seq_label):
         tsm.insert(f"dist_{seq_label}_{i}", f"{text} note {i}", vec, 0.5, concepts)
 
 
+# Coexisting facts: same (private) concept, BOTH valid, non-opposing, low text
+# overlap. A correct belief-revision detector must link/demote NEITHER member —
+# this is the PRECISION control. Each pair sits at the SAME controlled cosine as
+# a real correction, so only the CONTENT (no opposition marker, not a
+# re-statement) distinguishes it from a genuine supersession.
+_COEXIST_PAIRS = [
+    ("clean readable indentation based syntax", "a large standard library of modules"),
+    ("multi column secondary indexes", "a command line administration client"),
+    ("zero cost abstractions over iterators", "a package manager and build tool"),
+    ("numeric status codes for responses", "header fields that carry metadata"),
+    ("trained on a broad text corpus", "an intermediate embedding output layer"),
+    ("appends writes to a durable log", "a hot block cache kept in memory"),
+    ("fragments large packets for sending", "a dynamic routing table"),
+    ("short lived access tokens", "single sign on provider integration"),
+]
+
+
+def insert_coexisting(tsm, dim, n, correction_cos, rng, seq_label):
+    """Insert `n` COEXISTING fact pairs (precision control). Both members share a
+    private concept and sit at `correction_cos` to each other, but they are
+    independent, non-opposing statements — a correct detector creates NO belief
+    edge between them. Returns [(older_id, newer_id)]."""
+    pairs = []
+    for i in range(n):
+        ta, tb = _COEXIST_PAIRS[i % len(_COEXIST_PAIRS)]
+        concept = f"coexist{i}"
+        center = unit_vec(dim, rng)
+        va = jitter_vec(center, 0.03, rng)
+        vb = vec_at_cosine(va, correction_cos, rng)
+        aid, bid = f"cox_a_{seq_label}_{i}", f"cox_b_{seq_label}_{i}"
+        tsm.insert(aid, ta, va, 1.0, [concept])
+        tsm.insert(bid, tb, vb, 1.0, [concept])  # bid is newer (higher insert_seq)
+        pairs.append((aid, bid))
+    return pairs
+
+
 def build_corpus(tsm, dim, probes_n, distractors, gap, correction_cos, mode, rng):
     """Insert distractors + belief pairs with a temporal gap between each
-    stale fact and its correction. Returns the list of Probe objects.
+    stale fact and its correction. Returns (probes, coexisting_pairs).
 
     Insertion order per probe:  stale fact  ->  `gap` filler memories  ->  correction.
     This forces old->new ordering (Refines/Contradicts are directed old->new) and
@@ -238,8 +274,12 @@ def build_corpus(tsm, dim, probes_n, distractors, gap, correction_cos, mode, rng
 
         probes.append(Probe(concept, stale_id, corr_id, query_vec))
 
+    # Precision control: coexisting facts that must NOT be demoted. Same count as
+    # the genuine belief pairs, at the same controlled cosine.
+    coexist = insert_coexisting(tsm, dim, probes_n, correction_cos, rng, seq_label="cox")
+
     tsm.trigger_consolidation()
-    return probes
+    return probes, coexist
 
 
 # ---------------------------------------------------------------------------
@@ -277,10 +317,12 @@ def rank_of(results, target_id):
     return ids.index(target_id) + 1 if target_id in ids else None
 
 
-def score_arm(tsm, probes, mode_search, top_k, query_text_fn):
+def score_arm(tsm, probes, coexist, mode_search, top_k, query_text_fn):
     """Run all probes for one arm. Returns aggregate metrics.
 
     mode_search: "ann" -> search_ann ; "cog" -> search.
+    `false_demotion` is the fraction of coexisting pairs the detector WRONGLY
+    linked with a belief edge (the precision control; should be ~0).
     """
     n = len(probes)
     belief_correct = 0       # correction ranks ABOVE stale (the headline metric)
@@ -305,10 +347,21 @@ def score_arm(tsm, probes, mode_search, top_k, query_text_fn):
         if s_rank != 1:
             stale_suppressed += 1
 
+    # Precision control: a coexisting pair is FALSELY demoted if the detector
+    # created a belief edge (Contradicts/Refines) between its two members.
+    false_dem = 0
+    for older_id, newer_id in coexist:
+        linked = (newer_id in tsm.get_contradictions(older_id)) or (
+            newer_id in tsm.get_refinements(older_id)
+        )
+        if linked:
+            false_dem += 1
+
     return {
         "belief_accuracy": belief_correct / n,
         "correction_recall": correction_found / n,
         "stale_suppression": stale_suppressed / n,
+        "false_demotion": (false_dem / len(coexist)) if coexist else 0.0,
     }
 
 
@@ -328,9 +381,9 @@ def run_cell(tsm_module, dim, probes_n, distractors, gap, correction_cos, mode, 
         eng = tsm_module.MemoryEngine(db_path=os.path.join(tmp, "ann"), dimension=dim,
                                       auto_consolidation_secs=0, **base_cog_config())
         try:
-            probes = build_corpus(eng, dim, probes_n, distractors, gap, correction_cos, mode,
-                                  np.random.RandomState(seed))
-            arms["ANN"] = score_arm(eng, probes, "ann", top_k, query_text)
+            probes, coexist = build_corpus(eng, dim, probes_n, distractors, gap, correction_cos,
+                                           mode, np.random.RandomState(seed))
+            arms["ANN"] = score_arm(eng, probes, coexist, "ann", top_k, query_text)
         finally:
             eng.close()
 
@@ -338,9 +391,9 @@ def run_cell(tsm_module, dim, probes_n, distractors, gap, correction_cos, mode, 
         eng = tsm_module.MemoryEngine(db_path=os.path.join(tmp, "off"), dimension=dim,
                                       auto_consolidation_secs=0, **base_cog_config())
         try:
-            probes = build_corpus(eng, dim, probes_n, distractors, gap, correction_cos, mode,
-                                  np.random.RandomState(seed))
-            arms["CogOFF"] = score_arm(eng, probes, "cog", top_k, query_text)
+            probes, coexist = build_corpus(eng, dim, probes_n, distractors, gap, correction_cos,
+                                           mode, np.random.RandomState(seed))
+            arms["CogOFF"] = score_arm(eng, probes, coexist, "cog", top_k, query_text)
         finally:
             eng.close()
 
@@ -348,9 +401,9 @@ def run_cell(tsm_module, dim, probes_n, distractors, gap, correction_cos, mode, 
         eng = tsm_module.MemoryEngine(db_path=os.path.join(tmp, "on"), dimension=dim,
                                       auto_consolidation_secs=0, **cogon_config(mode))
         try:
-            probes = build_corpus(eng, dim, probes_n, distractors, gap, correction_cos, mode,
-                                  np.random.RandomState(seed))
-            arms["CogON"] = score_arm(eng, probes, "cog", top_k, query_text)
+            probes, coexist = build_corpus(eng, dim, probes_n, distractors, gap, correction_cos,
+                                           mode, np.random.RandomState(seed))
+            arms["CogON"] = score_arm(eng, probes, coexist, "cog", top_k, query_text)
         finally:
             eng.close()
 
@@ -398,7 +451,7 @@ def main():
     logger.info("=" * 78)
 
     header = (f"{'distractors':>11} | {'arm':<7} | {'belief_acc':>10} | "
-              f"{'corr_recall':>11} | {'stale_suppr':>11}")
+              f"{'corr_recall':>11} | {'stale_suppr':>11} | {'false_dem':>9}")
     rows = []
     verdicts = []
     for d in distractor_sweep:
@@ -410,9 +463,9 @@ def main():
         logger.info("-" * 78)
         for name in ("ANN", "CogOFF", "CogON"):
             m = arms[name]
-            logger.info("%11d | %-7s | %10.2f | %11.2f | %11.2f",
+            logger.info("%11d | %-7s | %10.2f | %11.2f | %11.2f | %9.2f",
                         d, name, m["belief_accuracy"], m["correction_recall"],
-                        m["stale_suppression"])
+                        m["stale_suppression"], m["false_demotion"])
         lift = arms["CogON"]["belief_accuracy"] - arms["CogOFF"]["belief_accuracy"]
         vs_ann = arms["CogON"]["belief_accuracy"] - arms["ANN"]["belief_accuracy"]
         logger.info("  -> feature lift (CogON - CogOFF) = %+.2f   |   vs ANN = %+.2f", lift, vs_ann)
@@ -424,12 +477,16 @@ def main():
     logger.info("=" * 78)
     for d, arms, lift, vs_ann in rows:
         logger.info("  distractors=%-6d  belief_acc ANN=%.2f CogOFF=%.2f CogON=%.2f  "
-                    "lift=%+.2f", d, arms["ANN"]["belief_accuracy"],
-                    arms["CogOFF"]["belief_accuracy"], arms["CogON"]["belief_accuracy"], lift)
+                    "lift=%+.2f  CogON false_dem=%.2f", d, arms["ANN"]["belief_accuracy"],
+                    arms["CogOFF"]["belief_accuracy"], arms["CogON"]["belief_accuracy"], lift,
+                    arms["CogON"]["false_demotion"])
 
     mean_lift = sum(verdicts) / len(verdicts) if verdicts else 0.0
+    mean_fd = (sum(a["CogON"]["false_demotion"] for _, a, _, _ in rows) / len(rows)
+               if rows else 0.0)
     logger.info("-" * 78)
     logger.info("Mean feature lift across sweep: %+.2f", mean_lift)
+    logger.info("Mean CogON false-demotion (coexisting facts wrongly demoted): %.2f", mean_fd)
     if mean_lift > 0.10:
         logger.info("VERDICT: belief-revision edges add MEASURABLE value beyond generic recall.")
     elif mean_lift > 0.0:

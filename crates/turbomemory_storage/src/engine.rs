@@ -1537,6 +1537,7 @@ impl StorageEngine {
             return Ok(0);
         }
         let demotion_factor = self.config.tier.supersession_demotion_factor;
+        let text_floor = self.config.tier.refinement_text_threshold;
 
         self.access_counters.drain_into(&self.meta)?;
 
@@ -1547,6 +1548,7 @@ impl StorageEngine {
             offset: PointOffset,
             insert_seq: u64,
             concepts: Vec<String>,
+            text: String,
         }
         let mut cands: Vec<Cand> = Vec::new();
         self.meta.for_each_record(|offset, rec| {
@@ -1555,6 +1557,7 @@ impl StorageEngine {
                 id: rec.id.clone(),
                 insert_seq: rec.insert_seq,
                 concepts: rec.concepts.clone(),
+                text: rec.text.clone(),
             });
         })?;
         cands.sort_by_key(|c| std::cmp::Reverse(c.insert_seq));
@@ -1604,6 +1607,14 @@ impl StorageEngine {
                 let sim = cosine_similarity(&embedding, other_vec);
                 drop(view);
                 if sim < threshold {
+                    continue;
+                }
+                // Precision gate: a refinement is a *re-statement* of the same
+                // claim (high text overlap). Reject low-overlap pairs so two
+                // coexisting facts about the same topic (same concept, high
+                // cosine, independent content) are not treated as a refinement
+                // and demoted.
+                if turbomemory_graph::text_jaccard_similarity(&cand.text, &other.text) < text_floor {
                     continue;
                 }
                 // Create the Refines edge: old (other) → new (cand).
@@ -1705,6 +1716,7 @@ impl StorageEngine {
         }
         let text_threshold = self.config.tier.contradiction_text_threshold;
         let weaken_factor = self.config.tier.contradiction_weaken_factor;
+        let require_opposition = self.config.tier.contradiction_require_opposition;
         let demotion_factor = self.config.tier.supersession_demotion_factor;
 
         self.access_counters.drain_into(&self.meta)?;
@@ -1779,6 +1791,14 @@ impl StorageEngine {
                 if text_sim >= text_threshold {
                     // High text overlap → this is a refinement, not a
                     // contradiction. Skip (check_refinements handles it).
+                    continue;
+                }
+                // Precision gate: a genuine contradiction OPPOSES the old claim
+                // (explicit negation/contrast cue). Two coexisting facts about
+                // the same topic also have low overlap but do NOT oppose — so
+                // without an opposition marker we do not create the edge (this
+                // is what stops belief revision from demoting coexisting facts).
+                if require_opposition && !turbomemory_graph::has_opposition_marker(&cand.text) {
                     continue;
                 }
                 // Create the Contradicts edge: old (other) → new (cand).
@@ -2172,6 +2192,8 @@ mod tests {
                 refinement_max_pairs_per_cycle: 1024,
                 contradiction_cosine_threshold: None,
                 contradiction_text_threshold: 0.3,
+                refinement_text_threshold: 0.25,
+                contradiction_require_opposition: true,
                 contradiction_weaken_factor: 0.5,
                 contradiction_max_pairs_per_cycle: 1024,
                 importance_auto_scoring: false,
@@ -2230,6 +2252,8 @@ mod tests {
                 refinement_max_pairs_per_cycle: 1024,
                 contradiction_cosine_threshold: None,
                 contradiction_text_threshold: 0.3,
+                refinement_text_threshold: 0.25,
+                contradiction_require_opposition: true,
                 contradiction_weaken_factor: 0.5,
                 contradiction_max_pairs_per_cycle: 1024,
                 importance_auto_scoring: false,
@@ -2569,9 +2593,10 @@ mod tests {
         // Old memory: a FALSE claim. Text mentions the topic word "rust" but
         // otherwise uses vocabulary disjoint from the correction so the Jaccard
         // similarity stays below the threshold — a contradiction, not a refinement.
-        //   A tokens: {rust, requires, manual, compilation, before, execution}
-        //   B tokens: {rust, executes, source, code, through, interpretation, directly}
-        //   intersection = {rust} → Jaccard = 1/12 ≈ 0.083 < 0.4.
+        //   A tokens: {rust, requires, manual, compilation, execution}
+        //   B tokens: {rust, compiled, actually, runs, interpretation}
+        //   intersection = {rust} → Jaccard = 1/9 ≈ 0.11 < 0.4, AND the
+        //   correction carries opposition markers ("not", "actually").
         engine
             .insert(
                 "old_claim",
@@ -2585,7 +2610,7 @@ mod tests {
         engine
             .insert(
                 "new_correction",
-                "Rust executes source code through interpretation directly",
+                "Rust is not compiled; it actually runs through interpretation",
                 &[0.9f32, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
                 1.5,
                 &["rust".to_string()],

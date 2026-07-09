@@ -604,6 +604,47 @@ pub fn text_jaccard_similarity(a: &str, b: &str) -> f32 {
     intersection as f32 / union as f32
 }
 
+/// Single-word opposition/negation markers, matched as whole tokens so "not"
+/// does not match inside "another". Kept lowercase.
+const OPPOSITION_MARKERS_WORD: &[&str] = &[
+    "not",
+    "never",
+    "cannot",
+    "actually",
+    "instead",
+    "false",
+    "incorrect",
+    "wrong",
+    "unlike",
+    "opposite",
+    "contrary",
+    "mistaken",
+];
+
+/// Multi-word / contraction opposition markers, matched as substrings of the
+/// lowercased text. `"n't"` catches the negation contractions (isn't, doesn't,
+/// don't, won't, can't, aren't, wasn't, didn't) that the tokenizer would split.
+const OPPOSITION_MARKERS_PHRASE: &[&str] = &["n't", "no longer", "rather than", "in fact"];
+
+/// Returns true if `text` contains an explicit opposition / negation marker.
+///
+/// Used by the contradiction detector to distinguish a genuine contradiction
+/// ("X actually uses Y instead") from two *coexisting* facts about the same
+/// topic (same concept, low text overlap, but no opposition). This is a
+/// lightweight bag-of-cues heuristic, not full NLI: it favors precision and
+/// will miss marker-less semantic contradictions.
+pub fn has_opposition_marker(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    if OPPOSITION_MARKERS_PHRASE.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+    let words: std::collections::HashSet<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    OPPOSITION_MARKERS_WORD.iter().any(|m| words.contains(m))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -901,5 +942,25 @@ mod tests {
             sim_diff < sim_same,
             "different texts should have lower Jaccard than identical: {sim_diff} < {sim_same}"
         );
+    }
+
+    #[test]
+    fn opposition_marker_detects_negation_and_contrast() {
+        // Genuine corrections carry an explicit opposition/negation cue.
+        assert!(has_opposition_marker(
+            "Rust is not compiled; it actually runs through interpretation"
+        ));
+        assert!(has_opposition_marker("Python no longer uses a global lock"));
+        assert!(has_opposition_marker("it isn't interpreted"));
+        assert!(has_opposition_marker("the model uses JIT instead"));
+        // Two coexisting facts about the same topic carry NO opposition marker.
+        assert!(!has_opposition_marker(
+            "python ships with a large standard library"
+        ));
+        assert!(!has_opposition_marker(
+            "the database exposes a command line client"
+        ));
+        // Whole-token matching: "not" must not fire inside "notation"/"another".
+        assert!(!has_opposition_marker("another notation for annotation"));
     }
 }
