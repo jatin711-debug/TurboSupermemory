@@ -32,7 +32,26 @@ class Mem0Adapter:
         """
         try:
             from mem0 import Memory
-            self.memory = Memory(config=config)
+            from mem0.configs.base import MemoryConfig
+            
+            # Use local embedder to avoid API keys
+            mem0_config = MemoryConfig(
+                embedder={
+                    "provider": "huggingface",
+                    "config": {
+                        "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+                    }
+                },
+                vector_store={
+                    "provider": "chroma",
+                    "config": {
+                        "collection_name": "mem0_benchmark",
+                        "path": "/tmp/mem0_db",
+                    }
+                }
+            )
+            
+            self.memory = Memory(config=mem0_config)
             logger.info("Mem0 adapter initialized")
         except ImportError:
             raise RuntimeError(

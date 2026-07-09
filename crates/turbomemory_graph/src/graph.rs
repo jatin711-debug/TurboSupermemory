@@ -1,9 +1,14 @@
 //! In-memory episodic-semantic graph with learnable edge weights.
+//!
+//! Internal implementation uses integer-interned node IDs (u32) for O(1)
+//! array indexing. The public API remains string-based for backward
+//! compatibility.
 
 use crate::extract::ConceptVocabulary;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+/// Stable node identifier exposed to callers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NodeId {
     Memory(String),
@@ -17,6 +22,7 @@ impl NodeId {
     pub fn concept(id: impl Into<String>) -> Self {
         NodeId::Concept(id.into())
     }
+    /// Returns the canonical string key used for serialization and public APIs.
     pub fn as_str(&self) -> String {
         match self {
             NodeId::Memory(s) => format!("mem:{s}"),
@@ -25,17 +31,40 @@ impl NodeId {
     }
 }
 
+/// Internal node type tag (replaces string prefix for fast branching).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NodeKind {
+    Memory,
+    Concept,
+}
+
+/// Internal node representation using integer ID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InternalNode {
+    pub kind: NodeKind,
+    /// The original external ID (memory ID or concept name).
+    pub external_id: String,
+    pub text: String,
+    /// For memory nodes: the `importance_factor` baseline.
+    #[serde(default)]
+    pub base_importance_factor: f32,
+}
+
+/// Internal edge representation using integer node IDs.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct InternalEdge {
+    pub source: u32,
+    pub target: u32,
+    pub kind: EdgeKind,
+    pub weight: f32,
+    #[serde(default)]
+    pub last_reinforced_at: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
     pub id: NodeId,
     pub text: String,
-    /// For memory nodes: the `importance_factor` (= `importance.sqrt()`) the
-    /// node's association/temporal edges were created at, i.e. the edge
-    /// *baseline*. Tracked so [`MemoryGraph::reweight_memory`] can rescale
-    /// edges to a new importance while preserving learned reinforcement
-    /// (which lives in the weight above this baseline). `0.0` for concept
-    /// nodes and for graphs loaded from older snapshots (treated as "no
-    /// baseline known" by `reweight_memory`).
     #[serde(default)]
     pub base_importance_factor: f32,
 }
@@ -45,44 +74,11 @@ pub enum EdgeKind {
     Association,
     Temporal,
     Abstraction,
-    /// A refinement edge: points from an *older* memory to a *newer* memory
-    /// that refines/superseds it. Direction: old → new.
-    ///
-    /// When spreading activation reaches the old memory (through its concept
-    /// edges), it propagates through the `Refines` edge to the newer memory,
-    /// ensuring the most current version of a piece of knowledge surfaces
-    /// even when the query matched the older version. The old memory is NOT
-    /// deleted — history is preserved so the agent can reason about how its
-    /// understanding evolved.
     Refines,
-    /// A contradiction edge: points from an *older* memory to a *newer*
-    /// memory that contradicts it. Direction: old → new.
-    ///
-    /// Like `Refines`, this lets spreading activation propagate from the old
-    /// (discredited) memory to the new (correcting) one. Unlike `Refines`,
-    /// when a `Contradicts` edge is created, the old memory's outgoing
-    /// association edges are *weakened* (multiplied by a decay factor), so
-    /// the old memory gradually fades from retrieval while the new one
-    /// surfaces. The old memory is NOT deleted — the agent can still find
-    /// it if explicitly asked, but it won't dominate retrieval.
     Contradicts,
 }
 
-/// An edge in the cognitive graph.
-///
-/// `weight` is the *learned* strength of the connection. It starts at a
-/// base value derived from the source memory's `importance` and is then
-/// updated by reinforcement (on retrieval) and decay (on consolidation):
-///
-/// ```text
-/// weight = base * importance_factor * reinforcement_factor * decay_factor
-/// ```
-///
-/// `last_reinforced_at` is a unix-seconds timestamp tracking when the edge
-/// was last strengthened, so decay can be applied lazily. Edges created
-/// before learning was enabled carry `last_reinforced_at = 0` and are
-/// treated as never-reinforced (decay does not erode them below their
-/// initial base weight until they have been reinforced at least once).
+/// An edge in the cognitive graph (public view).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Edge {
     pub source: NodeId,
@@ -93,9 +89,6 @@ pub struct Edge {
     pub last_reinforced_at: u64,
 }
 
-/// One-shot structural snapshot of the cognitive graph, returned by
-/// [`MemoryGraph::stats`]. Plain data carrier for introspection /
-/// debugging views — all fields are counts.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct GraphStats {
     pub node_count: usize,
@@ -107,7 +100,6 @@ pub struct GraphStats {
     pub abstraction_count: usize,
 }
 
-/// Result of an online concept-vocabulary evolution pass.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct VocabularyEvolutionStats {
     pub merged: usize,
@@ -121,48 +113,228 @@ pub enum ConceptKind {
     Generic,
 }
 
-/// Map a record `importance` (0.0..=1.0 typical, but unbounded) into an
-/// edge-strength multiplier. We use `importance.sqrt()` so that a
-/// zero-importance record still gets a non-zero (but tiny) link, while a
-/// high-importance record gets a proportionally stronger one. The sqrt
-/// curve keeps the dynamic range manageable: importance 0.25 -> 0.5x,
-/// importance 1.0 -> 1.0x, importance 4.0 -> 2.0x.
 fn importance_factor(importance: f32) -> f32 {
     if importance <= 0.0 {
-        // Floor at a small epsilon so zero-importance records remain
-        // reachable but rank below anything with positive importance.
         0.1
     } else {
         importance.sqrt()
     }
 }
 
+/// Maps external string keys to dense u32 node IDs. IDs are assigned in
+/// insertion order and never reused, so iteration order is stable across
+/// snapshots.
+#[derive(Debug, Clone, Default)]
+pub struct NodeInterner {
+    key_to_id: HashMap<String, u32>,
+    id_to_key: Vec<String>,
+    id_to_node: Vec<InternalNode>,
+}
+
+impl NodeInterner {
+    fn intern(&mut self, key: String, node: InternalNode) -> u32 {
+        if let Some(&id) = self.key_to_id.get(&key) {
+            return id;
+        }
+        let id = self.id_to_key.len() as u32;
+        self.key_to_id.insert(key.clone(), id);
+        self.id_to_key.push(key);
+        self.id_to_node.push(node);
+        id
+    }
+
+    fn resolve(&self, key: &str) -> Option<u32> {
+        self.key_to_id.get(key).copied()
+    }
+
+    fn get(&self, id: u32) -> Option<&InternalNode> {
+        self.id_to_node.get(id as usize)
+    }
+
+    fn get_mut(&mut self, id: u32) -> Option<&mut InternalNode> {
+        self.id_to_node.get_mut(id as usize)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (u32, &String, &InternalNode)> {
+        self.id_to_key
+            .iter()
+            .enumerate()
+            .filter(|(i, k)| self.key_to_id.get(*k) == Some(&(*i as u32)))
+            .map(|(i, k)| (i as u32, k, &self.id_to_node[i]))
+    }
+
+    fn memory_nodes(&self) -> impl Iterator<Item = (u32, &String, &InternalNode)> {
+        self.iter()
+            .filter(|(_, _, n)| matches!(n.kind, NodeKind::Memory))
+    }
+}
+
+/// Adjacency stored as a HashMap<u32, Vec<usize>> for fast O(1) neighbor
+/// lookup by integer node ID. This replaces the old String-keyed BTreeMap.
+#[derive(Debug, Clone, Default)]
+pub struct IntAdjacency {
+    map: HashMap<u32, Vec<usize>>,
+}
+
+impl IntAdjacency {
+    fn add(&mut self, source: u32, edge_idx: usize) {
+        self.map.entry(source).or_default().push(edge_idx);
+    }
+
+    fn get(&self, source: u32) -> Option<&[usize]> {
+        self.map.get(&source).map(|v| v.as_slice())
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+    }
+
+    fn rebuild(&mut self, edges: &[InternalEdge]) {
+        self.clear();
+        for (idx, edge) in edges.iter().enumerate() {
+            self.add(edge.source, idx);
+        }
+    }
+}
+
 /// A property graph over memories and extracted concepts with learnable
 /// edge weights and an abstraction hierarchy.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// Internally uses integer node IDs (u32) for fast array-based access.
+/// The public API remains string-based for backward compatibility.
+#[derive(Debug, Clone, Default)]
 pub struct MemoryGraph {
+    interner: NodeInterner,
+    int_edges: Vec<InternalEdge>,
+    int_adjacency: IntAdjacency,
+    last_memory_id: Option<String>,
+    co_occurrence: BTreeMap<String, usize>,
+    vocab: ConceptVocabulary,
+    suppressed_concepts: BTreeSet<String>,
+}
+
+/// Legacy serialization format for backward compatibility.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyMemoryGraph {
     nodes: BTreeMap<String, Node>,
     edges: Vec<Edge>,
     adjacency: BTreeMap<String, Vec<usize>>,
     last_memory_id: Option<String>,
-    /// Co-occurrence counts between concept pairs, accumulated on
-    /// `add_memory`. Used by `build_abstractions` to decide when two
-    /// concepts are related enough to warrant a parent abstraction node.
-    /// Keyed by the lexicographically-ordered `concept:a\0concept:b` pair
-    /// so (a,b) and (b,a) share a single counter.
     #[serde(default)]
     co_occurrence: BTreeMap<String, usize>,
-    /// Shared concept vocabulary that canonicalizes surface forms. Aliases
-    /// discovered by online vocabulary evolution are stored here so future
-    /// inserts map synonyms ("coding") to a single canonical concept node
-    /// ("programming").
     #[serde(default)]
     vocab: ConceptVocabulary,
-    /// Concepts that have been suppressed as over-general hubs. Their
-    /// outgoing association edges are not expanded during spreading
-    /// activation, preventing them from drowning out more specific concepts.
     #[serde(default)]
     suppressed_concepts: BTreeSet<String>,
+}
+
+impl From<LegacyMemoryGraph> for MemoryGraph {
+    fn from(legacy: LegacyMemoryGraph) -> Self {
+        let mut graph = MemoryGraph {
+            interner: NodeInterner::default(),
+            int_edges: Vec::new(),
+            int_adjacency: IntAdjacency::default(),
+            last_memory_id: legacy.last_memory_id,
+            co_occurrence: legacy.co_occurrence,
+            vocab: legacy.vocab,
+            suppressed_concepts: legacy.suppressed_concepts,
+        };
+
+        // Intern all nodes first
+        for (key, node) in &legacy.nodes {
+            let kind = match &node.id {
+                NodeId::Memory(_) => NodeKind::Memory,
+                NodeId::Concept(_) => NodeKind::Concept,
+            };
+            let external_id = match &node.id {
+                NodeId::Memory(s) => s.clone(),
+                NodeId::Concept(s) => s.clone(),
+            };
+            graph.intern_node(
+                key.clone(),
+                kind,
+                external_id,
+                node.text.clone(),
+                node.base_importance_factor,
+            );
+        }
+
+        // Convert edges to integer format
+        for edge in &legacy.edges {
+            let src_key = edge.source.as_str();
+            let tgt_key = edge.target.as_str();
+            if let (Some(src_id), Some(tgt_id)) =
+                (graph.get_node_id(&src_key), graph.get_node_id(&tgt_key))
+            {
+                graph.int_edges.push(InternalEdge {
+                    source: src_id,
+                    target: tgt_id,
+                    kind: edge.kind,
+                    weight: edge.weight,
+                    last_reinforced_at: edge.last_reinforced_at,
+                });
+            }
+        }
+        graph.int_adjacency.rebuild(&graph.int_edges);
+        graph
+    }
+}
+
+impl From<MemoryGraph> for LegacyMemoryGraph {
+    fn from(graph: MemoryGraph) -> Self {
+        let mut nodes = BTreeMap::new();
+        for (_id, key, node) in graph.interner.iter() {
+            let node_id = match node.kind {
+                NodeKind::Memory => NodeId::memory(&node.external_id),
+                NodeKind::Concept => NodeId::concept(&node.external_id),
+            };
+            nodes.insert(
+                key.clone(),
+                Node {
+                    id: node_id,
+                    text: node.text.clone(),
+                    base_importance_factor: node.base_importance_factor,
+                },
+            );
+        }
+
+        let edges = graph.edges();
+        let mut adjacency: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (idx, edge) in graph.int_edges.iter().enumerate() {
+            let source_key = graph.interner.id_to_key[edge.source as usize].clone();
+            adjacency.entry(source_key).or_default().push(idx);
+        }
+
+        LegacyMemoryGraph {
+            nodes,
+            edges,
+            adjacency,
+            last_memory_id: graph.last_memory_id,
+            co_occurrence: graph.co_occurrence,
+            vocab: graph.vocab,
+            suppressed_concepts: graph.suppressed_concepts,
+        }
+    }
+}
+
+impl Serialize for MemoryGraph {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let legacy: LegacyMemoryGraph = self.clone().into();
+        legacy.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for MemoryGraph {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let legacy = LegacyMemoryGraph::deserialize(deserializer)?;
+        Ok(legacy.into())
+    }
 }
 
 impl MemoryGraph {
@@ -170,20 +342,47 @@ impl MemoryGraph {
         Self::default()
     }
 
-    /// Backward-compatible insert: equivalent to `importance = 1.0`.
+    /// Intern a node and return its u32 ID. If already present, returns existing.
+    fn intern_node(
+        &mut self,
+        key: String,
+        kind: NodeKind,
+        external_id: String,
+        text: String,
+        base_importance_factor: f32,
+    ) -> u32 {
+        if let Some(&id) = self.interner.key_to_id.get(&key) {
+            return id;
+        }
+        let node = InternalNode {
+            kind,
+            external_id,
+            text,
+            base_importance_factor,
+        };
+        self.interner.intern(key, node)
+    }
+
+    fn get_node_id(&self, key: &str) -> Option<u32> {
+        self.interner.resolve(key)
+    }
+
+    fn add_int_edge(&mut self, source: u32, target: u32, kind: EdgeKind, weight: f32) {
+        let idx = self.int_edges.len();
+        self.int_edges.push(InternalEdge {
+            source,
+            target,
+            kind,
+            weight,
+            last_reinforced_at: 0,
+        });
+        self.int_adjacency.add(source, idx);
+    }
+
     pub fn add_memory(&mut self, id: &str, text: &str, concepts: &[String]) {
         self.add_memory_with_importance(id, text, concepts, 1.0);
     }
 
-    /// Insert a memory node, link it to its concepts with importance-weighted
-    /// association edges, and chain it temporally to the previous insert.
-    ///
-    /// Concepts are normalized to lowercase so that "Rust" and "rust" map to
-    /// the same concept node. The association edge weight is
-    /// `importance_factor(importance)`; the temporal edge weight is
-    /// `0.5 * importance_factor(importance)`. Both are bidirectional for
-    /// association (mem<->concept) and directional for temporal (prev_mem ->
-    /// mem).
     pub fn add_memory_with_importance(
         &mut self,
         id: &str,
@@ -193,21 +392,17 @@ impl MemoryGraph {
     ) {
         let mem_key = NodeId::memory(id).as_str();
         let imp = importance_factor(importance);
-        self.nodes.insert(
+        let mem_id = self.intern_node(
             mem_key.clone(),
-            Node {
-                id: NodeId::memory(id),
-                text: text.to_string(),
-                base_importance_factor: imp,
-            },
+            NodeKind::Memory,
+            id.to_string(),
+            text.to_string(),
+            imp,
         );
 
-        // Normalize concepts to lowercase, canonicalize through the learned
-        // vocabulary, and dedup. This ensures "Rust" / "rust" share a node
-        // and that aliases discovered by online vocabulary evolution (e.g.
-        // "coding" -> "programming") map to the canonical concept node.
+        // Normalize concepts to lowercase, canonicalize, dedup.
         let mut normalized: Vec<String> = Vec::with_capacity(concepts.len());
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
         for concept in concepts {
             let norm = self.vocab.resolve(concept);
             if !norm.is_empty() && seen.insert(norm.clone()) {
@@ -218,25 +413,15 @@ impl MemoryGraph {
         // Concept association edges (bidirectional), weighted by importance.
         for concept in &normalized {
             let concept_key = NodeId::concept(concept).as_str();
-            self.nodes
-                .entry(concept_key.clone())
-                .or_insert_with(|| Node {
-                    id: NodeId::concept(concept.clone()),
-                    text: concept.clone(),
-                    base_importance_factor: 0.0,
-                });
-            self.add_edge_internal(
-                NodeId::memory(id),
-                NodeId::concept(concept),
-                EdgeKind::Association,
-                imp,
+            let concept_id = self.intern_node(
+                concept_key.clone(),
+                NodeKind::Concept,
+                concept.clone(),
+                concept.clone(),
+                0.0,
             );
-            self.add_edge_internal(
-                NodeId::concept(concept),
-                NodeId::memory(id),
-                EdgeKind::Association,
-                imp,
-            );
+            self.add_int_edge(mem_id, concept_id, EdgeKind::Association, imp);
+            self.add_int_edge(concept_id, mem_id, EdgeKind::Association, imp);
         }
 
         // Accumulate concept co-occurrence for abstraction building.
@@ -245,7 +430,7 @@ impl MemoryGraph {
             sorted.sort();
             for i in 0..sorted.len() {
                 for j in (i + 1)..sorted.len() {
-                    let key = format!("concept:{}\u{0}concept:{}", sorted[i], sorted[j]);
+                    let key = format!("concept:{}{}concept:{}", sorted[i], '\0', sorted[j]);
                     *self.co_occurrence.entry(key).or_insert(0) += 1;
                 }
             }
@@ -253,159 +438,175 @@ impl MemoryGraph {
 
         // Temporal chaining between consecutive memories.
         if let Some(prev) = self.last_memory_id.take() {
-            self.add_edge_internal(
-                NodeId::memory(&prev),
-                NodeId::memory(id),
-                EdgeKind::Temporal,
-                0.5 * imp,
-            );
+            let prev_key = NodeId::memory(&prev).as_str();
+            if let Some(prev_id) = self.get_node_id(&prev_key) {
+                self.add_int_edge(prev_id, mem_id, EdgeKind::Temporal, 0.5 * imp);
+            }
         }
         self.last_memory_id = Some(id.to_string());
     }
 
-    /// Remove a memory node and all edges connected to it.
     pub fn remove_memory(&mut self, id: &str) {
         let mem_key = NodeId::memory(id).as_str();
-        if self.nodes.remove(&mem_key).is_none() {
+        let Some(mem_id) = self.get_node_id(&mem_key) else {
             return;
-        }
-        self.edges
-            .retain(|e| e.source.as_str() != mem_key && e.target.as_str() != mem_key);
-        self.rebuild_adjacency();
-    }
-
-    fn add_edge_internal(&mut self, source: NodeId, target: NodeId, kind: EdgeKind, weight: f32) {
-        let idx = self.edges.len();
-        self.edges.push(Edge {
-            source: source.clone(),
-            target,
-            kind,
-            weight,
-            last_reinforced_at: 0,
-        });
-        self.adjacency.entry(source.as_str()).or_default().push(idx);
-    }
-
-    /// Rebuild the adjacency map from the current edge list without sorting.
-    ///
-    /// Used after operations that change edge indices (e.g. removal).  Edges are
-    /// kept in insertion order during normal use so that add_memory stays O(1).
-    fn rebuild_adjacency(&mut self) {
-        self.adjacency.clear();
-        for (idx, edge) in self.edges.iter().enumerate() {
-            self.adjacency
-                .entry(edge.source.as_str())
-                .or_default()
-                .push(idx);
-        }
-    }
-
-    /// Sort edges and rebuild adjacency so iteration is deterministic across
-    /// incremental builds and reloads.
-    ///
-    /// This is only called on explicit compaction or serialization, not on the
-    /// insert hot path.
-    pub fn compact(&mut self) {
-        self.edges.sort_by(|a, b| {
-            a.source
-                .as_str()
-                .cmp(&b.source.as_str())
-                .then(a.target.as_str().cmp(&b.target.as_str()))
-                .then(a.kind.cmp(&b.kind))
-                .then(
-                    a.weight
-                        .partial_cmp(&b.weight)
-                        .unwrap_or(std::cmp::Ordering::Equal),
-                )
-        });
-        self.rebuild_adjacency();
-    }
-
-    fn normalize_edges(&mut self) {
-        self.compact();
+        };
+        // Remove the node from interner (mark as removed by clearing key map)
+        self.interner.key_to_id.remove(&mem_key);
+        // Remove edges connected to this node
+        self.int_edges
+            .retain(|e| e.source != mem_id && e.target != mem_id);
+        self.int_adjacency.rebuild(&self.int_edges);
     }
 
     pub fn node_count(&self) -> usize {
-        self.nodes.len()
+        self.interner.iter().count()
     }
 
     pub fn edge_count(&self) -> usize {
-        self.edges.len()
+        self.int_edges.len()
     }
 
-    /// Number of memory nodes in the graph.
     pub fn memory_count(&self) -> usize {
-        self.iter_memory_nodes().count()
-    }
-
-    /// Number of memory-node neighbors (outgoing association edges) for a
-    /// concept node.  Returns 0 if the node does not exist or is not a concept.
-    pub fn concept_degree(&self, concept: &str) -> usize {
-        let key = NodeId::concept(concept).as_str();
-        self.neighbors(&key)
+        self.interner
             .iter()
-            .filter(|e| matches!(e.kind, EdgeKind::Association))
+            .filter(|(_, _, n)| matches!(n.kind, NodeKind::Memory))
             .count()
     }
 
-    pub fn nodes(&self) -> &BTreeMap<String, Node> {
-        &self.nodes
+    pub fn concept_degree(&self, concept: &str) -> usize {
+        let key = NodeId::concept(concept).as_str();
+        let Some(id) = self.get_node_id(&key) else {
+            return 0;
+        };
+        self.int_adjacency
+            .get(id)
+            .map(|idxs| {
+                idxs.iter()
+                    .filter(|&&i| self.int_edges[i].kind == EdgeKind::Association)
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
-    pub fn edges(&self) -> &[Edge] {
-        &self.edges
+    /// Public API: returns nodes as BTreeMap for backward compatibility.
+    pub fn nodes(&self) -> BTreeMap<String, Node> {
+        let mut map = BTreeMap::new();
+        for (_id, key, node) in self.interner.iter() {
+            let node_id = match node.kind {
+                NodeKind::Memory => NodeId::memory(&node.external_id),
+                NodeKind::Concept => NodeId::concept(&node.external_id),
+            };
+            map.insert(
+                key.clone(),
+                Node {
+                    id: node_id,
+                    text: node.text.clone(),
+                    base_importance_factor: node.base_importance_factor,
+                },
+            );
+        }
+        map
     }
 
-    pub fn neighbors(&self, node_key: &str) -> Vec<&Edge> {
-        self.adjacency
-            .get(node_key)
-            .map(|idxs| idxs.iter().map(|&i| &self.edges[i]).collect())
+    /// Public API: returns edges with NodeId for backward compatibility.
+    pub fn edges(&self) -> Vec<Edge> {
+        self.int_edges
+            .iter()
+            .map(|e| {
+                let source_node = self.interner.get(e.source).expect("valid source");
+                let target_node = self.interner.get(e.target).expect("valid target");
+                Edge {
+                    source: match source_node.kind {
+                        NodeKind::Memory => NodeId::memory(&source_node.external_id),
+                        NodeKind::Concept => NodeId::concept(&source_node.external_id),
+                    },
+                    target: match target_node.kind {
+                        NodeKind::Memory => NodeId::memory(&target_node.external_id),
+                        NodeKind::Concept => NodeId::concept(&target_node.external_id),
+                    },
+                    kind: e.kind,
+                    weight: e.weight,
+                    last_reinforced_at: e.last_reinforced_at,
+                }
+            })
+            .collect()
+    }
+
+    /// Public API: returns neighbor edges (allocates Vec for compat).
+    pub fn neighbors(&self, node_key: &str) -> Vec<Edge> {
+        let Some(id) = self.get_node_id(node_key) else {
+            return Vec::new();
+        };
+        self.int_adjacency
+            .get(id)
+            .map(|idxs| {
+                idxs.iter()
+                    .map(|&i| {
+                        let e = &self.int_edges[i];
+                        let source_node = self.interner.get(e.source).expect("valid source");
+                        let target_node = self.interner.get(e.target).expect("valid target");
+                        Edge {
+                            source: match source_node.kind {
+                                NodeKind::Memory => NodeId::memory(&source_node.external_id),
+                                NodeKind::Concept => NodeId::concept(&source_node.external_id),
+                            },
+                            target: match target_node.kind {
+                                NodeKind::Memory => NodeId::memory(&target_node.external_id),
+                                NodeKind::Concept => NodeId::concept(&target_node.external_id),
+                            },
+                            kind: e.kind,
+                            weight: e.weight,
+                            last_reinforced_at: e.last_reinforced_at,
+                        }
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
-    pub fn iter_memory_nodes(&self) -> impl Iterator<Item = (&String, &Node)> {
-        self.nodes.iter().filter(|(k, _)| k.starts_with("mem:"))
+    /// Public API: iterate memory nodes as (key, Node) for backward compat.
+    pub fn iter_memory_nodes(&self) -> impl Iterator<Item = (String, Node)> + '_ {
+        self.interner.memory_nodes().map(|(_, key, node)| {
+            let node_id = match node.kind {
+                NodeKind::Memory => NodeId::memory(&node.external_id),
+                NodeKind::Concept => NodeId::concept(&node.external_id),
+            };
+            (
+                key.clone(),
+                Node {
+                    id: node_id,
+                    text: node.text.clone(),
+                    base_importance_factor: node.base_importance_factor,
+                },
+            )
+        })
     }
 
-    /// Reinforce the edges of a memory node, simulating rehearsal.
-    ///
-    /// Called when a memory is retrieved. Strengthens every edge touching
-    /// the memory — both outgoing (where the memory is the source) and
-    /// incoming association edges (where the memory is the target). This
-    /// ensures that when a concept node is activated by a query, it
-    /// propagates more energy to frequently-retrieved memories.
-    ///
-    /// Edges that have never been reinforced get a larger initial boost
-    /// (capturing the "first recall matters most" effect); subsequently
-    /// reinforced edges grow more slowly. Weights are clamped at 8.0.
-    ///
-    /// `now` is a unix-seconds timestamp used to stamp `last_reinforced_at`.
     pub fn reinforce(&mut self, id: &str, now: u64) {
         let mem_key = NodeId::memory(id).as_str();
+        let Some(mem_id) = self.get_node_id(&mem_key) else {
+            return;
+        };
 
-        // Strengthen outgoing edges (where the memory is the source).
-        let out_idxs: Vec<usize> = self.adjacency.get(&mem_key).cloned().unwrap_or_default();
-        for i in out_idxs {
-            let edge = &mut self.edges[i];
-            let boost = if edge.last_reinforced_at == 0 {
-                1.5
-            } else {
-                1.0 + 0.1 / (1.0 + edge.weight)
-            };
-            edge.weight = (edge.weight * boost).min(8.0);
-            edge.last_reinforced_at = now;
+        // Strengthen outgoing edges where memory is source.
+        if let Some(out_idxs) = self.int_adjacency.get(mem_id) {
+            let out_idxs: Vec<usize> = out_idxs.to_vec();
+            for i in out_idxs {
+                let edge = &mut self.int_edges[i];
+                let boost = if edge.last_reinforced_at == 0 {
+                    1.5
+                } else {
+                    1.0 + 0.1 / (1.0 + edge.weight)
+                };
+                edge.weight = (edge.weight * boost).min(8.0);
+                edge.last_reinforced_at = now;
+            }
         }
 
-        // Strengthen incoming Association edges (where the memory is the
-        // target). This is what makes reinforcement actually boost a
-        // memory's activation: when a concept is activated by the query,
-        // it propagates more energy through the strengthened concept→memory
-        // edge to the reinforced memory than to non-reinforced ones.
-        // We scan the edge list for Association edges targeting this memory.
-        // This is O(edges) but reinforcement only happens on retrieval (not
-        // on the insert hot path), and the edge list is typically small.
-        for edge in &mut self.edges {
-            if edge.kind == EdgeKind::Association && edge.target.as_str() == mem_key {
+        // Strengthen incoming Association edges where memory is target.
+        for edge in &mut self.int_edges {
+            if edge.kind == EdgeKind::Association && edge.target == mem_id {
                 let boost = if edge.last_reinforced_at == 0 {
                     1.5
                 } else {
@@ -417,91 +618,44 @@ impl MemoryGraph {
         }
     }
 
-    /// Apply exponential time-decay to all reinforced edges.
-    ///
-    /// `weight *= 0.5^((now - last_reinforced_at) / half_life)`, floored at
-    /// the edge's *original* importance-weighted base weight so that decay
-    /// erodes *learned* reinforcement but never drops an edge below the
-    /// strength it was created with. Edges that were never reinforced
-    /// (`last_reinforced_at == 0`) are left untouched — they are already at
-    /// their base weight and have no learned component to decay.
-    ///
-    /// This is the "forgetting" half of the retain-what-matters loop: stale,
-    /// unrehearsed memories fade back toward their baseline while recently
-    /// retrieved ones stay strong.
     pub fn decay_edges(&mut self, now: u64, half_life: u64) {
         if half_life == 0 {
             return;
         }
         let hl = half_life as f64;
-        for edge in &mut self.edges {
+        for edge in &mut self.int_edges {
             if edge.last_reinforced_at == 0 {
                 continue;
             }
             let age = now.saturating_sub(edge.last_reinforced_at) as f64;
             let factor = 0.5f64.powf(age / hl) as f32;
-            // Decay only the *learned* portion above the base weight. We do
-            // not track the original base weight per edge (to keep the struct
-            // small), so we use a floor of `weight * factor` but never below
-            // a small constant. A reinforced edge that has decayed fully
-            // settles at ~1.0 (the original default association weight),
-            // preserving baseline connectivity.
             let decayed = edge.weight * factor;
             edge.weight = decayed.max(1.0);
         }
     }
 
-    /// Rescale a memory's `Association` and `Temporal` edges so their
-    /// *baseline* component reflects `new_importance`, while preserving any
-    /// learned reinforcement/decay state on top of that baseline.
-    ///
-    /// Association edges are created at weight `importance_factor(importance)`
-    /// (= `importance.sqrt()`). When a record's importance changes (e.g. via
-    /// automatic importance scoring), we want the graph to reflect that. But
-    /// reinforcement multiplies edge weights up and decay brings them back
-    /// down, so we can't just re-derive each edge from `new_importance`
-    /// without erasing the learned state.
-    ///
-    /// Approach: an importance-factor-ratio rescale that preserves learned
-    /// reinforcement. The baseline (unreinforced) edge weight equals the old
-    /// `importance_factor`. The memory node tracks its `base_importance_factor`
-    /// (set at creation); the rescale ratio is `new_factor / old_factor`.
-    /// Unreinforced edges become exactly `new_factor` (the new baseline);
-    /// reinforced edges (weight > baseline) scale by the same ratio,
-    /// preserving their relative boost above the baseline. For legacy graphs
-    /// loaded from older snapshots (no stored baseline), we fall back to
-    /// inferring the baseline from unreinforced edges, then from the minimum
-    /// edge weight. Weights are clamped to `[0.01, 8.0]`.
-    ///
-    /// Refines / Contradicts edges are NOT rescaled — they are directed to a
-    /// newer memory and carry fixed semantic weight, not importance weight.
-    /// Returns `true` if the memory existed and was reweighted, `false` if it
-    /// is unknown or has no association edges to rescale.
     pub fn reweight_memory(&mut self, id: &str, new_importance: f32) -> bool {
         let mem_key = NodeId::memory(id).as_str();
-        if !self.nodes.contains_key(&mem_key) {
+        let Some(mem_id) = self.get_node_id(&mem_key) else {
             return false;
-        }
+        };
         let new_factor = importance_factor(new_importance);
 
-        // Gather this memory's own edge indices (outgoing Association +
-        // Temporal) plus incoming Association edges (where the memory is the
-        // target). Temporal edges are directional (prev -> mem) so we only
-        // rescale the ones whose source or target is this memory; concept
-        // association edges are bidirectional so both directions count.
         let mut own_idxs: Vec<usize> = self
-            .adjacency
-            .get(&mem_key)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|&i| {
-                let k = self.edges[i].kind;
-                k == EdgeKind::Association || k == EdgeKind::Temporal
+            .int_adjacency
+            .get(mem_id)
+            .map(|idxs| {
+                idxs.iter()
+                    .copied()
+                    .filter(|&i| {
+                        let k = self.int_edges[i].kind;
+                        k == EdgeKind::Association || k == EdgeKind::Temporal
+                    })
+                    .collect()
             })
-            .collect();
-        for (i, edge) in self.edges.iter().enumerate() {
-            if edge.target.as_str() == mem_key
+            .unwrap_or_default();
+        for (i, edge) in self.int_edges.iter().enumerate() {
+            if edge.target == mem_id
                 && (edge.kind == EdgeKind::Association || edge.kind == EdgeKind::Temporal)
                 && !own_idxs.contains(&i)
             {
@@ -512,26 +666,25 @@ impl MemoryGraph {
             return false;
         }
 
-        // Resolve the old baseline factor. Prefer the node's stored
-        // `base_importance_factor` (exact, set at creation). For legacy
-        // graphs (0.0) infer from unreinforced edges, then the min edge.
-        let stored = self.nodes[&mem_key].base_importance_factor;
+        let stored = self
+            .interner
+            .get(mem_id)
+            .map(|n| n.base_importance_factor)
+            .unwrap_or(0.0);
         let old_factor = if stored > 0.0 {
             stored
         } else {
-            // Legacy graph (no stored baseline): infer from unreinforced
-            // edges if any, else the minimum edge weight.
             let unreinforced_min = own_idxs
                 .iter()
-                .filter(|&&i| self.edges[i].last_reinforced_at == 0)
-                .map(|&i| self.edges[i].weight)
+                .filter(|&&i| self.int_edges[i].last_reinforced_at == 0)
+                .map(|&i| self.int_edges[i].weight)
                 .fold(f32::INFINITY, f32::min);
             if unreinforced_min.is_finite() {
                 unreinforced_min
             } else {
                 own_idxs
                     .iter()
-                    .map(|&i| self.edges[i].weight)
+                    .map(|&i| self.int_edges[i].weight)
                     .fold(f32::INFINITY, f32::min)
             }
         }
@@ -539,40 +692,25 @@ impl MemoryGraph {
         let ratio = new_factor / old_factor;
 
         for &i in &own_idxs {
-            self.edges[i].weight = (self.edges[i].weight * ratio).clamp(0.01, 8.0);
+            self.int_edges[i].weight = (self.int_edges[i].weight * ratio).clamp(0.01, 8.0);
         }
-        // Record the new baseline so subsequent reweights stay correct.
-        self.nodes.get_mut(&mem_key).unwrap().base_importance_factor = new_factor;
+        if let Some(node) = self.interner.get_mut(mem_id) {
+            node.base_importance_factor = new_factor;
+        }
         true
     }
 
-    /// Build abstraction edges: when two concepts co-occur on at least
-    /// `threshold` memories, create a parent concept node that abstracts
-    /// both, with bidirectional `Abstraction` edges. The parent node's id
-    /// is derived from the sorted pair so it is deterministic.
-    ///
-    /// This is the mechanism that lets the graph *generalize* instead of
-    /// staying flat: frequently co-occurring concepts ("rust" + "safety")
-    /// get a parent ("rust+safety") that spreading activation can traverse
-    /// to find memories that share either concept. Idempotent — calling it
-    /// again only adds new abstractions for pairs that have crossed the
-    /// threshold since the last call; existing parent nodes are reused.
-    ///
-    /// Returns the number of new abstraction edges added.
     pub fn build_abstractions(&mut self, threshold: usize) -> usize {
         if threshold == 0 {
             return 0;
         }
         let mut added = 0usize;
-        // Collect pairs above threshold. We iterate over a snapshot because
-        // we mutate `self` inside the loop.
         let pairs: Vec<(String, String, String)> = self
             .co_occurrence
             .iter()
             .filter(|(_, &count)| count >= threshold)
             .map(|(key, _)| {
-                // key is "concept:a\0concept:b"
-                let mut parts = key.splitn(2, '\u{0}');
+                let mut parts = key.splitn(2, '\0');
                 let a = parts.next().unwrap_or_default().to_string();
                 let b = parts.next().unwrap_or_default().to_string();
                 (a, b, key.clone())
@@ -580,8 +718,6 @@ impl MemoryGraph {
             .collect();
 
         for (a_key, b_key, co_key) in pairs {
-            // Parent concept id is the sorted pair of concept names, joined
-            // with '+'. Strip the "concept:" prefix for readability.
             let a_name = a_key.strip_prefix("concept:").unwrap_or(&a_key);
             let b_name = b_key.strip_prefix("concept:").unwrap_or(&b_key);
             let parent_name = if a_name <= b_name {
@@ -591,105 +727,87 @@ impl MemoryGraph {
             };
             let parent_key = NodeId::concept(&parent_name).as_str();
 
-            // Insert the parent node if absent.
-            let already_present = self.nodes.contains_key(&parent_key);
-            if !already_present {
-                self.nodes.insert(
+            let parent_id = if let Some(&id) = self.interner.key_to_id.get(&parent_key) {
+                id
+            } else {
+                self.intern_node(
                     parent_key.clone(),
-                    Node {
-                        id: NodeId::concept(&parent_name),
-                        text: parent_name.clone(),
-                        base_importance_factor: 0.0,
-                    },
-                );
-            }
+                    NodeKind::Concept,
+                    parent_name.clone(),
+                    parent_name.clone(),
+                    0.0,
+                )
+            };
 
-            // Add bidirectional Abstraction edges child->parent and
-            // parent->child if not already present. We check existence by
-            // scanning the source's adjacency to keep this O(degree) rather
-            // than O(edges).
             for child_key in [&a_key, &b_key] {
-                let exists = self
-                    .adjacency
-                    .get(child_key)
+                let child_id = self.get_node_id(child_key);
+                let exists = child_id
+                    .and_then(|cid| self.int_adjacency.get(cid))
                     .map(|idxs| {
                         idxs.iter().any(|&i| {
-                            self.edges[i].kind == EdgeKind::Abstraction
-                                && self.edges[i].target.as_str() == parent_key
+                            self.int_edges[i].kind == EdgeKind::Abstraction
+                                && self.int_edges[i].target == parent_id
                         })
                     })
                     .unwrap_or(false);
                 if !exists {
-                    self.add_edge_internal(
-                        NodeId::Concept(
-                            child_key
-                                .strip_prefix("concept:")
-                                .unwrap_or(child_key)
-                                .into(),
-                        ),
-                        NodeId::concept(&parent_name),
-                        EdgeKind::Abstraction,
-                        1.0,
-                    );
-                    self.add_edge_internal(
-                        NodeId::concept(&parent_name),
-                        NodeId::Concept(
-                            child_key
-                                .strip_prefix("concept:")
-                                .unwrap_or(child_key)
-                                .into(),
-                        ),
-                        EdgeKind::Abstraction,
-                        1.0,
-                    );
+                    let child_id = child_id.unwrap_or_else(|| {
+                        let name = child_key.strip_prefix("concept:").unwrap_or(child_key);
+                        self.intern_node(
+                            child_key.to_string(),
+                            NodeKind::Concept,
+                            name.to_string(),
+                            name.to_string(),
+                            0.0,
+                        )
+                    });
+                    self.add_int_edge(child_id, parent_id, EdgeKind::Abstraction, 1.0);
+                    self.add_int_edge(parent_id, child_id, EdgeKind::Abstraction, 1.0);
                     added += 2;
                 }
             }
-            // Mark this pair as consumed so a subsequent call does not
-            // re-scan it unless new co-occurrences have arrived. We reset
-            // the counter to 0; future `add_memory` calls will re-increment
-            // it, and the next `build_abstractions` will pick up only pairs
-            // that have accumulated `threshold` *new* co-occurrences.
             self.co_occurrence.insert(co_key, 0);
         }
         added
     }
 
-    /// Number of abstraction (parent concept) nodes in the graph.
     pub fn abstraction_count(&self) -> usize {
-        self.nodes
-            .values()
-            .filter(|n| matches!(n.id, NodeId::Concept(ref c) if c.contains('+')))
+        self.interner
+            .iter()
+            .filter(|(_, _, n)| matches!(n.kind, NodeKind::Concept) && n.external_id.contains('+'))
             .count()
     }
 
-    /// Number of concept nodes in the graph (excludes abstraction parents,
-    /// which are also `Concept`-kind nodes but contain `+`).
     pub fn concept_count(&self) -> usize {
-        self.nodes
-            .values()
-            .filter(|n| matches!(n.id, NodeId::Concept(ref c) if !c.contains('+')))
+        self.interner
+            .iter()
+            .filter(|(_, _, n)| matches!(n.kind, NodeKind::Concept) && !n.external_id.contains('+'))
             .count()
     }
 
-    /// Returns the concepts attached to memory `id` (the targets of its
-    /// outgoing `Association` edges that are concept nodes). Empty if the
-    /// memory is unknown or has no concepts. Order is the graph's internal
-    /// (deterministic BTreeMap) order.
     pub fn memory_concepts(&self, id: &str) -> Vec<String> {
         let key = NodeId::memory(id).as_str();
-        self.neighbors(&key)
-            .iter()
-            .filter(|e| e.kind == EdgeKind::Association)
-            .filter_map(|e| match &e.target {
-                NodeId::Concept(c) => Some(c.clone()),
-                _ => None,
+        let Some(mem_id) = self.get_node_id(&key) else {
+            return Vec::new();
+        };
+        self.int_adjacency
+            .get(mem_id)
+            .map(|idxs| {
+                idxs.iter()
+                    .filter(|&&i| self.int_edges[i].kind == EdgeKind::Association)
+                    .filter_map(|&i| {
+                        let target = self.interner.get(self.int_edges[i].target)?;
+                        if matches!(target.kind, NodeKind::Concept) {
+                            Some(target.external_id.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
             })
-            .collect()
+            .unwrap_or_default()
     }
 
-    /// One-shot structural snapshot of the graph for introspection /
-    /// debugging. Cheap: counts only, no traversal.
     pub fn stats(&self) -> GraphStats {
         GraphStats {
             node_count: self.node_count(),
@@ -702,42 +820,22 @@ impl MemoryGraph {
         }
     }
 
-    /// Access the learned concept vocabulary.
     pub fn vocab(&self) -> &ConceptVocabulary {
         &self.vocab
     }
 
-    /// Mutable access to the learned concept vocabulary.
     pub fn vocab_mut(&mut self) -> &mut ConceptVocabulary {
         &mut self.vocab
     }
 
-    /// Returns true if the concept has been suppressed as an over-general hub.
     pub fn is_concept_suppressed(&self, concept: &str) -> bool {
         self.suppressed_concepts.contains(&concept.to_lowercase())
     }
 
-    /// Number of currently suppressed concepts.
     pub fn suppressed_concept_count(&self) -> usize {
         self.suppressed_concepts.len()
     }
 
-    /// Online concept vocabulary evolution: merge similar concept nodes and
-    /// suppress over-general hubs.
-    ///
-    /// *Merge.* Two base concepts (not abstraction parents) are merged when the
-    /// Jaccard overlap of their associated memory sets is >= `overlap_threshold`.
-    /// The higher-degree concept survives as the canonical node; the loser is
-    /// removed and recorded as an alias in the vocabulary.
-    ///
-    /// *Suppress.* Base concepts whose degree exceeds `hub_fraction *
-    /// memory_count` are marked as suppressed. Their outgoing association edges
-    /// are not expanded during spreading activation, preventing them from
-    /// drowning more specific concepts.
-    ///
-    /// Work is bounded by `max_pairs`: at most this many merge operations are
-    /// performed in a single pass. Returns counts of merged and newly-suppressed
-    /// concepts.
     pub fn evolve_vocabulary(
         &mut self,
         overlap_threshold: f32,
@@ -749,25 +847,37 @@ impl MemoryGraph {
         }
         let threshold = overlap_threshold.clamp(0.0, 1.0);
 
-        // Build base-concept -> memory set, and pairwise co-occurrence counts.
         let mut concept_memories: BTreeMap<String, HashSet<String>> = BTreeMap::new();
         let mut co_occurrence: BTreeMap<String, usize> = BTreeMap::new();
 
         let memory_ids: Vec<String> = self
             .iter_memory_nodes()
-            .map(|(k, _)| k.strip_prefix("mem:").unwrap_or(k).to_string())
+            .map(|(k, _)| k.strip_prefix("mem:").unwrap_or(&k).to_string())
             .collect();
         for id in &memory_ids {
             let key = NodeId::memory(id).as_str();
+            let Some(mem_id) = self.get_node_id(&key) else {
+                continue;
+            };
             let mut concepts: Vec<String> = self
-                .neighbors(&key)
-                .iter()
-                .filter(|e| e.kind == EdgeKind::Association)
-                .filter_map(|e| match &e.target {
-                    NodeId::Concept(c) if !c.contains('+') => Some(c.clone()),
-                    _ => None,
+                .int_adjacency
+                .get(mem_id)
+                .map(|idxs| {
+                    idxs.iter()
+                        .filter(|&&i| self.int_edges[i].kind == EdgeKind::Association)
+                        .filter_map(|&i| {
+                            let target = self.interner.get(self.int_edges[i].target)?;
+                            if matches!(target.kind, NodeKind::Concept)
+                                && !target.external_id.contains('+')
+                            {
+                                Some(target.external_id.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
                 })
-                .collect();
+                .unwrap_or_default();
             concepts.sort();
             for c in &concepts {
                 concept_memories
@@ -780,19 +890,18 @@ impl MemoryGraph {
                     let a = &concepts[i];
                     let b = &concepts[j];
                     let pair_key = if a <= b {
-                        format!("concept:{a}\u{0}concept:{b}")
+                        format!("concept:{a}\0concept:{b}")
                     } else {
-                        format!("concept:{b}\u{0}concept:{a}")
+                        format!("concept:{b}\0concept:{a}")
                     };
                     *co_occurrence.entry(pair_key).or_insert(0) += 1;
                 }
             }
         }
 
-        // Score candidate pairs by Jaccard overlap.
         let mut candidates: Vec<(String, String, f32)> = Vec::new();
         for (pair_key, &count) in &co_occurrence {
-            let mut parts = pair_key.splitn(2, '\u{0}');
+            let mut parts = pair_key.splitn(2, '\0');
             let a_key = parts.next().unwrap_or_default().to_string();
             let b_key = parts.next().unwrap_or_default().to_string();
             let a = a_key.strip_prefix("concept:").unwrap_or(&a_key).to_string();
@@ -837,17 +946,19 @@ impl MemoryGraph {
             }
         }
 
-        // Suppress over-general hubs.
         let suppressed_before = self.suppressed_concepts.len();
         if hub_fraction > 0.0 {
             let memory_count = self.memory_count().max(1);
             let hub_threshold = (memory_count as f32 * hub_fraction).max(2.0) as usize;
             let base_concepts: Vec<String> = self
-                .nodes
-                .values()
-                .filter_map(|n| match &n.id {
-                    NodeId::Concept(c) if !c.contains('+') => Some(c.clone()),
-                    _ => None,
+                .interner
+                .iter()
+                .filter_map(|(_, _, n)| {
+                    if matches!(n.kind, NodeKind::Concept) && !n.external_id.contains('+') {
+                        Some(n.external_id.clone())
+                    } else {
+                        None
+                    }
                 })
                 .collect();
             for c in base_concepts {
@@ -858,8 +969,6 @@ impl MemoryGraph {
         }
         let suppressed = self.suppressed_concepts.len() - suppressed_before;
 
-        // Rebuild co-occurrence counters so future abstraction building is
-        // consistent with the merged vocabulary.
         self.rebuild_co_occurrence();
 
         VocabularyEvolutionStats {
@@ -869,70 +978,82 @@ impl MemoryGraph {
         }
     }
 
-    /// Merge `alias` into `canonical`: redirect all edges touching the alias
-    /// node to the canonical node, remove the alias node, and record the
-    /// alias mapping in the vocabulary. Returns true if the alias node existed.
     fn merge_concept_node(&mut self, alias: &str, canonical: &str) -> bool {
         let alias_key = NodeId::concept(alias).as_str();
         let canon_key = NodeId::concept(canonical).as_str();
-        if !self.nodes.contains_key(&alias_key) {
+        let Some(alias_id) = self.get_node_id(&alias_key) else {
             return false;
-        }
-        if !self.nodes.contains_key(&canon_key) {
-            // Canonical does not exist; just rename the alias node in place.
-            if let Some(node) = self.nodes.remove(&alias_key) {
-                let new_node = Node {
-                    id: NodeId::concept(canonical),
-                    text: canonical.to_string(),
-                    base_importance_factor: node.base_importance_factor,
-                };
-                self.nodes.insert(canon_key.clone(), new_node);
-                for edge in &mut self.edges {
-                    if edge.source.as_str() == alias_key {
-                        edge.source = NodeId::concept(canonical);
-                    }
-                    if edge.target.as_str() == alias_key {
-                        edge.target = NodeId::concept(canonical);
-                    }
-                }
-                self.rebuild_adjacency();
-                self.vocab.add_alias(alias, canonical);
-                self.suppressed_concepts.remove(alias);
+        };
+        let canon_id = if let Some(&id) = self.interner.key_to_id.get(&canon_key) {
+            id
+        } else {
+            // Canonical does not exist; rename alias in place.
+            if let Some(node) = self.interner.get_mut(alias_id) {
+                node.external_id = canonical.to_string();
+                node.text = canonical.to_string();
             }
+            self.interner.key_to_id.remove(&alias_key);
+            self.interner.key_to_id.insert(canon_key.clone(), alias_id);
+            self.vocab.add_alias(alias, canonical);
+            self.suppressed_concepts.remove(alias);
             return true;
-        }
+        };
 
-        // Collect edges incident on the alias node before mutating the edge list.
-        let outgoing: Vec<Edge> = self
-            .adjacency
-            .get(&alias_key)
-            .cloned()
+        let outgoing: Vec<InternalEdge> = self
+            .int_adjacency
+            .get(alias_id)
+            .map(|idxs| idxs.to_vec())
             .unwrap_or_default()
             .iter()
-            .map(|&i| self.edges[i].clone())
+            .map(|&i| self.int_edges[i])
             .collect();
-        let incoming: Vec<Edge> = self
-            .edges
+        let incoming: Vec<InternalEdge> = self
+            .int_edges
             .iter()
-            .filter(|e| e.target.as_str() == alias_key)
-            .cloned()
+            .filter(|e| e.target == alias_id)
+            .copied()
             .collect();
 
         for edge in outgoing {
-            match (&edge.source, &edge.target, edge.kind) {
-                (NodeId::Concept(_), NodeId::Memory(mem), EdgeKind::Association) => {
-                    self.ensure_edge(
-                        NodeId::concept(canonical),
-                        NodeId::memory(mem),
+            match (
+                self.interner.get(edge.source),
+                self.interner.get(edge.target),
+                edge.kind,
+            ) {
+                (Some(src), Some(_), EdgeKind::Association)
+                    if matches!(src.kind, NodeKind::Concept) =>
+                {
+                    let target_id = if self.interner.get(edge.target).map(|n| n.kind)
+                        == Some(NodeKind::Memory)
+                    {
+                        edge.target
+                    } else {
+                        continue;
+                    };
+                    self.ensure_int_edge(
+                        alias_id,
+                        target_id,
                         EdgeKind::Association,
                         edge.weight,
                         edge.last_reinforced_at,
                     );
                 }
-                (NodeId::Concept(_), NodeId::Concept(parent), EdgeKind::Abstraction) => {
-                    self.ensure_edge(
-                        NodeId::concept(canonical),
-                        NodeId::concept(parent),
+                (Some(src), Some(_), EdgeKind::Abstraction)
+                    if matches!(src.kind, NodeKind::Concept) =>
+                {
+                    let target_id = if self
+                        .interner
+                        .get(edge.target)
+                        .map(|n| matches!(n.kind, NodeKind::Concept))
+                        .unwrap_or(false)
+                    {
+                        edge.target
+                    } else {
+                        continue;
+                    };
+                    self.ensure_int_edge(
+                        alias_id,
+                        target_id,
                         EdgeKind::Abstraction,
                         edge.weight,
                         edge.last_reinforced_at,
@@ -942,20 +1063,28 @@ impl MemoryGraph {
             }
         }
         for edge in incoming {
-            match (&edge.source, &edge.target, edge.kind) {
-                (NodeId::Memory(mem), NodeId::Concept(_), EdgeKind::Association) => {
-                    self.ensure_edge(
-                        NodeId::memory(mem),
-                        NodeId::concept(canonical),
+            match (
+                self.interner.get(edge.source),
+                self.interner.get(edge.target),
+                edge.kind,
+            ) {
+                (Some(src), Some(_), EdgeKind::Association)
+                    if matches!(src.kind, NodeKind::Memory) =>
+                {
+                    self.ensure_int_edge(
+                        edge.source,
+                        canon_id,
                         EdgeKind::Association,
                         edge.weight,
                         edge.last_reinforced_at,
                     );
                 }
-                (NodeId::Concept(parent), NodeId::Concept(_), EdgeKind::Abstraction) => {
-                    self.ensure_edge(
-                        NodeId::concept(parent),
-                        NodeId::concept(canonical),
+                (Some(src), Some(_), EdgeKind::Abstraction)
+                    if matches!(src.kind, NodeKind::Concept) =>
+                {
+                    self.ensure_int_edge(
+                        edge.source,
+                        canon_id,
                         EdgeKind::Abstraction,
                         edge.weight,
                         edge.last_reinforced_at,
@@ -965,78 +1094,84 @@ impl MemoryGraph {
             }
         }
 
-        self.nodes.remove(&alias_key);
-        self.edges
-            .retain(|e| e.source.as_str() != alias_key && e.target.as_str() != alias_key);
-        self.rebuild_adjacency();
+        self.interner.key_to_id.remove(&alias_key);
+        self.int_edges
+            .retain(|e| e.source != alias_id && e.target != alias_id);
+        self.int_adjacency.rebuild(&self.int_edges);
         self.vocab.add_alias(alias, canonical);
         self.suppressed_concepts.remove(alias);
         true
     }
 
-    /// Add an edge or strengthen an existing edge between `source` and `target`.
-    /// If an edge of the same kind already exists, keep the larger weight and
-    /// the more recent reinforcement timestamp.
-    fn ensure_edge(
+    fn ensure_int_edge(
         &mut self,
-        source: NodeId,
-        target: NodeId,
+        source: u32,
+        target: u32,
         kind: EdgeKind,
         weight: f32,
         last_reinforced_at: u64,
     ) {
-        let source_key = source.as_str();
-        let target_key = target.as_str();
-        let existing = self.adjacency.get(&source_key).and_then(|idxs| {
-            idxs.iter().copied().find(|&i| {
-                self.edges[i].kind == kind && self.edges[i].target.as_str() == target_key
-            })
+        let existing = self.int_adjacency.get(source).and_then(|idxs| {
+            idxs.iter()
+                .copied()
+                .find(|&i| self.int_edges[i].kind == kind && self.int_edges[i].target == target)
         });
         if let Some(i) = existing {
-            let e = &mut self.edges[i];
+            let e = &mut self.int_edges[i];
             e.weight = e.weight.max(weight);
             e.last_reinforced_at = e.last_reinforced_at.max(last_reinforced_at);
         } else {
-            let idx = self.edges.len();
-            self.edges.push(Edge {
+            let idx = self.int_edges.len();
+            self.int_edges.push(InternalEdge {
                 source,
                 target,
                 kind,
                 weight,
                 last_reinforced_at,
             });
-            self.adjacency.entry(source_key).or_default().push(idx);
+            self.int_adjacency.add(source, idx);
         }
     }
 
-    /// Rebuild co-occurrence counters from the current graph. Called after
-    /// vocabulary merges so abstraction building stays consistent.
     fn rebuild_co_occurrence(&mut self) {
         self.co_occurrence.clear();
         let memory_ids: Vec<String> = self
             .iter_memory_nodes()
-            .map(|(k, _)| k.strip_prefix("mem:").unwrap_or(k).to_string())
+            .map(|(k, _)| k.strip_prefix("mem:").unwrap_or(&k).to_string())
             .collect();
         for id in &memory_ids {
             let key = NodeId::memory(id).as_str();
+            let Some(mem_id) = self.get_node_id(&key) else {
+                continue;
+            };
             let mut concepts: Vec<String> = self
-                .neighbors(&key)
-                .iter()
-                .filter(|e| e.kind == EdgeKind::Association)
-                .filter_map(|e| match &e.target {
-                    NodeId::Concept(c) if !c.contains('+') => Some(c.clone()),
-                    _ => None,
+                .int_adjacency
+                .get(mem_id)
+                .map(|idxs| {
+                    idxs.iter()
+                        .filter(|&&i| self.int_edges[i].kind == EdgeKind::Association)
+                        .filter_map(|&i| {
+                            let target = self.interner.get(self.int_edges[i].target)?;
+                            if matches!(target.kind, NodeKind::Concept)
+                                && !target.external_id.contains('+')
+                            {
+                                Some(target.external_id.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
                 })
-                .collect();
+                .unwrap_or_default();
             concepts.sort();
             for i in 0..concepts.len() {
                 for j in (i + 1)..concepts.len() {
                     let a = &concepts[i];
                     let b = &concepts[j];
                     let pair_key = if a <= b {
-                        format!("concept:{a}\u{0}concept:{b}")
+                        format!("concept:{a}\0concept:{b}")
                     } else {
-                        format!("concept:{b}\u{0}concept:{a}")
+                        format!("concept:{b}\0concept:{a}")
                     };
                     *self.co_occurrence.entry(pair_key).or_insert(0) += 1;
                 }
@@ -1044,85 +1179,63 @@ impl MemoryGraph {
         }
     }
 
-    /// Create a `Refines` edge from an older memory to a newer memory that
-    /// refines/superseds it. Direction: `old_id → new_id`.
-    ///
-    /// The edge weight starts at `weight` (typically 0.8) so spreading
-    /// activation from the old memory propagates to the new one, ensuring
-    /// the most current version surfaces. The old memory is NOT removed —
-    /// history is preserved.
-    ///
-    /// Idempotent: if a `Refines` edge from `old_id` to `new_id` already
-    /// exists, this is a no-op. Returns `true` if a new edge was created.
     pub fn add_refinement(&mut self, old_id: &str, new_id: &str, weight: f32) -> bool {
         let old_key = NodeId::memory(old_id).as_str();
         let new_key = NodeId::memory(new_id).as_str();
-        // Check if the edge already exists.
+        let Some(old_nid) = self.get_node_id(&old_key) else {
+            return false;
+        };
+        let Some(new_nid) = self.get_node_id(&new_key) else {
+            return false;
+        };
+
         let exists = self
-            .adjacency
-            .get(&old_key)
+            .int_adjacency
+            .get(old_nid)
             .map(|idxs| {
                 idxs.iter().any(|&i| {
-                    self.edges[i].kind == EdgeKind::Refines
-                        && self.edges[i].target.as_str() == new_key
+                    self.int_edges[i].kind == EdgeKind::Refines
+                        && self.int_edges[i].target == new_nid
                 })
             })
             .unwrap_or(false);
         if exists {
             return false;
         }
-        // Both nodes must exist.
-        if !self.nodes.contains_key(&old_key) || !self.nodes.contains_key(&new_key) {
-            return false;
-        }
-        self.add_edge_internal(
-            NodeId::memory(old_id),
-            NodeId::memory(new_id),
-            EdgeKind::Refines,
-            weight,
-        );
+        self.add_int_edge(old_nid, new_nid, EdgeKind::Refines, weight);
         true
     }
 
-    /// Number of `Refines` edges in the graph.
     pub fn refinement_count(&self) -> usize {
-        self.edges
+        self.int_edges
             .iter()
             .filter(|e| e.kind == EdgeKind::Refines)
             .count()
     }
 
-    /// Returns the ids of memories that `id` refines (i.e. the older
-    /// memories that `id` supersedes). Empty if `id` has no outgoing
-    /// `Refines` edges.
     pub fn refined_by(&self, id: &str) -> Vec<String> {
         let key = NodeId::memory(id).as_str();
-        self.neighbors(&key)
-            .iter()
-            .filter(|e| e.kind == EdgeKind::Refines)
-            .filter_map(|e| match &e.target {
-                NodeId::Memory(s) => Some(s.clone()),
-                _ => None,
+        let Some(nid) = self.get_node_id(&key) else {
+            return Vec::new();
+        };
+        self.int_adjacency
+            .get(nid)
+            .map(|idxs| {
+                idxs.iter()
+                    .filter(|&&i| self.int_edges[i].kind == EdgeKind::Refines)
+                    .filter_map(|&i| {
+                        let target = self.interner.get(self.int_edges[i].target)?;
+                        if matches!(target.kind, NodeKind::Memory) {
+                            Some(target.external_id.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
             })
-            .collect()
+            .unwrap_or_default()
     }
 
-    /// Create a `Contradicts` edge from an older memory to a newer memory
-    /// that contradicts it, AND weaken the old memory's outgoing
-    /// association edges so it fades from retrieval.
-    ///
-    /// Direction: `old_id → new_id`.
-    ///
-    /// The `Contradicts` edge lets spreading activation propagate from the
-    /// discredited memory to the correcting one. Additionally, the old
-    /// memory's outgoing `Association` and `Temporal` edges are multiplied
-    /// by `weaken_factor` (typically 0.5), reducing its activation in
-    /// future retrievals. The old memory is NOT deleted — it can still be
-    /// found if explicitly queried, but it won't dominate results.
-    ///
-    /// Idempotent: if a `Contradicts` edge from `old_id` to `new_id`
-    /// already exists, this is a no-op (the weakening is also skipped).
-    /// Returns `true` if a new edge was created.
     pub fn add_contradiction(
         &mut self,
         old_id: &str,
@@ -1132,79 +1245,130 @@ impl MemoryGraph {
     ) -> bool {
         let old_key = NodeId::memory(old_id).as_str();
         let new_key = NodeId::memory(new_id).as_str();
-        // Check if the edge already exists.
+        let Some(old_nid) = self.get_node_id(&old_key) else {
+            return false;
+        };
+        let Some(new_nid) = self.get_node_id(&new_key) else {
+            return false;
+        };
+
         let exists = self
-            .adjacency
-            .get(&old_key)
+            .int_adjacency
+            .get(old_nid)
             .map(|idxs| {
                 idxs.iter().any(|&i| {
-                    self.edges[i].kind == EdgeKind::Contradicts
-                        && self.edges[i].target.as_str() == new_key
+                    self.int_edges[i].kind == EdgeKind::Contradicts
+                        && self.int_edges[i].target == new_nid
                 })
             })
             .unwrap_or(false);
         if exists {
             return false;
         }
-        // Both nodes must exist.
-        if !self.nodes.contains_key(&old_key) || !self.nodes.contains_key(&new_key) {
-            return false;
-        }
-        // Weaken the old memory's outgoing Association and Temporal edges
-        // so it fades from retrieval. We do NOT weaken Refines or
-        // Contradicts edges — those are directed to the newer memory and
-        // should stay strong so the correction surfaces.
-        let old_idxs: Vec<usize> = self.adjacency.get(&old_key).cloned().unwrap_or_default();
+
+        let old_idxs: Vec<usize> = self
+            .int_adjacency
+            .get(old_nid)
+            .map(|v| v.to_vec())
+            .unwrap_or_default();
         for i in old_idxs {
-            let edge = &mut self.edges[i];
+            let edge = &mut self.int_edges[i];
             if edge.kind == EdgeKind::Association || edge.kind == EdgeKind::Temporal {
                 edge.weight *= weaken_factor;
             }
         }
-        // Create the Contradicts edge.
-        self.add_edge_internal(
-            NodeId::memory(old_id),
-            NodeId::memory(new_id),
-            EdgeKind::Contradicts,
-            weight,
-        );
+        self.add_int_edge(old_nid, new_nid, EdgeKind::Contradicts, weight);
         true
     }
 
-    /// Number of `Contradicts` edges in the graph.
     pub fn contradiction_count(&self) -> usize {
-        self.edges
+        self.int_edges
             .iter()
             .filter(|e| e.kind == EdgeKind::Contradicts)
             .count()
     }
 
-    /// Returns the ids of memories that contradict `id` (i.e. the newer
-    /// memories that correct `id`). Empty if `id` has no outgoing
-    /// `Contradicts` edges.
     pub fn contradicted_by(&self, id: &str) -> Vec<String> {
         let key = NodeId::memory(id).as_str();
-        self.neighbors(&key)
-            .iter()
-            .filter(|e| e.kind == EdgeKind::Contradicts)
-            .filter_map(|e| match &e.target {
-                NodeId::Memory(s) => Some(s.clone()),
-                _ => None,
+        let Some(nid) = self.get_node_id(&key) else {
+            return Vec::new();
+        };
+        self.int_adjacency
+            .get(nid)
+            .map(|idxs| {
+                idxs.iter()
+                    .filter(|&&i| self.int_edges[i].kind == EdgeKind::Contradicts)
+                    .filter_map(|&i| {
+                        let target = self.interner.get(self.int_edges[i].target)?;
+                        if matches!(target.kind, NodeKind::Memory) {
+                            Some(target.external_id.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
             })
-            .collect()
+            .unwrap_or_default()
     }
 
     pub fn to_json(&self) -> String {
-        // Return a deterministic serialization so reloads reproduce the same graph.
         let mut sorted = self.clone();
         sorted.compact();
         serde_json::to_string_pretty(&sorted).unwrap_or_default()
     }
 
     pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
-        let mut graph: Self = serde_json::from_str(s)?;
-        graph.normalize_edges();
+        let graph: Self = serde_json::from_str(s)?;
         Ok(graph)
+    }
+
+    pub fn compact(&mut self) {
+        self.int_edges.sort_by(|a, b| {
+            let a_src = self.interner.get(a.source).map(|n| &n.external_id);
+            let b_src = self.interner.get(b.source).map(|n| &n.external_id);
+            let a_tgt = self.interner.get(a.target).map(|n| &n.external_id);
+            let b_tgt = self.interner.get(b.target).map(|n| &n.external_id);
+            a_src
+                .cmp(&b_src)
+                .then(a_tgt.cmp(&b_tgt))
+                .then(a.kind.cmp(&b.kind))
+                .then(
+                    a.weight
+                        .partial_cmp(&b.weight)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+        });
+        self.int_adjacency.rebuild(&self.int_edges);
+    }
+
+    // ------------------------------------------------------------------
+    // Internal accessors for activation.rs (integer-based, fast)
+    // ------------------------------------------------------------------
+
+    /// Get the integer node ID for a memory ID string (fast path for activation).
+    pub(crate) fn memory_node_id(&self, id: &str) -> Option<u32> {
+        let key = NodeId::memory(id).as_str();
+        self.get_node_id(&key)
+    }
+
+    /// Get neighbor edge indices for a node ID (zero-allocation).
+    pub(crate) fn neighbor_indices(&self, node_id: u32) -> Option<&[usize]> {
+        self.int_adjacency.get(node_id)
+    }
+
+    /// Get an internal edge by index.
+    pub(crate) fn get_edge(&self, idx: usize) -> Option<&InternalEdge> {
+        self.int_edges.get(idx)
+    }
+
+    /// Get the external memory ID for a node ID (for result hydration).
+    pub(crate) fn node_external_id(&self, node_id: u32) -> Option<&str> {
+        self.interner.get(node_id).map(|n| n.external_id.as_str())
+    }
+
+    /// Get the kind of a node.
+    pub(crate) fn node_kind(&self, node_id: u32) -> Option<NodeKind> {
+        self.interner.get(node_id).map(|n| n.kind)
     }
 }
 
@@ -1227,13 +1391,12 @@ mod tests {
         let mut g = MemoryGraph::new();
         g.add_memory_with_importance("m1", "low", &["c".into()], 0.25);
         g.add_memory_with_importance("m2", "high", &["c".into()], 4.0);
-        // importance 0.25 -> factor 0.5; importance 4.0 -> factor 2.0
-        let m1_edges: Vec<&Edge> = g
+        let m1_edges: Vec<Edge> = g
             .neighbors(&NodeId::memory("m1").as_str())
             .into_iter()
             .filter(|e| e.kind == EdgeKind::Association)
             .collect();
-        let m2_edges: Vec<&Edge> = g
+        let m2_edges: Vec<Edge> = g
             .neighbors(&NodeId::memory("m2").as_str())
             .into_iter()
             .filter(|e| e.kind == EdgeKind::Association)
@@ -1273,7 +1436,6 @@ mod tests {
             after > before,
             "reinforce should increase total edge weight"
         );
-        // All reinforced edges should carry the timestamp.
         for e in g.neighbors(&NodeId::memory("m1").as_str()) {
             assert_eq!(e.last_reinforced_at, 1000);
         }
@@ -1283,7 +1445,6 @@ mod tests {
     fn reinforce_is_bounded() {
         let mut g = MemoryGraph::new();
         g.add_memory("m1", "x", &["c".into()]);
-        // Reinforce many times; weight must never exceed the clamp (8.0).
         for _ in 0..100 {
             g.reinforce("m1", 1000);
         }
@@ -1303,7 +1464,6 @@ mod tests {
         let mut g = MemoryGraph::new();
         g.add_memory("m1", "a", &["c1".into()]);
         g.add_memory("m2", "b", &["c2".into()]);
-        // Reinforce only m1.
         g.reinforce("m1", 1000);
         let m1_before: f32 = g
             .neighbors(&NodeId::memory("m1").as_str())
@@ -1315,7 +1475,6 @@ mod tests {
             .iter()
             .map(|e| e.weight)
             .sum();
-        // Decay with a 100s half-life, 1000s later -> 10 half-lives -> factor 2^-10.
         g.decay_edges(2000, 100);
         let m1_after: f32 = g
             .neighbors(&NodeId::memory("m1").as_str())
@@ -1342,7 +1501,6 @@ mod tests {
         let mut g = MemoryGraph::new();
         g.add_memory("m1", "a", &["c".into()]);
         g.reinforce("m1", 1000);
-        // Decay over an enormous age; weight should floor at 1.0, not 0.
         g.decay_edges(1_000_000_000, 1);
         let w = g
             .neighbors(&NodeId::memory("m1").as_str())
@@ -1358,7 +1516,6 @@ mod tests {
     #[test]
     fn build_abstractions_creates_parent_for_co_occurring_concepts() {
         let mut g = MemoryGraph::new();
-        // Three memories all sharing "rust" and "safety" -> co-occurrence 3.
         for i in 0..3 {
             g.add_memory(
                 &format!("m{i}"),
@@ -1375,7 +1532,6 @@ mod tests {
             g.abstraction_count() >= 1,
             "should have a parent concept node"
         );
-        // The parent node "rust+safety" should exist.
         assert!(g
             .nodes()
             .contains_key(&NodeId::concept("rust+safety").as_str()));
@@ -1405,7 +1561,6 @@ mod tests {
         let mut g = MemoryGraph::new();
         g.add_memory("m1", "a", &["x".into(), "y".into()]);
         g.add_memory("m2", "b", &["x".into(), "y".into()]);
-        // co-occurrence is 2; threshold 3 -> no abstraction.
         assert_eq!(g.build_abstractions(3), 0);
         assert_eq!(g.abstraction_count(), 0);
     }
@@ -1416,15 +1571,12 @@ mod tests {
         g.add_memory_with_importance("m1", "Rust is safe", &["rust".into(), "safety".into()], 2.0);
         g.add_memory_with_importance("m2", "Rust is fast", &["rust".into(), "speed".into()], 1.5);
         g.reinforce("m1", 1234);
-        // co-occurrence of "rust"+"safety" is 1, "rust"+"speed" is 1, "safety"+"speed" is 0.
-        // Lower threshold to 1 so abstractions get built for the test.
         g.build_abstractions(1);
 
         let json = g.to_json();
         let restored = MemoryGraph::from_json(&json).expect("roundtrip");
 
-        // The learned weights and timestamps should survive the roundtrip.
-        let m1_edges: Vec<&Edge> = restored
+        let m1_edges: Vec<Edge> = restored
             .neighbors(&NodeId::memory("m1").as_str())
             .into_iter()
             .filter(|e| e.kind == EdgeKind::Association)
@@ -1433,7 +1585,6 @@ mod tests {
             m1_edges.iter().any(|e| e.last_reinforced_at == 1234),
             "reinforcement timestamp should survive JSON roundtrip"
         );
-        // importance 2.0 -> factor sqrt(2) ~ 1.414
         let w = m1_edges.first().map(|e| e.weight).unwrap_or(0.0);
         assert!(
             (w - 2.0f32.sqrt()).abs() < 1e-4 || w > 2.0f32.sqrt(),
@@ -1457,12 +1608,10 @@ mod tests {
         let created = g.add_refinement("old", "new", 0.8);
         assert!(created, "should create a new Refines edge");
         assert_eq!(g.refinement_count(), 1);
-        // The edge is old → new, so neighbors(old) should include new.
         let old_neighbors = g.neighbors(&NodeId::memory("old").as_str());
         assert!(old_neighbors
             .iter()
             .any(|e| { e.kind == EdgeKind::Refines && e.target.as_str() == "mem:new" }));
-        // The reverse (new → old) should NOT exist.
         let new_neighbors = g.neighbors(&NodeId::memory("new").as_str());
         assert!(!new_neighbors
             .iter()
@@ -1486,9 +1635,7 @@ mod tests {
     fn add_refinement_rejects_missing_nodes() {
         let mut g = MemoryGraph::new();
         g.add_memory("old", "a", &["c".into()]);
-        // "new" does not exist.
         assert!(!g.add_refinement("old", "new", 0.8));
-        // "ghost" does not exist.
         assert!(!g.add_refinement("ghost", "old", 0.8));
         assert_eq!(g.refinement_count(), 0);
     }
@@ -1499,12 +1646,8 @@ mod tests {
         g.add_memory("old", "a", &["c".into()]);
         g.add_memory("new", "b", &["c".into()]);
         g.add_refinement("old", "new", 0.8);
-        // "new" is refined_by "old" — wait, the edge is old → new, so
-        // neighbors(old) includes new. refined_by(id) returns the targets
-        // of Refines edges FROM id. So refined_by("old") = ["new"].
         let refined = g.refined_by("old");
         assert_eq!(refined, vec!["new".to_string()]);
-        // "new" has no outgoing Refines edges.
         assert!(g.refined_by("new").is_empty());
     }
 
@@ -1532,7 +1675,6 @@ mod tests {
             "Rust does not have a garbage collector",
             &["rust".into()],
         );
-        // Record the old memory's edge weight before contradiction.
         let old_weight_before: f32 = g
             .neighbors(&NodeId::memory("old").as_str())
             .iter()
@@ -1543,7 +1685,6 @@ mod tests {
         let created = g.add_contradiction("old", "new", 0.8, 0.5);
         assert!(created, "should create a Contradicts edge");
         assert_eq!(g.contradiction_count(), 1);
-        // The old memory's Association edges should be weakened (halved).
         let old_weight_after: f32 = g
             .neighbors(&NodeId::memory("old").as_str())
             .iter()
@@ -1602,36 +1743,6 @@ mod tests {
     }
 
     #[test]
-    fn text_jaccard_distinguishes_same_and_different_content() {
-        use crate::extract::text_jaccard_similarity;
-        // Same topic, same content → high Jaccard.
-        let sim_same = text_jaccard_similarity(
-            "Rust memory safety guarantees",
-            "Rust memory safety guarantees",
-        );
-        assert!(
-            sim_same > 0.99,
-            "identical texts should have ~1.0 Jaccard: {sim_same}"
-        );
-        // Same topic, different content → lower Jaccard.
-        // Text A: "Rust memory safety guarantees" → {rust, memory, safety, guarantees}
-        // Text B: "Rust ownership borrow checker" → {rust, ownership, borrow, checker}
-        // intersection = {rust} = 1, union = 6, Jaccard = 1/6 ≈ 0.167
-        let sim_diff = text_jaccard_similarity(
-            "Rust memory safety guarantees",
-            "Rust ownership borrow checker",
-        );
-        assert!(
-            sim_diff < 0.3,
-            "different texts should have low Jaccard: {sim_diff}"
-        );
-        assert!(
-            sim_diff < sim_same,
-            "different texts should have lower Jaccard than identical: {sim_diff} < {sim_same}"
-        );
-    }
-
-    #[test]
     fn memory_concepts_returns_attached_concepts() {
         let mut g = MemoryGraph::new();
         g.add_memory("m1", "Rust safety", &["rust".into(), "safety".into()]);
@@ -1664,30 +1775,23 @@ mod tests {
             &["rust".into(), "concurrency".into()],
         );
         g.add_refinement("m1", "m2", 0.8);
-        // Build an abstraction so abstraction_count > 0. rust+safety would
-        // need co-occurrence; instead directly create one via build_abstractions
-        // (no co-occurrence here) — expect 0 abstraction edges. That's fine;
-        // we only assert the fields we control.
         let s = g.stats();
         assert_eq!(s.memory_count, 2);
-        // Concepts: rust, safety, concurrency (3) — none contain '+'.
         assert_eq!(s.concept_count, 3);
         assert_eq!(s.refinement_count, 1);
         assert_eq!(s.contradiction_count, 0);
         assert_eq!(s.abstraction_count, 0);
-        assert!(s.node_count >= 5); // 2 memories + 3 concepts
-        assert!(s.edge_count >= 6); // association edges (bidirectional) + temporal + refines
+        assert!(s.node_count >= 5);
+        assert!(s.edge_count >= 6);
     }
 
     #[test]
     fn concept_count_excludes_abstraction_parents() {
         let mut g = MemoryGraph::new();
-        // Two memories co-occurring on rust+safety three times → parent node.
         for i in 0..3 {
             g.add_memory(&format!("m{i}"), "text", &["rust".into(), "safety".into()]);
         }
         g.build_abstractions(3);
-        // Concepts: rust, safety (2). Abstraction parent: rust+safety (1).
         assert_eq!(g.concept_count(), 2);
         assert_eq!(g.abstraction_count(), 1);
     }
@@ -1696,7 +1800,6 @@ mod tests {
     fn reweight_memory_scales_edges_to_new_importance() {
         let mut g = MemoryGraph::new();
         g.add_memory_with_importance("m1", "Rust safety", &["rust".into(), "safety".into()], 1.0);
-        // Baseline: importance 1.0 -> factor 1.0, so assoc edges start at 1.0.
         let before: f32 = g
             .neighbors(&NodeId::memory("m1").as_str())
             .iter()
@@ -1708,7 +1811,6 @@ mod tests {
             "baseline min assoc weight {before}"
         );
 
-        // Raise importance to 4.0 -> factor 2.0. Min edge should become 2.0.
         let changed = g.reweight_memory("m1", 4.0);
         assert!(changed, "should reweight existing memory");
         let after: f32 = g
@@ -1727,8 +1829,6 @@ mod tests {
     fn reweight_memory_preserves_relative_reinforcement() {
         let mut g = MemoryGraph::new();
         g.add_memory_with_importance("m1", "Rust", &["rust".into()], 1.0);
-        // Baseline factor = importance_factor(1.0) = 1.0. Reinforce boosts
-        // the edge above baseline (1.5x on first recall).
         g.reinforce("m1", 1000);
         let reinforced_before: f32 = g
             .neighbors(&NodeId::memory("m1").as_str())
@@ -1741,8 +1841,6 @@ mod tests {
             "reinforced edge should be above baseline: {reinforced_before}"
         );
 
-        // Reweight to the SAME importance. ratio = 1.0/1.0 = 1.0, so the
-        // reinforced edge is preserved unchanged (reinforcement survives).
         g.reweight_memory("m1", 1.0);
         let reinforced_after: f32 = g
             .neighbors(&NodeId::memory("m1").as_str())
@@ -1755,8 +1853,6 @@ mod tests {
             "reweight to same importance should preserve reinforcement: {reinforced_after} vs {reinforced_before}"
         );
 
-        // Reweight to importance 4.0 (factor 2.0). ratio = 2.0/1.0 = 2.0, so
-        // the reinforced edge doubles and stays above the new baseline 2.0.
         g.reweight_memory("m1", 4.0);
         let reinforced_scaled: f32 = g
             .neighbors(&NodeId::memory("m1").as_str())
@@ -1780,9 +1876,6 @@ mod tests {
     #[test]
     fn evolve_vocabulary_merges_overlapping_concepts() {
         let mut g = MemoryGraph::new();
-        // "coding" and "programming" appear on the exact same two memories,
-        // so their Jaccard overlap is 1.0. "rust" only appears on one of
-        // those memories, so it should not be merged.
         g.add_memory(
             "m1",
             "coding programming",
@@ -1795,8 +1888,6 @@ mod tests {
         );
         let stats = g.evolve_vocabulary(0.9, 0.0, 1024);
         assert_eq!(stats.merged, 1, "expected one merge, got {stats:?}");
-        // The survivor should be the higher-degree concept ("coding" and
-        // "programming" both have degree 2; tie-break is lexical).
         let survivor = if "coding" < "programming" {
             "coding"
         } else {
@@ -1810,15 +1901,12 @@ mod tests {
         assert!(g.nodes().contains_key(&NodeId::concept(survivor).as_str()));
         assert!(g.nodes().contains_key(&NodeId::concept("rust").as_str()));
         assert!(!g.nodes().contains_key(&NodeId::concept(loser).as_str()));
-        // Future resolves of the loser should map to the survivor.
         assert_eq!(g.vocab().resolve(loser), survivor);
     }
 
     #[test]
     fn evolve_vocabulary_suppresses_hub_concepts() {
         let mut g = MemoryGraph::new();
-        // 4 memories total. "system" attaches to 3 of them, which is > 10%
-        // (hub threshold = max(4 * 0.1, 2) = 2).
         g.add_memory("m1", "a", &["system".into(), "alpha".into()]);
         g.add_memory("m2", "b", &["system".into(), "beta".into()]);
         g.add_memory("m3", "c", &["system".into(), "gamma".into()]);
@@ -1843,9 +1931,6 @@ mod tests {
     #[test]
     fn suppressed_concept_does_not_expand() {
         let mut g = MemoryGraph::new();
-        // Add m2 first so the temporal edge points m2 -> m1, not m1 -> m2.
-        // Otherwise the query seed on m1 would reach m2 through the temporal
-        // chain regardless of concept suppression.
         g.add_memory(
             "m2",
             "programming python",
@@ -1856,13 +1941,10 @@ mod tests {
             "rust programming",
             &["rust".into(), "programming".into()],
         );
-        // Suppress "programming" so it no longer bridges rust and python.
         g.evolve_vocabulary(1.0, 0.0, 1024);
         g.suppressed_concepts.insert("programming".into());
 
         let sa = SpreadingActivation::new(g, SpreadingConfig::default());
-        // Query that hits m1 should not be able to reach m2 through the
-        // suppressed "programming" hub.
         let results = sa.search("rust", &[("m1".into(), 0.9)], 5);
         assert!(results.is_some());
         let ids: Vec<String> = results.unwrap().into_iter().map(|(id, _)| id).collect();

@@ -20,6 +20,42 @@ import numpy as np
 logger = logging.getLogger("cognitive_eval.adapters.tsm")
 
 
+# Common single-word sentence starters that are capitalized for syntactic
+# reasons rather than because they are proper nouns. Multi-word capitalized
+# spans are always kept (they are almost always named entities).
+_SENTENCE_START_WORDS = {
+    "the", "a", "an", "i", "it", "he", "she", "they", "we", "you",
+    "this", "that", "these", "those", "there", "here", "what", "which",
+    "when", "where", "why", "how", "if", "but", "and", "or", "so",
+    "because", "although", "however", "therefore", "moreover", "furthermore",
+    "actually", "basically", "honestly", "hopefully", "unfortunately",
+    "fortunately", "interestingly", "surprisingly", "obviously", "clearly",
+    "sure", "yes", "no", "maybe", "ok", "okay", "right", "wrong",
+}
+
+# Stop words used to filter content-word extraction. Kept as a frozenset for
+# O(1) membership tests in the hot path.
+_STOP_WORDS = frozenset({
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "must", "shall", "can", "need", "dare",
+    "ought", "used", "to", "of", "in", "for", "on", "with", "at", "by",
+    "from", "as", "into", "through", "during", "before", "after", "above",
+    "below", "between", "under", "again", "further", "then", "once",
+    "here", "there", "when", "where", "why", "how", "all", "each", "few",
+    "more", "most", "other", "some", "such", "only", "own", "same", "than",
+    "too", "very", "just", "and", "but", "if", "or", "because", "until",
+    "while", "this", "that", "these", "those", "me", "my", "myself", "our",
+    "ours", "ourselves", "you", "your", "yours", "yourself", "yourselves",
+    "him", "his", "himself", "her", "hers", "herself", "its", "itself",
+    "them", "their", "theirs", "themselves", "what", "which", "who", "whom",
+    "whose", "whoever", "whomever", "whatever", "whichever", "also",
+    "about", "any", "both", "either", "neither", "nor", "not", "out",
+    "over", "off", "down", "up", "now", "still", "even", "well", "back",
+    "away", "around", "along", "since", "though", "unless", "whether",
+})
+
+
 def _setup_turbomemory():
     """Locate and load the compiled turbomemory extension."""
     # Find project root (2 levels up from this file: adapters/ -> cognitive_eval/ -> benchmarks/ -> project_root)
@@ -84,7 +120,10 @@ class TSMAdapter:
         """
         self.db_path = db_path
         self.embedding_model_name = embedding_model
-        
+        self.cognitive_features = cognitive_features
+        # Stop-word set used by _extract_concepts.
+        self._stop_words = _STOP_WORDS
+
         # Store mapping of id -> text for retrieval
         self._id_to_text = {}
         
@@ -136,16 +175,35 @@ class TSMAdapter:
             "auto_consolidation_secs": 0,  # Manual consolidation for determinism
         }
         
+        # Enable cognitive features by default for better recall
+        # These thresholds are tuned for conversational memory retrieval
+        config.update({
+            "refinement_cosine_threshold": 0.5,
+            "contradiction_cosine_threshold": 0.5,
+            "contradiction_text_threshold": 0.3,
+            "contradiction_weaken_factor": 0.5,
+            "cognitive_alpha": 0.7,  # Bounded additive graph boost over cosine
+            "spreading_iterations": 2,  # 2-hop bounded augmenter for better coverage
+            "spreading_decay": 0.5,
+            "seed_hops_from": 10,  # Expand from top-10 ANN seeds
+            "expansion_max_candidates": 50,  # Cap added candidates
+            "importance_auto_scoring": True,
+            "concept_evolution_enabled": True,
+            "abstraction_co_occurrence_threshold": 3,
+            "edge_decay_half_life_secs": 0,  # No decay for persistent memories
+        })
+        
         if cognitive_features:
             config.update({
                 "refinement_cosine_threshold": 0.5,
                 "contradiction_cosine_threshold": 0.5,
                 "contradiction_text_threshold": 0.3,
                 "contradiction_weaken_factor": 0.5,
-                "cognitive_alpha": 0.3,
-                "spreading_iterations": 6,
-                "spreading_decay": 0.7,
-                "spreading_beta": 0.0,
+                "cognitive_alpha": 0.7,  # Bounded additive graph boost over cosine
+                "spreading_iterations": 2,  # 2-hop bounded augmenter for better coverage
+                "spreading_decay": 0.5,
+                "seed_hops_from": 10,  # Expand from top-10 ANN seeds
+                "expansion_max_candidates": 50,  # Cap added candidates
                 "importance_auto_scoring": True,
                 "concept_evolution_enabled": True,
                 "abstraction_co_occurrence_threshold": 3,
@@ -156,6 +214,53 @@ class TSMAdapter:
         
         # Counter for unique IDs
         self._insert_counter = 0
+    
+    def _extract_concepts(self, text: str) -> List[str]:
+        """Extract meaningful concepts from text for graph building.
+
+        Uses a multi-strategy approach:
+        1. Named entities (capitalized phrases) - high-value proper nouns
+        2. Compound words with hyphens (high semantic value)
+        3. Nouns and content words (>3 chars, not stop words)
+
+        Prioritizes semantically meaningful concepts that help build the
+        memory graph. Returns at most 15 deduplicated lowercase concepts.
+        """
+        import re
+
+        concepts: List[str] = []
+
+        # Strategy 1: Capitalized phrases (proper nouns, names, places, orgs).
+        # These carry the highest discriminative value for retrieval.
+        for m in re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", text):
+            # Skip common sentence-start words unless multi-word.
+            m_lower = m.lower()
+            if len(m.split()) > 1 or m_lower not in _SENTENCE_START_WORDS:
+                concepts.append(m_lower)
+
+        # Strategy 2: Compound words with hyphens (e.g. "state-of-the-art").
+        concepts.extend(re.findall(r"\b[a-z]+(?:-[a-z]+)+\b", text.lower()))
+
+        # Strategy 3: Content words (nouns and important terms).
+        # A 4-char minimum plus stop-word filter removes most function words
+        # while keeping nouns, verbs, and domain terms.
+        for w in re.findall(r"\b[a-zA-Z]{4,}\b", text.lower()):
+            if w not in self._stop_words:
+                concepts.append(w)
+
+        # Deduplicate while preserving order of first occurrence.
+        seen = set()
+        unique: List[str] = []
+        for c in concepts:
+            c_clean = c.strip()
+            if c_clean and c_clean not in seen and len(c_clean) > 2:
+                seen.add(c_clean)
+                unique.append(c_clean)
+
+        # Cap the number of concepts to bound graph density. The engine's
+        # max_concepts setting also caps this, but pre-filtering here keeps
+        # the most salient (earliest) concepts.
+        return unique[:15]
     
     def add(self, messages: List[Dict], user_id: Optional[str] = None, batch: bool = True) -> Dict:
         """Add conversation messages to memory (Mem0-compatible API).
@@ -229,12 +334,16 @@ class TSMAdapter:
                 
                 self._id_to_text[memory_id] = fact
                 
+                # Extract simple concepts from the fact (nouns and key phrases)
+                # For now, use simple word extraction - in production this would use NLP
+                concepts = self._extract_concepts(fact)
+                
                 self.engine.insert(
                     id=memory_id,
                     text=fact,
                     embedding=embeddings[i].astype(np.float32),
                     importance_score=1.0,
-                    concepts=[],
+                    concepts=concepts,
                     payload=json.dumps({
                         "timestamp": meta['timestamp'],
                         "role": meta['role'],

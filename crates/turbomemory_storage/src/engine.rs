@@ -900,16 +900,17 @@ impl StorageEngine {
         self.search_with_ef_scoped(query_text, query_embedding, top_k, ef, scope)
     }
 
-    /// Hydrate graph results with embeddings and fuse the graph activation
-    /// score with the cosine similarity to produce the final ranking.
+    /// Hydrate augmenter results with embeddings and additively fuse the graph
+    /// boost with cosine similarity to produce the final ranking.
     ///
-    /// `final_score = cognitive_alpha * cosine + (1 - cognitive_alpha) * normalized_activation`
+    /// `final_score = cosine + (1 - alpha) * normalized_graph_delta`
     ///
-    /// At `cognitive_alpha = 1.0` (default) this is pure cosine — the graph
-    /// only influences *which* memories are candidates. At lower values the
-    /// graph activation score has a vote in the final ranking, allowing
-    /// reinforcement, refinement, and abstraction to surface memories that
-    /// pure cosine would rank lower.
+    /// `results` carries the augmenter's **pure graph delta** (>= 0, cosine is
+    /// NOT folded in). The boost is additive, so it can re-order candidates and
+    /// surface graph-discovered ones but never drops an ANN hit — preserving
+    /// the recall floor. `alpha` controls how much the graph may nudge the
+    /// ranking: `1.0` = pure cosine (graph only decides which candidates
+    /// exist); lower values give the graph delta more of a vote.
     fn hydrate_and_fuse(
         &self,
         results: Vec<(String, f32)>,
@@ -920,7 +921,7 @@ impl StorageEngine {
             return Ok(Vec::new());
         }
 
-        // Normalize graph activation scores to [0, 1].
+        // Normalize graph activation scores to [0, 1] for boosting
         let max_act = results
             .iter()
             .map(|(_, a)| *a)
@@ -934,8 +935,27 @@ impl StorageEngine {
                 self.find_record_by_id(&id).map(|rec| {
                     let cos = cosine_similarity(query_embedding, rec.embedding_f32());
                     let norm_act = act / max_act;
-                    let fused = alpha * cos + (1.0 - alpha) * norm_act;
-                    (id, fused)
+                    // Hybrid scoring: cosine + graph boost.
+                    // `cognitive_alpha` is the sole blend control:
+                    //   final = cos + (1 - alpha) * normalized_graph_signal
+                    // At alpha = 1.0 the ranking is pure cosine (graph only
+                    // influences which candidates exist). At lower alpha the
+                    // graph can re-rank via an additive, bounded boost.
+                    let graph_boost = (1.0 - alpha) * norm_act;
+                    let fused = cos + graph_boost;
+                    // Supersession demotion: a memory superseded by a newer one
+                    // (Contradicts/Refines edge created during consolidation)
+                    // carries a persisted factor < 1.0. Applying it
+                    // multiplicatively to the final score demotes the stale
+                    // belief even at alpha = 1.0, where the additive graph
+                    // boost has no effect. Default 1.0 (no demotion).
+                    let demotion = self
+                        .id_index
+                        .read()
+                        .get(id.as_str())
+                        .map(|&offset| self.meta.demotion_factor(offset))
+                        .unwrap_or(crate::metadata_store::NO_DEMOTION);
+                    (id, fused * demotion)
                 })
             })
             .collect();
@@ -963,6 +983,7 @@ impl StorageEngine {
         scope: Option<&str>,
     ) -> crate::Result<Option<Vec<(String, f32)>>> {
         validate_dimension(query_embedding, self.config.dimension)?;
+
         let seeds = self.search_ann_candidates_filtered_with_ef(
             query_embedding,
             top_k.max(10),
@@ -1515,6 +1536,7 @@ impl StorageEngine {
         if max_pairs == 0 {
             return Ok(0);
         }
+        let demotion_factor = self.config.tier.supersession_demotion_factor;
 
         self.access_counters.drain_into(&self.meta)?;
 
@@ -1590,6 +1612,13 @@ impl StorageEngine {
                 drop(graph);
                 if added {
                     created += 1;
+                    // Demote the refined (older) memory so the newer version
+                    // outranks it even under pure cosine. Multiplicative and
+                    // guarded by `added`, so it fires once per distinct
+                    // refinement (idempotent across re-runs and restarts).
+                    let cur = self.meta.demotion_factor(other.offset);
+                    self.meta
+                        .set_demotion_factor(other.offset, cur * demotion_factor);
                     // Transfer the older memory's unique concepts to the
                     // newer one, so the refinement is discoverable through
                     // all the same concept paths.
@@ -1676,6 +1705,7 @@ impl StorageEngine {
         }
         let text_threshold = self.config.tier.contradiction_text_threshold;
         let weaken_factor = self.config.tier.contradiction_weaken_factor;
+        let demotion_factor = self.config.tier.supersession_demotion_factor;
 
         self.access_counters.drain_into(&self.meta)?;
 
@@ -1758,6 +1788,15 @@ impl StorageEngine {
                 drop(graph);
                 if added {
                     created += 1;
+                    // Demote the superseded memory's retrieval score so the
+                    // newer, contradicting belief outranks it even under pure
+                    // cosine. Multiplicative against any existing demotion so
+                    // repeated supersession compounds. Guarded by `added`, so
+                    // this fires once per distinct contradiction (idempotent
+                    // across re-runs and restarts).
+                    let cur = self.meta.demotion_factor(other.offset);
+                    self.meta
+                        .set_demotion_factor(other.offset, cur * demotion_factor);
                 }
             }
         }
@@ -2032,7 +2071,7 @@ fn rebuild_graph(
     // correctly from the last persisted memory to the first new one.
     let existing_mem_ids: HashSet<String> = graph
         .iter_memory_nodes()
-        .map(|(k, _)| k.strip_prefix("mem:").unwrap_or(k).to_string())
+        .map(|(k, _)| k.strip_prefix("mem:").unwrap_or(&k).to_string())
         .collect();
     // Reset last_memory_id so new temporal edges chain from the most recent
     // persisted memory (if any) rather than from an arbitrary one. We find
@@ -2045,7 +2084,7 @@ fn rebuild_graph(
     if let Some((last_key, _)) = graph.iter_memory_nodes().last() {
         let last_id = last_key
             .strip_prefix("mem:")
-            .unwrap_or(last_key)
+            .unwrap_or(&last_key)
             .to_string();
         graph_reset_last_memory(&mut graph, &last_id);
     }
@@ -2369,6 +2408,97 @@ mod tests {
     }
 
     #[test]
+    fn supersession_demotion_makes_new_refinement_outrank_old_at_alpha_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        config.cognitive_alpha = 1.0;
+        config.tier.refinement_cosine_threshold = Some(0.5);
+        config.tier.supersession_demotion_factor = 0.4;
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+
+        engine
+            .insert(
+                "old",
+                "Rust memory safety",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+        engine
+            .insert(
+                "new",
+                "Rust memory safety updated",
+                &[0.95f32, 0.3122499, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(engine.check_refinements().unwrap(), 1);
+        let old_offset = *engine.id_index.read().get("old").unwrap();
+        assert!((engine.meta.demotion_factor(old_offset) - 0.4).abs() < 1e-6);
+
+        let results = engine
+            .search(
+                "rust memory safety",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                2,
+            )
+            .unwrap()
+            .expect("search should return candidates");
+        assert_eq!(results[0].0, "new", "demotion should lower stale memory");
+        assert!(results[0].1 > results[1].1);
+    }
+
+    #[test]
+    fn supersession_demotion_persists_after_flush_and_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        config.cognitive_alpha = 1.0;
+        config.tier.refinement_cosine_threshold = Some(0.5);
+        config.tier.supersession_demotion_factor = 0.4;
+
+        {
+            let engine = StorageEngine::open(tmp.path(), config.clone()).unwrap();
+            engine
+                .insert(
+                    "old",
+                    "Rust memory safety",
+                    &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    1.0,
+                    &["rust".to_string()],
+                )
+                .unwrap();
+            engine
+                .insert(
+                    "new",
+                    "Rust memory safety updated",
+                    &[0.95f32, 0.3122499, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    1.0,
+                    &["rust".to_string()],
+                )
+                .unwrap();
+            assert_eq!(engine.check_refinements().unwrap(), 1);
+            engine.flush().unwrap();
+        }
+
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        let old_offset = *engine.id_index.read().get("old").unwrap();
+        assert!((engine.meta.demotion_factor(old_offset) - 0.4).abs() < 1e-6);
+
+        let results = engine
+            .search(
+                "rust memory safety",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                2,
+            )
+            .unwrap()
+            .expect("search should return candidates after restart");
+        assert_eq!(results[0].0, "new");
+    }
+
+    #[test]
     fn check_refinements_disabled_by_default() {
         let tmp = tempfile::tempdir().unwrap();
         let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
@@ -2478,6 +2608,11 @@ mod tests {
         assert!(
             corrected.contains(&"new_correction".to_string()),
             "old_claim should be contradicted by new_correction, got {corrected:?}"
+        );
+        let old_offset = *engine.id_index.read().get("old_claim").unwrap();
+        assert!(
+            engine.meta.demotion_factor(old_offset) < crate::metadata_store::NO_DEMOTION,
+            "contradicted memory should receive a final-score demotion"
         );
     }
 

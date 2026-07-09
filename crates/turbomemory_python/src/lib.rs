@@ -219,10 +219,8 @@ impl PyMemoryEngine {
         dedup_cosine_threshold=None,
         dedup_max_pairs_per_cycle=None,
         auto_consolidation_secs=60,
-        fok_threshold=None,
         spreading_decay=None,
         spreading_iterations=None,
-        spreading_beta=None,
         abstraction_co_occurrence_threshold=None,
         edge_decay_half_life_secs=None,
         max_concepts=None,
@@ -235,6 +233,7 @@ impl PyMemoryEngine {
         contradiction_cosine_threshold=None,
         contradiction_text_threshold=None,
         contradiction_weaken_factor=None,
+        supersession_demotion_factor=None,
         contradiction_max_pairs_per_cycle=None,
         importance_auto_scoring=None,
         importance_learning_rate=None,
@@ -244,7 +243,9 @@ impl PyMemoryEngine {
         concept_evolution_enabled=None,
         concept_merge_overlap_threshold=None,
         concept_hub_degree_fraction=None,
-        concept_evolution_max_pairs_per_cycle=None
+        concept_evolution_max_pairs_per_cycle=None,
+        seed_hops_from=None,
+        expansion_max_candidates=None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -268,10 +269,8 @@ impl PyMemoryEngine {
         dedup_cosine_threshold: Option<f32>,
         dedup_max_pairs_per_cycle: Option<usize>,
         auto_consolidation_secs: u64,
-        fok_threshold: Option<f32>,
         spreading_decay: Option<f32>,
         spreading_iterations: Option<usize>,
-        spreading_beta: Option<f32>,
         abstraction_co_occurrence_threshold: Option<usize>,
         edge_decay_half_life_secs: Option<u64>,
         max_concepts: Option<usize>,
@@ -284,6 +283,7 @@ impl PyMemoryEngine {
         contradiction_cosine_threshold: Option<f32>,
         contradiction_text_threshold: Option<f32>,
         contradiction_weaken_factor: Option<f32>,
+        supersession_demotion_factor: Option<f32>,
         contradiction_max_pairs_per_cycle: Option<usize>,
         importance_auto_scoring: Option<bool>,
         importance_learning_rate: Option<f32>,
@@ -294,6 +294,8 @@ impl PyMemoryEngine {
         concept_merge_overlap_threshold: Option<f32>,
         concept_hub_degree_fraction: Option<f32>,
         concept_evolution_max_pairs_per_cycle: Option<usize>,
+        seed_hops_from: Option<usize>,
+        expansion_max_candidates: Option<usize>,
     ) -> PyResult<Self> {
         let mut config = StoreConfig::default_for_dimension(dimension);
         if let Some(me) = max_edges {
@@ -357,28 +359,33 @@ impl PyMemoryEngine {
         };
 
         // Cognitive-layer tuning (all optional, defaults preserved when None).
-        // - fok_threshold: Feeling-of-Knowing gate. Lower = more permissive
-        //   retrieval (returns more results); higher = stricter (rejects weak
-        //   matches). Default 0.58.
-        // - spreading_decay / spreading_iterations: control how far activation
-        //   propagates through the memory graph. Defaults 0.5 / 4.
+        // The cognitive layer is a bounded augmenter: ANN candidates form a
+        // recall floor and a single 1-hop graph expansion can only add
+        // candidates / apply a small additive boost.
+        // - spreading_decay: energy decay applied to graph-discovered (1-hop)
+        //   candidates. Default 0.5.
+        // - spreading_iterations: number of expansion hops. 0 disables graph
+        //   expansion (pure ANN + BM25); 1 (default) is the balanced setting.
+        // - seed_hops_from: how many top ANN seeds to expand from. Default 10.
+        // - expansion_max_candidates: cap on candidates added by expansion.
+        //   Default 50.
         // - abstraction_co_occurrence_threshold: enable abstraction hierarchy
         //   building. 0 (default) disables. A value of 3 means two concepts
         //   must co-occur on >= 3 memories before a parent concept is created.
         // - edge_decay_half_life_secs: enable edge forgetting. 0 (default)
         //   disables. A value of 86400 (1 day) means unrehearsed reinforced
         //   edges fade toward baseline with a 1-day half-life.
-        if let Some(fok) = fok_threshold {
-            config.spreading.fok_threshold = fok;
-        }
         if let Some(decay) = spreading_decay {
             config.spreading.decay = decay;
         }
         if let Some(iters) = spreading_iterations {
             config.spreading.iterations = iters;
         }
-        if let Some(beta) = spreading_beta {
-            config.spreading.beta = beta;
+        if let Some(shf) = seed_hops_from {
+            config.spreading.seed_hops_from = shf;
+        }
+        if let Some(emc) = expansion_max_candidates {
+            config.spreading.expansion_max_candidates = emc;
         }
         if let Some(th) = abstraction_co_occurrence_threshold {
             config.tier.abstraction_co_occurrence_threshold = th;
@@ -413,11 +420,10 @@ impl PyMemoryEngine {
         if let Some(rm) = refinement_max_pairs_per_cycle {
             config.tier.refinement_max_pairs_per_cycle = rm;
         }
-        // - cognitive_alpha: fusion weight for cognitive search.
-        //   final_score = cognitive_alpha * cosine + (1 - cognitive_alpha) * graph_activation
-        //   1.0 (default) = pure cosine (graph only chooses candidates).
-        //   0.5 = graph activation has equal vote with cosine (enables
-        //   reinforcement/refinement/abstraction to re-rank memories).
+        // - cognitive_alpha: additive fusion weight for cognitive search.
+        //   final_score = cosine + (1 - cognitive_alpha) * normalized_graph_delta.
+        //   1.0 = pure cosine (graph only chooses candidates). Lower values
+        //   allow reinforcement/refinement/abstraction to add a bounded boost.
         if let Some(ca) = cognitive_alpha {
             config.cognitive_alpha = ca;
         }
@@ -434,6 +440,9 @@ impl PyMemoryEngine {
         //   pairs at/above it are treated as refinements. Default 0.3.
         // - contradiction_weaken_factor: the old (contradicted) memory's
         //   association edges are multiplied by this factor. Default 0.5.
+        // - supersession_demotion_factor: final-score multiplier applied to
+        //   old memories superseded by refinement/contradiction. Default 0.4;
+        //   set to 1.0 to disable final-score demotion.
         // - contradiction_max_pairs_per_cycle: cap on Contradicts edges
         //   per consolidation. Default 1024.
         config.tier.contradiction_cosine_threshold = contradiction_cosine_threshold;
@@ -442,6 +451,9 @@ impl PyMemoryEngine {
         }
         if let Some(wf) = contradiction_weaken_factor {
             config.tier.contradiction_weaken_factor = wf;
+        }
+        if let Some(df) = supersession_demotion_factor {
+            config.tier.supersession_demotion_factor = df.clamp(0.0, 1.0);
         }
         if let Some(cp) = contradiction_max_pairs_per_cycle {
             config.tier.contradiction_max_pairs_per_cycle = cp;

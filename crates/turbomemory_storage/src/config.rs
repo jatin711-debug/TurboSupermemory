@@ -224,6 +224,17 @@ pub struct TierConfig {
     /// are multiplied when a contradiction is detected. Default 0.5 —
     /// halve the edge weights so the old memory fades but is not invisible.
     pub contradiction_weaken_factor: f32,
+    /// Multiplicative score penalty applied to a memory that has been
+    /// superseded by a newer one (via a `Contradicts` or `Refines` edge
+    /// created during consolidation). The superseded memory's fused retrieval
+    /// score is multiplied by this factor, so the current belief outranks the
+    /// stale one even when `cognitive_alpha = 1.0` (pure-cosine ranking).
+    /// Unlike `contradiction_weaken_factor` (which only weakens outgoing graph
+    /// edges and so cannot demote a record matched directly by cosine), this
+    /// acts on the final score and is durable across restarts. Default 0.4 —
+    /// a strong demotion that preserves history (the memory is never deleted).
+    /// Set to 1.0 to disable supersession demotion entirely.
+    pub supersession_demotion_factor: f32,
     /// Upper bound on contradiction edges created per consolidation cycle.
     pub contradiction_max_pairs_per_cycle: usize,
     /// Enable automatic importance scoring (self-organizing memory). When
@@ -319,6 +330,7 @@ impl TierConfig {
         contradiction_cosine_threshold: None,
         contradiction_text_threshold: 0.3,
         contradiction_weaken_factor: 0.5,
+        supersession_demotion_factor: 0.4,
         contradiction_max_pairs_per_cycle: 1024,
         // Automatic importance scoring: opt-in. When enabled, the engine
         // adjusts each record's importance based on retrieval patterns +
@@ -434,14 +446,16 @@ pub struct StoreConfig {
     /// Search-time beam width (`ef`).  Used as the floor for the per-segment
     /// candidate pool.
     pub search_list_size: usize,
-    /// Fusion weight for cognitive search: `final_score = cognitive_alpha *
-    /// cosine + (1 - cognitive_alpha) * graph_activation`.  At `1.0`
-    /// (default) the final ranking is pure cosine — the graph only
-    /// influences *which* memories are candidates, not their rank. At `0.5`
-    /// the graph activation score has equal weight with cosine, allowing
-    /// reinforcement, refinement, and abstraction to re-rank memories
-    /// above what pure cosine would produce. Range `[0.0, 1.0]`; clamped
-    /// at runtime.
+    /// Additive fusion weight for the cognitive augmenter:
+    /// `final_score = cosine + (1 - cognitive_alpha) * normalized_graph_signal`.
+    /// This is the sole blend control. At `1.0` the ranking is pure cosine —
+    /// the graph only influences *which* memories are candidates. Lower values
+    /// let the graph re-rank candidates via an additive, bounded boost
+    /// (reinforcement, refinement, contradiction, abstraction). The default
+    /// `0.7` gives the graph up to a 0.30 additive re-rank boost, enough to
+    /// surface a refinement/correction above its cosine-nearest older memory
+    /// while still preserving the ANN recall floor. Range `[0.0, 1.0]`;
+    /// clamped at runtime.
     pub cognitive_alpha: f32,
     pub outlier_count: usize,
     pub initial_capacity: usize,
@@ -450,8 +464,8 @@ pub struct StoreConfig {
     pub optimizer_budget: OptimizerBudget,
     /// How often the background consolidation worker runs.  `None` disables it.
     pub auto_consolidation_interval: Option<Duration>,
-    /// Cognitive-layer spreading-activation parameters (FOK threshold, decay,
-    /// iterations, lateral inhibition). Defaults to `SpreadingConfig::default()`.
+    /// Cognitive-layer bounded-augmenter parameters (lexical alpha, decay,
+    /// seed count, expansion cap). Defaults to `SpreadingConfig::default()`.
     pub spreading: SpreadingConfig,
 }
 
@@ -548,7 +562,7 @@ impl Default for StoreConfig {
             level0_factor: 2,
             ef_construction: 200,
             search_list_size: 100,
-            cognitive_alpha: 1.0,
+            cognitive_alpha: 0.7,
             outlier_count: 0,
             initial_capacity: 1024,
             tier: TierConfig::default(),

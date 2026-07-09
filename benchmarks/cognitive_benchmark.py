@@ -607,16 +607,13 @@ def main():
     logger.info("=" * 70)
 
     # --- Scenario 1: Abstraction traversal ---
-    # Cognitive ON: abstraction enabled + alpha=0.1 + 6 iterations + decay 0.7
-    # + beta=0.0 (disable lateral inhibition, which would zero out the
-    # weakly-activated target when many stronger memories exist).
+    # Cognitive ON: abstraction enabled + alpha=0.1 + multi-seed expansion.
     cog1 = run_scenario(tsm, dim, {
         "abstraction_co_occurrence_threshold": 3,
         "max_concepts": 10,
         "cognitive_alpha": 0.1,
-        "spreading_iterations": 6,
+        "spreading_iterations": 1,
         "spreading_decay": 0.7,
-        "spreading_beta": 0.0,
     }, scenario_abstraction_traversal, distractors=distractors)
 
     # Cognitive OFF: abstraction disabled, same spreading params.
@@ -624,9 +621,8 @@ def main():
     off1 = run_scenario(tsm, dim, {
         "max_concepts": 10,
         "cognitive_alpha": 0.1,
-        "spreading_iterations": 6,
+        "spreading_iterations": 1,
         "spreading_decay": 0.7,
-        "spreading_beta": 0.0,
     }, scenario_abstraction_traversal, distractors=distractors)
 
     # --- Scenario 2: Refinement surfacing ---

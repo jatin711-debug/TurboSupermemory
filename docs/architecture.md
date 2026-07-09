@@ -23,7 +23,7 @@ graph TD
 
 * [**`turbomemory_core`**](file:///d:/personal-projects/TurboSuperMemory/docs/core_quantization.md): SIMD math kernels (AVX2/NEON), Fast Walsh-Hadamard Transform (FWHT) preconditioning, Lloyd-Max centroids, and quantization encoders (Scalar, Sign, TurboQuant).
 * [**`turbomemory_storage`**](file:///d:/personal-projects/TurboSuperMemory/docs/storage_persistence.md): Mmap-backed dense vector storage, Write-Ahead Log (WAL) append-only durability, `redb` snapshot persistence, multi-agent scoping (`ScopeIndex`), metadata tables, and the segment consolidation engine.
-* [**`turbomemory_graph`**](file:///d:/personal-projects/TurboSuperMemory/docs/cognitive_graph.md): The episodic-semantic memory graph, BM25 indexing, spreading activation scoring, Working Memory compression (CCS), synonym vocabulary evolution, and automatic importance recomputation.
+* [**`turbomemory_graph`**](file:///d:/personal-projects/TurboSuperMemory/docs/cognitive_graph.md): The episodic-semantic memory graph, BM25 indexing, the bounded cognitive augmenter (single 1-hop graph-delta re-rank), Working Memory compression (CCS), synonym vocabulary evolution, and automatic importance recomputation.
 * [**`turbomemory_python`**](file:///d:/personal-projects/TurboSuperMemory/docs/bindings_api.md): High-performance PyO3 bindings exposing the memory engine as a Python package, including zero-copy NumPy array mappings and GIL-free concurrency.
 * [**`turbomemory_api`**](file:///d:/personal-projects/TurboSuperMemory/docs/bindings_api.md): Multi-protocol service providing REST (Axum) and gRPC (Tonic) frontends over a unified memory service.
 * [**`turbomemory_gpu`**](file:///d:/personal-projects/TurboSuperMemory/docs/gpu_acceleration.md): Optional GPU acceleration layer with a trait-based backend system (`GpuBackend`), CUDA implementation via `cudarc` (cuBLAS batched distance + custom HNSW build), and transparent CPU fallback.
@@ -100,18 +100,23 @@ sequenceDiagram
 ```
 
 ### 3.2 Read Path (Cognitive Retrieval)
+
+Retrieval is an **ANN-floor + bounded augmenter** model: the dense ANN top-k is a non-negotiable recall floor, and the cognitive graph performs a single bounded 1-hop expansion that can only *add* candidates and apply a small additive, non-negative re-rank boost. The augmenter returns a **pure graph delta** (cosine is never folded in); the engine fuses cosine with the normalized delta. There is no per-query Feeling-of-Knowing gate on the hot path — `search()` returns `None` only when there are no ANN seeds at all. (See [Cognitive Memory Graph](file:///d:/personal-projects/TurboSuperMemory/docs/cognitive_graph.md) §2–3.)
+
 ```mermaid
 flowchart TD
     Q["Query Input"] --> ANN["Parallel Segment Search: Hot/SealedHot/Warm/Cold"]
     ANN --> Rerank["Full f32 Vector Rerank via VectorStore"]
+    Rerank --> Floor["ANN candidate floor: graph delta = 0"]
     Q --> BM25["BM25 Lexical Score Trigger"]
-    Rerank --> GraphTrigger["Assemble Seeds: Cosine Similarity"]
-    BM25 --> GraphTrigger
-    GraphTrigger --> FOK{"Peak Energy >= fok_threshold?"}
-    FOK -- "No" --> ReturnNone["Return None / Feeling-of-Knowing Gate Blocks"]
-    FOK -- "Yes" --> Spreading["Spreading Activation Iterations"]
-    Spreading -- "Traverses Refines/Contradicts/Temporal" --> FinalEnergy["Final Activation Scores"]
-    FinalEnergy --> Fusion["Score Fusion: blended with Cosine Similarity"]
+    Floor --> Empty{"Any ANN seeds?"}
+    Empty -- "No" --> ReturnNone["Return None"]
+    Empty -- "Yes" --> Lexical["+ BM25 lexical boost into delta"]
+    BM25 --> Lexical
+    Lexical --> Expand["1-hop expand from top-M seeds"]
+    Expand --> Pools["Strong x1.0 / Temporal x0.5 / Normal x0.3"]
+    Pools --> Delta["Return PURE graph delta per candidate"]
+    Delta --> Fusion["Fuse: cosine + (1 - alpha) * normalized_delta"]
     Fusion --> Sort["Sort & Return Top K Results"]
 ```
 
@@ -268,7 +273,7 @@ For in-depth explanations of specific features, browse the detailed sub-document
 2. [**Storage, Durability, and Segment Tiers Subsystem**](file:///d:/personal-projects/TurboSuperMemory/docs/storage_persistence.md)
    * The Write-Ahead Log (WAL) durability, `redb` lazy snapshot persistence, segmented search execution, background optimization, and thread-safe concurrency.
 3. [**Cognitive Memory Graph Subsystem**](file:///d:/personal-projects/TurboSuperMemory/docs/cognitive_graph.md)
-   * Episodic-semantic graph nodes/edges, Spreading Activation, Feeling-of-Knowing (FOK) gating, pluggable CCS working memory compaction, synonym vocabulary evolution, and automatic importance scoring.
+   * Episodic-semantic graph nodes/edges, the bounded cognitive augmenter (ANN-floor + single 1-hop graph delta), pluggable CCS working memory compaction, synonym vocabulary evolution, and automatic importance scoring.
 4. [**Python Bindings and API Services Subsystem**](file:///d:/personal-projects/TurboSuperMemory/docs/bindings_api.md)
    * PyO3 binding structures, zero-copy NumPy array operations, thread GIL releases, Tonic gRPC, and Axum REST controllers.
 5. [**GPU Acceleration Subsystem**](file:///d:/personal-projects/TurboSuperMemory/docs/gpu_acceleration.md)

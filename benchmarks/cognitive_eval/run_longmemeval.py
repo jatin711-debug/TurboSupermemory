@@ -43,6 +43,7 @@ def run_benchmark(
     top_k: int = 10,
     quick: bool = False,
     quick_n: int = 10,
+    trigger_consolidation: bool = True,  # NEW: Enable consolidation by default
 ) -> dict:
     """Run LongMemEval benchmark on a given adapter.
     
@@ -52,6 +53,7 @@ def run_benchmark(
         top_k: Number of results to retrieve per query
         quick: If True, only evaluate first quick_n conversations
         quick_n: Number of conversations for quick mode
+        trigger_consolidation: Whether to trigger consolidation after ingestion (builds graph edges)
         
     Returns:
         Dict with benchmark results and metrics
@@ -87,11 +89,12 @@ def run_benchmark(
         add_result = adapter.add(conversation.messages, user_id=conversation.conv_id)
         ingest_time = (time.perf_counter() - ingest_start) * 1000
         
-        # Trigger consolidation after ingestion (for TSM) - DISABLED for benchmarks
-        # consolidation is too slow for benchmarking, not part of normal per-conversation operation
-        # if hasattr(adapter, 'trigger_consolidation'):
-        #     adapter.trigger_consolidation()
+        # Trigger consolidation after ingestion (for TSM) - builds graph edges
         consolidation_time = 0
+        if trigger_consolidation and hasattr(adapter, 'trigger_consolidation'):
+            cons_start = time.perf_counter()
+            adapter.trigger_consolidation()
+            consolidation_time = (time.perf_counter() - cons_start) * 1000
         
         conv_total = (time.perf_counter() - conv_start) * 1000
         step_times["total_per_conversation"].append(conv_total)
@@ -114,8 +117,12 @@ def run_benchmark(
         # Evaluate each query
         for query in conversation.queries:
             search_start = time.perf_counter()
-            # Use direct ANN for fast retrieval (not cognitive graph)
-            results = adapter.search(query.query_text, user_id=conversation.conv_id, top_k=top_k, use_cognitive=False)
+            # Use cognitive search by default for TSM (it's the whole point of the cognitive layer)
+            use_cognitive = hasattr(adapter, 'engine')
+            if use_cognitive:
+                results = adapter.search(query.query_text, user_id=conversation.conv_id, top_k=top_k, use_cognitive=True)
+            else:
+                results = adapter.search(query.query_text, user_id=conversation.conv_id, top_k=top_k, use_cognitive=False)
             search_time = (time.perf_counter() - search_start) * 1000
             
             latencies.append(search_time)
@@ -245,6 +252,8 @@ def compare_search_modes(adapter, conversations, top_k: int = 10) -> dict:
     """
     ann_times = []
     cog_times = []
+    ann_hits = []
+    cog_hits = []
     ann_results = []
     cog_results = []
     
@@ -252,6 +261,8 @@ def compare_search_modes(adapter, conversations, top_k: int = 10) -> dict:
         adapter.add(conv.messages, user_id=conv.conv_id)
         
         for query in conv.queries:
+            answer = query.answer_text.lower()
+            
             # ANN search
             start = time.perf_counter()
             ann_res = adapter.search(query.query_text, user_id=conv.conv_id, top_k=top_k, use_cognitive=False)
@@ -259,12 +270,30 @@ def compare_search_modes(adapter, conversations, top_k: int = 10) -> dict:
             ann_times.append(ann_time)
             ann_results.append(ann_res)
             
+            # Check if ANN found the answer
+            ann_hit = False
+            for r in ann_res:
+                text = r.get('text', '').lower()
+                if text and (answer in text or text in answer or any(word in text for word in answer.split() if len(word) > 3)):
+                    ann_hit = True
+                    break
+            ann_hits.append(ann_hit)
+            
             # Cognitive search
             start = time.perf_counter()
             cog_res = adapter.search(query.query_text, user_id=conv.conv_id, top_k=top_k, use_cognitive=True)
             cog_time = (time.perf_counter() - start) * 1000
             cog_times.append(cog_time)
             cog_results.append(cog_res)
+            
+            # Check if cognitive found the answer
+            cog_hit = False
+            for r in (cog_res or []):
+                text = r.get('text', '').lower()
+                if text and (answer in text or text in answer or any(word in text for word in answer.split() if len(word) > 3)):
+                    cog_hit = True
+                    break
+            cog_hits.append(cog_hit)
     
     # Compare overlap
     overlaps = []
@@ -275,14 +304,23 @@ def compare_search_modes(adapter, conversations, top_k: int = 10) -> dict:
             overlap = len(ann_ids & cog_ids) / len(ann_ids)
             overlaps.append(overlap)
     
+    ann_recall = sum(ann_hits) / len(ann_hits) if ann_hits else 0.0
+    cog_recall = sum(cog_hits) / len(cog_hits) if cog_hits else 0.0
+    
     return {
         'ann_mean_ms': float(np.mean(ann_times)),
         'ann_p50_ms': float(np.percentile(ann_times, 50)),
+        'ann_recall_at_k': ann_recall,
         'cog_mean_ms': float(np.mean(cog_times)),
         'cog_p50_ms': float(np.percentile(cog_times, 50)),
+        'cog_recall_at_k': cog_recall,
         'speedup': float(np.mean(cog_times) / np.mean(ann_times)),
         'avg_overlap': float(np.mean(overlaps)) if overlaps else 0.0,
         'num_queries': len(ann_times),
+        'ann_better_queries': sum(1 for a, c in zip(ann_hits, cog_hits) if a and not c),
+        'cog_better_queries': sum(1 for a, c in zip(ann_hits, cog_hits) if c and not a),
+        'both_correct': sum(1 for a, c in zip(ann_hits, cog_hits) if a and c),
+        'both_wrong': sum(1 for a, c in zip(ann_hits, cog_hits) if not a and not c),
     }
 
 
@@ -336,14 +374,14 @@ def main():
             else:
                 model_name = args.embedding_model
             
-            logger.info("Initializing TSM adapter with model=%s, extractor=%s (cognitive=OFF for benchmarks)",
+            logger.info("Initializing TSM adapter with model=%s, extractor=%s (cognitive enabled for benchmarks)",
                         model_name, args.extractor)
             adapter = TSMAdapter(
                 db_path=db_path,
                 embedding_model=model_name,
                 extractor=args.extractor,
                 batch_size=args.batch_size,
-                cognitive_features=False,  # Disabled for benchmarks - ANN only
+                cognitive_features=True,  # Always enable cognitive for benchmark
             )
         else:
             from cognitive_eval.adapters.mem0_adapter import Mem0Adapter
@@ -357,6 +395,7 @@ def main():
             top_k=args.top_k,
             quick=args.quick,
             quick_n=args.quick_n,
+            trigger_consolidation=True,  # Always trigger consolidation for TSM
         )
         
         # Print results
@@ -376,15 +415,26 @@ def main():
             print(f"\nANN Search:")
             print(f"  Mean: {comparison['ann_mean_ms']:.1f} ms")
             print(f"  P50:  {comparison['ann_p50_ms']:.1f} ms")
+            print(f"  Recall@{args.top_k}: {comparison['ann_recall_at_k']:.1%}")
             print(f"\nCognitive Search:")
             print(f"  Mean: {comparison['cog_mean_ms']:.1f} ms")
             print(f"  P50:  {comparison['cog_p50_ms']:.1f} ms")
+            print(f"  Recall@{args.top_k}: {comparison['cog_recall_at_k']:.1%}")
             print(f"\nSpeedup: ANN is {comparison['speedup']:.1f}x faster")
             print(f"Result overlap: {comparison['avg_overlap']:.1%}")
+            print(f"\nQuery breakdown:")
+            print(f"  Both correct:   {comparison['both_correct']}")
+            print(f"  Both wrong:     {comparison['both_wrong']}")
+            print(f"  ANN only:       {comparison['ann_better_queries']}")
+            print(f"  Cognitive only: {comparison['cog_better_queries']}")
             print(f"\nRecommendation:")
-            if comparison['speedup'] > 10:
-                print(f"  ⚡ Use ANN for speed-critical applications")
-                print(f"  🧠 Use cognitive for quality-critical applications")
+            if comparison['cog_recall_at_k'] > comparison['ann_recall_at_k']:
+                improvement = (comparison['cog_recall_at_k'] - comparison['ann_recall_at_k']) * 100
+                print(f"  🧠 Cognitive improves recall by {improvement:.1f} percentage points")
+            elif comparison['ann_recall_at_k'] > comparison['cog_recall_at_k']:
+                print(f"  ⚡ ANN has better recall. Cognitive may need tuning.")
+            else:
+                print(f"  ⚖️  Same recall. Use ANN for speed.")
             print("=" * 70)
         
         # Save results if requested

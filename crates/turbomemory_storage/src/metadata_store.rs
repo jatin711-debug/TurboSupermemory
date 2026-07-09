@@ -16,6 +16,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const RECORDS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("records");
 const META_TABLE: TableDefinition<&str, &str> = TableDefinition::new("meta");
+/// Per-record supersession demotion factors (`offset -> factor`).
+///
+/// Stored in a dedicated table rather than inside the bincode-serialized
+/// `MetaRecord` so that adding it requires no backward-compat migration:
+/// records written by older builds simply have no entry here and default to
+/// `NO_DEMOTION` (1.0, no demotion). The factor is consolidation-derived state
+/// and is recomputed idempotently on every consolidation cycle, so it is
+/// persisted only via the lazy redb snapshot (no WAL durability needed).
+const DEMOTION_TABLE: TableDefinition<u64, f32> = TableDefinition::new("supersession_demotion");
+
+/// Default demotion factor for a record that has never been superseded.
+pub const NO_DEMOTION: f32 = 1.0;
 
 /// Owns the durable metadata: records (without embeddings), cognitive graph,
 /// CCS, and sequence counters.
@@ -24,6 +36,12 @@ pub struct MetadataStore {
     db_path: PathBuf,
     records: RwLock<HashMap<PointOffset, MetaRecord>>,
     dirty: Mutex<HashSet<PointOffset>>,
+    /// Per-record supersession demotion factors. Absent entries mean
+    /// `NO_DEMOTION`. Populated from `DEMOTION_TABLE` on open and flushed back
+    /// alongside records.
+    demotion: RwLock<HashMap<PointOffset, f32>>,
+    /// Offsets whose demotion factor changed since the last flush.
+    demotion_dirty: Mutex<HashSet<PointOffset>>,
     next_offset: AtomicU64,
     next_seq: AtomicU64,
     /// Number of live metadata records. Maintained incrementally so callers
@@ -39,6 +57,7 @@ impl MetadataStore {
         let db = redb(Database::create(db_file))?;
         let records = Self::load_records(&db)?;
         let record_count = AtomicU64::new(records.len() as u64);
+        let demotion = Self::load_demotion(&db)?;
         let next_offset = Self::load_meta(&db, "next_offset")
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| records.keys().copied().max().map(|m| m + 1).unwrap_or(0));
@@ -56,6 +75,8 @@ impl MetadataStore {
             db_path,
             records: RwLock::new(records),
             dirty: Mutex::new(HashSet::new()),
+            demotion: RwLock::new(demotion),
+            demotion_dirty: Mutex::new(HashSet::new()),
             next_offset: AtomicU64::new(next_offset),
             next_seq: AtomicU64::new(next_seq),
             record_count,
@@ -75,6 +96,18 @@ impl MetadataStore {
                 let offset: u64 = k.value();
                 let rec: MetaRecord = bincode::deserialize(v.value())?;
                 map.insert(offset, rec);
+            }
+        }
+        Ok(map)
+    }
+
+    fn load_demotion(db: &Database) -> crate::Result<HashMap<PointOffset, f32>> {
+        let txn = redb(db.begin_read())?;
+        let mut map = HashMap::new();
+        if let Ok(table) = txn.open_table(DEMOTION_TABLE) {
+            for item in table.iter()? {
+                let (k, v) = item?;
+                map.insert(k.value(), v.value());
             }
         }
         Ok(map)
@@ -114,6 +147,35 @@ impl MetadataStore {
     /// Look up a metadata record from the in-memory cache.
     pub fn get(&self, offset: PointOffset) -> crate::Result<Option<MetaRecord>> {
         Ok(self.records.read().get(&offset).cloned())
+    }
+
+    /// Read the supersession demotion factor for a record.
+    ///
+    /// Returns [`NO_DEMOTION`] (1.0) when the record has never been superseded.
+    pub fn demotion_factor(&self, offset: PointOffset) -> f32 {
+        self.demotion
+            .read()
+            .get(&offset)
+            .copied()
+            .unwrap_or(NO_DEMOTION)
+    }
+
+    /// Set the supersession demotion factor for a record and mark it dirty.
+    ///
+    /// The factor is clamped to `[0.0, 1.0]`. A value of `1.0` removes any
+    /// existing demotion entry so the map stays sparse.
+    pub fn set_demotion_factor(&self, offset: PointOffset, factor: f32) {
+        let factor = factor.clamp(0.0, 1.0);
+        let mut map = self.demotion.write();
+        let changed = if factor >= NO_DEMOTION {
+            map.remove(&offset).is_some()
+        } else {
+            map.insert(offset, factor) != Some(factor)
+        };
+        drop(map);
+        if changed {
+            self.demotion_dirty.lock().insert(offset);
+        }
     }
 
     /// Insert or update metadata from a full `Record`.  The embedding is *not*
@@ -166,6 +228,11 @@ impl MetadataStore {
             self.record_count.fetch_sub(1, Ordering::Relaxed);
         }
         self.dirty.lock().insert(offset);
+        // Drop any demotion factor for the removed slot so the table does not
+        // retain stale entries for reused offsets.
+        if self.demotion.write().remove(&offset).is_some() {
+            self.demotion_dirty.lock().insert(offset);
+        }
         Ok(())
     }
 
@@ -173,7 +240,9 @@ impl MetadataStore {
     /// to `redb` in a single transaction.
     pub fn flush(&self, last_applied_seq: u64) -> crate::Result<()> {
         let dirty: HashSet<PointOffset> = std::mem::take(&mut *self.dirty.lock());
+        let demotion_dirty: HashSet<PointOffset> = std::mem::take(&mut *self.demotion_dirty.lock());
         if dirty.is_empty()
+            && demotion_dirty.is_empty()
             && self.last_applied_seq() == Some(last_applied_seq)
             && self.records.read().is_empty()
         {
@@ -189,6 +258,17 @@ impl MetadataStore {
                 if let Some(rec) = records.get(offset) {
                     let bytes = bincode::serialize(rec)?;
                     redb(table.insert(*offset, bytes.as_slice()))?;
+                } else {
+                    redb(table.remove(*offset))?;
+                }
+            }
+        }
+        if !demotion_dirty.is_empty() {
+            let demotion = self.demotion.read();
+            let mut table = redb(txn.open_table(DEMOTION_TABLE))?;
+            for offset in &demotion_dirty {
+                if let Some(factor) = demotion.get(offset) {
+                    redb(table.insert(*offset, *factor))?;
                 } else {
                     redb(table.remove(*offset))?;
                 }

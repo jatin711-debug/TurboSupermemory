@@ -13,6 +13,35 @@
 
 ---
 
+## Recently Completed — 2026-06-29 (Cognitive fusion no-op fix — pure graph delta contract)
+
+Fixed a silent no-op in the cognitive retrieval path: the graph augmenter was double-counting cosine, so its edges re-ranked nothing and `search()` behaved like plain ANN. The augmenter now returns a **pure, non-negative graph delta** and the engine owns the authoritative cosine, restoring belief-revision / refinement / temporal re-ranking.
+
+- **Root cause (`turbomemory_graph/src/activation.rs`).**
+  - `SpreadingActivation::search` folded the cosine seed score into the value it returned. The engine (`hydrate_and_fuse`) then added cosine *again*, so the normalized "graph signal" was a monotone function of cosine. Net effect: graph edges could not change ordering — cognition was a silent no-op that mirrored ANN.
+
+- **Fix: pure graph-delta contract (`turbomemory_graph/src/activation.rs`).**
+  - `search` now returns **only** the graph delta `Δ_graph(M) ≥ 0` per candidate; cosine is never folded in.
+  - ANN candidates are seeded with `delta = 0` (recall floor preserved). Cosine seed scores are stored separately (`seed_scores`) and used **internally only** to (a) pick the top-M expansion seeds and (b) weight the magnitude of propagated signal.
+  - BM25 lexical boost plus the three edge pools accumulate into `delta`: **Strong** (`Refines`/`Contradicts`) ×1.0 (traverses even to existing ANN candidates), **Temporal** ×0.5, **Normal** (`Association`, weight ≥ 0.5, new candidates only) ×0.3.
+  - Truncation ranks candidates by `seed cosine activation + delta` (to keep the ANN floor when trimming) but the returned value is the **pure delta**.
+  - `search()` returns `None` only when there are no ANN seeds at all — no tuned FOK threshold on the hot path.
+
+- **Fusion doc corrected (`turbomemory_storage/src/engine.rs`).**
+  - The fusion math `cos + (1 - alpha) * normalized_delta` was already correct once the delta became pure; only the `hydrate_and_fuse` doc comment was updated to `final_score = cosine + (1 - alpha) * normalized_graph_delta`.
+
+- **Test added (`activation.rs`).**
+  - `returned_score_is_pure_graph_delta_without_cosine`: a high-cosine ANN seed with no graph/lexical signal returns delta `0`; a `Refines` target receives a positive delta.
+
+- **Docs updated.**
+  - `docs/cognitive_graph.md` §2 rewritten to the "Bounded Cognitive Augmenter" model (delta contract, candidate floor, 1-hop pools table, numeric example); §3 fusion formula corrected to additive `cosine + (1-α)·normalized_delta`; §7 pipeline diagram refreshed (removed FOK gate / multi-iteration spreading / frontier truncation).
+  - `docs/architecture.md` §1, §3.2 read-path diagram, and §4 subsystem links updated to the bounded-augmenter + additive-fusion model.
+  - `README.md` cognitive-layer phrasing and repo-structure comment updated (no FOK gate on the hot path).
+
+Validated: `cargo fmt --all` applied; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo test --workspace --exclude turbomemory_python` = **ALL PASS** (core 29, graph 66, storage 72, crash_recovery 3). Cognitive benchmark after fix: toy (`--dimension 64 --distractors 0`) wins 2/4 with Contradiction now surfacing the correction; realistic default (768-dim, 1000 distractors) wins 3/4 (refinement, reinforcement, contradiction). Abstraction-at-scale remains the one losing scenario — a known limitation, not a regression.
+
+---
+
 ## Recently Completed — 2026-06-22 (GPU HNSW recall fix, batch search API, 100K validation)
 
 Fixed GPU HNSW recall collapse at 5K+ vectors, shipped `search_ann_batch` Python API, and validated 100% recall at 100K × 1536 with CUDA enabled.

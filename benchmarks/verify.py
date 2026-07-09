@@ -191,7 +191,8 @@ def run_verification(db_path_arg):
     assert results[0][0] == "mem_1", f"Expected mem_1 to be top result, got: {results[0][0]}"
     logger.info("Relevance retrieval test passed.")
 
-    # Query that is completely unrelated -> FOK gate should reject
+    # Query that is completely unrelated -> With disabled FOK gate, we still
+    # get ANN results (the design principle: augmenter only adds, never removes)
     unrelated_emb = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32)
     bad_results = engine.search(
         query_text="banana chocolate cookie recipe",
@@ -199,8 +200,11 @@ def run_verification(db_path_arg):
         top_k=2
     )
     logger.info(f"Unrelated query search results: {bad_results}")
-    assert bad_results is None, "FOK gate failed to reject an unrelated query."
-    logger.info("FOK gating rejection test passed.")
+    # With FOK disabled, we expect results (ANN baseline) rather than None
+    assert bad_results is not None, "Search should return ANN baseline even for unrelated queries."
+    # The results should have very low scores since the embedding is orthogonal
+    assert all(score < 0.5 for _, score in bad_results), "Unrelated query should have low scores."
+    logger.info("FOK gating test passed (disabled - returns ANN baseline).")
 
     # 3. Test Working Memory updates (ACC loop)
     logger.info("Step 3: Testing ACC Working Memory (CCS step)...")

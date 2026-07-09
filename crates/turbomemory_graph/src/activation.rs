@@ -1,43 +1,41 @@
 //! Spreading activation retrieval over the cognitive graph.
 
 use crate::bm25::Bm25Index;
-use crate::graph::{EdgeKind, MemoryGraph};
-use std::collections::BTreeMap;
+use crate::graph::{EdgeKind, MemoryGraph, NodeKind};
 
+/// Configuration for the bounded augmenter search.
+///
+/// The augmenter takes the ANN candidate set as a non-negotiable recall floor
+/// and performs a single bounded 1-hop graph expansion that can only *add*
+/// candidates and apply a small additive re-rank boost — it never drops or
+/// reorders away an ANN hit.
 #[derive(Debug, Clone)]
 pub struct SpreadingConfig {
-    /// Scaling factor for the initial semantic trigger.
+    /// Scaling factor for the initial semantic (ANN) trigger.
     pub semantic_alpha: f32,
-    /// Scaling factor for the initial lexical trigger.
+    /// Scaling factor for the BM25 lexical boost.
     pub lexical_alpha: f32,
-    /// Energy decay per hop.
+    /// Energy decay applied to graph-discovered candidates (1 hop).
     pub decay: f32,
-    /// Number of propagation iterations.
+    /// Number of expansion hops. `0` disables graph expansion (pure ANN+BM25).
+    /// `1` is the intended balanced setting.
     pub iterations: usize,
-    /// Lateral inhibition strength.
-    pub beta: f32,
-    /// Feeling-of-Knowing gate threshold. If the peak memory activation is below this, return None.
-    pub fok_threshold: f32,
-    /// Maximum number of activated nodes kept after each propagation iteration.
-    /// Limits memory and time for queries that would otherwise activate the
-    /// whole graph (e.g. empty text or very common terms).
-    pub max_frontier: usize,
-    /// When `query_text` is empty, concept nodes that connect to more than this
-    /// fraction of all memories are treated as hubs and are not expanded.
-    pub hub_fraction_threshold: f32,
+    /// Number of top-scoring ANN seeds to expand from (M). Clamped to [1, 20].
+    pub seed_hops_from: usize,
+    /// Maximum number of new candidates added by graph expansion. Clamped to
+    /// [10, 200]. Bounds the cost and blast radius of the augmenter.
+    pub expansion_max_candidates: usize,
 }
 
 impl Default for SpreadingConfig {
     fn default() -> Self {
         Self {
-            semantic_alpha: 1.0,
-            lexical_alpha: 0.6,
-            decay: 0.5,
-            iterations: 4,
-            beta: 0.3,
-            fok_threshold: 0.58,
-            max_frontier: 1_000,
-            hub_fraction_threshold: 0.05,
+            semantic_alpha: 1.0,          // Full weight for ANN candidates (floor)
+            lexical_alpha: 0.3,           // Moderate BM25 boost
+            decay: 0.5,                   // Decay for 1-hop graph candidates
+            iterations: 1,                // 1-hop bounded expansion
+            seed_hops_from: 10,           // Expand from top-10 ANN seeds
+            expansion_max_candidates: 50, // Cap added candidates at 50
         }
     }
 }
@@ -54,7 +52,7 @@ impl SpreadingActivation {
     pub fn new(graph: MemoryGraph, config: SpreadingConfig) -> Self {
         let mut bm25 = Bm25Index::new();
         for (key, node) in graph.iter_memory_nodes() {
-            let id = key.strip_prefix("mem:").unwrap_or(key);
+            let id = key.strip_prefix("mem:").unwrap_or(&key);
             bm25.add(id, &node.text);
         }
         Self {
@@ -127,161 +125,240 @@ impl SpreadingActivation {
             .add_contradiction(old_id, new_id, weight, weaken_factor)
     }
 
-    /// Semantic seeds are `(memory_id, normalized_similarity)` pairs from dense ANN search.
-    /// Returns `None` when the Feeling-of-Knowing gate rejects the query.
+    /// Bounded augmenter search: ANN candidates + 1-hop graph expansion.
+    ///
+    /// Core principle: the augmenter can only ADD candidates, never remove ANN
+    /// hits. It returns a **pure, non-negative graph delta** per candidate — it
+    /// does NOT fold cosine into the returned score. The engine owns the
+    /// authoritative cosine (computed from exact f32 embeddings) and fuses it
+    /// with this delta as `final = cosine + (1 - alpha) * normalized_delta`.
+    /// Keeping cosine out of this delta is what lets the graph term actually
+    /// re-rank — folding cosine in here (as a previous version did) made the
+    /// delta a monotone function of cosine and washed the graph signal out.
+    ///
+    /// The cosine seed scores ARE used internally to (a) select which seeds to
+    /// expand from and (b) weight the magnitude of the propagated graph signal,
+    /// but they are never added to the returned value.
+    ///
+    /// Algorithm:
+    /// 1. ANN candidates form the floor (delta seeded at 0 so they always
+    ///    appear; the engine ranks them by exact cosine).
+    /// 2. BM25 lexical boost contributes to the delta.
+    /// 3. Single 1-hop expansion from top-M seeds (M ≈ 10), split into pools:
+    ///    - Strong (Refines/Contradicts): always traversed, including to
+    ///      targets already in the ANN floor. This is what lets a refinement
+    ///      or correction surface above its cosine-nearest older memory.
+    ///      Boosted at full strength (factor 1.0).
+    ///    - Temporal: traversed to nearby-turn memories. Boosted at 0.5.
+    ///    - Normal (high-weight Association): only adds candidates NOT already
+    ///      in the ANN floor. Boosted at factor 0.3.
+    /// 4. Union expanded candidates into the pool — never replace, never drop
+    ///    ANN hits.
+    ///
+    /// Returns `(id, graph_delta)` pairs (delta >= 0). Returns None only if
+    /// there are no ANN seeds.
     pub fn search(
         &self,
         query_text: &str,
         semantic_seeds: &[(String, f32)],
         top_k: usize,
     ) -> Option<Vec<(String, f32)>> {
-        let mut activation: BTreeMap<String, f32> = BTreeMap::new();
+        use std::collections::HashMap;
 
-        // Semantic trigger
+        // Step 1: ANN candidates are the floor — we never drop them. `delta`
+        // holds the pure graph signal (cosine is NOT folded in); `seed_scores`
+        // holds the seed activation (semantic_alpha * cosine) used only to
+        // select and weight graph expansion.
+        let mut delta: HashMap<String, f32> = HashMap::with_capacity(semantic_seeds.len() * 2);
+        let mut seed_scores: HashMap<String, f32> = HashMap::with_capacity(semantic_seeds.len());
+        let mut ann_candidates: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(semantic_seeds.len());
+
         for (id, score) in semantic_seeds {
-            *activation.entry(format!("mem:{id}")).or_insert(0.0) +=
-                self.config.semantic_alpha * score.max(0.0);
+            let key = format!("mem:{id}");
+            // Floor candidate: delta starts at 0 so the engine ranks it by
+            // exact cosine unless the graph adds a boost.
+            delta.insert(key.clone(), 0.0);
+            seed_scores.insert(key.clone(), self.config.semantic_alpha * score.max(0.0));
+            ann_candidates.insert(key);
         }
 
-        // Lexical trigger
+        if delta.is_empty() {
+            return None;
+        }
+
+        // Step 2: BM25 lexical boost contributes to the graph delta.
         let lexical = self.bm25.score(query_text);
         let max_lex = lexical.iter().map(|(_, s)| *s).fold(0.0f32, f32::max);
         let lex_norm = if max_lex > 0.0 { 1.0 / max_lex } else { 0.0 };
         for (id, score) in lexical {
             let key = format!("mem:{id}");
-            let a = self.config.lexical_alpha * score * lex_norm;
-            *activation.entry(key).or_insert(0.0) += a;
+            let lex_boost = self.config.lexical_alpha * score * lex_norm;
+            *delta.entry(key).or_insert(0.0) += lex_boost;
         }
 
-        if activation.is_empty() {
-            return None;
-        }
+        // Step 3: 1-hop graph expansion from top-M seeds
+        // Only expand if we have graph edges and iterations > 0
+        if self.config.iterations > 0 {
+            // Pick top-M seeds by cosine activation (M = seed_hops_from,
+            // default 10). Seeds are chosen by `seed_scores` (semantic_alpha *
+            // cosine), NOT by the graph delta — the strongest ANN matches are
+            // the right anchors to expand from.
+            let seed_hops_from = self.config.seed_hops_from.clamp(1, 20);
+            let mut seed_list: Vec<(String, f32)> = seed_scores
+                .iter()
+                .filter(|(k, _)| k.starts_with("mem:"))
+                .map(|(k, v)| (k.clone(), *v))
+                .collect();
+            seed_list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            seed_list.truncate(seed_hops_from);
 
-        // Early-exit FOK gate: if even the best seed is below threshold,
-        // propagation cannot rescue the query.
-        let peak_seed = activation.values().cloned().fold(0.0f32, f32::max);
-        if peak_seed < self.config.fok_threshold {
-            return None;
-        }
+            // Collect all memory nodes reachable in 1 hop from seeds.
+            //
+            // Three expansion pools prevent semantically strong edges from
+            // being drowned out by the much larger pool of Association edges:
+            // - `strong`: Refines/Contradicts targets. These are NOT skipped
+            //   even when they are already ANN candidates, because the whole
+            //   point of a Refines/Contradicts edge is to re-rank a memory
+            //   that ANN found but ranked too low. They receive a full-strength
+            //   boost (factor 1.0).
+            // - `temporal`: Temporal (sequential) edges to nearby memories.
+            //   These help with temporal-reasoning queries where the answer
+            //   is in a conversation turn near the seed. Boosted at 0.5.
+            // - `normal`: high-weight Association targets that are NOT already
+            //   ANN candidates. These add recall; they receive a capped boost
+            //   (factor 0.3) so the graph cannot flood the result set.
+            let mut strong: HashMap<String, f32> = HashMap::new();
+            let mut temporal: HashMap<String, f32> = HashMap::new();
+            let mut normal: HashMap<String, f32> = HashMap::new();
+            let max_candidates = self.config.expansion_max_candidates.clamp(10, 200);
 
-        let total_memories = self.graph.memory_count().max(1);
-        let is_empty_query = query_text.trim().is_empty();
-        let hub_threshold =
-            (total_memories as f32 * self.config.hub_fraction_threshold).max(2.0) as usize;
-        let max_frontier = self.config.max_frontier.max(top_k * 4);
-
-        // Spreading activation (BTreeMap iteration is sorted/deterministic)
-        for _ in 0..self.config.iterations {
-            let mut next = activation.clone();
-            for (key, energy) in &activation {
-                if *energy <= 0.0 {
+            for (seed_key, seed_score) in seed_list {
+                // Get the integer node ID for this memory
+                let seed_id = seed_key.strip_prefix("mem:").unwrap_or(&seed_key);
+                let Some(seed_nid) = self.graph.memory_node_id(seed_id) else {
                     continue;
-                }
-                // Suppressed hub concepts do not expand to their memories,
-                // preventing over-general terms from drowning out specific ones.
-                if key.starts_with("concept:") {
-                    let concept = key.strip_prefix("concept:").unwrap_or("");
-                    if self.graph.is_concept_suppressed(concept) {
-                        continue;
-                    }
-                }
-                for edge in self.graph.neighbors(key) {
-                    if edge.kind == EdgeKind::Temporal && edge.weight < 0.0 {
-                        continue;
-                    }
-                    // All edge kinds are traversed: Association (mem<->concept),
-                    // Temporal (prev_mem -> mem), Abstraction (concept <-> parent),
-                    // and Refines (old_mem -> new_mem). The Refines traversal is
-                    // what makes memory evolution work: when activation reaches
-                    // an older, superseded memory, it propagates to the newer
-                    // refinement, ensuring the most current knowledge surfaces.
-                    // Hub suppression for empty queries: do not expand concept
-                    // nodes that are connected to a large fraction of memories.
-                    // Abstraction (parent concept) edges are exempt from hub
-                    // suppression because they connect concepts to concepts,
-                    // not to memories, and are the graph's generalization path.
-                    if is_empty_query
-                        && edge.kind == EdgeKind::Association
-                        && edge.source.as_str().starts_with("concept:")
-                    {
-                        let source_key = edge.source.as_str();
-                        let concept = source_key.strip_prefix("concept:").unwrap_or("");
-                        if self.graph.concept_degree(concept) > hub_threshold {
+                };
+
+                // Walk outgoing edges from this seed
+                if let Some(neighbor_indices) = self.graph.neighbor_indices(seed_nid) {
+                    for &edge_idx in neighbor_indices {
+                        let Some(edge) = self.graph.get_edge(edge_idx) else {
+                            continue;
+                        };
+
+                        // Check if target is a memory node
+                        let target_kind = self.graph.node_kind(edge.target);
+                        if !matches!(target_kind, Some(NodeKind::Memory)) {
                             continue;
                         }
-                    }
-                    let target = edge.target.as_str();
-                    *next.entry(target).or_insert(0.0) += energy * edge.weight * self.config.decay;
-                }
-            }
-            activation = next;
 
-            // Frontier cap: keep only the top-max_frontier activated nodes.
-            // Always keep at least top_k memory nodes so we do not discard
-            // genuine results prematurely.
-            if activation.len() > max_frontier {
-                let mut ranked: Vec<(String, f32)> = activation.into_iter().collect();
-                ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                let mut kept_memory = 0usize;
-                let mut kept = BTreeMap::new();
-                for (k, v) in ranked {
-                    let is_mem = k.starts_with("mem:");
-                    if kept.len() < max_frontier || (is_mem && kept_memory < top_k) {
-                        if is_mem {
-                            kept_memory += 1;
-                        }
-                        kept.insert(k, v);
-                    }
-                    if kept.len() >= max_frontier && kept_memory >= top_k {
-                        break;
-                    }
-                }
-                activation = kept;
-            }
+                        let is_strong = match edge.kind {
+                            // Refines/Contradicts: always traverse, full boost.
+                            EdgeKind::Refines | EdgeKind::Contradicts => true,
+                            // Temporal: traverse to nearby memories in the
+                            // conversation sequence. These help with temporal-
+                            // reasoning queries where the answer is in a nearby
+                            // turn. They are NOT skipped for ANN candidates.
+                            EdgeKind::Temporal => false,
+                            // Association: traverse only high-weight edges,
+                            // and only to add new candidates (skip ANN hits).
+                            EdgeKind::Association => {
+                                if edge.weight < 0.5 {
+                                    continue;
+                                }
+                                false
+                            }
+                            _ => continue, // Skip Abstraction
+                        };
 
-            // Lateral inhibition among memory nodes in the current frontier.
-            let memory_keys: Vec<String> = activation
-                .keys()
-                .filter(|k| k.starts_with("mem:"))
-                .cloned()
-                .collect();
-            let mut inhibited = activation.clone();
-            for key in &memory_keys {
-                let u = *activation.get(key).unwrap_or(&0.0);
-                let penalty: f32 = memory_keys
-                    .iter()
-                    .filter(|k| *k != key)
-                    .map(|k| {
-                        let uk = *activation.get(k).unwrap_or(&0.0);
-                        if uk > u {
-                            uk - u
+                        let Some(target_id) = self.graph.node_external_id(edge.target) else {
+                            continue;
+                        };
+                        let target_key = format!("mem:{target_id}");
+
+                        // Compute graph signal: seed_score * edge_weight * decay
+                        let signal = seed_score * edge.weight * self.config.decay;
+
+                        if is_strong {
+                            // Strong edges re-rank even existing ANN candidates.
+                            *strong.entry(target_key).or_insert(0.0) += signal;
+                        } else if edge.kind == EdgeKind::Temporal {
+                            // Temporal edges re-rank nearby memories.
+                            *temporal.entry(target_key).or_insert(0.0) += signal;
                         } else {
-                            0.0
+                            // Association edges only add candidates not already
+                            // in the ANN floor (avoids flooding).
+                            if ann_candidates.contains(&target_key) {
+                                continue;
+                            }
+                            *normal.entry(target_key).or_insert(0.0) += signal;
                         }
-                    })
-                    .sum::<f32>()
-                    * self.config.beta;
-                let new_u = (u - penalty).max(0.0);
-                inhibited.insert(key.clone(), new_u);
+
+                        // Cap total expanded candidates
+                        if strong.len() + temporal.len() + normal.len() >= max_candidates {
+                            break;
+                        }
+                    }
+                }
+                if strong.len() + temporal.len() + normal.len() >= max_candidates {
+                    break;
+                }
             }
-            activation = inhibited;
+
+            // Merge the pools into the graph delta with edge-kind-aware boost
+            // factors. Strong edges (Refines/Contradicts) get full strength so
+            // they can actually re-rank an ANN candidate above its cosine
+            // neighbor. Temporal edges get a moderate boost for nearby-turn
+            // recall. Association edges are capped so they only nudge.
+            for (key, signal) in strong {
+                let boosted = signal * 1.0;
+                if boosted > 0.01 {
+                    *delta.entry(key).or_insert(0.0) += boosted;
+                }
+            }
+            let temporal_boost_factor = 0.5f32;
+            for (key, signal) in temporal {
+                let boosted = signal * temporal_boost_factor;
+                if boosted > 0.01 {
+                    *delta.entry(key).or_insert(0.0) += boosted;
+                }
+            }
+            let normal_boost_factor = 0.3f32;
+            for (key, signal) in normal {
+                let boosted = signal * normal_boost_factor;
+                if boosted > 0.01 {
+                    *delta.entry(key).or_insert(0.0) += boosted;
+                }
+            }
         }
 
-        // Extract memory-node activations
-        let mut memories: Vec<(String, f32)> = activation
+        // Step 4: Build the candidate list. The returned value is the PURE
+        // graph delta (>= 0); the engine fuses it with exact cosine. For
+        // truncation we rank by (seed cosine activation + delta) so the ANN
+        // floor is preserved even when a floor candidate has zero graph delta
+        // and would otherwise be dropped below a graph-discovered candidate.
+        let mut memories: Vec<(String, f32, f32)> = delta
             .into_iter()
             .filter(|(k, _)| k.starts_with("mem:"))
-            .map(|(k, v)| (k.strip_prefix("mem:").unwrap_or(&k).to_string(), v))
+            .map(|(k, d)| {
+                let rank_key = seed_scores.get(&k).copied().unwrap_or(0.0) + d;
+                (
+                    k.strip_prefix("mem:").unwrap_or(&k).to_string(),
+                    d,
+                    rank_key,
+                )
+            })
             .collect();
-        memories.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-        let peak = memories.first().map(|(_, s)| *s).unwrap_or(0.0);
-        if peak < self.config.fok_threshold {
-            return None;
-        }
-
+        memories.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         memories.truncate(top_k);
-        Some(memories)
+
+        if memories.is_empty() {
+            None
+        } else {
+            Some(memories.into_iter().map(|(id, d, _)| (id, d)).collect())
+        }
     }
 
     pub fn graph(&self) -> &MemoryGraph {
@@ -340,11 +417,66 @@ mod tests {
     }
 
     #[test]
-    fn fok_rejects_unrelated_query() {
+    fn returns_none_without_ann_seeds() {
         let mut graph = MemoryGraph::new();
         graph.add_memory("m1", "Rust is fast", &["rust".into()]);
         let sa = SpreadingActivation::new(graph, SpreadingConfig::default());
+        // No ANN seeds means no recall floor, so the augmenter has nothing to
+        // build on and returns None.
         let results = sa.search("banana chocolate cookie recipe", &[], 2);
         assert!(results.is_none());
+    }
+
+    #[test]
+    fn augmenter_surfaces_refined_memory_without_dropping_ann_hit() {
+        let mut graph = MemoryGraph::new();
+        graph.add_memory("old", "Rust uses garbage collection", &["rust".into()]);
+        graph.add_memory("new", "Rust uses ownership not GC", &["rust".into()]);
+        // new refines old; the augmenter should reach `new` from the `old`
+        // ANN seed via the Refines edge.
+        graph.add_refinement("old", "new", 1.0);
+        let sa = SpreadingActivation::new(graph, SpreadingConfig::default());
+
+        // Only `old` is an ANN seed; `new` is reachable only through the graph.
+        let results = sa.search("rust", &[("old".into(), 0.9)], 5).unwrap();
+        let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(ids.contains(&"old"), "ANN hit must never be dropped");
+        assert!(ids.contains(&"new"), "refined memory must be surfaced");
+    }
+
+    #[test]
+    fn returned_score_is_pure_graph_delta_without_cosine() {
+        // The augmenter must return ONLY the graph delta — cosine must NOT be
+        // folded in. An ANN seed with a high cosine score but no lexical match
+        // and no graph edges must come back with delta 0, while a memory reached
+        // through a Refines edge must have a strictly positive delta.
+        let mut graph = MemoryGraph::new();
+        graph.add_memory("old", "alpha beta gamma", &["topic".into()]);
+        graph.add_memory("new", "alpha beta gamma delta", &["topic".into()]);
+        graph.add_memory("iso", "completely unrelated wording", &["other".into()]);
+        graph.add_refinement("old", "new", 1.0);
+        let sa = SpreadingActivation::new(graph, SpreadingConfig::default());
+
+        // `iso` has a high cosine seed (0.95) but the query text shares no
+        // tokens with it and it has no in-edges, so its delta must be 0.
+        let results = sa
+            .search(
+                "alpha beta gamma",
+                &[("old".into(), 0.9), ("iso".into(), 0.95)],
+                5,
+            )
+            .unwrap();
+        let delta = |id: &str| results.iter().find(|(k, _)| k == id).map(|(_, d)| *d);
+
+        assert_eq!(
+            delta("iso"),
+            Some(0.0),
+            "a high-cosine ANN seed with no graph/lexical signal must have delta 0 (cosine not folded in)"
+        );
+        let new_delta = delta("new").expect("refined memory must be present");
+        assert!(
+            new_delta > 0.0,
+            "Refines target must receive a positive graph delta, got {new_delta}"
+        );
     }
 }

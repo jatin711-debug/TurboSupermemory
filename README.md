@@ -13,7 +13,7 @@ TurboSuperMemory (TSM) is built on a different premise:
 
 > A database stores everything. A memory **remembers what matters, forgets what doesn't, revises beliefs when corrected, and surfaces the most current understanding.**
 
-TSM pairs a fast, tiered HNSW vector index with a **cognitive retrieval graph** — spreading activation, reinforcement learning on edges, belief revision, and self-organizing importance — behind a single embeddable API. The vector index makes it fast. The cognitive graph is what makes it a *memory*.
+TSM pairs a fast, tiered HNSW vector index with a **cognitive retrieval graph** — a bounded graph-delta augmenter, reinforcement learning on edges, belief revision, and self-organizing importance — behind a single embeddable API. The vector index makes it fast. The cognitive graph is what makes it a *memory*.
 
 ---
 
@@ -36,7 +36,7 @@ TSM's graph adds the signals a vector index throws away:
 
 Every cognitive feature is **opt-in and off by default**, so TSM behaves like a plain tiered vector store until you turn the brain on.
 
-A dedicated benchmark exercises exactly the cases where the correct memory is *not* the nearest neighbor. The cognitive layer wins **4 of 4** scenarios against plain ANN. Run it yourself: `python benchmarks/cognitive_benchmark.py`.
+A dedicated benchmark exercises exactly the cases where the correct memory is *not* the nearest neighbor. At realistic scale (768-dim, 1000 distractors) the cognitive layer wins **3 of 4** scenarios against plain ANN — refinement, reinforcement, and contradiction. Abstraction-at-scale is a known open limitation (the abstraction parent does not yet pull a sibling concept above its cosine-nearest neighbor at scale). Run it yourself: `python benchmarks/cognitive_benchmark.py`.
 
 ---
 
@@ -207,7 +207,7 @@ make build-api       # builds the gRPC + REST server binary
 | `cargo test --workspace --exclude turbomemory_python` | **75 passed / 0 failed** |
 | `python benchmarks/verify.py` (E2E) | all pass (7/7 steps) |
 | `python benchmarks/test_batch_search.py` | 0 mismatches batch vs single-query |
-| `python benchmarks/cognitive_benchmark.py` | **4/4 cognitive scenarios won** |
+| `python benchmarks/cognitive_benchmark.py` | **3/4 cognitive scenarios won** (abstraction-at-scale: known open limitation) |
 | `python benchmarks/audit_recall.py --num-items 100000 --dimension 1536` | **100.0% recall@10** |
 
 ### Industry-standard Cognitive Benchmarks
@@ -256,7 +256,7 @@ Test breakdown: core 29 · graph 65 · storage 68 · crash-recovery 3.
 ├── crates/
 │   ├── turbomemory_core/      # Vector math, FWHT, quantization, LUT search
 │   ├── turbomemory_storage/   # Tiered StorageEngine, mmap segments, WAL
-│   ├── turbomemory_graph/     # BM25, spreading activation, FOK gate, CCS
+│   ├── turbomemory_graph/     # BM25, bounded cognitive augmenter, CCS
 │   ├── turbomemory_python/    # PyO3 MemoryEngine bindings
 │   └── turbomemory_api/       # gRPC (tonic) + REST (axum) servers
 ├── Makefile
