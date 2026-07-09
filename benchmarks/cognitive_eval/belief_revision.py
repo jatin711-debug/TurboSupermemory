@@ -35,8 +35,11 @@ THREE SCALING AXES
   - distractors      : corpus noise (100 -> 10k). Does the win survive scale?
   - temporal gap     : # filler memories inserted BETWEEN stale fact and its correction.
                        Stresses temporal/insert-order dependence of edge building.
-  - subtlety (jitter): how far the correction sits from the stale fact in vector space.
-                       Larger jitter => ANN buries the correction deeper => harder.
+  - correction_cos   : cosine between the stale fact and its correction. LOWER cos =>
+                       correction is more distinct => ANN buries it deeper => harder.
+                       Replaces the old randn --subtlety, which was dimension-dependent
+                       and made corrections near-orthogonal at 768-dim (cos ~0.11 at
+                       subtlety 0.25); see benchmarks/PHASE0_GROUND_TRUTH.md.
 
 Usage:
     python benchmarks/cognitive_eval/belief_revision.py                 # default sweep
@@ -97,6 +100,23 @@ def unit_vec(dim, rng):
 
 def jitter_vec(base, jitter, rng):
     return _normalize(base + jitter * rng.randn(len(base)).astype(np.float32))
+
+
+def vec_at_cosine(base, target_cos, rng):
+    """Return a unit vector whose cosine with `base` is exactly `target_cos`.
+
+    Models a real 'correction': same topic (shares direction with the stale fact)
+    but a genuinely distinct statement. Unlike `jitter_vec`, this is
+    dimension-independent — `target_cos` IS the resulting cosine — so the eval
+    geometry is interpretable. `correction = c*base + sqrt(1-c^2)*base_perp`,
+    where `base_perp` is a random unit vector orthogonal to `base`.
+    """
+    base = _normalize(base)
+    r = rng.randn(len(base)).astype(np.float32)
+    r_perp = r - float(r @ base) * base  # component orthogonal to base
+    r_perp = _normalize(r_perp)
+    c = float(np.clip(target_cos, -1.0, 1.0))
+    return _normalize(c * base + np.sqrt(max(0.0, 1.0 - c * c)) * r_perp)
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +191,7 @@ def insert_distractors(tsm, dim, n, rng, seq_label):
         tsm.insert(f"dist_{seq_label}_{i}", f"{text} note {i}", vec, 0.5, concepts)
 
 
-def build_corpus(tsm, dim, probes_n, distractors, gap, subtlety, mode, rng):
+def build_corpus(tsm, dim, probes_n, distractors, gap, correction_cos, mode, rng):
     """Insert distractors + belief pairs with a temporal gap between each
     stale fact and its correction. Returns the list of Probe objects.
 
@@ -191,9 +211,13 @@ def build_corpus(tsm, dim, probes_n, distractors, gap, subtlety, mode, rng):
         # Topic cluster center; stale fact sits at the center, query near it.
         center = unit_vec(dim, rng)
         stale_vec = jitter_vec(center, 0.03, rng)
-        # Correction is the SAME topic but pushed `subtlety` away in vector space,
-        # so a query near the stale fact ranks the stale fact first under pure ANN.
-        correction_vec = jitter_vec(center, subtlety, rng)
+        # Correction is the SAME topic as the stale fact but a genuinely distinct
+        # statement: it sits at a CONTROLLED cosine to the stale fact
+        # (`correction_cos`). A query phrased near the stale fact therefore ranks
+        # the stale fact first under pure ANN; only belief revision should flip the
+        # order. Using a target cosine (not randn jitter) keeps the geometry
+        # interpretable and dimension-independent.
+        correction_vec = vec_at_cosine(stale_vec, correction_cos, rng)
         # Query is phrased the way the agent originally learned it -> near stale.
         query_vec = jitter_vec(stale_vec, 0.03, rng)
 
@@ -288,7 +312,7 @@ def score_arm(tsm, probes, mode_search, top_k, query_text_fn):
     }
 
 
-def run_cell(tsm_module, dim, probes_n, distractors, gap, subtlety, mode, top_k, seed):
+def run_cell(tsm_module, dim, probes_n, distractors, gap, correction_cos, mode, top_k, seed):
     """Build one corpus and score all three arms against it."""
     rng = np.random.RandomState(seed)
     tmp = tempfile.mkdtemp(prefix="tsm_belief_")
@@ -304,7 +328,7 @@ def run_cell(tsm_module, dim, probes_n, distractors, gap, subtlety, mode, top_k,
         eng = tsm_module.MemoryEngine(db_path=os.path.join(tmp, "ann"), dimension=dim,
                                       auto_consolidation_secs=0, **base_cog_config())
         try:
-            probes = build_corpus(eng, dim, probes_n, distractors, gap, subtlety, mode,
+            probes = build_corpus(eng, dim, probes_n, distractors, gap, correction_cos, mode,
                                   np.random.RandomState(seed))
             arms["ANN"] = score_arm(eng, probes, "ann", top_k, query_text)
         finally:
@@ -314,7 +338,7 @@ def run_cell(tsm_module, dim, probes_n, distractors, gap, subtlety, mode, top_k,
         eng = tsm_module.MemoryEngine(db_path=os.path.join(tmp, "off"), dimension=dim,
                                       auto_consolidation_secs=0, **base_cog_config())
         try:
-            probes = build_corpus(eng, dim, probes_n, distractors, gap, subtlety, mode,
+            probes = build_corpus(eng, dim, probes_n, distractors, gap, correction_cos, mode,
                                   np.random.RandomState(seed))
             arms["CogOFF"] = score_arm(eng, probes, "cog", top_k, query_text)
         finally:
@@ -324,7 +348,7 @@ def run_cell(tsm_module, dim, probes_n, distractors, gap, subtlety, mode, top_k,
         eng = tsm_module.MemoryEngine(db_path=os.path.join(tmp, "on"), dimension=dim,
                                       auto_consolidation_secs=0, **cogon_config(mode))
         try:
-            probes = build_corpus(eng, dim, probes_n, distractors, gap, subtlety, mode,
+            probes = build_corpus(eng, dim, probes_n, distractors, gap, correction_cos, mode,
                                   np.random.RandomState(seed))
             arms["CogON"] = score_arm(eng, probes, "cog", top_k, query_text)
         finally:
@@ -347,8 +371,10 @@ def main():
     ap.add_argument("--distractors", type=int, nargs="+", default=[100, 1000, 10000],
                     help="corpus-noise sweep")
     ap.add_argument("--gap", type=int, default=20, help="filler memories between stale fact and correction")
-    ap.add_argument("--subtlety", type=float, default=0.25,
-                    help="vector jitter of the correction relative to the topic center")
+    ap.add_argument("--correction-cos", type=float, default=0.7,
+                    help="target cosine between the stale fact and its correction "
+                         "(0.85=subtle edit, 0.55=more distinct). Replaces the old "
+                         "dimension-dependent --subtlety jitter.")
     ap.add_argument("--top-k", type=int, default=10)
     ap.add_argument("--seed", type=int, default=20260629)
     ap.add_argument("--quick", action="store_true", help="single small cell (smoke test)")
@@ -365,8 +391,8 @@ def main():
         probes_n = args.probes
 
     logger.info("=" * 78)
-    logger.info("Belief-Revision Eval — mode=%s dim=%d probes=%d gap=%d subtlety=%.2f top_k=%d",
-                args.mode, dim, probes_n, args.gap, args.subtlety, args.top_k)
+    logger.info("Belief-Revision Eval — mode=%s dim=%d probes=%d gap=%d correction_cos=%.2f top_k=%d",
+                args.mode, dim, probes_n, args.gap, args.correction_cos, args.top_k)
     logger.info("Headline metric: belief_accuracy = P(correction outranks the stale fact)")
     logger.info("Feature lift     = belief_accuracy(CogON) - belief_accuracy(CogOFF)")
     logger.info("=" * 78)
@@ -377,7 +403,7 @@ def main():
     verdicts = []
     for d in distractor_sweep:
         logger.info("Building cell: distractors=%d ...", d)
-        arms = run_cell(tsm, dim, probes_n, d, args.gap, args.subtlety, args.mode,
+        arms = run_cell(tsm, dim, probes_n, d, args.gap, args.correction_cos, args.mode,
                         args.top_k, args.seed)
         logger.info("-" * 78)
         logger.info(header)
