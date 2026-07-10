@@ -34,7 +34,7 @@ FEATURES    ?=
 # Build flags: add --features cuda if FEATURES=cuda
 CARGO_FEATURES := $(if $(FEATURES),--features $(FEATURES),)
 
-.PHONY: build build-python build-api test verify audit benchmark benchmark-gpu cognitive-benchmark batch-test clippy fmt clean api-server download-eval-data longmemeval locomoco compare report
+.PHONY: build build-python build-api test verify audit benchmark benchmark-gpu cognitive-benchmark batch-test clippy fmt clean api-server download-eval-data longmemeval locomoco compare report gate
 
 build:
 	export PYO3_PYTHON="$(PYO3_PYTHON)" && cargo build --workspace $(CARGO_FEATURES)
@@ -77,6 +77,14 @@ clippy:
 
 fmt:
 	cargo fmt --all
+
+# W2 regression gate: fmt + clippy + Rust tests + synthetic belief + LongMemEval
+# smoke (role-filtered) + recall floor. Run before every commit that touches the
+# engine or cognitive layer. Rebuilds the extension first so the evals load the
+# current code.
+gate: build-python
+	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
+	export PYO3_PYTHON="$(PYO3_PYTHON)" && $(PYTHON) benchmarks/regression_gate.py $(GATE_ARGS)
 
 clean:
 	cargo clean

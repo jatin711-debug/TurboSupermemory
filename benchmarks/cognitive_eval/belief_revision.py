@@ -49,6 +49,7 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import os
 import shutil
@@ -495,6 +496,13 @@ def main():
         logger.info("VERDICT: belief-revision edges add NO value over generic lexical/association "
                     "expansion. This is the failing signal the eval is designed to catch.")
     logger.info("=" * 78)
+
+    # Machine-readable one-liner for the regression gate (W2).
+    logger.info("GATE_SUMMARY: %s", json.dumps({
+        "mode": args.mode,
+        "mean_lift": round(mean_lift, 4),
+        "mean_false_demotion": round(mean_fd, 4),
+    }))
 
 
 if __name__ == "__main__":

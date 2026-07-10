@@ -24,6 +24,7 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -177,6 +178,25 @@ def main():
         else:
             logger.info("VERDICT: belief revision fired but adds ~no retrieval lift on real knowledge-update.")
     logger.info("=" * 100)
+
+    # Machine-readable one-liner for the regression gate (W2). Contains the
+    # knowledge-update lift, total ON edges, and per-type hit@1 lift so the gate
+    # can assert non-regression without parsing the human table.
+    def _h1_lift(t):
+        o, n = off.get(t), on.get(t)
+        if not o or not n or not o["n"] or not n["n"]:
+            return 0.0
+        return round(n["h1"] / n["n"] - o["h1"] / o["n"], 4)
+    ku_o2 = off.get("knowledge-update")
+    summary = {
+        "ku_hit1_lift": _h1_lift("knowledge-update"),
+        "ku_n": (ku_o2 or {}).get("n", 0),
+        "on_edges": on_edges["refine"] + on_edges["contra"],
+        "on_refine": on_edges["refine"],
+        "on_contra": on_edges["contra"],
+        "type_hit1_lift": {t: _h1_lift(t) for t in (set(off) | set(on))},
+    }
+    logger.info("GATE_SUMMARY: %s", json.dumps(summary))
 
 
 if __name__ == "__main__":

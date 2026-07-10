@@ -90,6 +90,22 @@ make cognitive-benchmark # build-python + copy DLL + python benchmarks/cognitive
 make batch-test   # build-python + copy DLL + python benchmarks/test_batch_search.py
 ```
 
+### Regression gate — run before every commit that touches the engine/cognitive layer
+
+```bash
+make gate          # fmt + clippy + Rust tests + synthetic belief + LongMemEval
+                   # smoke (role-filtered) + recall floor. Exits nonzero on any regression.
+make gate GATE_ARGS=--quick   # smaller LongMemEval limit (faster, noisier)
+```
+
+`make gate` (W2) is the automated guard for the cognitive-layer wins. It fails if
+formatting/clippy/tests break, if synthetic belief lift drops below +0.9 or any
+coexisting fact is falsely demoted, if the LongMemEval knowledge-update lift goes
+negative, if belief detection over-fires (edge-count ceiling — the Stage-A / broken
+mutual-NN guard), if any single-session type regresses, or if ANN recall falls below
+its floor. A refactor that silently no-ops cognition (as happened on 2026-06-29) or
+reintroduces belief over-firing (Stage A) is caught here.
+
 ### API Server
 
 ```bash

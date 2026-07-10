@@ -319,3 +319,74 @@ propagated delta (including the abstraction bridge) is negligible. The fix is th
 controlled-cosine geometry** Phase 1 applied to belief — the abstraction mechanism is wired and
 proven in isolation (unit test); demonstrating its lift needs the scenario geometry fixed and seed
 propagation to carry lexical/seed strength (Phase 4/abstraction follow-up).
+
+---
+
+# W1 — Role-aware memory as a first-class engine feature ✅ (2026-07-10)
+
+Stage B.2 proved user-scoping eliminates belief-revision collateral, but the fix lived **only in
+the eval adapter** (`store_roles` dropped assistant messages before insert). Any real TSM user still
+got Stage-A over-firing. W1 moves role-awareness into the engine.
+
+**Change.**
+- `Record`/`MetaRecord` gain a durable `source_role: Option<String>` (`serde(default)`, survives WAL
+  replay). Unlike `scope` it **never filters retrieval** — every role stays searchable.
+- New `TierConfig.belief_source_roles` (default `None` = legacy role-blind). When set,
+  `check_refinements` / `check_contradictions` / `nearest_superseding_neighbor` only let in-list
+  roles create or receive a supersession edge (`role_allowed` helper).
+- Write path: `insert_with_payload_role` / `insert_batch_with_payload_role` /
+  `update_with_payload_role` (old signatures delegate with `None`; REST/gRPC/existing callers
+  unchanged). Exposed via Python (`source_role` kwarg + `belief_source_roles` ctor kwarg), REST, and
+  gRPC (proto field 8). Rust tests: role-filtered exclusion (+ asserts the excluded memory is still
+  retrievable) and `source_role` WAL survival. Storage suite **74 → 76** green, clippy clean.
+
+**Two-way productization decision, on the FULL LongMemEval set (500 conversations, n=72
+knowledge-update — larger/harder than the 147-subset used for Stage A/B, hence smaller absolute
+lifts; all arms show ~+0.08 KU, so the smaller number is a dataset property, not a regression).**
+
+| metric | baseline (store-all, role-blind) | mode a (`--user-only`, adapter drops assistant) | **mode b (`--role-filtered`, engine)** |
+|---|--:|--:|--:|
+| knowledge-update hit@1 lift | +0.08 | +0.08 | **+0.07** |
+| single-session-user collateral (hit@1) | **−0.12** | −0.03 | **+0.00** |
+| single-session-assistant recall (hit@k, absolute) | 0.80 | **0.27** | **0.77** |
+| worst single-session lift | −0.12 | −0.03 | **−0.03** |
+| belief edges (500 convs) | 22,708 | 2,506 | **2,345** |
+
+**Verdict: mode b strictly dominates and is the recommended production config.** It keeps the belief
+win (+0.07 ≈ baseline's +0.08), **eliminates** the single-session-user collateral (+0.00 vs baseline
+−0.12), *and* preserves assistant-answerable recall (0.77 ≈ baseline 0.80) — whereas mode a throws
+assistant messages away and craters that recall to 0.27. The engine role-filter is therefore
+strictly better than the eval-only `store_roles` hack it replaces: same clean belief behavior,
+without discarding retrievable content. Recommended production config:
+`belief_source_roles=["user"]` + tag every insert with its `source_role`. Engine default stays
+`None` (backward-compatible; a caller who opts in without tagging roles simply gets no
+supersessions, never silent role-blind behavior). Committed `865224d` (code) + this section.
+
+# W2 — Regression gate ✅ (2026-07-10)
+
+Automated guard so a refactor can't silently destroy the cognitive-layer wins (as the 2026-06-29
+fusion no-op did, and as Stage-A over-firing did). `benchmarks/regression_gate.py` + `make gate`,
+documented in `AGENTS.md` ("run before every commit that touches the engine/cognitive layer").
+
+**Checks (PASS/FAIL table, nonzero exit on any fail):** `cargo fmt --check`; `clippy -D warnings`
+(workspace); `cargo test` (workspace ex-python); synthetic belief refinement+contradiction (assert
+lift ≥ +0.9, false_demotion ≤ 0.05); LongMemEval smoke `--limit 40 --role-filtered` (assert KU
+hit@1 lift ≥ −0.10, ON edges ∈ [10, 800] — the over-firing ceiling, worst single-session lift ≥
+−0.15); recall audit (ANN ≥ 95%). The two evals emit a machine-readable `GATE_SUMMARY: {json}` line
+the gate parses, so it never depends on the human tables.
+
+**Full clean run: GATE PASS 7/7** (synthetic +1.00/false_dem 0.00 both modes; LME smoke edges 248,
+no collateral; recall 100%).
+
+**Sabotage test (proves the gate has teeth).** Two findings:
+1. *Disabling the reverse-MNN mutual check* did **not** explode the edge count (248 → 335) — because
+   "one edge per new memory" independently bounds volume; reverse-MNN removal is a **precision**
+   regression (collateral +0.00 → −0.11, KU lift +0.00 → +0.20), not a volume one. At smoke scale
+   (`--limit 40`, per-type single-session n ≈ 5) that collateral signal is too noisy for a tight
+   threshold — so the gate's *reliable* teeth are the deterministic checks, not smoke per-type rates.
+   (Catching a reverse-MNN-class precision regression needs the **full** 500-conv run, which is the
+   per-workstream manual step, not the fast pre-commit gate.)
+2. *Breaking the demotion* (making supersession a no-op — the "cognition silently no-ops" class, same
+   shape as the 2026-06-29 fusion bug) collapsed synthetic belief lift **+1.00 → +0.00** for both
+   refinement and contradiction, tripping the `lift ≥ 0.9` check. **Gate FAILS as designed.** Code
+   reverted; clean build restored to +1.00/+1.00.

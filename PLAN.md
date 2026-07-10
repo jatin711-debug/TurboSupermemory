@@ -144,7 +144,18 @@ Small-n caveat: knowledge-update n=22, so hit@1 granularity is ~0.05. Treat |lif
 
 ## 5. Workstreams (in order)
 
-### W1 — Productize the B.2 win: first-class role-aware memory  ← START HERE
+### W1 — Productize the B.2 win: first-class role-aware memory  ✅ DONE (2026-07-10, `865224d` + PHASE_PROGRESS "W1")
+
+**Outcome:** shipped `source_role` on records + `belief_source_roles` config + role-gated detection,
+exposed through Python/REST/gRPC. On the full 500-conv LongMemEval, **mode b (`--role-filtered`)
+strictly dominates**: KU hit@1 +0.07 (≈ baseline +0.08), single-session-user collateral eliminated
+(+0.00 vs baseline −0.12), assistant recall preserved (0.77 vs mode-a's crater to 0.27), 2,345 edges.
+It is strictly better than the eval-only `store_roles` hack. Recommended prod config
+`belief_source_roles=["user"]` + tag inserts; engine default stays `None` (backward-compatible).
+Note: the +0.23 in the old B.2 note was a 147-subset small-n (n=22) artifact; the representative
+full-set lift is ~+0.07–0.08 across all arms. Storage tests 74→76, gate green. Original spec below.
+
+---
 
 **Why first:** the entire +0.23 win currently depends on `store_roles` — a filter inside the
 **eval adapter**. The engine, Python API, and REST/gRPC have no concept of message role. Any real
@@ -175,7 +186,16 @@ default; record the loser's numbers too.
   edge), WAL-replay survival of `source_role` (mirror the scope tests).
 - fmt/clippy/tests green; PHASE_PROGRESS.md "W1" section; one commit.
 
-### W2 — Regression gate (lock in everything proven so far)
+### W2 — Regression gate ✅ DONE (2026-07-10, PHASE_PROGRESS "W2")
+
+**Outcome:** `benchmarks/regression_gate.py` + `make gate` + AGENTS.md docs. 7 checks
+(fmt/clippy/tests + synthetic belief + role-filtered LongMemEval smoke + recall), evals emit
+`GATE_SUMMARY: {json}`. Full clean run **PASS 7/7**. Sabotage findings: reverse-MNN removal is a
+*precision* not *volume* regression (edge ceiling doesn't catch it; too noisy at smoke n≈5 — needs
+the full run); breaking demotion collapses synthetic lift +1.00→+0.00 and the gate **FAILS as
+designed**. Reverted to clean +1.00. Original spec below.
+
+---
 
 **Why now:** every subsequent workstream churns `engine.rs`/`activation.rs`. Without an automated
 gate, a refactor can silently destroy the +0.23 (it happened once: the fusion no-op of 2026-06-29
