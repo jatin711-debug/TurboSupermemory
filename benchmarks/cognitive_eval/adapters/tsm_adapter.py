@@ -105,7 +105,9 @@ class TSMAdapter:
         extractor: str = "mock",
         extractor_model: str = "llama3.2:3b",
         cognitive_features: bool = False,  # Disabled by default for benchmarks
+        belief_revision: bool = True,  # Build Contradicts/Refines edges + demotion
         dimension: Optional[int] = None,
+        model=None,  # Preloaded embedding model to share across adapters
         **kwargs,
     ):
         """Initialize the TSM adapter.
@@ -130,9 +132,12 @@ class TSMAdapter:
         # Load embedding model (with fallback for sentence-transformers issues)
         # We try sentence-transformers first, but on Windows it often fails
         # due to torchcodec/FFmpeg dependency issues
-        self.model = None
+        self.model = model
         self.dim = dimension
-        
+        if self.model is not None and self.dim is None:
+            dim_attr = self.model.get_sentence_embedding_dimension
+            self.dim = dim_attr() if callable(dim_attr) else dim_attr
+
         # Try sentence-transformers first (only if not on Windows or if explicitly requested)
         if sys.platform != "win32":
             try:
@@ -209,8 +214,17 @@ class TSMAdapter:
                 "abstraction_co_occurrence_threshold": 3,
             })
         
+        # Belief-revision toggle: disabling nulls the refinement/contradiction
+        # thresholds so NO Contradicts/Refines edges (and no supersession
+        # demotion) are created. Everything else (concepts, abstraction, alpha,
+        # spreading) stays identical, so an ON-vs-OFF delta is attributable to
+        # belief revision specifically.
+        if not belief_revision:
+            config["refinement_cosine_threshold"] = None
+            config["contradiction_cosine_threshold"] = None
         self.engine = self.tsm.MemoryEngine(**config)
-        logger.info("TSM engine initialized with cognitive_features=%s", cognitive_features)
+        logger.info("TSM engine initialized (cognitive=%s, belief_revision=%s)",
+                    cognitive_features, belief_revision)
         
         # Counter for unique IDs
         self._insert_counter = 0

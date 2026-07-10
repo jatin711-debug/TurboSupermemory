@@ -21,6 +21,8 @@ class Query:
     query_text: str
     answer_text: str
     message_index: int  # Which message in the conversation this query refers to
+    question_type: str = ""   # e.g. 'knowledge-update', 'temporal-reasoning', ...
+    is_abstention: bool = False
 
 
 @dataclass
@@ -52,6 +54,8 @@ def load_from_json(path: Union[str, Path]) -> List[Conversation]:
                 query_text=q["query_text"],
                 answer_text=q["answer_text"],
                 message_index=q["message_index"],
+                question_type=q.get("question_type", ""),
+                is_abstention=q.get("is_abstention", False),
             )
             for q in item.get("queries", [])
         ]
@@ -152,6 +156,8 @@ def load_from_parquet(path: Union[str, Path]) -> List[Conversation]:
             query_text=str(row.get("question", "")),
             answer_text=str(row.get("answer", "")),
             message_index=len(messages) - 1 if messages else 0,
+            question_type=str(row.get("question_type", "")),
+            is_abstention=bool(row.get("is_abstention", False)),
         )
 
         conversations.append(

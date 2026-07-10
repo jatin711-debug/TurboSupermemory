@@ -150,6 +150,65 @@ access-salience term in fusion (a positive analogue of the supersession-demotion
 new, separately-validated feature, deliberately **not** bolted on here to avoid destabilizing the
 validated belief/recall results.
 
+---
+
+# Stage A — Real-data validation (LongMemEval) — THE GO/NO-GO
+
+Everything in Phases 0–5 was validated on synthetic evals. Stage A tests belief revision on
+**real conversational data** (LongMemEval), the industry benchmark, to answer the existential
+question: does the cognitive layer's marquee feature actually help in the real world?
+
+**Harness (`run_belief_longmemeval.py`, new).** LongMemEval test set (147 questions; 22 are
+`knowledge-update` = the belief-revision subset: "what camera do I have NOW", "PREVIOUS status
+before current"). Real `all-MiniLM-L6-v2` embeddings, mock sentence extractor, **one isolated
+engine per conversation** (belief detection stays within a user), belief revision **ON vs OFF**
+(only the Contradicts/Refines edges + supersession demotion differ; everything else identical).
+Metric: distinctive-token answer-containment at rank 1/3/k — a retrieval proxy, so absolute numbers
+are noisy but the **ON−OFF lift** is trustworthy (proxy noise cancels). The loader was fixed to
+preserve `question_type`/`is_abstention`; the adapter gained `belief_revision` + shared-`model`
+flags.
+
+**Result: belief revision is NET-NEGATIVE on real data.**
+
+| question_type | n | hit@1 off/on/lift | hit@3 off/on/lift | hit@k off/on/lift |
+|---|--:|---|---|---|
+| **knowledge-update** | 22 | 0.27/0.27/**+0.00** | 0.73/0.55/**−0.18** | 0.91/0.82/**−0.09** |
+| single-session-user | 20 | 0.75/0.65/−0.10 | 0.90/0.70/−0.20 | 1.00/0.85/**−0.15** |
+| single-session-preference | 9 | 0.11/0.00/−0.11 | 0.33/0.11/−0.22 | 0.33/0.22/−0.11 |
+| single-session-assistant | 16 | 0.25/0.06/−0.19 | 0.31/0.44/+0.12 | 0.62/0.62/+0.00 |
+| temporal-reasoning | 38 | 0.37/0.32/−0.05 | 0.45/0.45/+0.00 | 0.58/0.61/+0.03 |
+| multi-session | 36 | 0.11/0.14/+0.03 | 0.22/0.22/+0.00 | 0.39/0.42/+0.03 |
+
+Belief edges built across 147 conversations: **refine 23,255 + contra 5,056 = 28,311** — refinement
+fires on ~20% of ALL fact pairs, essentially unconditional. It **never helps** knowledge-update (the
+subset it targets) and **hurts** the single-session types (single-session-user 1.00 → 0.85).
+
+**Root cause — the detector over-fires catastrophically on real text.** The thresholds (refinement
+cosine ≥ 0.5 + text-overlap ≥ 0.25 + shared concept) were calibrated on synthetic near-orthogonal
+vectors with a wide cosine spread. Real embeddings (MiniLM) have a **compressed** cosine
+distribution where most same-topic sentence pairs clear 0.5, and real conversations are full of
+legitimately-similar-but-not-superseding facts. Each spurious refinement demotes the "older"
+memory, so within a conversation later sentences bury earlier ones en masse → correct answers fall
+out of top-k. **The Phase-2 precision (1.00 on clean synthetic coexisting facts) does not transfer
+to real text.**
+
+**Honest caveats.** (1) Retrieval-containment proxy, not LLM-judged — but the OFF arm has high
+recall and ON demonstrably drops it, so the harm is real, not a proxy artifact. (2) Lightweight
+MiniLM — a different embedding distribution could shift the thresholds, but 28k edges shows the
+problem is structural, not a tuning nudge. (3) Mock sentence-splitting inflates near-duplicate
+facts — real LLM extraction (ollama, currently down) would dedupe and likely reduce over-firing,
+but the demotion-hurts result stands. The gold-standard metric (retrieve → LLM answer → LLM judge)
+is the follow-up once an LLM is available.
+
+**Verdict & route implication.** For the current implementation this is a **NO**: belief revision
+must not be scaled or shipped as-is — it degrades real-world retrieval. This is the single most
+important finding of the effort and it confirms the no-compromises route: the production blocker is
+**detection trustworthiness on real text (Stage B)** — thresholds calibrated to the embedding
+distribution (or adaptive/percentile-based), mutual-nearest-neighbour + LLM/NLI verification before
+the *destructive* demotion, recoverable/bounded demotion, and scope-respecting detection (it
+currently ignores scope). Only once belief revision is net-positive on real data does scaling the
+cognitive layer make sense. The vector store itself (OFF arm) retrieves well — that part is solid.
+
 ## Phase 5 — Unify + calibrate fusion ✅ (2026-07-10)
 
 **Problem.** `hydrate_and_fuse` computed the graph boost as `act / max_act` — normalized by the
