@@ -231,102 +231,191 @@ impl SpreadingActivation {
             let mut strong: HashMap<String, f32> = HashMap::new();
             let mut temporal: HashMap<String, f32> = HashMap::new();
             let mut normal: HashMap<String, f32> = HashMap::new();
+            let mut abstraction: HashMap<String, f32> = HashMap::new();
             let max_candidates = self.config.expansion_max_candidates.clamp(10, 200);
+            let decay = self.config.decay;
 
-            for (seed_key, seed_score) in seed_list {
-                // Get the integer node ID for this memory
+            'seeds: for (seed_key, seed_score) in seed_list {
                 let seed_id = seed_key.strip_prefix("mem:").unwrap_or(&seed_key);
                 let Some(seed_nid) = self.graph.memory_node_id(seed_id) else {
                     continue;
                 };
+                let Some(seed_edges) = self.graph.neighbor_indices(seed_nid) else {
+                    continue;
+                };
 
-                // Walk outgoing edges from this seed
-                if let Some(neighbor_indices) = self.graph.neighbor_indices(seed_nid) {
-                    for &edge_idx in neighbor_indices {
-                        let Some(edge) = self.graph.get_edge(edge_idx) else {
-                            continue;
-                        };
+                for &edge_idx in seed_edges {
+                    let Some(edge) = self.graph.get_edge(edge_idx) else {
+                        continue;
+                    };
+                    let target_kind = self.graph.node_kind(edge.target);
 
-                        // Check if target is a memory node
-                        let target_kind = self.graph.node_kind(edge.target);
-                        if !matches!(target_kind, Some(NodeKind::Memory)) {
-                            continue;
-                        }
-
-                        let is_strong = match edge.kind {
-                            // Refines/Contradicts: always traverse, full boost.
-                            EdgeKind::Refines | EdgeKind::Contradicts => true,
-                            // Temporal: traverse to nearby memories in the
-                            // conversation sequence. These help with temporal-
-                            // reasoning queries where the answer is in a nearby
-                            // turn. They are NOT skipped for ANN candidates.
-                            EdgeKind::Temporal => false,
-                            // Association: traverse only high-weight edges,
-                            // and only to add new candidates (skip ANN hits).
-                            EdgeKind::Association => {
-                                if edge.weight < 0.5 {
-                                    continue;
-                                }
-                                false
+                    match edge.kind {
+                        // mem -> mem belief edge: always traverse, full boost.
+                        EdgeKind::Refines | EdgeKind::Contradicts
+                            if matches!(target_kind, Some(NodeKind::Memory)) =>
+                        {
+                            if let Some(tid) = self.graph.node_external_id(edge.target) {
+                                let signal = seed_score * edge.weight * decay;
+                                *strong.entry(format!("mem:{tid}")).or_insert(0.0) += signal;
                             }
-                            _ => continue, // Skip Abstraction
-                        };
-
-                        let Some(target_id) = self.graph.node_external_id(edge.target) else {
-                            continue;
-                        };
-                        let target_key = format!("mem:{target_id}");
-
-                        // Compute graph signal: seed_score * edge_weight * decay
-                        let signal = seed_score * edge.weight * self.config.decay;
-
-                        if is_strong {
-                            // Strong edges re-rank even existing ANN candidates.
-                            *strong.entry(target_key).or_insert(0.0) += signal;
-                        } else if edge.kind == EdgeKind::Temporal {
-                            // Temporal edges re-rank nearby memories.
-                            *temporal.entry(target_key).or_insert(0.0) += signal;
-                        } else {
-                            // Association edges only add candidates not already
-                            // in the ANN floor (avoids flooding).
-                            if ann_candidates.contains(&target_key) {
+                        }
+                        // mem -> mem sequential edge.
+                        EdgeKind::Temporal if matches!(target_kind, Some(NodeKind::Memory)) => {
+                            if let Some(tid) = self.graph.node_external_id(edge.target) {
+                                let signal = seed_score * edge.weight * decay;
+                                *temporal.entry(format!("mem:{tid}")).or_insert(0.0) += signal;
+                            }
+                        }
+                        // mem -> concept: spread through the concept layer so a
+                        // query can reach memories that share a concept (2 hops)
+                        // or a sibling concept via the abstraction parent (4 hops)
+                        // despite low cosine to the query. Without this the concept
+                        // graph and abstraction hierarchy never influence ranking.
+                        EdgeKind::Association if matches!(target_kind, Some(NodeKind::Concept)) => {
+                            let concept_nid = edge.target;
+                            let concept_name =
+                                self.graph.node_external_id(concept_nid).unwrap_or("");
+                            if self.graph.is_concept_suppressed(concept_name) {
                                 continue;
                             }
-                            *normal.entry(target_key).or_insert(0.0) += signal;
+                            let concept_w = edge.weight;
+                            let Some(concept_edges) = self.graph.neighbor_indices(concept_nid)
+                            else {
+                                continue;
+                            };
+                            for &cidx in concept_edges {
+                                let Some(cedge) = self.graph.get_edge(cidx) else {
+                                    continue;
+                                };
+                                let ckind = self.graph.node_kind(cedge.target);
+                                if cedge.kind == EdgeKind::Association
+                                    && matches!(ckind, Some(NodeKind::Memory))
+                                    && cedge.target != seed_nid
+                                {
+                                    // concept -> sibling memory (2 hops).
+                                    if let Some(mid) = self.graph.node_external_id(cedge.target) {
+                                        let key = format!("mem:{mid}");
+                                        if !ann_candidates.contains(&key) {
+                                            let signal =
+                                                seed_score * concept_w * cedge.weight * decay * decay;
+                                            *normal.entry(key).or_insert(0.0) += signal;
+                                        }
+                                    }
+                                } else if cedge.kind == EdgeKind::Abstraction
+                                    && matches!(ckind, Some(NodeKind::Concept))
+                                {
+                                    // concept -> parent -> sibling concept -> memory.
+                                    let parent_nid = cedge.target;
+                                    let Some(parent_edges) =
+                                        self.graph.neighbor_indices(parent_nid)
+                                    else {
+                                        continue;
+                                    };
+                                    for &pidx in parent_edges {
+                                        let Some(pedge) = self.graph.get_edge(pidx) else {
+                                            continue;
+                                        };
+                                        if pedge.kind != EdgeKind::Abstraction
+                                            || pedge.target == concept_nid
+                                            || !matches!(
+                                                self.graph.node_kind(pedge.target),
+                                                Some(NodeKind::Concept)
+                                            )
+                                        {
+                                            continue;
+                                        }
+                                        let sib_nid = pedge.target;
+                                        let sib_name =
+                                            self.graph.node_external_id(sib_nid).unwrap_or("");
+                                        if self.graph.is_concept_suppressed(sib_name) {
+                                            continue;
+                                        }
+                                        let Some(sib_edges) = self.graph.neighbor_indices(sib_nid)
+                                        else {
+                                            continue;
+                                        };
+                                        for &sidx in sib_edges {
+                                            let Some(sedge) = self.graph.get_edge(sidx) else {
+                                                continue;
+                                            };
+                                            if sedge.kind != EdgeKind::Association
+                                                || !matches!(
+                                                    self.graph.node_kind(sedge.target),
+                                                    Some(NodeKind::Memory)
+                                                )
+                                            {
+                                                continue;
+                                            }
+                                            if let Some(mid) =
+                                                self.graph.node_external_id(sedge.target)
+                                            {
+                                                let key = format!("mem:{mid}");
+                                                if !ann_candidates.contains(&key) {
+                                                    // The abstraction parent is a
+                                                    // DELIBERATE learned bridge
+                                                    // between related concepts, not
+                                                    // incidental multi-hop noise, so
+                                                    // it pays a single `decay` (not
+                                                    // decay^3) — otherwise a 4-hop
+                                                    // bridge can never carry enough
+                                                    // activation to surface a
+                                                    // sibling-concept memory the
+                                                    // query cannot reach by cosine.
+                                                    let signal = seed_score
+                                                        * concept_w
+                                                        * cedge.weight
+                                                        * pedge.weight
+                                                        * sedge.weight
+                                                        * decay;
+                                                    *abstraction.entry(key).or_insert(0.0) +=
+                                                        signal;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if strong.len() + temporal.len() + normal.len() + abstraction.len()
+                                    >= max_candidates
+                                {
+                                    break 'seeds;
+                                }
+                            }
                         }
-
-                        // Cap total expanded candidates
-                        if strong.len() + temporal.len() + normal.len() >= max_candidates {
-                            break;
-                        }
+                        _ => {}
                     }
-                }
-                if strong.len() + temporal.len() + normal.len() >= max_candidates {
-                    break;
+                    if strong.len() + temporal.len() + normal.len() + abstraction.len()
+                        >= max_candidates
+                    {
+                        break 'seeds;
+                    }
                 }
             }
 
             // Merge the pools into the graph delta with edge-kind-aware boost
-            // factors. Strong edges (Refines/Contradicts) get full strength so
-            // they can actually re-rank an ANN candidate above its cosine
-            // neighbor. Temporal edges get a moderate boost for nearby-turn
-            // recall. Association edges are capped so they only nudge.
+            // factors. Strong (Refines/Contradicts) full strength; Temporal 0.5;
+            // Association-mediated 2-hop concept spread 0.3; Abstraction (4-hop,
+            // through the parent) 0.6 so a sibling-concept memory the query cannot
+            // reach by cosine can still surface.
             for (key, signal) in strong {
-                let boosted = signal * 1.0;
-                if boosted > 0.01 {
-                    *delta.entry(key).or_insert(0.0) += boosted;
+                if signal > 0.01 {
+                    *delta.entry(key).or_insert(0.0) += signal;
                 }
             }
-            let temporal_boost_factor = 0.5f32;
             for (key, signal) in temporal {
-                let boosted = signal * temporal_boost_factor;
+                let boosted = signal * 0.5;
                 if boosted > 0.01 {
                     *delta.entry(key).or_insert(0.0) += boosted;
                 }
             }
-            let normal_boost_factor = 0.3f32;
             for (key, signal) in normal {
-                let boosted = signal * normal_boost_factor;
+                let boosted = signal * 0.3;
+                if boosted > 0.01 {
+                    *delta.entry(key).or_insert(0.0) += boosted;
+                }
+            }
+            for (key, signal) in abstraction {
+                let boosted = signal * 0.6;
                 if boosted > 0.01 {
                     *delta.entry(key).or_insert(0.0) += boosted;
                 }
@@ -477,6 +566,40 @@ mod tests {
         assert!(
             new_delta > 0.0,
             "Refines target must receive a positive graph delta, got {new_delta}"
+        );
+    }
+
+    #[test]
+    fn augmenter_reaches_sibling_concept_via_abstraction() {
+        let mut graph = MemoryGraph::new();
+        // Co-occurring memories tagged [a, b] build the abstraction parent a+b.
+        for i in 0..3 {
+            graph.add_memory(&format!("co{i}"), "co occur", &["a".into(), "b".into()]);
+        }
+        assert!(graph.build_abstractions(3) >= 2, "abstraction parent should form");
+        // Anchor memory tagged only with the query concept `a` (the ANN seed).
+        graph.add_memory("anchor", "anchor note", &["a".into()]);
+        // Target tagged only with the SIBLING concept `b`; not an ANN seed and
+        // shares no concept with the anchor directly. Reachable only through
+        // a -> (a+b parent) -> b -> target.
+        graph.add_memory("target", "target note", &["b".into()]);
+        let sa = SpreadingActivation::new(graph, SpreadingConfig::default());
+
+        let results = sa.search("a", &[("anchor".into(), 0.9)], 10).unwrap();
+        let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(ids.contains(&"anchor"), "ANN seed must be preserved");
+        assert!(
+            ids.contains(&"target"),
+            "sibling-concept memory must surface via abstraction, got {ids:?}"
+        );
+        let target_delta = results
+            .iter()
+            .find(|(k, _)| k == "target")
+            .map(|(_, d)| *d)
+            .unwrap();
+        assert!(
+            target_delta > 0.0,
+            "abstraction-reached target must have a positive graph delta"
         );
     }
 }

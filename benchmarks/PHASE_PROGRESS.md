@@ -80,10 +80,50 @@ extending the working regime below cos 0.5 is now a tuning exercise rather than 
 
 ---
 
-## Phase 3 — Re-wire abstraction into retrieval (next)
+## Phase 3 — Re-wire abstraction into retrieval ✅ wiring (2026-07-10)
 
-Abstraction is architecturally dead: the augmenter expands 1 hop from *memory* seeds and drops
-non-memory targets, and `Association` edges are memory↔concept only — so concept/abstraction paths
-are never traversed. Re-wire retrieval (concept-seeded or 2-hop) so a query hitting one concept can
-reach memories of a sibling concept through the abstraction parent, and prove isolated lift on the
-abstraction scenario.
+**Problem (from Phase 0).** The augmenter expanded 1 hop from *memory* seeds and dropped every
+non-memory target; since `Association` edges are memory↔concept only, the concept graph and the
+whole abstraction hierarchy were **never traversed** — `build_abstractions()` produced nodes/edges
+that had zero effect on retrieval.
+
+**Change (`activation.rs`).** Replaced the memory-only 1-hop expansion with concept-mediated
+traversal from each memory seed:
+- `mem → concept → mem` (2-hop association spread, boost 0.3) — reach memories sharing a concept.
+- `mem → concept → parent → sibling-concept → mem` (abstraction bridge, boost 0.6) — reach a
+  *sibling*-concept memory via the learned abstraction parent. The bridge pays a single `decay`
+  (not per-hop) because it is a deliberate learned link, not incidental multi-hop noise.
+- `mem → mem` Refines/Contradicts (strong ×1.0) and Temporal (×0.5) preserved.
+- Suppressed hub concepts are skipped; expansion stays bounded by `expansion_max_candidates`.
+New unit test `augmenter_reaches_sibling_concept_via_abstraction` proves the target is reached via
+`a → parent → b → target` with a positive delta.
+
+**Validation.** Rust **174 passed / 0 failed**, clippy clean. No regression on the critical
+guarantees: ANN Recall@5 **100%**; belief revision held (contradiction 1.00/1.00, refinement
+0.96/1.00, false_demotion 0.00); cognitive('memory') Recall@5 99.8%.
+
+**Honest limitation — surfacing is blocked by fusion, deferred to Phase 5.** The abstraction bridge
+now *reaches* the sibling-concept target, but at scale the target does not *surface* in the top-k.
+Root cause (diagnosed): `hydrate_and_fuse` normalizes the graph delta by the result-set `max_delta`,
+and the cosine-near ANN seeds accumulate large deltas (lexical + rich concept associations) that
+shrink the far-cosine target's normalized delta below the distractor cosine floor. The same
+result-set-relative normalization drove cognitive('') empty-query recall from 1.2% → 0.0%. Both are
+Phase 5 (fusion) — the abstraction mechanism is wired and reachable; it needs an **absolute**
+(non-result-set-relative) graph-boost to surface. Also observed: naive concept extraction
+(`max_concepts=10`) builds hundreds of spurious abstraction parents from junk tokens, diluting the
+bridge — hub suppression (concept evolution, C3) is the robustness follow-up.
+
+---
+
+## Phase 4 — Isolate reinforcement lift (next)
+
+Reinforcement shows no feature-attributable lift (CogON==CogOFF everywhere). Build an isolated eval
+where a rehearsed memory must outrank a cosine-nearer non-rehearsed one; keep/tune only if it shows
+lift.
+
+## Phase 5 — Unify + calibrate fusion (next; unblocks Phase 3 surfacing)
+
+Replace the result-set-relative `delta / max_delta` normalization with a bounded **absolute**
+graph boost so cosine-far, graph-reached memories (abstraction targets) surface on their own delta
+magnitude, and empty-query temporal displacement stops burying true neighbors. Re-validate all
+evals + recall.
