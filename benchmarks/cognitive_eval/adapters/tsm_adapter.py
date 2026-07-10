@@ -108,6 +108,7 @@ class TSMAdapter:
         belief_revision: bool = True,  # Build Contradicts/Refines edges + demotion
         dimension: Optional[int] = None,
         model=None,  # Preloaded embedding model to share across adapters
+        store_roles=None,  # e.g. {"user"} to store only user facts; None = all roles
         **kwargs,
     ):
         """Initialize the TSM adapter.
@@ -123,6 +124,9 @@ class TSMAdapter:
         self.db_path = db_path
         self.embedding_model_name = embedding_model
         self.cognitive_features = cognitive_features
+        # Optional role filter: a memory of USER facts should not ingest the
+        # assistant's own (verbose, repetitive) responses as revisable "facts".
+        self.store_roles = set(store_roles) if store_roles is not None else None
         # Stop-word set used by _extract_concepts.
         self._stop_words = _STOP_WORDS
 
@@ -315,7 +319,10 @@ class TSMAdapter:
             content = msg.get("content", "")
             if not content or not content.strip():
                 continue
-            
+            # Role filter: skip messages whose role is excluded (e.g. assistant).
+            if self.store_roles is not None and msg.get("role", "user") not in self.store_roles:
+                continue
+
             facts = self.extractor.extract_facts(content, context)
             context.append(content)
             

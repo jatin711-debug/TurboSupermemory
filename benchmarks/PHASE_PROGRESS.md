@@ -253,6 +253,32 @@ not just topical similarity — and/or LLM/NLI verification before the destructi
 gold-standard LLM-judge metric once ollama is available. But the direction is proven: **MNN turned
 the marquee feature from a liability into a measurable win on real data.**
 
+**Stage B.2 — the residual was assistant boilerplate.** A dump of the actual refinement pairs
+showed the remaining 6,701 refinements were overwhelmingly the mock extractor sentence-splitting the
+*assistant's* verbose, bulleted, repetitive responses (e.g. `"* After 1-2 years... 70-80%"` →
+`"* After 2-3 years... 50-60%"` — different list items, not a supersession; `"What is your budget?"`
+→ `"My budget is $800"` — question→answer). A conversational memory should store the **user's** facts,
+not replay the assistant's chatter, so the adapter gained a `store_roles` filter (eval flag
+`--user-only`). With user-only facts:
+
+| metric | all roles | **user-only** |
+|---|--:|--:|
+| belief edges (147 convs) | refine 6,701 / contra 429 | **refine 683 / contra 80** (−90%) |
+| knowledge-update hit@1 lift | +0.23 | **+0.23** (held) |
+| single-session-user lift | −0.10 hit@k | **+0.00** |
+| single-session-preference lift | −0.11 | **+0.00** |
+| single-session-assistant lift | (n/a) | **+0.00** |
+
+Belief revision keeps its full +0.23 knowledge-update rank-1 win and the collateral damage is
+**eliminated** — every single-session type is exactly 0.00 (belief revision no longer touches
+memories it shouldn't). Base recall even improved from the reduced noise (KU hit@3 OFF 0.73 → 0.86).
+
+**Net Stage B verdict: belief revision is now genuinely net-positive on real data with no downside** —
++0.23 rank-1 on the belief-revision subset, zero collateral, 763 (not 28,311) edges. The path from
+here is the gold-standard LLM-judge metric (needs ollama) and LLM/NLI verification for the highest-
+stakes demotions, but the mechanism is validated: **mutual-nearest-neighbour detection + user-scoped
+facts make belief revision work on real conversational memory.**
+
 ## Phase 5 — Unify + calibrate fusion ✅ (2026-07-10)
 
 **Problem.** `hydrate_and_fuse` computed the graph boost as `act / max_act` — normalized by the
