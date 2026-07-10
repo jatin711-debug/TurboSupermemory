@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use turbomemory_graph::{CognitiveCompressor, CompressedCognitiveState, DeterministicCompressor};
 use turbomemory_storage::config::{QuantizerKind, StoreConfig};
-use turbomemory_storage::engine::StorageEngine;
+use turbomemory_storage::engine::{StorageEngine, SupersessionKind};
 
 /// Map storage errors to specific Python exception types.
 fn storage_err(e: turbomemory_storage::StorageError) -> PyErr {
@@ -247,6 +247,7 @@ impl PyMemoryEngine {
         concept_hub_degree_fraction=None,
         concept_evolution_max_pairs_per_cycle=None,
         belief_source_roles=None,
+        defer_supersession_commit=None,
         seed_hops_from=None,
         expansion_max_candidates=None
     ))]
@@ -300,6 +301,7 @@ impl PyMemoryEngine {
         concept_hub_degree_fraction: Option<f32>,
         concept_evolution_max_pairs_per_cycle: Option<usize>,
         belief_source_roles: Option<Vec<String>>,
+        defer_supersession_commit: Option<bool>,
         seed_hops_from: Option<usize>,
         expansion_max_candidates: Option<usize>,
     ) -> PyResult<Self> {
@@ -521,6 +523,9 @@ impl PyMemoryEngine {
         // (role-blind) so callers can pass [] to mean the default explicitly.
         if let Some(roles) = belief_source_roles {
             config.tier.belief_source_roles = if roles.is_empty() { None } else { Some(roles) };
+        }
+        if let Some(defer) = defer_supersession_commit {
+            config.tier.defer_supersession_commit = defer;
         }
 
         let inner = StorageEngine::open(db_path, config).map_err(storage_err)?;
@@ -916,6 +921,45 @@ impl PyMemoryEngine {
                     scope,
                     source_role,
                 )
+                .map_err(storage_err)
+        })
+    }
+
+    /// Detect belief-revision supersessions WITHOUT committing them (W3). Returns
+    /// a list of `(old_id, new_id, kind, cosine)` where `kind` is `"refinement"`
+    /// or `"contradiction"`. Feed the pairs that survive an external verifier
+    /// (e.g. an NLI cross-encoder) back to `commit_supersessions`. Requires the
+    /// engine to be built with `defer_supersession_commit=True` so consolidation
+    /// does not auto-commit them first.
+    fn propose_supersessions(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<Vec<(String, String, String, f32)>> {
+        let props = py.allow_threads(|| self.inner.propose_supersessions().map_err(storage_err))?;
+        Ok(props
+            .into_iter()
+            .map(|p| (p.old_id, p.new_id, p.kind.as_str().to_string(), p.cosine))
+            .collect())
+    }
+
+    /// Commit verified supersessions (W3). `pairs` is a list of
+    /// `(old_id, new_id, kind)` with `kind` in `{"refinement","contradiction"}`.
+    /// Creates the Refines/Contradicts edge and applies bounded demotion for
+    /// each surviving pair. Unknown-kind or dead-id pairs are skipped. Returns
+    /// the number of edges created.
+    #[pyo3(signature = (pairs))]
+    fn commit_supersessions(
+        &self,
+        py: Python<'_>,
+        pairs: Vec<(String, String, String)>,
+    ) -> PyResult<usize> {
+        let parsed: Vec<(String, String, SupersessionKind)> = pairs
+            .into_iter()
+            .filter_map(|(o, n, k)| SupersessionKind::from_label(&k).map(|kind| (o, n, kind)))
+            .collect();
+        py.allow_threads(|| {
+            self.inner
+                .commit_supersessions_by_id(&parsed)
                 .map_err(storage_err)
         })
     }

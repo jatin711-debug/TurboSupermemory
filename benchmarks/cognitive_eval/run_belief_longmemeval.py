@@ -74,18 +74,24 @@ def hit_at(answer, texts, k):
 
 
 def run_arm(belief_on, conversations, model_name, top_k, extractor, shared_model=None,
-            store_roles=None, belief_source_roles=None):
+            store_roles=None, belief_source_roles=None, verify_demotions=False,
+            shared_verifier=None):
     """One fresh engine PER conversation (belief detection stays within a user,
     matching a properly-scoped store and isolating the mechanism). The embedding
     model is loaded once and shared across all engines."""
     by_type = defaultdict(lambda: {"n": 0, "h1": 0, "h3": 0, "hk": 0})
     edges = {"refine": 0, "contra": 0}
     model = shared_model
+    verifier = shared_verifier
+    if belief_on and verify_demotions and verifier is None:
+        from cognitive_eval.verification import NLIVerifier
+        verifier = NLIVerifier()
     for conv in conversations:
         db_path = tempfile.mkdtemp(prefix="tsm_lme_")
         adapter = TSMAdapter(db_path=db_path, embedding_model=model_name, extractor=extractor,
                              cognitive_features=True, belief_revision=belief_on, model=model,
-                             store_roles=store_roles, belief_source_roles=belief_source_roles)
+                             store_roles=store_roles, belief_source_roles=belief_source_roles,
+                             verify_demotions=(belief_on and verify_demotions), verifier=verifier)
         model = adapter.model  # reuse the loaded model for the next conversation
         try:
             adapter.add(conv.messages, user_id=conv.conv_id)
@@ -106,7 +112,7 @@ def run_arm(belief_on, conversations, model_name, top_k, extractor, shared_model
         finally:
             adapter.close()
             shutil.rmtree(db_path, ignore_errors=True)
-    return by_type, edges, model
+    return by_type, edges, model, verifier
 
 
 def main():
@@ -124,6 +130,9 @@ def main():
                     help="MODE B: store ALL roles (every memory stays retrievable) but restrict "
                          "belief-revision detection to user facts via the engine's first-class "
                          "belief_source_roles. This is the productized form of --user-only.")
+    ap.add_argument("--verify-demotions", action="store_true",
+                    help="W3: gate each proposed supersession through a local NLI cross-encoder "
+                         "before the destructive demotion (propose -> verify -> commit).")
     args = ap.parse_args()
     store_roles = {"user"} if args.user_only else None
     belief_source_roles = ["user"] if args.role_filtered else None
@@ -140,14 +149,15 @@ def main():
                  "huggingface_hub", "sentence_transformers", "transformers"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
-    logger.info("Running OFF arm (belief revision disabled)... store_roles=%s belief_source_roles=%s",
-                store_roles, belief_source_roles)
-    off, off_edges, model = run_arm(False, convs, args.model, args.top_k, args.extractor,
-                                    store_roles=store_roles, belief_source_roles=belief_source_roles)
+    logger.info("Running OFF arm (belief revision disabled)... store_roles=%s belief_source_roles=%s "
+                "verify_demotions=%s", store_roles, belief_source_roles, args.verify_demotions)
+    off, off_edges, model, _ = run_arm(False, convs, args.model, args.top_k, args.extractor,
+                                       store_roles=store_roles, belief_source_roles=belief_source_roles)
     logger.info("Running ON arm (belief revision enabled)...")
-    on, on_edges, _ = run_arm(True, convs, args.model, args.top_k, args.extractor,
-                              shared_model=model, store_roles=store_roles,
-                              belief_source_roles=belief_source_roles)
+    on, on_edges, _, _ = run_arm(True, convs, args.model, args.top_k, args.extractor,
+                                 shared_model=model, store_roles=store_roles,
+                                 belief_source_roles=belief_source_roles,
+                                 verify_demotions=args.verify_demotions)
 
     logger.info("Belief edges built — OFF: %s   ON: %s", off_edges, on_edges)
     logger.info("=" * 100)

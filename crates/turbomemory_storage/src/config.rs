@@ -301,6 +301,14 @@ pub struct TierConfig {
     /// eval-only `store_roles` filter that eliminated belief-revision
     /// collateral damage on real conversational data (LongMemEval Stage B.2).
     pub belief_source_roles: Option<Vec<String>>,
+    /// Defer supersession commitment out of the consolidation cycle. When
+    /// `false` (default), `trigger_consolidation` auto-detects AND commits
+    /// refinements/contradictions inline (the standard behavior). When `true`,
+    /// consolidation SKIPS committing them — the caller is expected to drive
+    /// `propose_supersessions` → verify → `commit_supersessions` explicitly, so
+    /// an external verifier (e.g. an NLI cross-encoder, W3) can vet each
+    /// demotion before it happens. No-op unless belief revision is enabled.
+    pub defer_supersession_commit: bool,
 }
 
 impl TierConfig {
@@ -377,6 +385,9 @@ impl TierConfig {
         // Role-blind belief revision by default (legacy behavior). Set to
         // e.g. Some(vec!["user".into()]) to scope supersession to user facts.
         belief_source_roles: None,
+        // Consolidation auto-commits supersessions by default. Set true to
+        // defer to an explicit propose -> verify -> commit flow (W3).
+        defer_supersession_commit: false,
     };
 
     /// Recommended thresholds for a given vector dimension.

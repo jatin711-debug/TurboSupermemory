@@ -1334,17 +1334,19 @@ impl StorageEngine {
         self.deduplicate()?;
         self.evict()?;
 
-        // Memory evolution: detect refinements (newer memories that
-        // supersede older ones about the same topic) and create Refines
-        // edges so retrieval surfaces the most current version. Opt-in.
-        self.check_refinements()?;
-
-        // Contradiction detection: when a newer memory contradicts an
-        // older one (same topic, opposing content), create Contradicts
-        // edges and weaken the old memory so it fades. Runs after
-        // check_refinements so refinement pairs (high text overlap) are
-        // not double-counted as contradictions. Opt-in.
-        self.check_contradictions()?;
+        // Memory evolution: detect refinements + contradictions and commit the
+        // resulting Refines/Contradicts edges + demotion so retrieval surfaces
+        // the current belief. Refinements run before contradictions so a
+        // high-text-overlap pair is treated as a refinement, not double-counted
+        // as a contradiction. Both opt-in.
+        //
+        // When `defer_supersession_commit` is set, consolidation does NOT commit
+        // here — the caller drives `propose_supersessions` → verify →
+        // `commit_supersessions` so a verifier can vet each demotion (W3).
+        if !self.config.tier.defer_supersession_commit {
+            self.check_refinements()?;
+            self.check_contradictions()?;
+        }
 
         // Cognitive-layer learning: decay stale reinforced edges and build
         // abstraction hierarchies from concept co-occurrence. Both are opt-in
@@ -1620,14 +1622,23 @@ impl StorageEngine {
     ///
     /// Returns the number of new `Refines` edges created.
     pub fn check_refinements(&self) -> crate::Result<usize> {
+        let props = self.propose_refinements()?;
+        self.commit_supersessions(&props)
+    }
+
+    /// Detection half of refinement belief-revision: find newer memories that
+    /// re-state older ones (mutual-nearest-neighbour + text-overlap + role/scope
+    /// gates) and return them as [`ProposedSupersession`]s **without** mutating
+    /// the graph or demoting anything. `commit_supersessions` applies the result.
+    /// This split lets a verifier vet each demotion before it happens (W3).
+    pub fn propose_refinements(&self) -> crate::Result<Vec<ProposedSupersession>> {
         let Some(threshold) = self.config.tier.refinement_cosine_threshold else {
-            return Ok(0);
+            return Ok(Vec::new());
         };
         let max_pairs = self.config.tier.refinement_max_pairs_per_cycle;
         if max_pairs == 0 {
-            return Ok(0);
+            return Ok(Vec::new());
         }
-        let demotion_factor = self.config.tier.supersession_demotion_factor;
         let text_floor = self.config.tier.refinement_text_threshold;
         let allowed_roles = self.config.tier.belief_source_roles.as_deref();
 
@@ -1658,10 +1669,10 @@ impl StorageEngine {
         })?;
         cands.sort_by_key(|c| std::cmp::Reverse(c.insert_seq));
 
-        let mut created = 0usize;
+        let mut proposed: Vec<ProposedSupersession> = Vec::new();
 
         for cand in &cands {
-            if created >= max_pairs {
+            if proposed.len() >= max_pairs {
                 break;
             }
             // Role gate: when belief_source_roles is set, only memories whose
@@ -1727,52 +1738,59 @@ impl StorageEngine {
                 continue;
             }
 
-            // Create the single Refines edge (old -> new) + bounded demotion.
-            let mut graph = self.graph.write();
-            let added = graph.add_refinement(&other.id, &cand.id, 0.8);
-            drop(graph);
+            proposed.push(ProposedSupersession {
+                old_id: other.id.clone(),
+                new_id: cand.id.clone(),
+                old_offset: other.offset,
+                new_offset: cand.offset,
+                kind: SupersessionKind::Refinement,
+                cosine: cosine_similarity(&embedding, &other_emb),
+            });
+        }
+
+        Ok(proposed)
+    }
+
+    /// Commit half of belief-revision: for each proposed supersession, create
+    /// the `Refines`/`Contradicts` edge (old → new), apply bounded demotion to
+    /// the older memory, and (for refinements) transfer the older memory's
+    /// unique concepts to the newer one. Idempotent per pair (a duplicate edge
+    /// is skipped and does not re-demote). Returns the number of edges created.
+    ///
+    /// Splitting this from `propose_*` is the verification seam (W3): a caller
+    /// can filter the proposed list (e.g. through an NLI cross-encoder) before
+    /// committing, so a demotion only happens once it is semantically confirmed.
+    pub fn commit_supersessions(&self, proposed: &[ProposedSupersession]) -> crate::Result<usize> {
+        let demotion_factor = self.config.tier.supersession_demotion_factor;
+        let weaken_factor = self.config.tier.contradiction_weaken_factor;
+        let mut created = 0usize;
+
+        for p in proposed {
+            let added = {
+                let mut graph = self.graph.write();
+                match p.kind {
+                    SupersessionKind::Refinement => graph.add_refinement(&p.old_id, &p.new_id, 0.8),
+                    SupersessionKind::Contradiction => {
+                        graph.add_contradiction(&p.old_id, &p.new_id, 0.8, weaken_factor)
+                    }
+                }
+            };
             if !added {
                 continue;
             }
             created += 1;
-            let cur = self.meta.demotion_factor(other.offset);
+
+            // Bounded, persisted demotion of the superseded memory.
+            let cur = self.meta.demotion_factor(p.old_offset);
             self.meta.set_demotion_factor(
-                other.offset,
+                p.old_offset,
                 (cur * demotion_factor).max(SUPERSESSION_DEMOTION_FLOOR),
             );
 
-            // Transfer the older memory's unique concepts to the newer one so the
-            // refinement is discoverable through all the same concept paths.
-            let unique_concepts: Vec<String> = other
-                .concepts
-                .iter()
-                .filter(|c| !cand.concepts.contains(c))
-                .cloned()
-                .collect();
-            if !unique_concepts.is_empty() {
-                let mut new_concepts = cand.concepts.clone();
-                for c in &unique_concepts {
-                    if !new_concepts.contains(c) {
-                        new_concepts.push(c.clone());
-                    }
-                }
-                if let Some(mut rec) = self.meta.get(cand.offset)? {
-                    rec.concepts = new_concepts;
-                    self.meta.put(
-                        cand.offset,
-                        &rec.with_embedding(Arc::from(embedding.as_slice())),
-                    )?;
-                }
-                let mut graph = self.graph.write();
-                if let Some(rec) = self.find_record_by_id(&cand.id) {
-                    graph.add_memory_with_importance(
-                        &cand.id,
-                        &rec.text,
-                        &rec.concepts,
-                        rec.importance,
-                    );
-                }
-                drop(graph);
+            // Refinements also transfer the older memory's unique concepts to
+            // the newer one so it is discoverable through the same concept paths.
+            if p.kind == SupersessionKind::Refinement {
+                self.transfer_unique_concepts(p.old_offset, p.new_offset, &p.new_id)?;
             }
         }
 
@@ -1780,6 +1798,84 @@ impl StorageEngine {
             self.save_graph()?;
         }
         Ok(created)
+    }
+
+    /// Commit supersessions identified only by `(old_id, new_id, kind)` — the
+    /// shape that survives a round-trip through an external (Python) verifier,
+    /// which does not see internal offsets. Offsets are re-resolved from the id
+    /// index at commit time (robust if the layout shifted since `propose_*`).
+    /// Pairs whose ids are no longer live are silently skipped.
+    pub fn commit_supersessions_by_id(
+        &self,
+        pairs: &[(String, String, SupersessionKind)],
+    ) -> crate::Result<usize> {
+        let props: Vec<ProposedSupersession> = {
+            let id_index = self.id_index.read();
+            pairs
+                .iter()
+                .filter_map(|(old_id, new_id, kind)| {
+                    let old_offset = *id_index.get(old_id.as_str())?;
+                    let new_offset = *id_index.get(new_id.as_str())?;
+                    Some(ProposedSupersession {
+                        old_id: old_id.clone(),
+                        new_id: new_id.clone(),
+                        old_offset,
+                        new_offset,
+                        kind: *kind,
+                        cosine: 0.0,
+                    })
+                })
+                .collect()
+        };
+        self.commit_supersessions(&props)
+    }
+
+    /// Merge the older memory's concepts (that the newer one lacks) into the
+    /// newer memory's concept set, updating both metadata and the graph.
+    fn transfer_unique_concepts(
+        &self,
+        old_offset: PointOffset,
+        new_offset: PointOffset,
+        new_id: &str,
+    ) -> crate::Result<()> {
+        let (Some(old_rec), Some(new_rec)) =
+            (self.meta.get(old_offset)?, self.meta.get(new_offset)?)
+        else {
+            return Ok(());
+        };
+        let unique: Vec<String> = old_rec
+            .concepts
+            .iter()
+            .filter(|c| !new_rec.concepts.contains(c))
+            .cloned()
+            .collect();
+        if unique.is_empty() {
+            return Ok(());
+        }
+        let mut new_concepts = new_rec.concepts.clone();
+        for c in unique {
+            if !new_concepts.contains(&c) {
+                new_concepts.push(c);
+            }
+        }
+        let embedding: Vec<f32> = {
+            let view = self.vectors.read_view();
+            match view.get(new_offset) {
+                Some(v) => v.to_vec(),
+                None => return Ok(()),
+            }
+        };
+        let mut rec = new_rec;
+        rec.concepts = new_concepts;
+        self.meta.put(
+            new_offset,
+            &rec.with_embedding(Arc::from(embedding.as_slice())),
+        )?;
+        let mut graph = self.graph.write();
+        if let Some(r) = self.find_record_by_id(new_id) {
+            graph.add_memory_with_importance(new_id, &r.text, &r.concepts, r.importance);
+        }
+        Ok(())
     }
 
     /// Nearest live neighbour of `embedding` (examined nearest-first via the ANN
@@ -1871,17 +1967,24 @@ impl StorageEngine {
     ///
     /// Returns the number of new `Contradicts` edges created.
     pub fn check_contradictions(&self) -> crate::Result<usize> {
+        let props = self.propose_contradictions()?;
+        self.commit_supersessions(&props)
+    }
+
+    /// Detection half of contradiction belief-revision: find newer memories
+    /// that oppose older ones (same topic, low text overlap, opposition marker,
+    /// mutual-nearest-neighbour) and return them as [`ProposedSupersession`]s
+    /// **without** mutating the graph. `commit_supersessions` applies the result.
+    pub fn propose_contradictions(&self) -> crate::Result<Vec<ProposedSupersession>> {
         let Some(threshold) = self.config.tier.contradiction_cosine_threshold else {
-            return Ok(0);
+            return Ok(Vec::new());
         };
         let max_pairs = self.config.tier.contradiction_max_pairs_per_cycle;
         if max_pairs == 0 {
-            return Ok(0);
+            return Ok(Vec::new());
         }
         let text_threshold = self.config.tier.contradiction_text_threshold;
-        let weaken_factor = self.config.tier.contradiction_weaken_factor;
         let require_opposition = self.config.tier.contradiction_require_opposition;
-        let demotion_factor = self.config.tier.supersession_demotion_factor;
         let allowed_roles = self.config.tier.belief_source_roles.as_deref();
 
         self.access_counters.drain_into(&self.meta)?;
@@ -1910,9 +2013,9 @@ impl StorageEngine {
         })?;
         cands.sort_by_key(|c| std::cmp::Reverse(c.insert_seq));
 
-        let mut created = 0usize;
+        let mut proposed: Vec<ProposedSupersession> = Vec::new();
         for cand in &cands {
-            if created >= max_pairs {
+            if proposed.len() >= max_pairs {
                 break;
             }
             if !role_allowed(&cand.source_role, allowed_roles) {
@@ -1956,7 +2059,7 @@ impl StorageEngine {
                 continue;
             }
 
-            // Mutual-nearest gate (see check_refinements): `other`'s nearest
+            // Mutual-nearest gate (see propose_refinements): `other`'s nearest
             // NEWER same-concept, same-scope neighbour must be `cand`.
             let view = self.vectors.read_view();
             let Some(ovec) = view.get(other.offset) else {
@@ -1978,25 +2081,28 @@ impl StorageEngine {
                 continue;
             }
 
-            // Create the single Contradicts edge (old -> new) + bounded demotion.
-            let mut graph = self.graph.write();
-            let added = graph.add_contradiction(&other.id, &cand.id, 0.8, weaken_factor);
-            drop(graph);
-            if !added {
-                continue;
-            }
-            created += 1;
-            let cur = self.meta.demotion_factor(other.offset);
-            self.meta.set_demotion_factor(
-                other.offset,
-                (cur * demotion_factor).max(SUPERSESSION_DEMOTION_FLOOR),
-            );
+            proposed.push(ProposedSupersession {
+                old_id: other.id.clone(),
+                new_id: cand.id.clone(),
+                old_offset: other.offset,
+                new_offset: cand.offset,
+                kind: SupersessionKind::Contradiction,
+                cosine: cosine_similarity(&embedding, &other_emb),
+            });
         }
 
-        if created > 0 {
-            self.save_graph()?;
-        }
-        Ok(created)
+        Ok(proposed)
+    }
+
+    /// Detection over BOTH refinement and contradiction, for the verified
+    /// belief-revision path (W3): a caller runs this, vets each pair through an
+    /// external verifier, then `commit_supersessions` on the survivors. When no
+    /// verifier is installed, consolidation instead auto-commits via
+    /// `check_refinements` + `check_contradictions` (identical detection logic).
+    pub fn propose_supersessions(&self) -> crate::Result<Vec<ProposedSupersession>> {
+        let mut proposed = self.propose_refinements()?;
+        proposed.extend(self.propose_contradictions()?);
+        Ok(proposed)
     }
 
     /// Automatic importance scoring (self-organizing memory). For each live
@@ -2313,6 +2419,50 @@ pub(crate) fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// The kind of supersession relationship a proposed pair represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupersessionKind {
+    /// Newer memory re-states / updates the older one (high text overlap).
+    Refinement,
+    /// Newer memory opposes the older one (same topic, low overlap + marker).
+    Contradiction,
+}
+
+impl SupersessionKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SupersessionKind::Refinement => "refinement",
+            SupersessionKind::Contradiction => "contradiction",
+        }
+    }
+
+    /// Parse `"refinement"` / `"contradiction"` (case-insensitive). Any other
+    /// value maps to `None`.
+    pub fn from_label(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "refinement" | "refine" | "refines" => Some(SupersessionKind::Refinement),
+            "contradiction" | "contra" | "contradicts" => Some(SupersessionKind::Contradiction),
+            _ => None,
+        }
+    }
+}
+
+/// A supersession candidate produced by detection (`propose_*`) but NOT yet
+/// committed to the graph. This is the seam that lets an external verifier
+/// (e.g. an NLI cross-encoder) vet a demotion before it happens: detection is
+/// pure (no graph mutation), and `commit_supersessions` applies the edge +
+/// bounded demotion only for the pairs that survive verification.
+#[derive(Debug, Clone)]
+pub struct ProposedSupersession {
+    pub old_id: String,
+    pub new_id: String,
+    pub old_offset: PointOffset,
+    pub new_offset: PointOffset,
+    pub kind: SupersessionKind,
+    /// Cosine similarity between the two memories at detection time.
+    pub cosine: f32,
 }
 
 /// Whether a memory's provenance `role` may participate in belief revision
@@ -2748,6 +2898,65 @@ mod tests {
             rec.source_role.as_deref(),
             Some("user"),
             "source_role should persist across restart"
+        );
+    }
+
+    /// The propose/commit split (W3): `propose_*` detects pairs WITHOUT
+    /// mutating the graph or demoting; `commit_supersessions` is what applies
+    /// the edge + demotion. A verifier can drop pairs between the two steps.
+    #[test]
+    fn propose_supersessions_is_pure_commit_mutates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        config.tier.refinement_cosine_threshold = Some(0.5);
+        config.tier.refinement_max_pairs_per_cycle = 100;
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        engine
+            .insert(
+                "old",
+                "Rust memory safety",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+        engine
+            .insert(
+                "new",
+                "Rust borrow checker safety",
+                &[0.9f32, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+
+        // propose detects the pair but does NOT touch the graph or demotion.
+        let props = engine.propose_supersessions().unwrap();
+        assert_eq!(props.len(), 1, "one refinement should be proposed");
+        assert_eq!(props[0].old_id, "old");
+        assert_eq!(props[0].new_id, "new");
+        assert_eq!(props[0].kind, SupersessionKind::Refinement);
+        let old_off = *engine.id_index.read().get("old").unwrap();
+        assert!(
+            (engine.meta.demotion_factor(old_off) - 1.0).abs() < 1e-6,
+            "propose must not demote"
+        );
+        assert_eq!(
+            engine.graph.read().graph().refinement_count(),
+            0,
+            "propose must not create edges"
+        );
+
+        // A verifier that REJECTS the pair (empty commit) leaves everything untouched.
+        assert_eq!(engine.commit_supersessions(&[]).unwrap(), 0);
+        assert_eq!(engine.graph.read().graph().refinement_count(), 0);
+
+        // Committing the accepted pair applies the edge + bounded demotion.
+        assert_eq!(engine.commit_supersessions(&props).unwrap(), 1);
+        assert_eq!(engine.graph.read().graph().refinement_count(), 1);
+        assert!(
+            engine.meta.demotion_factor(old_off) < 1.0,
+            "commit must demote"
         );
     }
 

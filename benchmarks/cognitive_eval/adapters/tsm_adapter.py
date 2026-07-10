@@ -113,6 +113,9 @@ class TSMAdapter:
                                    # belief detection in the engine (mode b). Every
                                    # memory stays retrievable; only supersession is
                                    # restricted to these roles.
+        verify_demotions=False,    # W3: gate each supersession through an NLI
+                                   # cross-encoder before the destructive demotion.
+        verifier=None,             # preloaded NLIVerifier to share across adapters.
         **kwargs,
     ):
         """Initialize the TSM adapter.
@@ -135,6 +138,13 @@ class TSMAdapter:
         # mode b: store every role but restrict belief-revision detection to
         # these roles inside the engine (first-class role-aware memory).
         self.belief_source_roles = list(belief_source_roles) if belief_source_roles else None
+        # W3: verified demotion. When on, consolidation defers supersession
+        # commitment and the adapter drives propose -> NLI-verify -> commit.
+        self.verify_demotions = bool(verify_demotions)
+        self.verifier = verifier
+        if self.verify_demotions and self.verifier is None:
+            from ..verification import NLIVerifier
+            self.verifier = NLIVerifier()
         # Stop-word set used by _extract_concepts.
         self._stop_words = _STOP_WORDS
 
@@ -239,6 +249,10 @@ class TSMAdapter:
         # receive supersession edges.
         if self.belief_source_roles:
             config["belief_source_roles"] = self.belief_source_roles
+        # Verified demotion: defer supersession commitment so the adapter can
+        # vet each pair before it demotes anything.
+        if self.verify_demotions:
+            config["defer_supersession_commit"] = True
         self.engine = self.tsm.MemoryEngine(**config)
         logger.info("TSM engine initialized (cognitive=%s, belief_revision=%s)",
                     cognitive_features, belief_revision)
@@ -483,8 +497,24 @@ class TSMAdapter:
         ]
     
     def trigger_consolidation(self) -> None:
-        """Trigger manual consolidation (for deterministic benchmarks)."""
+        """Trigger manual consolidation (for deterministic benchmarks).
+
+        With `verify_demotions`, consolidation defers supersession commitment;
+        the adapter then detects candidate supersessions, vets each through the
+        NLI verifier, and commits only the survivors — so a demotion never
+        happens until it is semantically confirmed.
+        """
         self.engine.trigger_consolidation()
+        if not self.verify_demotions:
+            return
+        proposed = self.engine.propose_supersessions()  # (old, new, kind, cosine)
+        if not proposed:
+            return
+        accepted = self.verifier.verify(proposed, self._id_to_text)
+        if accepted:
+            self.engine.commit_supersessions(accepted)
+        logger.info("verified demotion: proposed=%d accepted=%d",
+                    len(proposed), len(accepted))
     
     def close(self) -> None:
         """Close the TSM engine and clean up."""
