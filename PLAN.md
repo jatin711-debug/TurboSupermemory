@@ -214,7 +214,19 @@ Document in `AGENTS.md`: "run `make gate` before every commit."
 **Acceptance:** gate passes at HEAD; sabotage test — commenting out the reverse-MNN check makes
 the gate FAIL (prove it can catch the Stage-A class of bug).
 
-### W3 — Verified demotion: propose → verify → commit (no ollama needed)
+### W3 — Verified demotion ✅ DONE (2026-07-10, PHASE_PROGRESS "W3")
+
+**Outcome:** engine split into pure `propose_supersessions` + `commit_supersessions`
+(auto-commit path behavior-identical, 77 tests); `defer_supersession_commit` config;
+PyO3 exposed. Local NLI cross-encoder verifier (`verification/nli.py`, transformers
+not sentence_transformers) — accept contradiction+entailment, reject neutral. On
+200-conv LongMemEval: verification holds KU +0.07, **cuts edges 962→393 (−59%)**, and
+drives **all collateral to exactly 0.00**; NLI audit shows 58% of geometric proposals
+are neutral coexisting facts (correctly rejected). Opt-in; default path unchanged
+(gate 7/7). Discovered + flagged a pre-existing native-memory leak in the per-conv
+eval harness (OOMs at full-500; relevant to W7). Original spec below.
+
+---
 
 **Why:** demotion is the only destructive cognitive action. MNN is a *geometric* gate; the
 no-compromises bar is a *semantic* check before burying a memory. An NLI cross-encoder runs

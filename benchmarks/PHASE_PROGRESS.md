@@ -390,3 +390,56 @@ no collateral; recall 100%).
    shape as the 2026-06-29 fusion bug) collapsed synthetic belief lift **+1.00 → +0.00** for both
    refinement and contradiction, tripping the `lift ≥ 0.9` check. **Gate FAILS as designed.** Code
    reverted; clean build restored to +1.00/+1.00.
+
+# W3 — Verified demotion (propose → verify → commit) ✅ (2026-07-10)
+
+Demotion is the only *destructive* cognitive action. MNN (W1/Stage B) is a
+*geometric* gate; W3 adds a *semantic* gate before a memory is ever buried — with
+no LLM server (local NLI cross-encoder on GPU).
+
+**Engine (behavior-preserving refactor).** Detection split from commitment:
+`propose_refinements`/`propose_contradictions`/`propose_supersessions` are pure
+(no graph mutation, no demotion) and return `ProposedSupersession`
+{old,new,offsets,kind,cosine}; `commit_supersessions` (and
+`commit_supersessions_by_id` for the Python round-trip) apply the edge + bounded
+demotion + concept transfer. `check_refinements`/`check_contradictions` are now
+thin propose+commit wrappers, so the auto-commit path is identical (storage
+76→77 tests green; unverified full-500 reproduced W1 exactly: 2,349 edges, KU
++0.069). New `defer_supersession_commit` config lets consolidation hand the
+decision to the caller. Exposed via PyO3 (`propose_supersessions`,
+`commit_supersessions`, `defer_supersession_commit`).
+
+**Verifier (`verification/nli.py`).** Local NLI cross-encoder
+(`cross-encoder/nli-deberta-v3-xsmall`) loaded via `transformers` directly
+(sentence_transformers is unusable here — torchcodec/FFmpeg). premise=new,
+hypothesis=old; **accept contradiction+entailment, REJECT neutral** — neutral =
+coexisting facts, the exact false positive that caused single-session collateral.
+Proven on examples: Camry-vs-F150 → contradiction (accept), hiking-vs-color →
+neutral (reject), moved-to-Boston → entailment (accept).
+
+**Validation (LongMemEval, 200 conversations, same convs, mode b).**
+
+| metric | unverified | **verified (NLI)** |
+|---|--:|--:|
+| belief edges | 962 (879 R / 83 C) | **393 (382 R / 11 C)** −59% |
+| knowledge-update hit@1 lift | +0.11 | **+0.07** (held; Δ≈1 q at n=28) |
+| temporal-reasoning hit@1 | −0.02 | **+0.00** |
+| single-session-assistant hit@k | −0.05 | **+0.00** |
+| every non-KU type (h1/h3/hk) | some noise | **exactly +0.00** |
+
+NLI audit on 288 real proposed pairs (`verify_supersessions.py`): **58% rejected
+as neutral** (coexisting facts), 42% accepted (97 entailment + 23 contradiction)
+— the 42% accept rate matches the edge reduction. **Verdict: verification holds
+the knowledge-update win, halves the destructive demotions, and drives all
+collateral to exactly zero** — the NLI gate removes the coexisting-fact false
+positives that geometry alone cannot. Opt-in (`verify_demotions` /
+`--verify-demotions`); the default no-verifier path is unchanged (gate still
+7/7). Small honest caveat: KU +0.11→+0.07 is within n=28 noise but the verifier
+may reject an occasional genuine refinement — a margin/threshold tune (exposed:
+`min_margin`, `accept_labels`) could recover it; the default rule favors
+precision (never demote a still-true memory).
+
+**NOTE (out of scope, flagged separately):** the per-conversation eval harness
+(one MemoryEngine per conversation) OOMs at the full 500-set — a native-memory
+leak across engine create/close cycles (close() likely not releasing
+mmap/redb/tantivy/usearch). Hence the 200-conv validation. Relevant to W7 (scale).
