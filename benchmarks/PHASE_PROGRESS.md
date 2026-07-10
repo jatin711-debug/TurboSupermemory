@@ -209,6 +209,50 @@ the *destructive* demotion, recoverable/bounded demotion, and scope-respecting d
 currently ignores scope). Only once belief revision is net-positive on real data does scaling the
 cognitive layer make sense. The vector store itself (OFF arm) retrieves well — that part is solid.
 
+---
+
+# Stage B — Trustworthy detection (mutual-nearest-neighbour) — FLIPPED TO POSITIVE
+
+Stage A showed belief revision over-fires on real text (28k edges, ~20% of all fact pairs) and is
+net-negative. Stage B fixes the *detection*, not the demotion.
+
+**Change (`engine.rs` `check_refinements` / `check_contradictions`).**
+- **Mutual-nearest-neighbour gate** (`nearest_superseding_neighbor`): a supersession fires only if
+  the two memories are *each other's* nearest same-concept neighbour. This is **scale-free** — it
+  does not depend on the absolute cosine threshold (which means different things across embedding
+  models and caused the over-firing), so it is the structural cure.
+- **One edge per new memory** — a new fact supersedes its single best prior fact, not up to 10
+  qualifying neighbours (the main over-firing source).
+- **Scope-respecting** — detection no longer pairs memories across users (fixes a multi-tenancy
+  leak: it previously could demote user A's memory based on user B's).
+- **Bounded demotion** (`SUPERSESSION_DEMOTION_FLOOR = 0.3`) — a memory is never buried below 30%
+  of its score no matter how many times it is flagged, capping the blast radius of any residual
+  false positive.
+
+**Result (LongMemEval test set, ON vs OFF, per-conversation).**
+
+| metric | Stage A | **Stage B** |
+|---|--:|--:|
+| belief edges (147 convs) | refine 23,255 / contra 5,056 | **refine 6,701 / contra 429** (−75%) |
+| knowledge-update hit@1 lift | +0.00 | **+0.23** (0.27 → 0.50) |
+| knowledge-update hit@3 lift | −0.18 | **+0.00** |
+| single-session-user hit@3 lift | −0.20 | −0.05 |
+| single-session-assistant hit@3 lift | (n/a) | +0.12 |
+| verdict | "NO value" | **"MEASURABLY improves knowledge-update"** |
+
+Belief revision is now **net-positive where it matters** (current fact surfaced at rank 1 far more
+often on the belief-revision subset), and the Stage-A collateral damage is roughly halved. Synthetic
+`belief_revision` held +1.00 / false_demotion 0.00 (MNN doesn't break clean pairs); storage suite
+green (74+3); clippy clean.
+
+**Residual (next iteration).** 6,701 refinements is still over-firing — within a single conversation,
+sequential same-topic sentences can be mutually-nearest, so refinement still demotes some legitimate
+facts, leaving minor harm on single-session-user (−0.10 hit@k) and the KU recall tail (−0.09). The
+next tightening is a stronger refinement signal (higher text-overlap floor — a genuine re-statement,
+not just topical similarity — and/or LLM/NLI verification before the destructive demotion), plus the
+gold-standard LLM-judge metric once ollama is available. But the direction is proven: **MNN turned
+the marquee feature from a liability into a measurable win on real data.**
+
 ## Phase 5 — Unify + calibrate fusion ✅ (2026-07-10)
 
 **Problem.** `hydrate_and_fuse` computed the graph boost as `act / max_act` — normalized by the

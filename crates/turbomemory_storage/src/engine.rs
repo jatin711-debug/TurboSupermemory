@@ -42,6 +42,11 @@ const EXACT_FALLBACK_THRESHOLD: usize = 4096;
 
 const WAL_DIR: &str = "wal";
 
+/// A superseded memory's demotion never compounds below this floor, no matter
+/// how many times it is flagged. Bounds the blast radius of any false-positive
+/// supersession so belief revision can never bury a memory below 30% of score.
+const SUPERSESSION_DEMOTION_FLOOR: f32 = 0.3;
+
 /// The main storage engine.
 pub struct StorageEngine {
     config: Arc<StoreConfig>,
@@ -1552,6 +1557,7 @@ impl StorageEngine {
             insert_seq: u64,
             concepts: Vec<String>,
             text: String,
+            scope: Option<String>,
         }
         let mut cands: Vec<Cand> = Vec::new();
         self.meta.for_each_record(|offset, rec| {
@@ -1561,12 +1567,12 @@ impl StorageEngine {
                 insert_seq: rec.insert_seq,
                 concepts: rec.concepts.clone(),
                 text: rec.text.clone(),
+                scope: rec.scope.clone(),
             });
         })?;
         cands.sort_by_key(|c| std::cmp::Reverse(c.insert_seq));
 
         let mut created = 0usize;
-        let mut processed: HashSet<PointOffset> = HashSet::new();
 
         for cand in &cands {
             if created >= max_pairs {
@@ -1580,113 +1586,169 @@ impl StorageEngine {
             let embedding: Vec<f32> = vec.to_vec();
             drop(view);
 
-            // Find near neighbors via ANN.
-            let neighbors = self.search_ann_candidates(&embedding, 10)?;
-            for (nid, _) in neighbors {
-                if created >= max_pairs {
-                    break;
-                }
-                if nid == cand.id {
-                    continue;
-                }
-                // Find the neighbor in our candidate list.
-                let Some(other) = cands.iter().find(|c| c.id == nid) else {
-                    continue;
-                };
-                // The neighbor must be OLDER (lower insert_seq).
-                if other.insert_seq >= cand.insert_seq {
-                    continue;
-                }
-                // They must share at least one concept.
-                let shares_concept = cand.concepts.iter().any(|c| other.concepts.contains(c));
-                if !shares_concept {
-                    continue;
-                }
-                // Verify exact cosine.
-                let view = self.vectors.read_view();
-                let Some(other_vec) = view.get(other.offset) else {
-                    continue;
-                };
-                let sim = cosine_similarity(&embedding, other_vec);
-                drop(view);
-                if sim < threshold {
-                    continue;
-                }
-                // Precision gate: a refinement is a *re-statement* of the same
-                // claim (high text overlap). Reject low-overlap pairs so two
-                // coexisting facts about the same topic (same concept, high
-                // cosine, independent content) are not treated as a refinement
-                // and demoted.
-                if turbomemory_graph::text_jaccard_similarity(&cand.text, &other.text) < text_floor {
-                    continue;
-                }
-                // Create the Refines edge: old (other) → new (cand).
-                let mut graph = self.graph.write();
-                let added = graph.add_refinement(&other.id, &cand.id, 0.8);
-                drop(graph);
-                if added {
-                    created += 1;
-                    // Demote the refined (older) memory so the newer version
-                    // outranks it even under pure cosine. Multiplicative and
-                    // guarded by `added`, so it fires once per distinct
-                    // refinement (idempotent across re-runs and restarts).
-                    let cur = self.meta.demotion_factor(other.offset);
-                    self.meta
-                        .set_demotion_factor(other.offset, cur * demotion_factor);
-                    // Transfer the older memory's unique concepts to the
-                    // newer one, so the refinement is discoverable through
-                    // all the same concept paths.
-                    let unique_concepts: Vec<String> = other
-                        .concepts
-                        .iter()
-                        .filter(|c| !cand.concepts.contains(c))
-                        .cloned()
-                        .collect();
-                    if !unique_concepts.is_empty() {
-                        let mut new_concepts = cand.concepts.clone();
-                        for c in &unique_concepts {
-                            if !new_concepts.contains(c) {
-                                new_concepts.push(c.clone());
-                            }
-                        }
-                        // Update the record's concepts in metadata so the
-                        // transfer persists across restarts.
-                        if let Some(mut rec) = self.meta.get(cand.offset)? {
-                            rec.concepts = new_concepts;
-                            self.meta.put(
-                                cand.offset,
-                                &rec.with_embedding(
-                                    // Re-attach a dummy embedding — put only
-                                    // stores metadata, the embedding lives in
-                                    // VectorStore and is not affected.
-                                    Arc::from(embedding.as_slice()),
-                                ),
-                            )?;
-                        }
-                        // Also update the graph: re-add the new memory with
-                        // the augmented concepts so the new concept edges
-                        // exist. This is idempotent for existing concepts
-                        // (graph dedupes by node id).
-                        let mut graph = self.graph.write();
-                        if let Some(rec) = self.find_record_by_id(&cand.id) {
-                            graph.add_memory_with_importance(
-                                &cand.id,
-                                &rec.text,
-                                &rec.concepts,
-                                rec.importance,
-                            );
-                        }
-                        drop(graph);
+            // Forward: cand's single nearest OLDER same-concept, same-scope
+            // neighbour above the cosine floor. One supersession edge per new
+            // memory (not one per qualifying neighbour, which over-fired).
+            let Some(other_id) = self.nearest_superseding_neighbor(
+                &embedding,
+                &cand.concepts,
+                &cand.scope,
+                &cand.id,
+                cand.insert_seq,
+                false,
+                threshold,
+            )?
+            else {
+                continue;
+            };
+            let Some(other) = cands.iter().find(|c| c.id == other_id) else {
+                continue;
+            };
+
+            // A refinement is a *re-statement* of the same claim: require high
+            // text overlap so two coexisting facts are not treated as one.
+            if turbomemory_graph::text_jaccard_similarity(&cand.text, &other.text) < text_floor {
+                continue;
+            }
+
+            // Mutual-nearest gate: `other`'s nearest NEWER same-concept,
+            // same-scope neighbour must be `cand`. This scale-free check is what
+            // stops the over-firing that made belief revision net-negative on
+            // real conversational data.
+            let view = self.vectors.read_view();
+            let Some(ovec) = view.get(other.offset) else {
+                continue;
+            };
+            let other_emb: Vec<f32> = ovec.to_vec();
+            drop(view);
+            let back = self.nearest_superseding_neighbor(
+                &other_emb,
+                &other.concepts,
+                &other.scope,
+                &other.id,
+                other.insert_seq,
+                true,
+                threshold,
+            )?;
+            if back.as_deref() != Some(cand.id.as_str()) {
+                continue;
+            }
+
+            // Create the single Refines edge (old -> new) + bounded demotion.
+            let mut graph = self.graph.write();
+            let added = graph.add_refinement(&other.id, &cand.id, 0.8);
+            drop(graph);
+            if !added {
+                continue;
+            }
+            created += 1;
+            let cur = self.meta.demotion_factor(other.offset);
+            self.meta.set_demotion_factor(
+                other.offset,
+                (cur * demotion_factor).max(SUPERSESSION_DEMOTION_FLOOR),
+            );
+
+            // Transfer the older memory's unique concepts to the newer one so the
+            // refinement is discoverable through all the same concept paths.
+            let unique_concepts: Vec<String> = other
+                .concepts
+                .iter()
+                .filter(|c| !cand.concepts.contains(c))
+                .cloned()
+                .collect();
+            if !unique_concepts.is_empty() {
+                let mut new_concepts = cand.concepts.clone();
+                for c in &unique_concepts {
+                    if !new_concepts.contains(c) {
+                        new_concepts.push(c.clone());
                     }
                 }
+                if let Some(mut rec) = self.meta.get(cand.offset)? {
+                    rec.concepts = new_concepts;
+                    self.meta.put(
+                        cand.offset,
+                        &rec.with_embedding(Arc::from(embedding.as_slice())),
+                    )?;
+                }
+                let mut graph = self.graph.write();
+                if let Some(rec) = self.find_record_by_id(&cand.id) {
+                    graph.add_memory_with_importance(
+                        &cand.id,
+                        &rec.text,
+                        &rec.concepts,
+                        rec.importance,
+                    );
+                }
+                drop(graph);
             }
-            processed.insert(cand.offset);
         }
 
         if created > 0 {
             self.save_graph()?;
         }
         Ok(created)
+    }
+
+    /// Nearest live neighbour of `embedding` (examined nearest-first via the ANN
+    /// index) that shares a concept with `concepts`, is in the same `scope`, and
+    /// is strictly newer (`newer=true`) or strictly older (`newer=false`) than
+    /// `pivot_seq`, with cosine >= `floor`. `exclude` is skipped. Returns the
+    /// neighbour's id.
+    ///
+    /// This is the core of **mutual-nearest-neighbour** supersession detection:
+    /// a genuine "B supersedes A" pair are each other's nearest same-concept
+    /// neighbour. Requiring mutuality is scale-free — independent of the absolute
+    /// cosine threshold, which means different things across embedding models —
+    /// and is what stops the detector from over-firing on real conversational
+    /// text (where many same-topic sentences clear any fixed threshold, so the
+    /// old "link every older neighbour above threshold" logic demoted ~20% of
+    /// all fact pairs and made belief revision net-negative on LongMemEval).
+    #[allow(clippy::too_many_arguments)]
+    fn nearest_superseding_neighbor(
+        &self,
+        embedding: &[f32],
+        concepts: &[String],
+        scope: &Option<String>,
+        exclude: &str,
+        pivot_seq: u64,
+        newer: bool,
+        floor: f32,
+    ) -> crate::Result<Option<String>> {
+        let neighbors = self.search_ann_candidates(embedding, 10)?;
+        let id_index = self.id_index.read();
+        let view = self.vectors.read_view();
+        for (nid, _) in neighbors {
+            if nid == exclude {
+                continue;
+            }
+            let Some(&off) = id_index.get(nid.as_str()) else {
+                continue;
+            };
+            let Some(rec) = self.meta.get(off)? else {
+                continue;
+            };
+            if newer {
+                if rec.insert_seq <= pivot_seq {
+                    continue;
+                }
+            } else if rec.insert_seq >= pivot_seq {
+                continue;
+            }
+            if rec.scope != *scope {
+                continue;
+            }
+            if !concepts.iter().any(|c| rec.concepts.contains(c)) {
+                continue;
+            }
+            let Some(ov) = view.get(off) else {
+                continue;
+            };
+            if cosine_similarity(embedding, ov) < floor {
+                continue;
+            }
+            return Ok(Some(nid));
+        }
+        Ok(None)
     }
 
     /// Contradiction detection: when a newer memory contradicts an older
@@ -1731,6 +1793,7 @@ impl StorageEngine {
             insert_seq: u64,
             text: String,
             concepts: Vec<String>,
+            scope: Option<String>,
         }
         let mut cands: Vec<Cand> = Vec::new();
         self.meta.for_each_record(|offset, rec| {
@@ -1740,6 +1803,7 @@ impl StorageEngine {
                 insert_seq: rec.insert_seq,
                 text: rec.text.clone(),
                 concepts: rec.concepts.clone(),
+                scope: rec.scope.clone(),
             });
         })?;
         cands.sort_by_key(|c| std::cmp::Reverse(c.insert_seq));
@@ -1756,72 +1820,70 @@ impl StorageEngine {
             let embedding: Vec<f32> = vec.to_vec();
             drop(view);
 
-            let neighbors = self.search_ann_candidates(&embedding, 10)?;
-            for (nid, _) in neighbors {
-                if created >= max_pairs {
-                    break;
-                }
-                if nid == cand.id {
-                    continue;
-                }
-                let Some(other) = cands.iter().find(|c| c.id == nid) else {
-                    continue;
-                };
-                // The neighbor must be OLDER.
-                if other.insert_seq >= cand.insert_seq {
-                    continue;
-                }
-                // They must share at least one concept.
-                let shares_concept = cand.concepts.iter().any(|c| other.concepts.contains(c));
-                if !shares_concept {
-                    continue;
-                }
-                // Verify exact cosine.
-                let view = self.vectors.read_view();
-                let Some(other_vec) = view.get(other.offset) else {
-                    continue;
-                };
-                let sim = cosine_similarity(&embedding, other_vec);
-                drop(view);
-                if sim < threshold {
-                    continue;
-                }
-                // KEY DISTINGUISHER from refinement: the texts must be
-                // DISSIMILAR (low Jaccard). A refinement has high text
-                // overlap (same topic, updated content); a contradiction
-                // has low text overlap (same topic, opposing content).
-                let text_sim = turbomemory_graph::text_jaccard_similarity(&cand.text, &other.text);
-                if text_sim >= text_threshold {
-                    // High text overlap → this is a refinement, not a
-                    // contradiction. Skip (check_refinements handles it).
-                    continue;
-                }
-                // Precision gate: a genuine contradiction OPPOSES the old claim
-                // (explicit negation/contrast cue). Two coexisting facts about
-                // the same topic also have low overlap but do NOT oppose — so
-                // without an opposition marker we do not create the edge (this
-                // is what stops belief revision from demoting coexisting facts).
-                if require_opposition && !turbomemory_graph::has_opposition_marker(&cand.text) {
-                    continue;
-                }
-                // Create the Contradicts edge: old (other) → new (cand).
-                // This also weakens the old memory's edges.
-                let mut graph = self.graph.write();
-                let added = graph.add_contradiction(&other.id, &cand.id, 0.8, weaken_factor);
-                drop(graph);
-                if added {
-                    created += 1;
-                    // Demote the superseded memory's retrieval score so the
-                    // newer, contradicting belief outranks it even under pure
-                    // cosine. Multiplicative against any existing demotion so
-                    // repeated supersession compounds. Guarded by `added`, so
-                    // this fires once per distinct contradiction (idempotent
-                    // across re-runs and restarts).
-                    let cur = self.meta.demotion_factor(other.offset);
-                    self.meta
-                        .set_demotion_factor(other.offset, cur * demotion_factor);
-                }
+            // Forward: cand's single nearest OLDER same-concept, same-scope
+            // neighbour above the cosine floor (one edge per new memory).
+            let Some(other_id) = self.nearest_superseding_neighbor(
+                &embedding,
+                &cand.concepts,
+                &cand.scope,
+                &cand.id,
+                cand.insert_seq,
+                false,
+                threshold,
+            )?
+            else {
+                continue;
+            };
+            let Some(other) = cands.iter().find(|c| c.id == other_id) else {
+                continue;
+            };
+
+            // KEY DISTINGUISHER from refinement: a contradiction has LOW text
+            // overlap (same topic, opposing content); high overlap is a
+            // refinement (handled by check_refinements).
+            let text_sim = turbomemory_graph::text_jaccard_similarity(&cand.text, &other.text);
+            if text_sim >= text_threshold {
+                continue;
             }
+            // ...and an explicit opposition/negation marker in the newer text.
+            if require_opposition && !turbomemory_graph::has_opposition_marker(&cand.text) {
+                continue;
+            }
+
+            // Mutual-nearest gate (see check_refinements): `other`'s nearest
+            // NEWER same-concept, same-scope neighbour must be `cand`.
+            let view = self.vectors.read_view();
+            let Some(ovec) = view.get(other.offset) else {
+                continue;
+            };
+            let other_emb: Vec<f32> = ovec.to_vec();
+            drop(view);
+            let back = self.nearest_superseding_neighbor(
+                &other_emb,
+                &other.concepts,
+                &other.scope,
+                &other.id,
+                other.insert_seq,
+                true,
+                threshold,
+            )?;
+            if back.as_deref() != Some(cand.id.as_str()) {
+                continue;
+            }
+
+            // Create the single Contradicts edge (old -> new) + bounded demotion.
+            let mut graph = self.graph.write();
+            let added = graph.add_contradiction(&other.id, &cand.id, 0.8, weaken_factor);
+            drop(graph);
+            if !added {
+                continue;
+            }
+            created += 1;
+            let cur = self.meta.demotion_factor(other.offset);
+            self.meta.set_demotion_factor(
+                other.offset,
+                (cur * demotion_factor).max(SUPERSESSION_DEMOTION_FLOOR),
+            );
         }
 
         if created > 0 {
