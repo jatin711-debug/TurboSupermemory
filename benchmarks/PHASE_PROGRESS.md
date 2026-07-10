@@ -121,9 +121,43 @@ Reinforcement shows no feature-attributable lift (CogON==CogOFF everywhere). Bui
 where a rehearsed memory must outrank a cosine-nearer non-rehearsed one; keep/tune only if it shows
 lift.
 
-## Phase 5 — Unify + calibrate fusion (next; unblocks Phase 3 surfacing)
+## Phase 5 — Unify + calibrate fusion ✅ (2026-07-10)
 
-Replace the result-set-relative `delta / max_delta` normalization with a bounded **absolute**
-graph boost so cosine-far, graph-reached memories (abstraction targets) surface on their own delta
-magnitude, and empty-query temporal displacement stops burying true neighbors. Re-validate all
-evals + recall.
+**Problem.** `hydrate_and_fuse` computed the graph boost as `act / max_act` — normalized by the
+result-set maximum. A weak incidental signal (a temporal successor on an empty query) got inflated
+to full strength when every delta was small (empty-query cognitive recall 1.2% → 0.0%), while a
+genuine far-cosine signal got crushed when some other candidate had a large delta.
+
+**Change (`engine.rs::hydrate_and_fuse`).** Replaced the result-set-relative normalization with an
+**absolute, saturating** transform:
+
+```
+final = cos + (1 - alpha) * act / (1 + act)      # was: cos + (1 - alpha) * act/max_act
+```
+
+The boost now depends only on the candidate's OWN graph signal, bounded in `[0, 1)`, so it neither
+inflates weak signals nor crushes genuine ones. Demotion (belief revision) is unchanged.
+
+**Result.**
+
+| metric | before | after |
+|---|--:|--:|
+| ANN Recall@5 (floor) | 100% | **100%** |
+| Cognitive('memory') Recall@5 | 99.8% | **100%** |
+| Cognitive('') empty-query Recall@5 | 0.0% | **100%** |
+| Belief revision (contra / refine, 100&1000) | 1.00 / 0.96–1.00 | **1.00 / 0.96–1.00** (false_dem 0.00) |
+| Cognitive benchmark scale / toy | 3/4 · 2/4 | 3/4 · **1/4** |
+
+Storage suite **74 passed**, clippy clean. The empty-query displacement is fully fixed and the
+fusion is now interpretable. The toy 2/4→1/4 is the loss of the abstraction *non-attributable* win
+(the old max-normalization was artificially inflating a far-cosine candidate's boost); the one
+*feature-attributable* win (contradiction, toy) is preserved, and scale is unchanged.
+
+**Crystallized abstraction root cause.** With correct (absolute) fusion, the abstraction target
+still doesn't surface because the `cognitive_benchmark` scenario builds vectors with `make_close_vec`
+— which, like the pre-Phase-1 belief geometry, yields **near-orthogonal** vectors in 768-dim (seeds
+at cosine ~0.1 to the query). Graph propagation is scaled by that weak seed activation, so every
+propagated delta (including the abstraction bridge) is negligible. The fix is the **same
+controlled-cosine geometry** Phase 1 applied to belief — the abstraction mechanism is wired and
+proven in isolation (unit test); demonstrating its lift needs the scenario geometry fixed and seed
+propagation to carry lexical/seed strength (Phase 4/abstraction follow-up).

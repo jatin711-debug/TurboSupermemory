@@ -903,7 +903,13 @@ impl StorageEngine {
     /// Hydrate augmenter results with embeddings and additively fuse the graph
     /// boost with cosine similarity to produce the final ranking.
     ///
-    /// `final_score = cosine + (1 - alpha) * normalized_graph_delta`
+    /// `final_score = cosine + (1 - alpha) * saturating_graph_delta`, where
+    /// `saturating_graph_delta = act / (1 + act)` — an **absolute** transform of
+    /// the candidate's own graph signal, NOT a result-set-relative
+    /// `act / max_act`. The old max normalization shrank a cosine-far but
+    /// graph-reached memory's boost below the noise whenever some other
+    /// candidate had a large delta (and inflated a weak incidental signal when
+    /// every delta was small). The saturating form fixes both.
     ///
     /// `results` carries the augmenter's **pure graph delta** (>= 0, cosine is
     /// NOT folded in). The boost is additive, so it can re-order candidates and
@@ -921,12 +927,6 @@ impl StorageEngine {
             return Ok(Vec::new());
         }
 
-        // Normalize graph activation scores to [0, 1] for boosting
-        let max_act = results
-            .iter()
-            .map(|(_, a)| *a)
-            .fold(0.0f32, f32::max)
-            .max(1e-10);
         let alpha = self.config.cognitive_alpha.clamp(0.0, 1.0);
 
         let mut hydrated: Vec<(String, f32)> = results
@@ -934,14 +934,17 @@ impl StorageEngine {
             .filter_map(|(id, act)| {
                 self.find_record_by_id(&id).map(|rec| {
                     let cos = cosine_similarity(query_embedding, rec.embedding_f32());
-                    let norm_act = act / max_act;
-                    // Hybrid scoring: cosine + graph boost.
-                    // `cognitive_alpha` is the sole blend control:
-                    //   final = cos + (1 - alpha) * normalized_graph_signal
-                    // At alpha = 1.0 the ranking is pure cosine (graph only
-                    // influences which candidates exist). At lower alpha the
-                    // graph can re-rank via an additive, bounded boost.
-                    let graph_boost = (1.0 - alpha) * norm_act;
+                    // Absolute, saturating graph boost: `act / (1 + act)` depends
+                    // on the candidate's OWN graph signal, not the result-set
+                    // maximum. This lets a cosine-far but graph-reached memory
+                    // (e.g. an abstraction target) surface on its own delta, and
+                    // stops a weak incidental signal (e.g. a temporal successor on
+                    // an empty query) from being inflated to full strength just
+                    // because every delta in the set is small.
+                    //   final = cos + (1 - alpha) * act/(1+act)
+                    // At alpha = 1.0 ranking is pure cosine (graph only decides
+                    // which candidates exist); lower alpha gives the graph a vote.
+                    let graph_boost = (1.0 - alpha) * (act / (1.0 + act));
                     let fused = cos + graph_boost;
                     // Supersession demotion: a memory superseded by a newer one
                     // (Contradicts/Refines edge created during consolidation)
