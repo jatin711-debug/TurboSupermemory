@@ -115,11 +115,40 @@ bridge — hub suppression (concept evolution, C3) is the robustness follow-up.
 
 ---
 
-## Phase 4 — Isolate reinforcement lift (next)
+## Phase 4 — Isolate reinforcement lift ✅ measured (2026-07-10)
 
-Reinforcement shows no feature-attributable lift (CogON==CogOFF everywhere). Build an isolated eval
-where a rehearsed memory must outrank a cosine-nearer non-rehearsed one; keep/tune only if it shows
-lift.
+**Eval (`reinforcement_eval.py`, new).** Controlled-cosine geometry: per probe, an `anchor` ANN
+seed plus **three sibling memories** at equal low cosine to the query (all non-ANN, reachable only
+via `anchor → concept → sibling`). The siblings are symmetric, so cold retrieval orders them purely
+by insertion tie-break; we rehearse the **last-inserted** sibling (the cold tie-break *loser*) so
+any lift is attributable to reinforcement, not geometry. Metric: `P(rehearsed sibling outranks its
+2 cold siblings)`; `lift = CogON(rehearsed) − CogOFF(not rehearsed)`.
+
+**Result: no isolated lift.**
+
+| distractors | CogOFF | CogON | lift |
+|--:|--:|--:|--:|
+| 100 | 0.25 | 0.29 | +0.04 |
+| 1000 | 0.46 | 0.38 | −0.08 |
+
+Mean lift **−0.02** — noise around zero. (Two earlier eval designs were discarded: equal-cosine
+symmetric pairs gave a deterministic *tie-break* confound, CogOFF=CogON=1.00; a single low-cosine
+memory was surfaced into the top-8 by base concept-expansion regardless of rehearsal.)
+
+**Finding.** The edge-reinforcement mechanism works at the graph level (unit tests confirm
+`reinforce` strengthens edges), but it is **decoupled from retrieval ranking**: (a) the augmenter's
+graph boost only surfaces *non-ANN* candidates — reinforcing an ANN candidate's concept edge does
+not re-rank it (the normal pool skips ANN hits); (b) base concept expansion already surfaces a
+reachable memory whether or not it is rehearsed, subsuming reinforcement's contribution. This
+rigorously confirms the BASELINE observation (CogON==CogOFF) with an isolated eval.
+
+**Interpretation & next step.** Reinforcement's real role is the **retain/forget loop** (edge decay
++ importance feedback via `recompute_importance`), an axis distinct from direct ranking — the right
+way to demonstrate it is a retention eval (rehearsed memory persists while a never-accessed one
+decays/evicts), not a ranking eval. Making reinforcement *directly* re-rank would need an explicit
+access-salience term in fusion (a positive analogue of the supersession-demotion factor); that is a
+new, separately-validated feature, deliberately **not** bolted on here to avoid destabilizing the
+validated belief/recall results.
 
 ## Phase 5 — Unify + calibrate fusion ✅ (2026-07-10)
 
