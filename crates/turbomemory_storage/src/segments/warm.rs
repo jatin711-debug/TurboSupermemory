@@ -314,6 +314,7 @@ mod tests {
                 tier: Tier::Warm,
                 payload: None,
                 scope: None,
+                source_role: None,
             },
         )
     }
@@ -407,6 +408,7 @@ mod tests {
                         tier: Tier::Warm,
                         payload: None,
                         scope: None,
+                        source_role: None,
                     },
                 )
             })

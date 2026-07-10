@@ -297,8 +297,11 @@ impl SpreadingActivation {
                                     if let Some(mid) = self.graph.node_external_id(cedge.target) {
                                         let key = format!("mem:{mid}");
                                         if !ann_candidates.contains(&key) {
-                                            let signal =
-                                                seed_score * concept_w * cedge.weight * decay * decay;
+                                            let signal = seed_score
+                                                * concept_w
+                                                * cedge.weight
+                                                * decay
+                                                * decay;
                                             *normal.entry(key).or_insert(0.0) += signal;
                                         }
                                     }
@@ -576,7 +579,10 @@ mod tests {
         for i in 0..3 {
             graph.add_memory(&format!("co{i}"), "co occur", &["a".into(), "b".into()]);
         }
-        assert!(graph.build_abstractions(3) >= 2, "abstraction parent should form");
+        assert!(
+            graph.build_abstractions(3) >= 2,
+            "abstraction parent should form"
+        );
         // Anchor memory tagged only with the query concept `a` (the ANN seed).
         graph.add_memory("anchor", "anchor note", &["a".into()]);
         // Target tagged only with the SIBLING concept `b`; not an ANN seed and

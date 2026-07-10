@@ -890,6 +890,7 @@ impl SegmentHolder {
                     tier: Tier::Warm,
                     payload: None,
                     scope: None,
+                    source_role: None,
                 };
                 records.push((offset, record));
             }
@@ -1093,6 +1094,7 @@ mod tests {
                 tier: Tier::Hot,
                 payload: None,
                 scope: None,
+                source_role: None,
             },
         )
     }

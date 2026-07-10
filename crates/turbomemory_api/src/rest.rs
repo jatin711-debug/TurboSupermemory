@@ -26,6 +26,8 @@ struct InsertReq {
     payload: Option<String>,
     #[serde(default)]
     scope: Option<String>,
+    #[serde(default)]
+    source_role: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -46,6 +48,8 @@ struct InsertBatchReq {
     payloads: Vec<String>,
     #[serde(default)]
     scopes: Vec<String>,
+    #[serde(default)]
+    source_roles: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -76,6 +80,8 @@ struct UpdateReq {
     payload: Option<String>,
     #[serde(default)]
     scope: Option<String>,
+    #[serde(default)]
+    source_role: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -149,7 +155,7 @@ async fn insert(
     State(service): State<MemoryService>,
     Json(req): Json<InsertReq>,
 ) -> Result<Json<InsertResp>, ApiError> {
-    let success = service.engine().insert_with_payload(
+    let success = service.engine().insert_with_payload_role(
         &req.id,
         &req.text,
         &req.embedding,
@@ -157,6 +163,7 @@ async fn insert(
         &req.concepts,
         req.payload,
         req.scope,
+        req.source_role,
     )?;
     Ok(Json(InsertResp { success }))
 }
@@ -175,8 +182,13 @@ async fn insert_batch(
     } else {
         req.scopes.into_iter().map(Some).collect()
     };
+    let source_roles: Vec<Option<String>> = if req.source_roles.is_empty() {
+        Vec::new()
+    } else {
+        req.source_roles.into_iter().map(Some).collect()
+    };
     let emb_refs: Vec<&[f32]> = req.embeddings.iter().map(|v| v.as_slice()).collect();
-    let count = service.engine().insert_batch_with_payload(
+    let count = service.engine().insert_batch_with_payload_role(
         &req.ids,
         &req.texts,
         &emb_refs,
@@ -184,6 +196,7 @@ async fn insert_batch(
         &req.concepts,
         &payloads,
         &scopes,
+        &source_roles,
     )?;
     Ok(Json(InsertBatchResp { count }))
 }
@@ -200,7 +213,7 @@ async fn update(
     State(service): State<MemoryService>,
     Json(req): Json<UpdateReq>,
 ) -> Result<Json<UpdateResp>, ApiError> {
-    let success = service.engine().update_with_payload(
+    let success = service.engine().update_with_payload_role(
         &req.id,
         &req.text,
         &req.embedding,
@@ -208,6 +221,7 @@ async fn update(
         &req.concepts,
         req.payload,
         req.scope,
+        req.source_role,
     )?;
     Ok(Json(UpdateResp { success }))
 }

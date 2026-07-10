@@ -109,6 +109,10 @@ class TSMAdapter:
         dimension: Optional[int] = None,
         model=None,  # Preloaded embedding model to share across adapters
         store_roles=None,  # e.g. {"user"} to store only user facts; None = all roles
+        belief_source_roles=None,  # e.g. ["user"]: store ALL roles but role-scope
+                                   # belief detection in the engine (mode b). Every
+                                   # memory stays retrievable; only supersession is
+                                   # restricted to these roles.
         **kwargs,
     ):
         """Initialize the TSM adapter.
@@ -126,7 +130,11 @@ class TSMAdapter:
         self.cognitive_features = cognitive_features
         # Optional role filter: a memory of USER facts should not ingest the
         # assistant's own (verbose, repetitive) responses as revisable "facts".
+        # (mode a: drop non-matching messages entirely.)
         self.store_roles = set(store_roles) if store_roles is not None else None
+        # mode b: store every role but restrict belief-revision detection to
+        # these roles inside the engine (first-class role-aware memory).
+        self.belief_source_roles = list(belief_source_roles) if belief_source_roles else None
         # Stop-word set used by _extract_concepts.
         self._stop_words = _STOP_WORDS
 
@@ -226,6 +234,11 @@ class TSMAdapter:
         if not belief_revision:
             config["refinement_cosine_threshold"] = None
             config["contradiction_cosine_threshold"] = None
+        # Engine-level role scoping for belief revision (mode b). The engine
+        # then only lets memories whose source_role is in this list create or
+        # receive supersession edges.
+        if self.belief_source_roles:
+            config["belief_source_roles"] = self.belief_source_roles
         self.engine = self.tsm.MemoryEngine(**config)
         logger.info("TSM engine initialized (cognitive=%s, belief_revision=%s)",
                     cognitive_features, belief_revision)
@@ -372,6 +385,7 @@ class TSMAdapter:
                         "original_message": meta['content'],
                     }),
                     scope=user_id,
+                    source_role=meta['role'],
                 )
         insert_time = (time.perf_counter() - insert_start) * 1000
         total_time = (time.perf_counter() - total_start) * 1000

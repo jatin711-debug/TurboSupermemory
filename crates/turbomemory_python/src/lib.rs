@@ -246,6 +246,7 @@ impl PyMemoryEngine {
         concept_merge_overlap_threshold=None,
         concept_hub_degree_fraction=None,
         concept_evolution_max_pairs_per_cycle=None,
+        belief_source_roles=None,
         seed_hops_from=None,
         expansion_max_candidates=None
     ))]
@@ -298,6 +299,7 @@ impl PyMemoryEngine {
         concept_merge_overlap_threshold: Option<f32>,
         concept_hub_degree_fraction: Option<f32>,
         concept_evolution_max_pairs_per_cycle: Option<usize>,
+        belief_source_roles: Option<Vec<String>>,
         seed_hops_from: Option<usize>,
         expansion_max_candidates: Option<usize>,
     ) -> PyResult<Self> {
@@ -515,11 +517,17 @@ impl PyMemoryEngine {
         if let Some(mp) = concept_evolution_max_pairs_per_cycle {
             config.tier.concept_evolution_max_pairs_per_cycle = mp;
         }
+        // Belief-revision role scoping: an empty list is treated as "no filter"
+        // (role-blind) so callers can pass [] to mean the default explicitly.
+        if let Some(roles) = belief_source_roles {
+            config.tier.belief_source_roles = if roles.is_empty() { None } else { Some(roles) };
+        }
 
         let inner = StorageEngine::open(db_path, config).map_err(storage_err)?;
         Ok(Self { inner })
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         id,
@@ -528,7 +536,8 @@ impl PyMemoryEngine {
         importance_score,
         concepts,
         payload=None,
-        scope=None
+        scope=None,
+        source_role=None
     ))]
     fn insert(
         &self,
@@ -540,13 +549,23 @@ impl PyMemoryEngine {
         concepts: Vec<String>,
         payload: Option<String>,
         scope: Option<String>,
+        source_role: Option<String>,
     ) -> PyResult<bool> {
         let emb_input = extract_f32_input(embedding)?;
         let emb = emb_input.as_slice();
         let payload = parse_payload(payload)?;
         py.allow_threads(|| {
             self.inner
-                .insert_with_payload(id, text, emb, importance_score, &concepts, payload, scope)
+                .insert_with_payload_role(
+                    id,
+                    text,
+                    emb,
+                    importance_score,
+                    &concepts,
+                    payload,
+                    scope,
+                    source_role,
+                )
                 .map_err(storage_err)
         })
     }
@@ -559,7 +578,8 @@ impl PyMemoryEngine {
         scores,
         concepts,
         payloads=None,
-        scopes=None
+        scopes=None,
+        source_roles=None
     ))]
     fn insert_batch(
         &self,
@@ -571,6 +591,7 @@ impl PyMemoryEngine {
         concepts: Vec<Vec<String>>,
         payloads: Option<Vec<String>>,
         scopes: Option<Vec<String>>,
+        source_roles: Option<Vec<String>>,
     ) -> PyResult<usize> {
         let matrix = extract_f32_matrix(embeddings)?;
         let rows = matrix.rows();
@@ -585,10 +606,21 @@ impl PyMemoryEngine {
             Some(list) => list.into_iter().map(Some).collect(),
             None => Vec::new(),
         };
+        let source_roles: Vec<Option<String>> = match source_roles {
+            Some(list) => list.into_iter().map(Some).collect(),
+            None => Vec::new(),
+        };
         py.allow_threads(|| {
             self.inner
-                .insert_batch_with_payload(
-                    &ids, &texts, &rows, &scores, &concepts, &payloads, &scopes,
+                .insert_batch_with_payload_role(
+                    &ids,
+                    &texts,
+                    &rows,
+                    &scores,
+                    &concepts,
+                    &payloads,
+                    &scopes,
+                    &source_roles,
                 )
                 .map_err(storage_err)
         })
@@ -856,7 +888,7 @@ impl PyMemoryEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (id, text, embedding, importance_score, concepts, payload=None, scope=None))]
+    #[pyo3(signature = (id, text, embedding, importance_score, concepts, payload=None, scope=None, source_role=None))]
     fn update(
         &self,
         py: Python<'_>,
@@ -867,13 +899,23 @@ impl PyMemoryEngine {
         concepts: Vec<String>,
         payload: Option<String>,
         scope: Option<String>,
+        source_role: Option<String>,
     ) -> PyResult<bool> {
         let emb_input = extract_f32_input(embedding)?;
         let emb = emb_input.as_slice();
         let payload = parse_payload(payload)?;
         py.allow_threads(|| {
             self.inner
-                .update_with_payload(id, text, emb, importance_score, &concepts, payload, scope)
+                .update_with_payload_role(
+                    id,
+                    text,
+                    emb,
+                    importance_score,
+                    &concepts,
+                    payload,
+                    scope,
+                    source_role,
+                )
                 .map_err(storage_err)
         })
     }

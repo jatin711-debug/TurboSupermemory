@@ -30,6 +30,7 @@ message InsertRequest {
   repeated string concepts = 5;
   optional string payload = 6;
   optional string scope = 7;
+  optional string source_role = 8;
 }
 
 message InsertResponse {
@@ -44,6 +45,7 @@ message InsertBatchRequest {
   repeated StringList concepts = 5;
   repeated string payloads = 6;
   repeated string scopes = 7;
+  repeated string source_roles = 8;
 }
 
 message Embedding {
@@ -74,6 +76,7 @@ message UpdateRequest {
   repeated string concepts = 5;
   optional string payload = 6;
   optional string scope = 7;
+  optional string source_role = 8;
 }
 
 message UpdateResponse {

@@ -28,7 +28,7 @@ impl Memory for MemoryService {
         let req = request.into_inner();
         let success = self
             .engine()
-            .insert_with_payload(
+            .insert_with_payload_role(
                 &req.id,
                 &req.text,
                 &req.embedding,
@@ -36,6 +36,7 @@ impl Memory for MemoryService {
                 &req.concepts,
                 req.payload,
                 req.scope,
+                req.source_role,
             )
             .map_err(ApiError::from)?;
         Ok(Response::new(InsertResponse { success }))
@@ -61,9 +62,14 @@ impl Memory for MemoryService {
         } else {
             req.scopes.into_iter().map(Some).collect()
         };
+        let source_roles: Vec<Option<String>> = if req.source_roles.is_empty() {
+            Vec::new()
+        } else {
+            req.source_roles.into_iter().map(Some).collect()
+        };
         let count = self
             .engine()
-            .insert_batch_with_payload(
+            .insert_batch_with_payload_role(
                 &ids,
                 &texts,
                 &emb_refs,
@@ -71,6 +77,7 @@ impl Memory for MemoryService {
                 &concepts,
                 &payloads,
                 &scopes,
+                &source_roles,
             )
             .map_err(ApiError::from)?;
         Ok(Response::new(InsertBatchResponse {
@@ -97,7 +104,7 @@ impl Memory for MemoryService {
         let req = request.into_inner();
         let success = self
             .engine()
-            .update_with_payload(
+            .update_with_payload_role(
                 &req.id,
                 &req.text,
                 &req.embedding,
@@ -105,6 +112,7 @@ impl Memory for MemoryService {
                 &req.concepts,
                 req.payload,
                 req.scope,
+                req.source_role,
             )
             .map_err(ApiError::from)?;
         Ok(Response::new(UpdateResponse { success }))

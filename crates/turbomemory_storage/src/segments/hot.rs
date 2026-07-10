@@ -219,6 +219,7 @@ mod tests {
             tier: Tier::Hot,
             payload: None,
             scope: None,
+            source_role: None,
         }
     }
 

@@ -72,7 +72,8 @@ def hit_at(answer, texts, k):
     return kts[0] in joined
 
 
-def run_arm(belief_on, conversations, model_name, top_k, extractor, shared_model=None, store_roles=None):
+def run_arm(belief_on, conversations, model_name, top_k, extractor, shared_model=None,
+            store_roles=None, belief_source_roles=None):
     """One fresh engine PER conversation (belief detection stays within a user,
     matching a properly-scoped store and isolating the mechanism). The embedding
     model is loaded once and shared across all engines."""
@@ -83,7 +84,7 @@ def run_arm(belief_on, conversations, model_name, top_k, extractor, shared_model
         db_path = tempfile.mkdtemp(prefix="tsm_lme_")
         adapter = TSMAdapter(db_path=db_path, embedding_model=model_name, extractor=extractor,
                              cognitive_features=True, belief_revision=belief_on, model=model,
-                             store_roles=store_roles)
+                             store_roles=store_roles, belief_source_roles=belief_source_roles)
         model = adapter.model  # reuse the loaded model for the next conversation
         try:
             adapter.add(conv.messages, user_id=conv.conv_id)
@@ -115,10 +116,16 @@ def main():
     ap.add_argument("--model", type=str, default="sentence-transformers/all-MiniLM-L6-v2")
     ap.add_argument("--extractor", type=str, default="mock", choices=["mock", "ollama"])
     ap.add_argument("--user-only", action="store_true",
-                    help="store only USER messages as facts (belief revision should operate on the "
-                         "user's evolving statements, not the assistant's verbose responses)")
+                    help="MODE A: store only USER messages as facts (drop assistant turns entirely). "
+                         "belief revision should operate on the user's evolving statements, not the "
+                         "assistant's verbose responses)")
+    ap.add_argument("--role-filtered", action="store_true",
+                    help="MODE B: store ALL roles (every memory stays retrievable) but restrict "
+                         "belief-revision detection to user facts via the engine's first-class "
+                         "belief_source_roles. This is the productized form of --user-only.")
     args = ap.parse_args()
     store_roles = {"user"} if args.user_only else None
+    belief_source_roles = ["user"] if args.role_filtered else None
 
     convs = load_longmemeval(args.data_dir)
     if args.limit:
@@ -132,12 +139,14 @@ def main():
                  "huggingface_hub", "sentence_transformers", "transformers"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
-    logger.info("Running OFF arm (belief revision disabled)... store_roles=%s", store_roles)
+    logger.info("Running OFF arm (belief revision disabled)... store_roles=%s belief_source_roles=%s",
+                store_roles, belief_source_roles)
     off, off_edges, model = run_arm(False, convs, args.model, args.top_k, args.extractor,
-                                    store_roles=store_roles)
+                                    store_roles=store_roles, belief_source_roles=belief_source_roles)
     logger.info("Running ON arm (belief revision enabled)...")
     on, on_edges, _ = run_arm(True, convs, args.model, args.top_k, args.extractor,
-                              shared_model=model, store_roles=store_roles)
+                              shared_model=model, store_roles=store_roles,
+                              belief_source_roles=belief_source_roles)
 
     logger.info("Belief edges built — OFF: %s   ON: %s", off_edges, on_edges)
     logger.info("=" * 100)

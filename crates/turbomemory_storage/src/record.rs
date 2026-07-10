@@ -33,6 +33,14 @@ pub struct Record {
     /// a shared knowledge base.
     #[serde(default)]
     pub scope: Option<String>,
+    /// Optional provenance role of the memory (e.g. `"user"`, `"assistant"`,
+    /// `"tool"`). `None` means unattributed. Unlike `scope`, this never filters
+    /// retrieval — every role stays fully searchable. It gates only belief
+    /// revision: when `TierConfig::belief_source_roles` is set, supersession
+    /// detection considers memories whose role is in that list, so the
+    /// assistant's own chatter can never demote (or be demoted by) a user fact.
+    #[serde(default)]
+    pub source_role: Option<String>,
 }
 
 impl Record {
@@ -67,6 +75,9 @@ pub struct MetaRecord {
     /// Optional agent/memory scope. `None` means global/shared memory.
     #[serde(default)]
     pub scope: Option<String>,
+    /// Optional provenance role (`"user"`, `"assistant"`, ...). See `Record`.
+    #[serde(default)]
+    pub source_role: Option<String>,
 }
 
 impl MetaRecord {
@@ -85,6 +96,7 @@ impl MetaRecord {
             tier: self.tier,
             payload: self.payload.clone(),
             scope: self.scope.clone(),
+            source_role: self.source_role.clone(),
         }
     }
 }
@@ -103,6 +115,7 @@ impl From<&Record> for MetaRecord {
             tier: rec.tier,
             payload: rec.payload.clone(),
             scope: rec.scope.clone(),
+            source_role: rec.source_role.clone(),
         }
     }
 }

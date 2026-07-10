@@ -291,6 +291,16 @@ pub struct TierConfig {
     /// Maximum number of concept-merge operations per consolidation cycle.
     /// Default 1024.
     pub concept_evolution_max_pairs_per_cycle: usize,
+    /// Restrict belief-revision (refinement + contradiction) detection to
+    /// memories whose `source_role` is in this list. `None` (default) means
+    /// role-blind detection — every memory can supersede or be superseded,
+    /// the legacy behavior. `Some(["user"])` makes supersession consider only
+    /// user-authored facts, so the assistant's own verbose/bulleted responses
+    /// can never demote (or be demoted by) a user memory — while all roles
+    /// remain fully retrievable. This is the engine-level form of the
+    /// eval-only `store_roles` filter that eliminated belief-revision
+    /// collateral damage on real conversational data (LongMemEval Stage B.2).
+    pub belief_source_roles: Option<Vec<String>>,
 }
 
 impl TierConfig {
@@ -364,6 +374,9 @@ impl TierConfig {
         concept_merge_overlap_threshold: 0.7,
         concept_hub_degree_fraction: 0.1,
         concept_evolution_max_pairs_per_cycle: 1024,
+        // Role-blind belief revision by default (legacy behavior). Set to
+        // e.g. Some(vec!["user".into()]) to scope supersession to user facts.
+        belief_source_roles: None,
     };
 
     /// Recommended thresholds for a given vector dimension.

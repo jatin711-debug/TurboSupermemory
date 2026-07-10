@@ -389,6 +389,26 @@ impl StorageEngine {
         payload: Option<String>,
         scope: Option<String>,
     ) -> crate::Result<bool> {
+        self.insert_with_payload_role(
+            id, text, embedding, importance, concepts, payload, scope, None,
+        )
+    }
+
+    /// Insert with an explicit provenance `source_role` (`"user"`,
+    /// `"assistant"`, ...). The role never affects retrieval; it only gates
+    /// belief-revision detection when `TierConfig::belief_source_roles` is set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_with_payload_role(
+        &self,
+        id: &str,
+        text: &str,
+        embedding: &[f32],
+        importance: f32,
+        concepts: &[String],
+        payload: Option<String>,
+        scope: Option<String>,
+        source_role: Option<String>,
+    ) -> crate::Result<bool> {
         validate_dimension(embedding, self.config.dimension)?;
         if self.id_index.read().contains_key(id) {
             return Err(StorageError::DuplicateId(id.to_string()));
@@ -416,6 +436,7 @@ impl StorageEngine {
             tier: crate::config::Tier::Hot,
             payload,
             scope,
+            source_role,
         };
 
         // 1. Persist the embedding to the mmap-backed vector store first.
@@ -458,6 +479,33 @@ impl StorageEngine {
         payloads: &[Option<String>],
         scopes: &[Option<String>],
     ) -> crate::Result<usize> {
+        self.insert_batch_with_payload_role(
+            ids,
+            texts,
+            embeddings,
+            importances,
+            concepts,
+            payloads,
+            scopes,
+            &[],
+        )
+    }
+
+    /// Batch insert with per-record provenance `source_roles` (parallel to
+    /// `ids`). An empty slice means every record is unattributed. See
+    /// `insert_with_payload_role`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_batch_with_payload_role(
+        &self,
+        ids: &[String],
+        texts: &[String],
+        embeddings: &[&[f32]],
+        importances: &[f32],
+        concepts: &[Vec<String>],
+        payloads: &[Option<String>],
+        scopes: &[Option<String>],
+        source_roles: &[Option<String>],
+    ) -> crate::Result<usize> {
         let n = ids.len();
         if n == 0 {
             return Ok(0);
@@ -468,6 +516,7 @@ impl StorageEngine {
             || concepts.len() < n
             || (!payloads.is_empty() && payloads.len() < n)
             || (!scopes.is_empty() && scopes.len() < n)
+            || (!source_roles.is_empty() && source_roles.len() < n)
         {
             return Err(StorageError::InvalidArgument(
                 "batch arrays have mismatched lengths".into(),
@@ -512,6 +561,11 @@ impl StorageEngine {
             } else {
                 scopes[i].clone()
             };
+            let source_role = if source_roles.is_empty() {
+                None
+            } else {
+                source_roles[i].clone()
+            };
             // Augment caller-supplied concepts with auto-extracted ones.
             let extractor_config = self.config.tier.extractor_config();
             let concepts = merge_concepts_with_config(
@@ -533,6 +587,7 @@ impl StorageEngine {
                 tier: crate::config::Tier::Hot,
                 payload,
                 scope,
+                source_role,
             };
             records.push((offset, record));
         }
@@ -652,11 +707,39 @@ impl StorageEngine {
         payload: Option<String>,
         scope: Option<String>,
     ) -> crate::Result<bool> {
+        self.update_with_payload_role(
+            id, text, embedding, importance, concepts, payload, scope, None,
+        )
+    }
+
+    /// Update with an explicit provenance `source_role`. See
+    /// `insert_with_payload_role`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_with_payload_role(
+        &self,
+        id: &str,
+        text: &str,
+        embedding: &[f32],
+        importance: f32,
+        concepts: &[String],
+        payload: Option<String>,
+        scope: Option<String>,
+        source_role: Option<String>,
+    ) -> crate::Result<bool> {
         if !self.id_index.read().contains_key(id) {
             return Ok(false);
         }
         self.delete_by_id(id)?;
-        self.insert_with_payload(id, text, embedding, importance, concepts, payload, scope)?;
+        self.insert_with_payload_role(
+            id,
+            text,
+            embedding,
+            importance,
+            concepts,
+            payload,
+            scope,
+            source_role,
+        )?;
         Ok(true)
     }
 
@@ -1546,6 +1629,7 @@ impl StorageEngine {
         }
         let demotion_factor = self.config.tier.supersession_demotion_factor;
         let text_floor = self.config.tier.refinement_text_threshold;
+        let allowed_roles = self.config.tier.belief_source_roles.as_deref();
 
         self.access_counters.drain_into(&self.meta)?;
 
@@ -1558,6 +1642,7 @@ impl StorageEngine {
             concepts: Vec<String>,
             text: String,
             scope: Option<String>,
+            source_role: Option<String>,
         }
         let mut cands: Vec<Cand> = Vec::new();
         self.meta.for_each_record(|offset, rec| {
@@ -1568,6 +1653,7 @@ impl StorageEngine {
                 concepts: rec.concepts.clone(),
                 text: rec.text.clone(),
                 scope: rec.scope.clone(),
+                source_role: rec.source_role.clone(),
             });
         })?;
         cands.sort_by_key(|c| std::cmp::Reverse(c.insert_seq));
@@ -1577,6 +1663,11 @@ impl StorageEngine {
         for cand in &cands {
             if created >= max_pairs {
                 break;
+            }
+            // Role gate: when belief_source_roles is set, only memories whose
+            // provenance role is in the list can create supersessions.
+            if !role_allowed(&cand.source_role, allowed_roles) {
+                continue;
             }
             // Get this record's embedding for ANN search.
             let view = self.vectors.read_view();
@@ -1597,6 +1688,7 @@ impl StorageEngine {
                 cand.insert_seq,
                 false,
                 threshold,
+                allowed_roles,
             )?
             else {
                 continue;
@@ -1629,6 +1721,7 @@ impl StorageEngine {
                 other.insert_seq,
                 true,
                 threshold,
+                allowed_roles,
             )?;
             if back.as_deref() != Some(cand.id.as_str()) {
                 continue;
@@ -1713,6 +1806,7 @@ impl StorageEngine {
         pivot_seq: u64,
         newer: bool,
         floor: f32,
+        allowed_roles: Option<&[String]>,
     ) -> crate::Result<Option<String>> {
         let neighbors = self.search_ann_candidates(embedding, 10)?;
         let id_index = self.id_index.read();
@@ -1735,6 +1829,11 @@ impl StorageEngine {
                 continue;
             }
             if rec.scope != *scope {
+                continue;
+            }
+            // Role gate: a neighbour can only participate in a supersession
+            // (as the superseded memory) if its provenance role is allowed.
+            if !role_allowed(&rec.source_role, allowed_roles) {
                 continue;
             }
             if !concepts.iter().any(|c| rec.concepts.contains(c)) {
@@ -1783,6 +1882,7 @@ impl StorageEngine {
         let weaken_factor = self.config.tier.contradiction_weaken_factor;
         let require_opposition = self.config.tier.contradiction_require_opposition;
         let demotion_factor = self.config.tier.supersession_demotion_factor;
+        let allowed_roles = self.config.tier.belief_source_roles.as_deref();
 
         self.access_counters.drain_into(&self.meta)?;
 
@@ -1794,6 +1894,7 @@ impl StorageEngine {
             text: String,
             concepts: Vec<String>,
             scope: Option<String>,
+            source_role: Option<String>,
         }
         let mut cands: Vec<Cand> = Vec::new();
         self.meta.for_each_record(|offset, rec| {
@@ -1804,6 +1905,7 @@ impl StorageEngine {
                 text: rec.text.clone(),
                 concepts: rec.concepts.clone(),
                 scope: rec.scope.clone(),
+                source_role: rec.source_role.clone(),
             });
         })?;
         cands.sort_by_key(|c| std::cmp::Reverse(c.insert_seq));
@@ -1812,6 +1914,9 @@ impl StorageEngine {
         for cand in &cands {
             if created >= max_pairs {
                 break;
+            }
+            if !role_allowed(&cand.source_role, allowed_roles) {
+                continue;
             }
             let view = self.vectors.read_view();
             let Some(vec) = view.get(cand.offset) else {
@@ -1830,6 +1935,7 @@ impl StorageEngine {
                 cand.insert_seq,
                 false,
                 threshold,
+                allowed_roles,
             )?
             else {
                 continue;
@@ -1866,6 +1972,7 @@ impl StorageEngine {
                 other.insert_seq,
                 true,
                 threshold,
+                allowed_roles,
             )?;
             if back.as_deref() != Some(cand.id.as_str()) {
                 continue;
@@ -2208,6 +2315,24 @@ pub(crate) fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// Whether a memory's provenance `role` may participate in belief revision
+/// under the `allowed` role filter (`TierConfig::belief_source_roles`).
+///
+/// - `allowed == None` → role-blind: every memory participates (legacy).
+/// - `allowed == Some(list)` → only memories whose role is in `list`
+///   participate. Unattributed memories (`role == None`) are excluded, so a
+///   caller that opts into role-scoping without tagging roles simply gets no
+///   supersessions rather than silently role-blind behavior.
+fn role_allowed(role: &Option<String>, allowed: Option<&[String]>) -> bool {
+    match allowed {
+        None => true,
+        Some(list) => match role {
+            Some(r) => list.iter().any(|a| a == r),
+            None => false,
+        },
+    }
+}
+
 /// Recency-weighted salience: `access_count * 2^(-age / half_life)`.
 ///
 /// Mirrors `segment_holder::access_score` (kept private there); used by
@@ -2493,6 +2618,136 @@ mod tests {
         assert!(
             refined.contains(&"new".to_string()),
             "old should refine to new, got {refined:?}"
+        );
+    }
+
+    /// With `belief_source_roles = ["user"]`, an assistant-authored memory can
+    /// neither create nor receive a supersession edge, even though the same
+    /// vectors DO create one when both memories are user-authored (control).
+    /// The assistant memory stays fully retrievable — role never filters search.
+    #[test]
+    fn role_filtered_detection_excludes_nonuser_memories() {
+        let old_vec = [1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let new_vec = [0.9f32, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+        // Control: both user-authored → a Refines edge is created.
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut config = small_config(8);
+            config.tier.refinement_cosine_threshold = Some(0.5);
+            config.tier.refinement_max_pairs_per_cycle = 100;
+            config.tier.belief_source_roles = Some(vec!["user".to_string()]);
+            let engine = StorageEngine::open(tmp.path(), config).unwrap();
+            engine
+                .insert_with_payload_role(
+                    "old",
+                    "Rust memory safety",
+                    &old_vec,
+                    1.0,
+                    &["rust".to_string()],
+                    None,
+                    None,
+                    Some("user".to_string()),
+                )
+                .unwrap();
+            engine
+                .insert_with_payload_role(
+                    "new",
+                    "Rust borrow checker safety",
+                    &new_vec,
+                    1.0,
+                    &["rust".to_string()],
+                    None,
+                    None,
+                    Some("user".to_string()),
+                )
+                .unwrap();
+            assert_eq!(
+                engine.check_refinements().unwrap(),
+                1,
+                "control: two user facts should create a Refines edge"
+            );
+        }
+
+        // Role-filtered: the older memory is assistant-authored → excluded from
+        // supersession, so no edge forms despite identical vectors/concepts.
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut config = small_config(8);
+            config.tier.refinement_cosine_threshold = Some(0.5);
+            config.tier.refinement_max_pairs_per_cycle = 100;
+            config.tier.belief_source_roles = Some(vec!["user".to_string()]);
+            let engine = StorageEngine::open(tmp.path(), config).unwrap();
+            engine
+                .insert_with_payload_role(
+                    "asst_old",
+                    "Rust memory safety",
+                    &old_vec,
+                    1.0,
+                    &["rust".to_string()],
+                    None,
+                    None,
+                    Some("assistant".to_string()),
+                )
+                .unwrap();
+            engine
+                .insert_with_payload_role(
+                    "user_new",
+                    "Rust borrow checker safety",
+                    &new_vec,
+                    1.0,
+                    &["rust".to_string()],
+                    None,
+                    None,
+                    Some("user".to_string()),
+                )
+                .unwrap();
+            assert_eq!(
+                engine.check_refinements().unwrap(),
+                0,
+                "assistant memory must be excluded from supersession"
+            );
+
+            // ...but the assistant memory is still fully retrievable.
+            let results = engine
+                .search("rust memory safety", &old_vec, 5)
+                .unwrap()
+                .expect("search should return candidates");
+            assert!(
+                results.iter().any(|(id, _)| id == "asst_old"),
+                "role filter must not affect retrieval; got {results:?}"
+            );
+        }
+    }
+
+    /// `source_role` is durable: it survives WAL replay across a restart.
+    #[test]
+    fn source_role_survives_flush_and_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = small_config(8);
+        {
+            let engine = StorageEngine::open(tmp.path(), config.clone()).unwrap();
+            engine
+                .insert_with_payload_role(
+                    "u1",
+                    "a user fact",
+                    &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    1.0,
+                    &["fact".to_string()],
+                    None,
+                    None,
+                    Some("user".to_string()),
+                )
+                .unwrap();
+            engine.flush().unwrap();
+        }
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        let offset = *engine.id_index.read().get("u1").unwrap();
+        let rec = engine.meta.get(offset).unwrap().unwrap();
+        assert_eq!(
+            rec.source_role.as_deref(),
+            Some("user"),
+            "source_role should persist across restart"
         );
     }
 

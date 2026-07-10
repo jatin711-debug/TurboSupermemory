@@ -545,6 +545,7 @@ fn build_segment(engine: &StorageEngine, job: &Job) -> crate::Result<BuiltSegmen
                         tier: Tier::Warm,
                         payload: None,
                         scope: None,
+                        source_role: None,
                     },
                 )
             })
