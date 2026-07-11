@@ -104,6 +104,8 @@ class TSMAdapter:
         embedding_model: str = "BAAI/bge-large-en-v1.5",
         extractor: str = "mock",
         extractor_model: str = "llama3.2:3b",
+        extractor_instance=None,   # W6: a prebuilt extractor to SHARE across
+                                   # adapters/arms (reuses its cross-arm cache).
         cognitive_features: bool = False,  # Disabled by default for benchmarks
         belief_revision: bool = True,  # Build Contradicts/Refines edges + demotion
         dimension: Optional[int] = None,
@@ -195,14 +197,11 @@ class TSMAdapter:
         # Load turbomemory
         self.tsm = _setup_turbomemory()
         
-        # Initialize extractor
-        if extractor == "ollama":
-            from ..extraction.ollama import OllamaExtractor
-            self.extractor = OllamaExtractor(model=extractor_model)
-        else:
-            from ..extraction.mock import MockExtractor
-            self.extractor = MockExtractor()
-            logger.info("Using mock extractor (no LLM)")
+        # Initialize extractor via the factory (auto/ollama/openai/mock). A
+        # shared prebuilt instance short-circuits so its cross-arm cache is reused.
+        from ..extraction import create_extractor
+        self.extractor = create_extractor(extractor, ollama_model=extractor_model,
+                                          shared=extractor_instance)
         
         # Initialize TSM engine with cognitive features
         config = {

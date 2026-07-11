@@ -75,7 +75,7 @@ def hit_at(answer, texts, k):
 
 def run_arm(belief_on, conversations, model_name, top_k, extractor, shared_model=None,
             store_roles=None, belief_source_roles=None, verify_demotions=False,
-            shared_verifier=None, judge=None):
+            shared_verifier=None, judge=None, extractor_instance=None):
     """One fresh engine PER conversation (belief detection stays within a user,
     matching a properly-scoped store and isolating the mechanism). The embedding
     model is loaded once and shared across all engines.
@@ -95,6 +95,7 @@ def run_arm(belief_on, conversations, model_name, top_k, extractor, shared_model
     for conv in conversations:
         db_path = tempfile.mkdtemp(prefix="tsm_lme_")
         adapter = TSMAdapter(db_path=db_path, embedding_model=model_name, extractor=extractor,
+                             extractor_instance=extractor_instance,
                              cognitive_features=True, belief_revision=belief_on, model=model,
                              store_roles=store_roles, belief_source_roles=belief_source_roles,
                              verify_demotions=(belief_on and verify_demotions), verifier=verifier)
@@ -130,7 +131,10 @@ def main():
     ap.add_argument("--limit", type=int, default=None, help="cap #conversations (quick pipeline check)")
     ap.add_argument("--top-k", type=int, default=10)
     ap.add_argument("--model", type=str, default="sentence-transformers/all-MiniLM-L6-v2")
-    ap.add_argument("--extractor", type=str, default="mock", choices=["mock", "ollama"])
+    ap.add_argument("--extractor", type=str, default="mock",
+                    choices=["mock", "ollama", "openai", "auto"],
+                    help="fact extractor. 'auto' = Ollama if reachable else OpenAI (real LLM "
+                         "extraction); 'mock' is the offline gate-only splitter.")
     ap.add_argument("--user-only", action="store_true",
                     help="MODE A: store only USER messages as facts (drop assistant turns entirely). "
                          "belief revision should operate on the user's evolving statements, not the "
@@ -142,20 +146,29 @@ def main():
     ap.add_argument("--verify-demotions", action="store_true",
                     help="W3: gate each proposed supersession through a local NLI cross-encoder "
                          "before the destructive demotion (propose -> verify -> commit).")
-    ap.add_argument("--judge", choices=["none", "openai"], default="none",
+    ap.add_argument("--judge", choices=["none", "auto", "ollama", "openai"], default="none",
                     help="W6 GOLD-STANDARD metric: score answers with an LLM judge "
                          "(retrieve -> LLM answers from memories -> LLM grades vs gold), not just "
-                         "the retrieval proxy. Requires OPENAI_API_KEY in the environment.")
-    ap.add_argument("--judge-model", type=str, default="gpt-4o-mini")
+                         "the retrieval proxy. 'auto' = Ollama if reachable (free) else OpenAI.")
+    ap.add_argument("--judge-model", type=str, default=None,
+                    help="override judge model (default: llama3.2:3b for ollama, gpt-4o-mini for openai)")
     args = ap.parse_args()
     store_roles = {"user"} if args.user_only else None
     belief_source_roles = ["user"] if args.role_filtered else None
 
     judge = None
-    if args.judge == "openai":
-        from cognitive_eval.judge import OpenAIJudge
-        judge = OpenAIJudge(model=args.judge_model)
-        logger.info("LLM-judge ENABLED (model=%s) — this spends OpenAI credits.", args.judge_model)
+    if args.judge != "none":
+        from cognitive_eval.judge import create_judge
+        kw = {}
+        if args.judge_model:
+            kw = {"ollama_model": args.judge_model, "openai_model": args.judge_model}
+        judge = create_judge(args.judge, **kw)
+        logger.info("LLM-judge ENABLED (%s: %s)", args.judge, type(judge).__name__)
+
+    # Build ONE extractor and share it across both arms so its cross-arm cache
+    # means the identical corpus is only extracted once (halves LLM cost/time).
+    from cognitive_eval.extraction import create_extractor
+    shared_extractor = create_extractor(args.extractor)
 
     convs = load_longmemeval(args.data_dir)
     if args.limit:
@@ -173,12 +186,13 @@ def main():
                 "verify_demotions=%s", store_roles, belief_source_roles, args.verify_demotions)
     off, off_edges, model, _ = run_arm(False, convs, args.model, args.top_k, args.extractor,
                                        store_roles=store_roles, belief_source_roles=belief_source_roles,
-                                       judge=judge)
+                                       judge=judge, extractor_instance=shared_extractor)
     logger.info("Running ON arm (belief revision enabled)...")
     on, on_edges, _, _ = run_arm(True, convs, args.model, args.top_k, args.extractor,
                                  shared_model=model, store_roles=store_roles,
                                  belief_source_roles=belief_source_roles,
-                                 verify_demotions=args.verify_demotions, judge=judge)
+                                 verify_demotions=args.verify_demotions, judge=judge,
+                                 extractor_instance=shared_extractor)
 
     logger.info("Belief edges built — OFF: %s   ON: %s", off_edges, on_edges)
     logger.info("=" * 100)
@@ -214,8 +228,8 @@ def main():
     # correctly from the retrieved memories? Reported per type as off/on/lift.
     judged_summary = None
     if judge is not None:
-        logger.info("LLM-JUDGED answer accuracy (gold standard)   [judge model=%s, calls=%d]",
-                    args.judge_model, judge.calls)
+        logger.info("LLM-JUDGED answer accuracy (gold standard)   [judge=%s model=%s, calls=%d]",
+                    type(judge).__name__, getattr(judge, "model", "?"), judge.calls)
         logger.info("%-26s %5s | %-22s", "question_type", "n", "acc  off/on/lift")
         logger.info("-" * 60)
 

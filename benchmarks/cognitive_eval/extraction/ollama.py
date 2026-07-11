@@ -27,7 +27,7 @@ class OllamaExtractor:
     
     def __init__(
         self,
-        model: str = "llama3.2:3b",
+        model: str = "qwen2.5:3b",
         host: str = "http://localhost:11434",
         temperature: float = 0.1,
     ):
@@ -160,10 +160,19 @@ If no facts can be extracted, return: {{"facts": []}}
         return results
     
     def health_check(self) -> bool:
-        """Check if Ollama is available and the model is loaded."""
+        """True only if the Ollama server is reachable AND this model is pulled
+        (a reachable server with a missing model 404s at call time)."""
         try:
-            self._client.list()
-            return True
+            r = self._client.list()
+            raw = r.models if hasattr(r, "models") else r.get("models", [])
+            names = []
+            for m in raw:
+                names.append(getattr(m, "model", None) or (m.get("model") or m.get("name")
+                             if isinstance(m, dict) else None))
+            ok = any(n and (n == self.model or n.startswith(self.model)) for n in names)
+            if not ok:
+                logger.warning("Ollama model '%s' not found among %s", self.model, names)
+            return ok
         except Exception as e:
             logger.error("Ollama health check failed: %s", e)
             return False
