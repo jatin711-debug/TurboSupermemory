@@ -138,3 +138,112 @@ $env:HF_HUB_OFFLINE = "1"; $env:TRANSFORMERS_OFFLINE = "1"                 # emb
 - Ollama local: `qwen2.5:3b` pulled; `--extractor auto` / `--judge auto` prefer it (free) else OpenAI.
 - `make gate` before every commit touching engine/cognitive code. Living record:
   `benchmarks/PHASE_PROGRESS.md` — append a section per phase, one commit per milestone.
+
+
+---
+
+# Roadmap v2.1 — Research-Grounded Improvement Plan (2026-07-11)
+
+Survey of arXiv as of July 2026 (via the arXiv API). The current literature both
+**validates our direction and hands us the next moves**:
+
+| paper (arXiv, date) | what it says | what it means for us |
+|---|---|---|
+| **A-TMA: Decoupling State-Aware Memory Failures** (2607.01935, Jul 2) | Names "**ghost memory**": old/current/transition facts coexisting in retrieval mislead the answer model; systems must know *what is true now* | **Explains our A1 null.** Demotion changes rank; ghost facts still enter the context, and rank is invisible there. The fix is **state separation at answer time**, not ranking |
+| **EMBER: Budgeted Evidence Retention** (2606.05894, Jun 4) | Retention under an explicit budget for long-horizon agents | Our A2 wedge (+0.40 judged) is exactly this axis — independently validated as a live research frontier |
+| **What to Keep, What to Forget: Rate–Distortion View of Memory Compaction** (2607.08032, Jul 9) | Unifies eviction/pruning/summarization as rate–distortion: budget = rate, minimize task distortion | The theoretical frame for our retention product; motivates **compress-instead-of-delete** |
+| **PACMS: Submodular Context Selection** (2606.20047, Jun 18) | Context selection under budget as submodular maximization (pluggable engine) | The right **algorithm for `recall(query, token_budget)`**: greedy facility-location/MMR, (1−1/e) guarantee |
+| **Mandol: Agglomerative Agent Memory** (2606.29778, Jun 29) | Agglomerative (cluster-and-merge) memory; flags RAG "lack of token budget control" | Supports summary-hierarchy consolidation + budget-controlled recall |
+| **MemDelta: Controlled Baselines and Hidden Confounds in Agent Memory Evaluation** (2606.29914, Jun 29) | Vary ONE component at a time on LongMemEval-S; reported memory gains often confound model/embedder changes | **Our ON/OFF isolation methodology, published.** Use its protocol for A4 head-to-head |
+| **When Not to Write Memory** (2607.02579, Jun 30) | Refusing to write is a first-class decision; correlated traces cause false promotion | Generalizes our role-filter into a **write-gating policy** |
+| **PLACEMEM** (2607.04089, Jul 5) / **MOSS** (2607.04391, Jul 5) | Memory as a compute-aware control plane; auditable memory | System-design direction: background consolidation jobs decoupled from serve path; audit log |
+| Memory-poisoning attack papers (several, Jun–Jul 2026) | Agent memory is an attack surface | Our provenance (source_role) + NLI verify + write-gating double as **poisoning defenses** — a Phase C security story |
+
+Plus cognitive science we should finally use properly: **ACT-R base-level activation**
+(Anderson & Schooler rational analysis): recall probability follows a **power law over
+spaced accesses**, `A_i = ln(sum_j t_j^(-d))` — better-grounded than our single
+`access_count x 2^(-age/half_life)` heuristic.
+
+## Track 1 — Algorithms (each item: motivation → change → kill/keep test on our harness)
+
+**B1. Exclusion-not-demotion (state-aware answer context) — HIGHEST LEVERAGE, ~1 wk, ~$0.4**
+- *Why:* A-TMA ghost-memory diagnosis fits our A1 data exactly (judged lift <= 0 at every k;
+  ss-user negative — stale facts still reached the context and misled the model).
+- *Change:* we already have the NLI-verified supersession graph. At recall, superseded
+  memories are **excluded** from the returned set (or tagged `[OUTDATED as of ...]`), not
+  just rank-demoted. Engine: filter/annotate by demotion state at hydrate/adapter level.
+- *Test:* rerun the A1 multi-k judged eval with a third arm "belief-exclude". Keep if
+  knowledge-update judged lift > +0.05 at any k with other types >= -0.05. This can
+  **revive belief revision at the answer level** using infrastructure already built.
+
+**B2. Budget-aware recall as submodular selection (PACMS) — ~1 wk, ~$0.4**
+- *Change:* `recall(query, token_budget)`: greedy maximization of relevance + coverage -
+  redundancy (facility location / MMR) under a token knapsack, over the fused candidate set.
+- *Test:* judged accuracy at fixed budgets (50/100/200 tokens) vs naive top-k truncation
+  (the A3 harness already measures exactly this). Keep if >= +0.05 judged at any budget.
+
+**B3. ACT-R power-law activation for retention — ~1–2 wk, ~$0.3**
+- *Change:* keep the last K=8 access timestamps per record (ring buffer);
+  `activation = ln(sum t_j^(-d))`, d~0.5; use for eviction ranking (and optionally the
+  importance blend). Spaced/repeated access beats one recent burst — matches human
+  forgetting data and the EMBER budgeted-retention framing.
+- *Test:* judged retention 3-arm: FIFO vs current-exponential vs ACT-R. Keep if ACT-R >=
+  current (any gain is a bonus; parity still simplifies the theory/story).
+
+**B4. Compress-instead-of-delete (rate–distortion consolidation; Mandol) — ~2 wk, ~$0.5**
+- *Change:* eviction victims are clustered (existing dedup/concept machinery) and reduced to
+  a **gist summary memory** (cheap extractive first; LLM summarizer optional) with lineage
+  links; details deleted, gist retained within budget.
+- *Test:* judged retention arms: delete vs compress. Keep if compress > delete on judged
+  accuracy at the same budget. This is the rate–distortion product claim: "forget detail,
+  keep gist."
+
+**B5. Write-gating (When-Not-To-Write) — ~3 days, ~$0.2**
+- *Change:* novelty gate at `add()`: near-duplicate (cosine + text) of an existing memory →
+  reinforce the existing record instead of writing a new one. Reduces budget pressure and
+  poisoning surface. (Role-filter already ships; this generalizes it.)
+- *Test:* retention + belief evals unchanged-or-better with fewer stored records.
+
+## Track 2 — Data structures
+
+1. **Access-history ring buffer** per record (K=8 timestamps, ~64B) — powers B3. WAL-persisted.
+2. **Lazy eviction heap** — O(log n) victim selection instead of the O(N) scan; uniform decay
+   preserves relative order between access events, so re-heapify only on access. Matters at
+   many-small-stores scale; the profiler validates.
+3. **Binary/delta graph snapshot** — replace the ~24 KB/record JSON (bincode + periodic
+   delta). Target <2 KB/record, O(delta) save. Kills the second W7 scale wall.
+4. **Summary-hierarchy nodes** — gist ← detail lineage (for B4), enabling progressive
+   disclosure at recall (expand gist to surviving details if budget allows).
+5. **Per-scope store layout + engine pool (LRU of open scopes)** — the many-small-notebooks
+   multi-tenant shape; pairs with the leak fix below.
+
+## Track 3 — System design
+
+1. **Fix the engine-lifecycle native leak** (flagged; blocker for engine pooling).
+2. **Finish incremental consolidation** — importance recompute + abstraction/vocab on
+   new-records-only (seq-cursor pattern proven 4.4x; profiler drives).
+3. **Control-plane consolidation (PLACEMEM)** — detect/verify/compress as background jobs on
+   an idle-time scheduler, decoupled from the serve path (we already split propose/commit —
+   extend to a job queue). "Sleep-time" consolidation.
+4. **Auditable memory (MOSS) + poisoning defenses** — expose a mutation audit log (the WAL is
+   already the substrate); provenance + NLI-verify + write-gating documented as the
+   security story for Phase C.
+5. **MemDelta-conformant A4** — head-to-head vs Mem0/naive-RAG holding embedder + answer
+   model fixed, varying only the memory system; LongMemEval-S protocol.
+
+## Execution order & gates
+
+| step | item | gate |
+|---|---|---|
+| 1 | B1 exclusion-not-demotion | KU judged lift > +0.05 at any k, no type < -0.05 |
+| 2 | B2 submodular budget recall | >= +0.05 judged at any fixed budget vs truncation |
+| 3 | B3 ACT-R activation (+ ring buffer, heap) | >= parity with current on judged retention |
+| 4 | B4 compress-instead-of-delete (+ hierarchy) | > delete-arm on judged accuracy at same budget |
+| 5 | B5 write-gating | no regression, fewer records |
+| 6 | A4 MemDelta-style head-to-head | competitive with Mem0 under the same budget |
+| (parallel) | leak fix, binary snapshot, incremental heads | profiler + gate green |
+
+Each step lands as one commit with a PHASE_PROGRESS section; `make gate` before every
+commit; judged runs use the disk-cached extractor (~free) + per-model quota flags. After
+step 6, fold the winners into the SDK (Roadmap v2 Phase B) — by then `recall(query,
+token_budget)` is not a wrapper but the algorithmically-differentiated core.
