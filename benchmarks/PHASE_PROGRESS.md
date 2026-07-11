@@ -443,3 +443,55 @@ precision (never demote a still-true memory).
 (one MemoryEngine per conversation) OOMs at the full 500-set — a native-memory
 leak across engine create/close cycles (close() likely not releasing
 mmap/redb/tantivy/usearch). Hence the 200-conv validation. Relevant to W7 (scale).
+
+# W4 — Abstraction / concept-expansion real-data verdict ✅ (2026-07-11)
+
+Abstraction was the last cognitive mechanism without a real-data verdict — WIRED
+(Phase 3 + unit test: a query reaches a sibling-concept memory through the learned
+abstraction parent) but unproven on real conversational data. W4 isolates it.
+
+**Mechanism (`SpreadingConfig.concept_expansion`, default true).** When false, the
+augmenter skips the concept-mediated branch entirely (2-hop `mem→concept→mem` and
+4-hop `mem→concept→parent→sibling-concept→mem`), leaving only belief + temporal
+traversal. Exposed via PyO3 + adapter. Unit test
+`concept_expansion_toggle_isolates_abstraction_reachability` is a clean A/B — and
+revealed the old Phase-3 test was partly reachable via the auto-created **temporal**
+chain, not abstraction; the new test inserts a filler to break temporal adjacency so
+the target is reachable ONLY through the abstraction bridge (graph suite 68→69).
+
+**Isolation eval (`run_abstraction_longmemeval.py`, 200 convs, belief ON +
+role-filtered in BOTH arms; only `concept_expansion` differs). Abstraction edges
+build identically in both arms (61,399 vs 61,435) — only retrieval USE differs.**
+
+| question_type (n) | hit@k lift (ON − OFF) |
+|---|--:|
+| temporal-reasoning (52) | **+0.06** (0.52→0.58) |
+| knowledge-update (28) | −0.04 |
+| multi-session (48) | −0.04 |
+| all single-session types | +0.00 |
+
+**Verdict: MIXED / marginal — honest near-neutral, NOT a broad win.** Concept +
+abstraction expansion gives a real, mechanistically-sensible lift on
+**temporal-reasoning** (+0.06 hit@k — the type where multi-hop concept bridges connect
+facts across time), but pays for it with small losses on knowledge-update and
+multi-session (−0.04 each). Net across types ≈ neutral, and every delta is 1–3
+questions (within noise at n=28–52). Single-session types are untouched (+0.00), as
+expected — they need no multi-hop. This does NOT clear the four-mechanism MVP bar of a
+robust *isolated* lift; it clears it only narrowly and only for temporal-reasoning.
+
+**Product call:** keep `concept_expansion` default ON (it is the established behavior,
+belief evals W1/W3 ran with it on, and the temporal gain is the largest single
+effect), but it is a candidate for **per-query-type gating** (on for
+temporal-reasoning, off for multi-session/KU) in future — the current global setting
+trades a temporal gain for multi-session/KU hit@k losses. The auto-verdict threshold
+was tightened (worst-type ≥ −0.02 for a "win") so it reports MIXED honestly rather
+than overclaiming.
+
+**Four-mechanism MVP status after W4:** belief revision = **strong real-data positive**
+(W1/W3: KU rank-1 win, zero collateral, NLI-verified); reinforcement (ranking) =
+**honest negative** (Phase 4, no isolated lift); abstraction = **marginal/mixed**
+(narrow temporal-reasoning gain, ~neutral overall); forgetting/retention = W5 (next).
+The synthetic `cognitive_benchmark.py` geometry rework (planned W4 step to show
+abstraction lift in an ideal low-distractor regime) is **deferred/subsumed** — the
+mechanism is already proven wired by the unit test, and the real-data verdict (the one
+that decides) is in; re-demonstrating a toy-scale lift would not change it.

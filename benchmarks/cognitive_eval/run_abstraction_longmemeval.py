@@ -135,8 +135,15 @@ def main():
     logger.info("=" * 100)
     logger.info("Best hit@k lift on a multi-hop target type: %+.2f | worst hit@k lift any type: %+.2f",
                 best_lift, worst_lift)
-    if best_lift > 0.05 and worst_lift >= -0.05:
+    # A robust win needs a clear gain AND no meaningful loss on any type. A gain
+    # on one type paid for by a loss on another is a WASH, not a win — report it
+    # honestly (the auto-verdict must not overclaim on a mixed, noisy result).
+    if best_lift > 0.05 and worst_lift >= -0.02:
         logger.info("VERDICT: concept/abstraction expansion MEASURABLY helps on real data — keep ON.")
+    elif best_lift > 0.05 and worst_lift < -0.02:
+        logger.info("VERDICT: concept/abstraction expansion is MIXED — a gain on one type (%.2f) is "
+                    "offset by a loss on another (%.2f); net ~neutral, within n-noise.",
+                    best_lift, worst_lift)
     elif worst_lift < -0.05:
         logger.info("VERDICT: concept/abstraction expansion HURTS some type — needs tuning or default OFF.")
     else:

@@ -250,7 +250,21 @@ locally on the GPU — this is NOT blocked on ollama.
 ≤ B.2, labelled-sample precision ≥ 0.9. Graceful no-verifier fallback proven by the gate still
 passing with verification OFF.
 
-### W4 — Abstraction: last unproven mechanism → real-data verdict
+### W4 — Abstraction real-data verdict ✅ DONE (2026-07-11, PHASE_PROGRESS "W4")
+
+**Outcome:** added `concept_expansion` isolation toggle (SpreadingConfig + PyO3 +
+adapter) + `run_abstraction_longmemeval.py`. 200-conv isolation (belief on + role-
+filtered both arms): **MIXED / marginal** — temporal-reasoning hit@k **+0.06** but
+knowledge-update and multi-session **−0.04** each; net ~neutral, within n-noise; single-
+session untouched. Not a robust isolated win; clears the MVP bar only narrowly for
+temporal-reasoning. Kept default ON (established behavior + temporal gain); flagged as a
+future per-query-type gating candidate. A/B unit test also revealed the old Phase-3
+abstraction test was partly reachable via the temporal chain (fixed with a filler).
+Synthetic geometry rework deferred/subsumed (mechanism already proven by unit test; real
+data decides). Four-mechanism MVP: belief=strong+, reinforcement=honest−, abstraction=
+mixed, retention=W5. Original spec below.
+
+---
 
 **Why:** MVP bar = all four mechanisms proven with isolated lift. Belief ✅, reinforcement =
 recorded honest negative on ranking, forgetting → W5. Abstraction is the one still in limbo.
