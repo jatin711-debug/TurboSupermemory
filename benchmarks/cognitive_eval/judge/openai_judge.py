@@ -32,11 +32,9 @@ _JUDGE_SYS = (
 
 class OpenAIJudge:
     def __init__(self, model="gpt-4o-mini", max_retries=4, request_timeout=30.0):
-        if not os.environ.get("OPENAI_API_KEY"):
-            raise RuntimeError(
-                "OPENAI_API_KEY is not set in the environment. Set it (do not paste "
-                "it into chat) and re-run, e.g. PowerShell: $env:OPENAI_API_KEY='sk-...'"
-            )
+        from .._secrets import ensure_openai_key, key_file_hint
+        if not ensure_openai_key():
+            raise RuntimeError("No OpenAI key. " + key_file_hint())
         from openai import OpenAI
 
         # The client reads OPENAI_API_KEY from the environment itself; the key is

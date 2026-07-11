@@ -56,3 +56,5 @@ vespa
 faiss
 ResearchPapers
 bench_results
+openai_key.txt
+.openai_key
