@@ -332,7 +332,19 @@ retrieve → LLM answers → LLM judges (the official LongMemEval protocol).
 **Acceptance:** LLM-judged per-type accuracy, belief ON ≥ OFF on knowledge-update, no type
 regresses; results recorded with the proxy numbers side-by-side.
 
-### W7 — Scale + ops (only after W2 gate exists)
+### W7 — Scale + ops 🟡 CORE FIX DONE (2026-07-11, PHASE_PROGRESS "W7")
+
+**Outcome:** `profile_consolidation.py` measured the dominant cost — MNN supersession
+detection re-scans all N every cycle (69s@10k, 277s whole cycle). Fixed with an
+incremental seq-cursor (`incremental_supersession_detection`, opt-in): steady-state cycle
+now O(new) not O(total) — **4.4× faster** 2nd consolidation (base=20k+200: 487s→111s), with
+propose cut ~376s→~1s. Honest: the remaining 111s is OTHER O(N) passes (importance, segment
+HNSW builds, abstraction/vocab evolution, graph-JSON snapshot at ~24KB/record) — still to be
+made incremental for 1M. Rust test `incremental_detection_finds_cross_cycle_refinement`
+(storage 78→79). Remaining W7 (follow-ons): other consolidation O(N) passes, graph snapshot
+format, API/ops (tracing/auth/Docker), flagged native-memory leak. Original spec below.
+
+---
 
 - Profile consolidation with cognitive features at 100k/1M inserts: MNN costs ~2 ANN queries per
   new memory per cycle; `recompute_importance`, dedup, and graph rebuild are O(live records)

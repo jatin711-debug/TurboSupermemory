@@ -593,5 +593,23 @@ index). One-time bulk-load cost is unchanged. Correct across cycles (Rust test
 cycle 2 is still found). On a reloaded store the watermark starts past all loaded
 history (no re-scan of the past). Opt-in so no default-behavior change; storage 78→79.
 
-**Steady-state speedup (base + delta, time the 2nd cycle): PENDING** — measured by
-`profile_consolidation.py --steady-state`; number recorded on completion.
+**Steady-state speedup (base=20k + delta=200, time the 2nd cycle):**
+
+| 2nd consolidation | time | |
+|---|--:|---|
+| incremental OFF (full re-scan of 20,200) | 487 s | |
+| incremental ON (delta 200 only) | 111 s | **4.4× faster** |
+
+**Honest read:** incremental detection cut the propose cost from ~376 s (≈77% of the
+cycle) to ~1 s — a huge reduction of the single dominant pass. But the cycle only sped
+up 4.4× because **~111 s of OTHER O(N) consolidation work remains** and is NOT yet
+incremental: importance recompute, segment sealing / HNSW builds, abstraction +
+concept-vocabulary evolution, and the full graph-JSON snapshot. So the W7 fix removes
+the biggest head of a multi-headed O(N) beast; reaching 1M needs the remaining passes
+made incremental too (seq-cursor for importance; only-new-records for abstraction/vocab;
+delta-encoded or binary graph snapshot instead of full JSON). The profiler
+(`profile_consolidation.py`) is the tool to drive that follow-on, one measured head at a
+time. **W7 status:** dominant cost measured + fixed (4.4× steady-state, propose now
+O(delta)); remaining consolidation O(N) passes + graph-snapshot format + API/ops
+hardening (tracing, auth, Docker) + the flagged per-conversation native-memory leak are
+scoped follow-ons.
