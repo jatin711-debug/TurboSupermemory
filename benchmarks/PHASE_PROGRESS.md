@@ -707,3 +707,44 @@ corpus regardless of arm.
 **Phase A status after A1: the wedge now rests entirely on A2 (judged
 retention).** An evicted fact is unanswerable at any k, so survival should
 convert almost by construction — if it doesn't, the Phase A gate says stop.
+
+## A2 — judged retention ✅ THE WEDGE SURVIVES (2026-07-11)
+
+Retention rerun under the gold standard: real extraction (gpt-4.1-nano, disk-
+cached), post-eviction answers judged by gpt-4.1-mini (333 calls). 120 convs,
+budget max_records=10, identical ops both arms, only `access_aware_eviction`
+differs. 119 budget-pressured conversations, n=114 queries.
+
+| metric | OFF (FIFO) | ON (retain-what-is-used) | lift |
+|---|--:|--:|--:|
+| gold survival | 0.13 | 0.63 | +0.50 |
+| hit@1 | 0.06 | 0.31 | +0.25 |
+| hit@3 | 0.11 | 0.46 | +0.35 |
+| **LLM-judged answer accuracy** | **0.06** | **0.46** | **+0.40** |
+
+**GOLD VERDICT (A2): the survival win CONVERTS — 7.6× higher judged answer
+accuracy under budget pressure.** Unlike belief revision's rank win (invisible
+once the fact is in-context), eviction is binary: an evicted fact is
+unanswerable at any k. Retain-what-is-used is real end-to-end product value,
+now proven at the answer level with real extraction and a real judge.
+
+## Phase A decision (per the Roadmap v2 gate)
+
+| experiment | verdict |
+|---|---|
+| A1 — belief revision at k=1/3/5/10 | ❌ killed (no answer lift at any budget; demoted to hygiene feature) |
+| A3 — accuracy-per-token for belief | ❌ moot (no accuracy gap to trade) |
+| **A2 — judged retention** | ✅ **+0.40 judged accuracy (0.06→0.46, 7.6×)** |
+| A4 — head-to-head vs market baseline | pending (next; frame around the retention claim) |
+
+**THE GATE PASSES via A2. The product headline is retention:** *"Under a
+memory budget, TSM keeps the memories that matter — 7.6× higher answer
+accuracy than naive FIFO memory when the store can't keep everything."*
+Phase B builds around this: budget-aware `recall()`, the conversational
+preset (access-aware eviction ON), and the SDK. A4 reframes to the retention
+claim: compare against Mem0/naive-RAG under the SAME memory budget (a system
+with no principled eviction policy is the true market baseline). Caveats to
+carry: oracle-rehearsal design (we access exactly the query-relevant facts —
+models "used facts get kept", which is the mechanism claim, not a usage-
+pattern claim); budget=10 is aggressive pressure; full-set + LoCoMo
+confirmation before any public number.
