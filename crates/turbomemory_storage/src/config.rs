@@ -318,6 +318,16 @@ pub struct TierConfig {
     /// used to isolate the retention mechanism (W5 OFF arm). No effect unless
     /// eviction is active (`max_records`/`evict_score_floor` set).
     pub access_aware_eviction: bool,
+    /// Only run supersession detection (refinement + contradiction) over records
+    /// inserted SINCE the last consolidation, via a seq-cursor watermark, rather
+    /// than re-scanning every live record every cycle. `false` (default) keeps
+    /// the full-scan behavior. `true` makes steady-state consolidation cost
+    /// O(new records) instead of O(total): a new memory is checked once, when it
+    /// is new (an older memory it supersedes is still found via the ANN index).
+    /// This is the fix for the dominant scale cost measured in W7 (MNN detection
+    /// was ~70s at 10k because it re-scanned all N every cycle). Recommended for
+    /// production / large stores; the one-time bulk-load cost is unchanged.
+    pub incremental_supersession_detection: bool,
 }
 
 impl TierConfig {
@@ -400,6 +410,9 @@ impl TierConfig {
         // Cognitive retain-what-is-used eviction by default. Set false for the
         // naive FIFO baseline (W5 isolation).
         access_aware_eviction: true,
+        // Full-scan supersession detection by default; set true for the
+        // seq-cursor incremental path (W7 scale fix).
+        incremental_supersession_detection: false,
     };
 
     /// Recommended thresholds for a given vector dimension.

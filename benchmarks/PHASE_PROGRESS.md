@@ -552,3 +552,46 @@ The whole cognitive layer is now isolation-validated on the industry benchmark, 
 class in the engine (not eval hacks), and guarded by `make gate`. Remaining plan:
 W6 gold-standard LLM-judge metric (needs ollama), W7 scale/ops (incl. the flagged
 per-conversation eval-harness memory leak).
+
+# W7 — Scale: measure first, then fix the dominant cost (2026-07-11)
+
+Per PLAN W7, profile cognitive consolidation BEFORE optimizing, so the fix targets
+the real bottleneck. `profile_consolidation.py` uses one long-lived engine (avoids
+the flagged per-conversation eval-harness leak).
+
+**Profile (dim=768, cognitive features on, single consolidation over a fresh store):**
+
+| phase | N=2k | N=10k | scaling |
+|---|--:|--:|---|
+| ingest (insert_batch) | 0.13s | 0.64s | ~linear |
+| **propose_supersessions (MNN)** | **13.2s** | **68.9s** | ~linear in N, but per-cycle |
+| recompute_importance | 0.26s | 1.46s | O(N), minor |
+| deduplicate (disabled) | 0 | 0 | — |
+| evict (O(N) scan) | ~0 | ~0 | negligible |
+| **trigger_consolidation (whole)** | **16.9s** | **277s** | **superlinear** |
+| flush (+ graph JSON) | 0.46s | 0.55s | — |
+| graph + store on disk | 47 MB | 246 MB | ~24 KB/record |
+
+**Finding: supersession detection (mutual-nearest-neighbour) is the dominant cost** —
+it does ~O(N) ANN searches (forward + reverse per candidate, ×refinement+contradiction)
+**every consolidation cycle**, re-scanning ALL live records even though only newly-
+inserted ones can be the "newer" side of a supersession. 69s at 10k → hopeless at 1M.
+The full cycle is 277s at 10k because it runs that scan ~4× plus commit/concept-transfer,
+concept-evolution, abstraction-building, and segment HNSW builds — several of which are
+also superlinear (future work). The graph+store footprint (~24 KB/record → ~2.4 GB at
+100k, ~24 GB at 1M) is a second, separate scale wall (the graph persists as JSON).
+
+**Fix (matches PLAN's "seq-cursor"): incremental supersession detection.** New
+`TierConfig.incremental_supersession_detection` (default false). A per-engine
+`supersession_watermark` (AtomicU64) records the max `insert_seq` checked; `propose_*`
+process only records at/after it (cands are newest-first, so they break at the
+watermark), and `trigger_consolidation` advances it past the current max seq after
+detection. So a steady-state cycle costs **O(new records), not O(total)** — a new memory
+is checked once, when it's new (an older memory it supersedes is still found via the ANN
+index). One-time bulk-load cost is unchanged. Correct across cycles (Rust test
+`incremental_detection_finds_cross_cycle_refinement`: a supersession first detectable in
+cycle 2 is still found). On a reloaded store the watermark starts past all loaded
+history (no re-scan of the past). Opt-in so no default-behavior change; storage 78→79.
+
+**Steady-state speedup (base + delta, time the 2nd cycle): PENDING** — measured by
+`profile_consolidation.py --steady-state`; number recorded on completion.

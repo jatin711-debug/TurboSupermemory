@@ -249,6 +249,7 @@ impl PyMemoryEngine {
         belief_source_roles=None,
         defer_supersession_commit=None,
         access_aware_eviction=None,
+        incremental_supersession_detection=None,
         seed_hops_from=None,
         expansion_max_candidates=None,
         concept_expansion=None
@@ -305,6 +306,7 @@ impl PyMemoryEngine {
         belief_source_roles: Option<Vec<String>>,
         defer_supersession_commit: Option<bool>,
         access_aware_eviction: Option<bool>,
+        incremental_supersession_detection: Option<bool>,
         seed_hops_from: Option<usize>,
         expansion_max_candidates: Option<usize>,
         concept_expansion: Option<bool>,
@@ -536,6 +538,9 @@ impl PyMemoryEngine {
         }
         if let Some(aae) = access_aware_eviction {
             config.tier.access_aware_eviction = aae;
+        }
+        if let Some(inc) = incremental_supersession_detection {
+            config.tier.incremental_supersession_detection = inc;
         }
 
         let inner = StorageEngine::open(db_path, config).map_err(storage_err)?;

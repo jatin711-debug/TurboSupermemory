@@ -28,6 +28,7 @@ use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use turbomemory_core::{cosine_similarity, normalize, validate_dimension};
 use turbomemory_graph::{
@@ -76,6 +77,11 @@ pub struct StorageEngine {
     /// Optional GPU backend for accelerated distance computation.
     /// Initialized lazily on first use; CPU fallback if CUDA unavailable.
     gpu: Arc<Mutex<Option<Arc<dyn turbomemory_gpu::GpuBackend>>>>,
+    /// Seq-cursor for incremental supersession detection (W7): the `insert_seq`
+    /// at/after which records still need supersession checking. Advanced past
+    /// the current max seq after each consolidation. Only consulted when
+    /// `incremental_supersession_detection` is enabled.
+    supersession_watermark: Arc<AtomicU64>,
 }
 
 impl Clone for StorageEngine {
@@ -98,6 +104,7 @@ impl Clone for StorageEngine {
             update_worker: self.update_worker.clone(),
             access_counters: self.access_counters.clone(),
             gpu: self.gpu.clone(),
+            supersession_watermark: self.supersession_watermark.clone(),
         }
     }
 }
@@ -315,6 +322,8 @@ impl StorageEngine {
         let access_counters = Arc::new(AccessCounters::new());
         let compressor: Arc<RwLock<Arc<dyn CognitiveCompressor>>> =
             Arc::new(RwLock::new(Arc::new(DeterministicCompressor)));
+        // Snapshot before `meta` is moved into the cyclic closure.
+        let meta_next_seq = meta.next_seq();
 
         Ok(Arc::new_cyclic(move |weak| {
             let optimizer = BackgroundOptimizer::new(weak.clone(), interval, budget);
@@ -347,6 +356,10 @@ impl StorageEngine {
                 update_worker: Arc::new(update_worker),
                 access_counters,
                 gpu: Arc::new(Mutex::new(None)),
+                // Records already present at open (reloaded history) are treated
+                // as already-checked; only inserts after this point need
+                // incremental supersession detection.
+                supersession_watermark: Arc::new(AtomicU64::new(meta_next_seq)),
             }
         }))
     }
@@ -1353,6 +1366,11 @@ impl StorageEngine {
             self.check_refinements()?;
             self.check_contradictions()?;
         }
+        // Advance the incremental watermark past everything inserted so far, so
+        // the next cycle only checks records added after this one. (When the
+        // flag is off the watermark is never read, so this is harmless.)
+        self.supersession_watermark
+            .store(self.meta.next_seq(), Ordering::Relaxed);
 
         // Cognitive-layer learning: decay stale reinforced edges and build
         // abstraction hierarchies from concept co-occurrence. Both are opt-in
@@ -1654,6 +1672,14 @@ impl StorageEngine {
         }
         let text_floor = self.config.tier.refinement_text_threshold;
         let allowed_roles = self.config.tier.belief_source_roles.as_deref();
+        // Incremental (W7): only process records inserted since the last
+        // consolidation. Cands are sorted newest-first, so we break once we
+        // reach the watermark. `0` (full scan) when the flag is off.
+        let watermark = if self.config.tier.incremental_supersession_detection {
+            self.supersession_watermark.load(Ordering::Relaxed)
+        } else {
+            0
+        };
 
         self.access_counters.drain_into(&self.meta)?;
 
@@ -1686,6 +1712,11 @@ impl StorageEngine {
 
         for cand in &cands {
             if proposed.len() >= max_pairs {
+                break;
+            }
+            // Incremental: cands are newest-first, so once we reach an already-
+            // processed record (below the watermark) every remaining one is too.
+            if cand.insert_seq < watermark {
                 break;
             }
             // Role gate: when belief_source_roles is set, only memories whose
@@ -1999,6 +2030,11 @@ impl StorageEngine {
         let text_threshold = self.config.tier.contradiction_text_threshold;
         let require_opposition = self.config.tier.contradiction_require_opposition;
         let allowed_roles = self.config.tier.belief_source_roles.as_deref();
+        let watermark = if self.config.tier.incremental_supersession_detection {
+            self.supersession_watermark.load(Ordering::Relaxed)
+        } else {
+            0
+        };
 
         self.access_counters.drain_into(&self.meta)?;
 
@@ -2029,6 +2065,10 @@ impl StorageEngine {
         let mut proposed: Vec<ProposedSupersession> = Vec::new();
         for cand in &cands {
             if proposed.len() >= max_pairs {
+                break;
+            }
+            // Incremental: newest-first, so stop at the first already-checked one.
+            if cand.insert_seq < watermark {
                 break;
             }
             if !role_allowed(&cand.source_role, allowed_roles) {
@@ -2881,6 +2921,64 @@ mod tests {
                 "role filter must not affect retrieval; got {results:?}"
             );
         }
+    }
+
+    /// Incremental supersession detection (W7): with the seq-cursor on, a
+    /// refinement detected in a LATER consolidation cycle (a newer memory
+    /// superseding one from an earlier cycle) is still found — the watermark
+    /// only skips records that were already checked, not new ones.
+    #[test]
+    fn incremental_detection_finds_cross_cycle_refinement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        config.tier.refinement_cosine_threshold = Some(0.5);
+        config.tier.refinement_max_pairs_per_cycle = 100;
+        config.tier.incremental_supersession_detection = true;
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+
+        // Cycle 1: two memories about the same topic → one refinement.
+        engine
+            .insert(
+                "old",
+                "Rust memory safety",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+        engine
+            .insert(
+                "mid",
+                "Rust borrow checker safety",
+                &[0.9f32, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+        engine.trigger_consolidation().unwrap();
+        assert_eq!(
+            engine.graph.read().graph().refinement_count(),
+            1,
+            "cycle 1 refinement"
+        );
+
+        // Cycle 2: a newer memory superseding the previous one — inserted AFTER
+        // the watermark advanced, so it must still be detected.
+        engine
+            .insert(
+                "new",
+                "Rust borrow checker memory safety",
+                &[0.85f32, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+        engine.trigger_consolidation().unwrap();
+        assert!(
+            engine.graph.read().graph().refinement_count() >= 2,
+            "cross-cycle refinement must be detected with the incremental cursor, got {}",
+            engine.graph.read().graph().refinement_count()
+        );
     }
 
     /// `source_role` is durable: it survives WAL replay across a restart.
