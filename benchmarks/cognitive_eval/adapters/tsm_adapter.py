@@ -118,6 +118,9 @@ class TSMAdapter:
         verifier=None,             # preloaded NLIVerifier to share across adapters.
         concept_expansion=None,    # W4: enable/disable concept + abstraction graph
                                    # expansion in the augmenter (None = engine default=on).
+        max_records=None,          # W5: bounded-storage cap (forces eviction).
+        access_aware_eviction=None,# W5: cognitive retain-what-is-used eviction (True)
+                                   # vs naive FIFO baseline (False). None = default(on).
         **kwargs,
     ):
         """Initialize the TSM adapter.
@@ -149,6 +152,9 @@ class TSMAdapter:
             self.verifier = NLIVerifier()
         # W4: concept/abstraction graph expansion toggle (None = engine default).
         self.concept_expansion = concept_expansion
+        # W5: retention/eviction knobs.
+        self.max_records = max_records
+        self.access_aware_eviction = access_aware_eviction
         # Stop-word set used by _extract_concepts.
         self._stop_words = _STOP_WORDS
 
@@ -259,6 +265,11 @@ class TSMAdapter:
             config["defer_supersession_commit"] = True
         if self.concept_expansion is not None:
             config["concept_expansion"] = bool(self.concept_expansion)
+        # W5: bounded storage + eviction policy.
+        if self.max_records is not None:
+            config["max_records"] = int(self.max_records)
+        if self.access_aware_eviction is not None:
+            config["access_aware_eviction"] = bool(self.access_aware_eviction)
         self.engine = self.tsm.MemoryEngine(**config)
         logger.info("TSM engine initialized (cognitive=%s, belief_revision=%s)",
                     cognitive_features, belief_revision)

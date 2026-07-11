@@ -248,6 +248,7 @@ impl PyMemoryEngine {
         concept_evolution_max_pairs_per_cycle=None,
         belief_source_roles=None,
         defer_supersession_commit=None,
+        access_aware_eviction=None,
         seed_hops_from=None,
         expansion_max_candidates=None,
         concept_expansion=None
@@ -303,6 +304,7 @@ impl PyMemoryEngine {
         concept_evolution_max_pairs_per_cycle: Option<usize>,
         belief_source_roles: Option<Vec<String>>,
         defer_supersession_commit: Option<bool>,
+        access_aware_eviction: Option<bool>,
         seed_hops_from: Option<usize>,
         expansion_max_candidates: Option<usize>,
         concept_expansion: Option<bool>,
@@ -531,6 +533,9 @@ impl PyMemoryEngine {
         }
         if let Some(defer) = defer_supersession_commit {
             config.tier.defer_supersession_commit = defer;
+        }
+        if let Some(aae) = access_aware_eviction {
+            config.tier.access_aware_eviction = aae;
         }
 
         let inner = StorageEngine::open(db_path, config).map_err(storage_err)?;
@@ -809,6 +814,12 @@ impl PyMemoryEngine {
     /// bounded-storage eviction is keeping the collection under `max_records`.
     fn record_count(&self, py: Python<'_>) -> PyResult<usize> {
         Ok(py.allow_threads(|| self.inner.record_count()))
+    }
+
+    /// True if a record with this id is still live (not evicted/deleted). Used
+    /// by the retention eval (W5) to measure gold-fact survival after eviction.
+    fn contains_id(&self, py: Python<'_>, id: String) -> PyResult<bool> {
+        Ok(py.allow_threads(|| self.inner.contains_id(&id)))
     }
 
     /// Returns True if the engine is using GPU acceleration for distance

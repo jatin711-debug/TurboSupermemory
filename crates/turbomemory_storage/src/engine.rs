@@ -683,6 +683,12 @@ impl StorageEngine {
         self.update_with_payload(id, text, embedding, importance, concepts, None, None)
     }
 
+    /// Whether a record with this id is currently live (present in the id
+    /// index, i.e. not evicted/deleted).
+    pub fn contains_id(&self, id: &str) -> bool {
+        self.id_index.read().contains_key(id)
+    }
+
     /// Return the JSON payload attached to a record, if any.
     pub fn get_payload(&self, id: &str) -> crate::Result<Option<String>> {
         let idx = self.id_index.read();
@@ -1393,19 +1399,26 @@ impl StorageEngine {
 
         let now = now_secs();
         let half_life = tier.recency_half_life_secs.max(1);
-        // Grace window: never evict a record whose last access (or insertion)
-        // is more recent than this. Guards against evicting just-inserted
-        // records before they have had a chance to be queried.
+        let access_aware = tier.access_aware_eviction;
+        // Grace window: never evict a record whose last access is more recent
+        // than this. Guards against evicting a just-rehearsed record before it
+        // has been queried. Only meaningful for access-aware eviction; the naive
+        // FIFO baseline ignores access entirely.
         let grace = half_life / 8;
 
-        // Snapshot (offset, id, score, protected) for every live record.
+        // Snapshot (offset, id, score) for every live record. Lower score =
+        // evicted first. Access-aware: score = access_count × recency (a
+        // rehearsed memory scores high and survives). FIFO baseline: score =
+        // insert_seq (oldest-inserted evicted first), access ignored.
         let mut scored: Vec<(PointOffset, String, f64)> = Vec::new();
         let mut protected: Vec<(PointOffset, String)> = Vec::new();
         self.meta.for_each_record(|offset, rec| {
-            if now.saturating_sub(rec.last_accessed) < grace {
+            if access_aware && now.saturating_sub(rec.last_accessed) < grace {
                 protected.push((offset, rec.id.clone()));
-            } else {
+            } else if access_aware {
                 scored.push((offset, rec.id.clone(), access_score(rec, now, half_life)));
+            } else {
+                scored.push((offset, rec.id.clone(), rec.insert_seq as f64));
             }
         })?;
 
@@ -3569,6 +3582,54 @@ mod tests {
         // The frequently-accessed records must survive.
         assert!(engine.find_record_by_id("mem_0").is_some());
         assert!(engine.find_record_by_id("mem_1").is_some());
+    }
+
+    /// W5 isolation: with `access_aware_eviction = false`, eviction is pure FIFO
+    /// (oldest-inserted evicted first) and IGNORES rehearsal — even a
+    /// heavily-accessed old record is dropped, while the naive access-aware
+    /// policy (previous test) would have kept it. This is the OFF baseline that
+    /// isolates the retain-what-is-used mechanism.
+    #[test]
+    fn fifo_eviction_ignores_rehearsal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        config.tier.max_records = Some(2);
+        config.tier.recency_half_life_secs = 3600;
+        config.tier.access_aware_eviction = false; // naive FIFO baseline
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        for i in 0..5usize {
+            engine
+                .insert(
+                    &format!("mem_{i}"),
+                    &format!("text {i}"),
+                    &make_vec(8, i),
+                    1.0,
+                    &[],
+                )
+                .unwrap();
+        }
+        // Rehearse the OLDEST records heavily — under FIFO this must NOT save them.
+        for idx in [0usize, 1] {
+            let q = make_vec(8, idx);
+            for _ in 0..5 {
+                engine.search_ann(&q, 1).unwrap();
+            }
+        }
+        let evicted = engine.evict().unwrap();
+        assert!(
+            evicted >= 3,
+            "expected eviction down to the cap, got {evicted}"
+        );
+        assert!(engine.record_count() <= 2);
+        // FIFO keeps the NEWEST, drops the oldest — rehearsal is ignored.
+        assert!(
+            engine.find_record_by_id("mem_0").is_none(),
+            "FIFO must evict the oldest despite rehearsal"
+        );
+        assert!(
+            engine.find_record_by_id("mem_4").is_some(),
+            "newest must survive under FIFO"
+        );
     }
 
     #[test]

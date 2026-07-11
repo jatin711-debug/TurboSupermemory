@@ -309,6 +309,15 @@ pub struct TierConfig {
     /// an external verifier (e.g. an NLI cross-encoder, W3) can vet each
     /// demotion before it happens. No-op unless belief revision is enabled.
     pub defer_supersession_commit: bool,
+    /// Whether eviction ranks records by cognitive salience (retrieval-driven
+    /// `access_score` = access_count × recency, with a grace window for
+    /// recently-accessed records) or by pure insertion order. `true` (default)
+    /// is the cognitive retain-what-is-used policy: a rehearsed/retrieved memory
+    /// survives budget-pressure eviction over an unused one. `false` is the naive
+    /// baseline — evict oldest-inserted first (FIFO), ignoring access entirely —
+    /// used to isolate the retention mechanism (W5 OFF arm). No effect unless
+    /// eviction is active (`max_records`/`evict_score_floor` set).
+    pub access_aware_eviction: bool,
 }
 
 impl TierConfig {
@@ -388,6 +397,9 @@ impl TierConfig {
         // Consolidation auto-commits supersessions by default. Set true to
         // defer to an explicit propose -> verify -> commit flow (W3).
         defer_supersession_commit: false,
+        // Cognitive retain-what-is-used eviction by default. Set false for the
+        // naive FIFO baseline (W5 isolation).
+        access_aware_eviction: true,
     };
 
     /// Recommended thresholds for a given vector dimension.
