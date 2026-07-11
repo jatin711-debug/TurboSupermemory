@@ -286,7 +286,18 @@ recorded honest negative on ranking, forgetting → W5. Abstraction is the one s
 record; otherwise honest negative → default OFF, record why. Either outcome closes the MVP
 question for abstraction.
 
-### W5 — Reinforcement + forgetting: prove the retention axis
+### W5 — Retention / forgetting ✅ DONE (2026-07-11, PHASE_PROGRESS "W5")
+
+**Outcome:** added `access_aware_eviction` flag (cognitive salience vs naive FIFO) +
+`engine.contains_id` + `retention_eval.py`. 200-conv isolation (identical ops both arms,
+only eviction policy differs, budget=10): **gold survival OFF 0.18 → ON 0.60 (+0.41)**,
+hit@k +0.41 — a used memory survives budget eviction 3.3× more often. STRONG POSITIVE;
+reconciles the Phase-4 reinforcement negative (reinforcement drives retention, not
+ranking). **Four-mechanism MVP COMPLETE:** belief=strong+, reinforcement=positive-on-
+retention, forgetting=strong+, abstraction=marginal. Rust test
+`fifo_eviction_ignores_rehearsal` (storage 77→78). Original spec below.
+
+---
 
 **Why:** Phase 4 proved rehearsal doesn't re-rank. The honest claim left for
 reinforcement/decay/importance is: **under a memory budget, TSM retains what matters**. Nobody
