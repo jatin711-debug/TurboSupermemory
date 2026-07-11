@@ -32,6 +32,7 @@ import shutil
 import sys
 import tempfile
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cognitive_eval.adapters.tsm_adapter import TSMAdapter
@@ -40,6 +41,32 @@ from cognitive_eval.benchmark_datasets.longmemeval import load_longmemeval
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
                     handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger("belief_longmemeval")
+
+
+def _msg_content(m):
+    return m.content if hasattr(m, "content") else (m.get("content", "") if isinstance(m, dict) else "")
+
+
+def prewarm_extraction(extractor, conversations, workers=12):
+    """Extract every unique message CONCURRENTLY up front to fill the extractor's
+    cache, so the per-conversation add() (and the second arm) hit the cache
+    instead of paying serial LLM latency. No-op for extractors without a cache
+    (e.g. mock)."""
+    if not hasattr(extractor, "_cache"):
+        return
+    seen, msgs = set(), []
+    for conv in conversations:
+        for m in conv.messages:
+            c = _msg_content(m)
+            if c and c.strip() and c not in seen:
+                seen.add(c)
+                msgs.append(c)
+    if not msgs:
+        return
+    logger.info("Pre-extracting %d unique messages concurrently (%d workers)...", len(msgs), workers)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(lambda t: extractor.extract_facts(t), msgs))
+    logger.info("Pre-extraction done (extractor calls=%s).", getattr(extractor, "calls", "?"))
 
 _STOP = set((
     "a an the of to in on at for and or but is are was were be been am i you my your his her "
@@ -75,7 +102,7 @@ def hit_at(answer, texts, k):
 
 def run_arm(belief_on, conversations, model_name, top_k, extractor, shared_model=None,
             store_roles=None, belief_source_roles=None, verify_demotions=False,
-            shared_verifier=None, judge=None, extractor_instance=None):
+            shared_verifier=None, judge=None, extractor_instance=None, judge_workers=8):
     """One fresh engine PER conversation (belief detection stays within a user,
     matching a properly-scoped store and isolating the mechanism). The embedding
     model is loaded once and shared across all engines.
@@ -87,6 +114,7 @@ def run_arm(belief_on, conversations, model_name, top_k, extractor, shared_model
     number; the hit@k columns remain the retrieval proxy."""
     by_type = defaultdict(lambda: {"n": 0, "h1": 0, "h3": 0, "hk": 0, "jn": 0, "jc": 0})
     edges = {"refine": 0, "contra": 0}
+    judge_tasks = []  # (type, query, texts, gold) — judged concurrently after retrieval
     model = shared_model
     verifier = shared_verifier
     if belief_on and verify_demotions and verifier is None:
@@ -117,11 +145,20 @@ def run_arm(belief_on, conversations, model_name, top_k, extractor, shared_model
                 s["h3"] += int(hit_at(q.answer_text, texts, 3))
                 s["hk"] += int(hit_at(q.answer_text, texts, top_k))
                 if judge is not None:
-                    s["jn"] += 1
-                    s["jc"] += int(judge.answer_and_judge(q.query_text, texts, q.answer_text))
+                    # Defer the (I/O-bound) judge calls; run them concurrently
+                    # after retrieval so a whole arm isn't gated on serial latency.
+                    judge_tasks.append((q.question_type or "?", q.query_text, texts, q.answer_text))
         finally:
             adapter.close()
             shutil.rmtree(db_path, ignore_errors=True)
+
+    if judge is not None and judge_tasks:
+        logger.info("Judging %d answers concurrently (%d workers)...", len(judge_tasks), judge_workers)
+        with ThreadPoolExecutor(max_workers=judge_workers) as ex:
+            verdicts = list(ex.map(lambda t: judge.answer_and_judge(t[1], t[2], t[3]), judge_tasks))
+        for (tkey, _, _, _), correct in zip(judge_tasks, verdicts):
+            by_type[tkey]["jn"] += 1
+            by_type[tkey]["jc"] += int(correct)
     return by_type, edges, model, verifier
 
 
@@ -151,7 +188,9 @@ def main():
                          "(retrieve -> LLM answers from memories -> LLM grades vs gold), not just "
                          "the retrieval proxy. 'auto' = Ollama if reachable (free) else OpenAI.")
     ap.add_argument("--judge-model", type=str, default=None,
-                    help="override judge model (default: llama3.2:3b for ollama, gpt-4o-mini for openai)")
+                    help="override judge model (default: qwen2.5:3b for ollama, gpt-4o-mini for openai)")
+    ap.add_argument("--workers", type=int, default=8,
+                    help="concurrency for LLM extraction/judging (I/O-bound API calls)")
     args = ap.parse_args()
     store_roles = {"user"} if args.user_only else None
     belief_source_roles = ["user"] if args.role_filtered else None
@@ -177,6 +216,10 @@ def main():
     logger.info("Loaded %d conversations, %d queries. Model=%s extractor=%s top_k=%d",
                 len(convs), n_q, args.model, args.extractor, args.top_k)
 
+    # Warm the extractor cache concurrently so the arms don't pay serial LLM
+    # latency per message (the dominant cost with a real extractor).
+    prewarm_extraction(shared_extractor, convs, workers=max(args.workers, 8))
+
     # Quiet the per-conversation adapter + HF download chatter.
     for name in ("cognitive_eval.adapters.tsm", "httpx", "httpcore", "urllib3",
                  "huggingface_hub", "sentence_transformers", "transformers"):
@@ -186,13 +229,14 @@ def main():
                 "verify_demotions=%s", store_roles, belief_source_roles, args.verify_demotions)
     off, off_edges, model, _ = run_arm(False, convs, args.model, args.top_k, args.extractor,
                                        store_roles=store_roles, belief_source_roles=belief_source_roles,
-                                       judge=judge, extractor_instance=shared_extractor)
+                                       judge=judge, extractor_instance=shared_extractor,
+                                       judge_workers=args.workers)
     logger.info("Running ON arm (belief revision enabled)...")
     on, on_edges, _, _ = run_arm(True, convs, args.model, args.top_k, args.extractor,
                                  shared_model=model, store_roles=store_roles,
                                  belief_source_roles=belief_source_roles,
                                  verify_demotions=args.verify_demotions, judge=judge,
-                                 extractor_instance=shared_extractor)
+                                 extractor_instance=shared_extractor, judge_workers=args.workers)
 
     logger.info("Belief edges built — OFF: %s   ON: %s", off_edges, on_edges)
     logger.info("=" * 100)
