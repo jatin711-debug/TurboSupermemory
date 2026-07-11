@@ -102,17 +102,21 @@ def hit_at(answer, texts, k):
 
 def run_arm(belief_on, conversations, model_name, top_k, extractor, shared_model=None,
             store_roles=None, belief_source_roles=None, verify_demotions=False,
-            shared_verifier=None, judge=None, extractor_instance=None, judge_workers=8):
+            shared_verifier=None, judge=None, extractor_instance=None, judge_workers=8,
+            judge_ks=None):
     """One fresh engine PER conversation (belief detection stays within a user,
     matching a properly-scoped store and isolating the mechanism). The embedding
     model is loaded once and shared across all engines.
 
-    When `judge` (an OpenAIJudge) is supplied, each query is additionally scored
-    by the GOLD-STANDARD metric: the judge answers from the top-k retrieved
-    memories, then grades that answer against gold (`jn`/`jc` counters). The
-    per-type judged accuracy (and its ON-vs-OFF lift) is the real benchmark
-    number; the hit@k columns remain the retrieval proxy."""
-    by_type = defaultdict(lambda: {"n": 0, "h1": 0, "h3": 0, "hk": 0, "jn": 0, "jc": 0})
+    When `judge` is supplied, each query is additionally scored by the
+    GOLD-STANDARD metric at every k in `judge_ks` (default [top_k]): the judge
+    answers from the TRUNCATED top-k retrieved memories, then grades that answer
+    against gold. Retrieval runs ONCE at top_k; truncation gives the low-k
+    points (A1) and the per-k context-token counts give accuracy-per-token (A3)
+    from the same run. Returned `judged[type][k] = {n, c, tok}`."""
+    by_type = defaultdict(lambda: {"n": 0, "h1": 0, "h3": 0, "hk": 0})
+    judged = defaultdict(dict)  # type -> k -> {n, c, tok}
+    judge_ks = sorted(set(judge_ks or [top_k]))
     edges = {"refine": 0, "contra": 0}
     judge_tasks = []  # (type, query, texts, gold) — judged concurrently after retrieval
     model = shared_model
@@ -153,13 +157,25 @@ def run_arm(belief_on, conversations, model_name, top_k, extractor, shared_model
             shutil.rmtree(db_path, ignore_errors=True)
 
     if judge is not None and judge_tasks:
-        logger.info("Judging %d answers concurrently (%d workers)...", len(judge_tasks), judge_workers)
+        pairs = [(i, k) for i in range(len(judge_tasks)) for k in judge_ks]
+        logger.info("Judging %d answers (%d queries x k=%s) concurrently (%d workers)...",
+                    len(pairs), len(judge_tasks), judge_ks, judge_workers)
+
+        def _judge_at_k(pair):
+            i, k = pair
+            _t, q, texts, gold = judge_tasks[i]
+            return judge.answer_and_judge(q, texts[:k], gold)
+
         with ThreadPoolExecutor(max_workers=judge_workers) as ex:
-            verdicts = list(ex.map(lambda t: judge.answer_and_judge(t[1], t[2], t[3]), judge_tasks))
-        for (tkey, _, _, _), correct in zip(judge_tasks, verdicts):
-            by_type[tkey]["jn"] += 1
-            by_type[tkey]["jc"] += int(correct)
-    return by_type, edges, model, verifier
+            verdicts = list(ex.map(_judge_at_k, pairs))
+        for (i, k), correct in zip(pairs, verdicts):
+            tkey, _q, texts, _g = judge_tasks[i]
+            cell = judged[tkey].setdefault(k, {"n": 0, "c": 0, "tok": 0})
+            cell["n"] += 1
+            cell["c"] += int(correct)
+            # ~4 chars/token: good enough for a cost curve.
+            cell["tok"] += sum(len(t) // 4 for t in texts[:k] if t)
+    return by_type, edges, model, verifier, judged
 
 
 def main():
@@ -189,9 +205,18 @@ def main():
                          "the retrieval proxy. 'auto' = Ollama if reachable (free) else OpenAI.")
     ap.add_argument("--judge-model", type=str, default=None,
                     help="override judge model (default: qwen2.5:3b for ollama, gpt-4o-mini for openai)")
+    ap.add_argument("--judge-ks", type=str, default=None,
+                    help="comma-separated ks to judge at by TRUNCATING the top_k retrieval "
+                         "(e.g. '1,3,5,10'). One retrieval pass gives the whole accuracy-vs-"
+                         "context-budget curve (Phase A1+A3). Default: just top_k.")
     ap.add_argument("--workers", type=int, default=8,
                     help="concurrency for LLM extraction/judging (I/O-bound API calls)")
     args = ap.parse_args()
+    judge_ks = None
+    if args.judge_ks:
+        judge_ks = sorted({int(x) for x in args.judge_ks.split(",") if x.strip()})
+        if any(k > args.top_k for k in judge_ks):
+            ap.error(f"--judge-ks entries must be <= --top-k ({args.top_k})")
     store_roles = {"user"} if args.user_only else None
     belief_source_roles = ["user"] if args.role_filtered else None
 
@@ -227,16 +252,18 @@ def main():
 
     logger.info("Running OFF arm (belief revision disabled)... store_roles=%s belief_source_roles=%s "
                 "verify_demotions=%s", store_roles, belief_source_roles, args.verify_demotions)
-    off, off_edges, model, _ = run_arm(False, convs, args.model, args.top_k, args.extractor,
-                                       store_roles=store_roles, belief_source_roles=belief_source_roles,
-                                       judge=judge, extractor_instance=shared_extractor,
-                                       judge_workers=args.workers)
+    off, off_edges, model, _, off_j = run_arm(
+        False, convs, args.model, args.top_k, args.extractor,
+        store_roles=store_roles, belief_source_roles=belief_source_roles,
+        judge=judge, extractor_instance=shared_extractor,
+        judge_workers=args.workers, judge_ks=judge_ks)
     logger.info("Running ON arm (belief revision enabled)...")
-    on, on_edges, _, _ = run_arm(True, convs, args.model, args.top_k, args.extractor,
-                                 shared_model=model, store_roles=store_roles,
-                                 belief_source_roles=belief_source_roles,
-                                 verify_demotions=args.verify_demotions, judge=judge,
-                                 extractor_instance=shared_extractor, judge_workers=args.workers)
+    on, on_edges, _, _, on_j = run_arm(
+        True, convs, args.model, args.top_k, args.extractor,
+        shared_model=model, store_roles=store_roles,
+        belief_source_roles=belief_source_roles,
+        verify_demotions=args.verify_demotions, judge=judge,
+        extractor_instance=shared_extractor, judge_workers=args.workers, judge_ks=judge_ks)
 
     logger.info("Belief edges built — OFF: %s   ON: %s", off_edges, on_edges)
     logger.info("=" * 100)
@@ -268,38 +295,57 @@ def main():
             logger.info("VERDICT: belief revision fired but adds ~no retrieval lift on real knowledge-update.")
     logger.info("=" * 100)
 
-    # GOLD-STANDARD LLM-judged accuracy (W6): the real metric — did an LLM answer
-    # correctly from the retrieved memories? Reported per type as off/on/lift.
+    # GOLD-STANDARD LLM-judged accuracy at each context budget k (Phase A1+A3):
+    # did an LLM answer correctly from the TRUNCATED top-k? Reported per type
+    # per k, with the mean context tokens per query at that k (the cost axis).
     judged_summary = None
     if judge is not None:
+        ks = judge_ks or [args.top_k]
         logger.info("LLM-JUDGED answer accuracy (gold standard)   [judge=%s model=%s, calls=%d]",
                     type(judge).__name__, getattr(judge, "model", "?"), judge.calls)
-        logger.info("%-26s %5s | %-22s", "question_type", "n", "acc  off/on/lift")
-        logger.info("-" * 60)
 
-        def jacc(d):
-            return d["jc"] / d["jn"] if d.get("jn") else 0.0
+        def jcell(jd, t, k):
+            c = jd.get(t, {}).get(k)
+            return (c["c"] / c["n"], c["tok"] / c["n"], c["n"]) if c and c["n"] else (0.0, 0.0, 0)
+
         judged_summary = {}
-        for t in sorted(set(off) | set(on), key=lambda t: (t != "knowledge-update", t)):
-            o = off.get(t, {"jn": 0, "jc": 0})
-            n = on.get(t, {"jn": 0, "jc": 0})
-            if not o.get("jn") and not n.get("jn"):
-                continue
-            of, oo = jacc(o), jacc(n)
-            mark = "  <== belief revision" if t == "knowledge-update" else ""
-            logger.info("%-26s %5d | %.2f/%.2f/%+.2f%s", t, max(o.get("jn", 0), n.get("jn", 0)),
-                        of, oo, oo - of, mark)
-            judged_summary[t] = round(oo - of, 4)
-        ku_o3, ku_n3 = off.get("knowledge-update"), on.get("knowledge-update")
-        if ku_o3 and ku_o3.get("jn"):
-            klift = jacc(ku_n3) - jacc(ku_o3)
-            logger.info("KNOWLEDGE-UPDATE judged-accuracy lift: %+.2f  (n=%d)", klift, ku_o3["jn"])
-            if klift > 0.05:
-                logger.info("GOLD VERDICT: belief revision improves LLM-judged answer accuracy on "
-                            "knowledge-update — the retrieval win translates to real answers.")
+        all_types = sorted(set(off_j) | set(on_j), key=lambda t: (t != "knowledge-update", t))
+        for k in ks:
+            # mean context tokens/query at this k (ON arm; OFF is ~identical)
+            toks = [jcell(on_j, t, k)[1] for t in all_types if jcell(on_j, t, k)[2]]
+            avg_tok = sum(toks) / len(toks) if toks else 0.0
+            logger.info("-" * 72)
+            logger.info("k=%-2d (avg ctx ~%d tok/query)   %-26s %5s | %s",
+                        k, avg_tok, "question_type", "n", "acc  off/on/lift")
+            ksum = {}
+            for t in all_types:
+                of, _, no = jcell(off_j, t, k)
+                oo, _, nn = jcell(on_j, t, k)
+                if not no and not nn:
+                    continue
+                mark = "  <== belief revision" if t == "knowledge-update" else ""
+                logger.info("%36s %-26s %5d | %.2f/%.2f/%+.2f%s", "", t, max(no, nn),
+                            of, oo, oo - of, mark)
+                ksum[t] = round(oo - of, 4)
+            judged_summary[str(k)] = {"type_lift": ksum, "avg_ctx_tokens": round(avg_tok, 1)}
+        logger.info("-" * 72)
+        # Headline: knowledge-update judged lift per k (the A1 kill/keep signal).
+        for k in ks:
+            of, _, no = jcell(off_j, "knowledge-update", k)
+            oo, _, _ = jcell(on_j, "knowledge-update", k)
+            if no:
+                logger.info("KNOWLEDGE-UPDATE judged lift @ k=%-2d: %+.2f  (off %.2f -> on %.2f, n=%d)",
+                            k, oo - of, of, oo, no)
+        low_ks = [k for k in ks if k <= 3]
+        if low_ks:
+            best_low = max((jcell(on_j, "knowledge-update", k)[0] -
+                            jcell(off_j, "knowledge-update", k)[0]) for k in low_ks)
+            if best_low > 0.05:
+                logger.info("GOLD VERDICT (A1): belief revision improves judged accuracy under a TIGHT "
+                            "context budget (k<=3) — the rank win pays off where context is scarce.")
             else:
-                logger.info("GOLD VERDICT: belief revision's retrieval win does NOT clearly translate "
-                            "to LLM-judged answer accuracy (investigate).")
+                logger.info("GOLD VERDICT (A1): no judged-accuracy lift even at k<=3 — the belief-revision "
+                            "rank win does not convert to answers at any tested budget.")
         logger.info("=" * 100)
 
     # Machine-readable one-liner for the regression gate (W2). Contains the
@@ -320,7 +366,7 @@ def main():
         "type_hit1_lift": {t: _h1_lift(t) for t in (set(off) | set(on))},
     }
     if judged_summary is not None:
-        summary["judged_acc_lift"] = judged_summary
+        summary["judged_by_k"] = judged_summary
         summary["judge_calls"] = judge.calls
     logger.info("GATE_SUMMARY: %s", json.dumps(summary))
 
