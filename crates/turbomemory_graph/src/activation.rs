@@ -25,6 +25,15 @@ pub struct SpreadingConfig {
     /// Maximum number of new candidates added by graph expansion. Clamped to
     /// [10, 200]. Bounds the cost and blast radius of the augmenter.
     pub expansion_max_candidates: usize,
+    /// Enable concept-mediated expansion: the 2-hop `mem → concept → sibling
+    /// memory` and 4-hop `mem → concept → abstraction parent → sibling concept →
+    /// memory` paths. This is what lets the concept graph + abstraction
+    /// hierarchy influence ranking (a query can reach a memory it shares a
+    /// concept/parent with, despite low cosine). `true` (default) is the current
+    /// behavior; `false` isolates the belief/temporal edges from concept +
+    /// abstraction expansion (the W4 OFF arm). Belief (`Refines`/`Contradicts`)
+    /// and `Temporal` traversal are unaffected either way.
+    pub concept_expansion: bool,
 }
 
 impl Default for SpreadingConfig {
@@ -36,6 +45,7 @@ impl Default for SpreadingConfig {
             iterations: 1,                // 1-hop bounded expansion
             seed_hops_from: 10,           // Expand from top-10 ANN seeds
             expansion_max_candidates: 50, // Cap added candidates at 50
+            concept_expansion: true,      // Concept + abstraction graph expansion on
         }
     }
 }
@@ -272,7 +282,10 @@ impl SpreadingActivation {
                         // or a sibling concept via the abstraction parent (4 hops)
                         // despite low cosine to the query. Without this the concept
                         // graph and abstraction hierarchy never influence ranking.
-                        EdgeKind::Association if matches!(target_kind, Some(NodeKind::Concept)) => {
+                        EdgeKind::Association
+                            if self.config.concept_expansion
+                                && matches!(target_kind, Some(NodeKind::Concept)) =>
+                        {
                             let concept_nid = edge.target;
                             let concept_name =
                                 self.graph.node_external_id(concept_nid).unwrap_or("");
@@ -606,6 +619,61 @@ mod tests {
         assert!(
             target_delta > 0.0,
             "abstraction-reached target must have a positive graph delta"
+        );
+    }
+
+    #[test]
+    fn concept_expansion_toggle_isolates_abstraction_reachability() {
+        // A/B isolation of the concept + abstraction contribution (W4). A filler
+        // memory sits between `anchor` and `target` so they are NOT temporally
+        // adjacent — the ONLY path from the anchor's concept `a` to `target`
+        // (concept `b`) is a -> (a+b parent) -> b -> target. So `target` surfaces
+        // iff concept_expansion is on; with it off only belief/temporal remain.
+        let build = || {
+            let mut graph = MemoryGraph::new();
+            for i in 0..3 {
+                graph.add_memory(&format!("co{i}"), "co occur", &["a".into(), "b".into()]);
+            }
+            assert!(graph.build_abstractions(3) >= 2);
+            graph.add_memory("anchor", "anchor note", &["a".into()]);
+            graph.add_memory("filler", "filler note", &["z".into()]); // breaks temporal adjacency
+            graph.add_memory("target", "target note", &["b".into()]);
+            graph
+        };
+
+        // ON: the sibling-concept target surfaces via the abstraction bridge.
+        let sa_on = SpreadingActivation::new(build(), SpreadingConfig::default());
+        let on_ids: Vec<String> = sa_on
+            .search("a", &[("anchor".into(), 0.9)], 10)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(
+            on_ids.iter().any(|id| id == "target"),
+            "concept_expansion ON: target must surface via abstraction, got {on_ids:?}"
+        );
+
+        // OFF: with concept expansion disabled, target is unreachable (no belief
+        // edge, and the filler broke the temporal path).
+        let cfg_off = SpreadingConfig {
+            concept_expansion: false,
+            ..SpreadingConfig::default()
+        };
+        let sa_off = SpreadingActivation::new(build(), cfg_off);
+        let off_ids: Vec<String> = sa_off
+            .search("a", &[("anchor".into(), 0.9)], 10)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(
+            off_ids.iter().any(|id| id == "anchor"),
+            "ANN seed preserved"
+        );
+        assert!(
+            !off_ids.iter().any(|id| id == "target"),
+            "concept_expansion OFF: target must NOT surface, got {off_ids:?}"
         );
     }
 }

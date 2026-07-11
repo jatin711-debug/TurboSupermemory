@@ -116,6 +116,8 @@ class TSMAdapter:
         verify_demotions=False,    # W3: gate each supersession through an NLI
                                    # cross-encoder before the destructive demotion.
         verifier=None,             # preloaded NLIVerifier to share across adapters.
+        concept_expansion=None,    # W4: enable/disable concept + abstraction graph
+                                   # expansion in the augmenter (None = engine default=on).
         **kwargs,
     ):
         """Initialize the TSM adapter.
@@ -145,6 +147,8 @@ class TSMAdapter:
         if self.verify_demotions and self.verifier is None:
             from ..verification import NLIVerifier
             self.verifier = NLIVerifier()
+        # W4: concept/abstraction graph expansion toggle (None = engine default).
+        self.concept_expansion = concept_expansion
         # Stop-word set used by _extract_concepts.
         self._stop_words = _STOP_WORDS
 
@@ -253,6 +257,8 @@ class TSMAdapter:
         # vet each pair before it demotes anything.
         if self.verify_demotions:
             config["defer_supersession_commit"] = True
+        if self.concept_expansion is not None:
+            config["concept_expansion"] = bool(self.concept_expansion)
         self.engine = self.tsm.MemoryEngine(**config)
         logger.info("TSM engine initialized (cognitive=%s, belief_revision=%s)",
                     cognitive_features, belief_revision)

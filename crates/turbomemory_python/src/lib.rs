@@ -249,7 +249,8 @@ impl PyMemoryEngine {
         belief_source_roles=None,
         defer_supersession_commit=None,
         seed_hops_from=None,
-        expansion_max_candidates=None
+        expansion_max_candidates=None,
+        concept_expansion=None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -304,6 +305,7 @@ impl PyMemoryEngine {
         defer_supersession_commit: Option<bool>,
         seed_hops_from: Option<usize>,
         expansion_max_candidates: Option<usize>,
+        concept_expansion: Option<bool>,
     ) -> PyResult<Self> {
         let mut config = StoreConfig::default_for_dimension(dimension);
         if let Some(me) = max_edges {
@@ -394,6 +396,9 @@ impl PyMemoryEngine {
         }
         if let Some(emc) = expansion_max_candidates {
             config.spreading.expansion_max_candidates = emc;
+        }
+        if let Some(ce) = concept_expansion {
+            config.spreading.concept_expansion = ce;
         }
         if let Some(th) = abstraction_co_occurrence_threshold {
             config.tier.abstraction_co_occurrence_threshold = th;
