@@ -613,3 +613,55 @@ time. **W7 status:** dominant cost measured + fixed (4.4× steady-state, propose
 O(delta)); remaining consolidation O(N) passes + graph-snapshot format + API/ops
 hardening (tracing, auth, Docker) + the flagged per-conversation native-memory leak are
 scoped follow-ons.
+
+# W6 — Gold-standard LLM-judge metric (the moment of truth) ⚠️ (2026-07-11)
+
+Everything W1–W5 measured was a RETRIEVAL proxy (does a top-k memory contain the gold
+token?). W6 adds the real LongMemEval metric with REAL extraction: OpenAI (gpt-4o-mini)
+extracts facts, retrieves, answers using ONLY the retrieved memories, then grades the
+answer vs gold. Role-filtered belief ON vs OFF, 120 conversations, top_k=10.
+
+**Retrieval proxy (real OpenAI extraction — confirms the prior mock-based result holds):**
+knowledge-update hit@1 OFF 0.39 → ON 0.50 (**+0.11**); the rank win is real and survives
+real extraction.
+
+**Gold-standard LLM-judged ANSWER ACCURACY (OFF / ON / lift):**
+
+| question_type (n) | judged acc lift |
+|---|--:|
+| knowledge-update (18) | 0.39 / 0.39 / **+0.00** |
+| single-session-preference (9) | +0.11 |
+| single-session-assistant (11) | +0.09 |
+| temporal-reasoning (28) | −0.04 |
+| single-session-user (18) | −0.11 |
+| multi-session (31) | −0.13 |
+
+**GOLD VERDICT: the belief-revision RETRIEVAL win does NOT translate into an
+answer-accuracy win at top_k=10.** knowledge-update judged accuracy is identical
+(+0.00); other types are small-n noise that roughly cancels. This is the single most
+important honest finding of the whole effort, and it is exactly why a gold-standard
+metric exists.
+
+**Why (the mechanism, not an excuse).** Belief revision improves the RANK of the current
+fact and demotes the stale one. But the judge feeds the LLM the WHOLE top-10 set, so if
+the current fact is anywhere in those 10 — which it usually is at k=10 — the LLM answers
+correctly regardless of rank. Rank-within-context is invisible to an answer metric when
+context is generous. So the proxy (rank-sensitive) and the gold standard (rank-insensitive
+once the fact is in-context) measure different things, and here they disagree.
+
+**What this does and does not say.**
+- It does NOT invalidate belief revision as a mechanism — the current fact genuinely
+  ranks higher and stale facts are demoted (proven W1–W3, NLI-verified).
+- It DOES say: at a generous context budget (top_k=10), that rank improvement buys no
+  extra answer accuracy on this benchmark. The value, if any, lives in **low-k / tight
+  token-budget** regimes (top_k = 1–3), where excluding the stale fact and surfacing the
+  current one changes what the LLM even sees. That is the open, testable hypothesis
+  (`--top-k 3` judged rerun) — untested here, so no claim is made.
+- Retention/forgetting (W5) is a DIFFERENT axis this metric did not probe.
+
+**Honest bottom line for the product thesis:** the cognitive layer's headline claim
+("belief revision surfaces the current fact") is TRUE at the retrieval level but, at
+top_k=10, does NOT yet convert to better answers. Whether it converts at small k is the
+next experiment. This is the number that should drive the "is this a product?" decision —
+and it says "not proven yet at the answer level," which is worth knowing honestly rather
+than shipping on a proxy. Run: gpt-4o-mini, 367 judge calls, ~$0.25.
