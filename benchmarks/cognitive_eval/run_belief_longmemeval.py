@@ -75,11 +75,17 @@ def hit_at(answer, texts, k):
 
 def run_arm(belief_on, conversations, model_name, top_k, extractor, shared_model=None,
             store_roles=None, belief_source_roles=None, verify_demotions=False,
-            shared_verifier=None):
+            shared_verifier=None, judge=None):
     """One fresh engine PER conversation (belief detection stays within a user,
     matching a properly-scoped store and isolating the mechanism). The embedding
-    model is loaded once and shared across all engines."""
-    by_type = defaultdict(lambda: {"n": 0, "h1": 0, "h3": 0, "hk": 0})
+    model is loaded once and shared across all engines.
+
+    When `judge` (an OpenAIJudge) is supplied, each query is additionally scored
+    by the GOLD-STANDARD metric: the judge answers from the top-k retrieved
+    memories, then grades that answer against gold (`jn`/`jc` counters). The
+    per-type judged accuracy (and its ON-vs-OFF lift) is the real benchmark
+    number; the hit@k columns remain the retrieval proxy."""
+    by_type = defaultdict(lambda: {"n": 0, "h1": 0, "h3": 0, "hk": 0, "jn": 0, "jc": 0})
     edges = {"refine": 0, "contra": 0}
     model = shared_model
     verifier = shared_verifier
@@ -109,6 +115,9 @@ def run_arm(belief_on, conversations, model_name, top_k, extractor, shared_model
                 s["h1"] += int(hit_at(q.answer_text, texts, 1))
                 s["h3"] += int(hit_at(q.answer_text, texts, 3))
                 s["hk"] += int(hit_at(q.answer_text, texts, top_k))
+                if judge is not None:
+                    s["jn"] += 1
+                    s["jc"] += int(judge.answer_and_judge(q.query_text, texts, q.answer_text))
         finally:
             adapter.close()
             shutil.rmtree(db_path, ignore_errors=True)
@@ -133,9 +142,20 @@ def main():
     ap.add_argument("--verify-demotions", action="store_true",
                     help="W3: gate each proposed supersession through a local NLI cross-encoder "
                          "before the destructive demotion (propose -> verify -> commit).")
+    ap.add_argument("--judge", choices=["none", "openai"], default="none",
+                    help="W6 GOLD-STANDARD metric: score answers with an LLM judge "
+                         "(retrieve -> LLM answers from memories -> LLM grades vs gold), not just "
+                         "the retrieval proxy. Requires OPENAI_API_KEY in the environment.")
+    ap.add_argument("--judge-model", type=str, default="gpt-4o-mini")
     args = ap.parse_args()
     store_roles = {"user"} if args.user_only else None
     belief_source_roles = ["user"] if args.role_filtered else None
+
+    judge = None
+    if args.judge == "openai":
+        from cognitive_eval.judge import OpenAIJudge
+        judge = OpenAIJudge(model=args.judge_model)
+        logger.info("LLM-judge ENABLED (model=%s) — this spends OpenAI credits.", args.judge_model)
 
     convs = load_longmemeval(args.data_dir)
     if args.limit:
@@ -152,12 +172,13 @@ def main():
     logger.info("Running OFF arm (belief revision disabled)... store_roles=%s belief_source_roles=%s "
                 "verify_demotions=%s", store_roles, belief_source_roles, args.verify_demotions)
     off, off_edges, model, _ = run_arm(False, convs, args.model, args.top_k, args.extractor,
-                                       store_roles=store_roles, belief_source_roles=belief_source_roles)
+                                       store_roles=store_roles, belief_source_roles=belief_source_roles,
+                                       judge=judge)
     logger.info("Running ON arm (belief revision enabled)...")
     on, on_edges, _, _ = run_arm(True, convs, args.model, args.top_k, args.extractor,
                                  shared_model=model, store_roles=store_roles,
                                  belief_source_roles=belief_source_roles,
-                                 verify_demotions=args.verify_demotions)
+                                 verify_demotions=args.verify_demotions, judge=judge)
 
     logger.info("Belief edges built — OFF: %s   ON: %s", off_edges, on_edges)
     logger.info("=" * 100)
@@ -189,6 +210,40 @@ def main():
             logger.info("VERDICT: belief revision fired but adds ~no retrieval lift on real knowledge-update.")
     logger.info("=" * 100)
 
+    # GOLD-STANDARD LLM-judged accuracy (W6): the real metric — did an LLM answer
+    # correctly from the retrieved memories? Reported per type as off/on/lift.
+    judged_summary = None
+    if judge is not None:
+        logger.info("LLM-JUDGED answer accuracy (gold standard)   [judge model=%s, calls=%d]",
+                    args.judge_model, judge.calls)
+        logger.info("%-26s %5s | %-22s", "question_type", "n", "acc  off/on/lift")
+        logger.info("-" * 60)
+
+        def jacc(d):
+            return d["jc"] / d["jn"] if d.get("jn") else 0.0
+        judged_summary = {}
+        for t in sorted(set(off) | set(on), key=lambda t: (t != "knowledge-update", t)):
+            o = off.get(t, {"jn": 0, "jc": 0})
+            n = on.get(t, {"jn": 0, "jc": 0})
+            if not o.get("jn") and not n.get("jn"):
+                continue
+            of, oo = jacc(o), jacc(n)
+            mark = "  <== belief revision" if t == "knowledge-update" else ""
+            logger.info("%-26s %5d | %.2f/%.2f/%+.2f%s", t, max(o.get("jn", 0), n.get("jn", 0)),
+                        of, oo, oo - of, mark)
+            judged_summary[t] = round(oo - of, 4)
+        ku_o3, ku_n3 = off.get("knowledge-update"), on.get("knowledge-update")
+        if ku_o3 and ku_o3.get("jn"):
+            klift = jacc(ku_n3) - jacc(ku_o3)
+            logger.info("KNOWLEDGE-UPDATE judged-accuracy lift: %+.2f  (n=%d)", klift, ku_o3["jn"])
+            if klift > 0.05:
+                logger.info("GOLD VERDICT: belief revision improves LLM-judged answer accuracy on "
+                            "knowledge-update — the retrieval win translates to real answers.")
+            else:
+                logger.info("GOLD VERDICT: belief revision's retrieval win does NOT clearly translate "
+                            "to LLM-judged answer accuracy (investigate).")
+        logger.info("=" * 100)
+
     # Machine-readable one-liner for the regression gate (W2). Contains the
     # knowledge-update lift, total ON edges, and per-type hit@1 lift so the gate
     # can assert non-regression without parsing the human table.
@@ -206,6 +261,9 @@ def main():
         "on_contra": on_edges["contra"],
         "type_hit1_lift": {t: _h1_lift(t) for t in (set(off) | set(on))},
     }
+    if judged_summary is not None:
+        summary["judged_acc_lift"] = judged_summary
+        summary["judge_calls"] = judge.calls
     logger.info("GATE_SUMMARY: %s", json.dumps(summary))
 
 
