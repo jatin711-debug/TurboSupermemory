@@ -665,3 +665,45 @@ top_k=10, does NOT yet convert to better answers. Whether it converts at small k
 next experiment. This is the number that should drive the "is this a product?" decision —
 and it says "not proven yet at the answer level," which is worth knowing honestly rather
 than shipping on a proxy. Run: gpt-4o-mini, 367 judge calls, ~$0.25.
+
+---
+
+# Phase A — kill-gate experiments (Roadmap v2)
+
+## A1 + A3 — judged accuracy vs context budget ❌ KILL SIGNAL (2026-07-11)
+
+One retrieval pass at top_k=10, answers judged at TRUNCATED k ∈ {1,3,5,10}
+(gpt-4o-mini extraction + judge, 120 convs, role-filtered belief ON vs OFF,
+1,363 judge calls, ~$0.50). The hypothesis: the belief-revision rank win pays
+off where context is tight (k≤3), because excluding the stale fact changes
+what the LLM sees.
+
+**Result — the hypothesis is FALSE:**
+
+| k | avg ctx tok/query | knowledge-update judged acc (off→on) | lift |
+|--:|--:|---|--:|
+| 1 | ~17 | 0.44 → 0.44 | **+0.00** |
+| 3 | ~55 | 0.44 → 0.39 | **−0.06** |
+| 5 | ~91 | 0.50 → 0.39 | **−0.11** |
+| 10 | ~187 | 0.33 → 0.28 | **−0.06** |
+
+No judged-accuracy lift at ANY context budget — including k=1, the最 favorable
+regime. Worse: single-session-user judged accuracy is consistently NEGATIVE
+with belief ON (−0.06 to −0.22 across k), suggesting demotion occasionally
+buries a fact the answer needed. The retrieval proxy still shows the rank win
+(KU hit@1 +0.06 this run) — the mechanism re-ranks as designed — but the A1
+kill/keep signal is unambiguous: **belief revision does not convert to answer
+accuracy at any tested budget. Demoted to "hygiene feature"; it is NOT the
+product headline.** (Run-to-run note: n=18 KU; proxy lift varies +0.06–0.11
+across runs — small-n noise, but the judged null is consistent across two
+independent full runs and four budgets.)
+
+**A3 (accuracy-per-token) fallout:** with no ON-vs-OFF accuracy gap, there is
+no "same accuracy, fewer tokens" claim for belief revision either. The A3
+curve remains useful as baseline data: accuracy rises k=1→5 then FALLS at
+k=10 for several types (context dilution) — top-5 is the sweet spot for this
+corpus regardless of arm.
+
+**Phase A status after A1: the wedge now rests entirely on A2 (judged
+retention).** An evicted fact is unanswerable at any k, so survival should
+convert almost by construction — if it doesn't, the Phase A gate says stop.
