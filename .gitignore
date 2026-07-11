@@ -58,3 +58,4 @@ ResearchPapers
 bench_results
 openai_key.txt
 .openai_key
+benchmarks/cognitive_eval/extraction/_cache/

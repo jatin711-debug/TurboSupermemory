@@ -687,7 +687,7 @@ what the LLM sees.
 | 5 | ~91 | 0.50 → 0.39 | **−0.11** |
 | 10 | ~187 | 0.33 → 0.28 | **−0.06** |
 
-No judged-accuracy lift at ANY context budget — including k=1, the最 favorable
+No judged-accuracy lift at ANY context budget — including k=1, the most favorable
 regime. Worse: single-session-user judged accuracy is consistently NEGATIVE
 with belief ON (−0.06 to −0.22 across k), suggesting demotion occasionally
 buries a fact the answer needed. The retrieval proxy still shows the rank win

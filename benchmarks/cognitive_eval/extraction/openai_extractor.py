@@ -30,7 +30,8 @@ _SYS = (
 
 
 class OpenAIExtractor:
-    def __init__(self, model: str = "gpt-4o-mini", max_retries: int = 4, request_timeout: float = 30.0):
+    def __init__(self, model: str = "gpt-4o-mini", max_retries: int = 6, request_timeout: float = 30.0,
+                 cache_dir: str = None):
         from .._secrets import ensure_openai_key, key_file_hint
         if not ensure_openai_key():
             raise RuntimeError("No OpenAI key. " + key_file_hint())
@@ -40,7 +41,29 @@ class OpenAIExtractor:
         self.model = model
         self.max_retries = max_retries
         self.calls = 0
+        # Persistent disk cache: the same corpus must never be extracted (paid
+        # for) twice across runs. Keyed by message text; one file per model.
+        import pathlib
+        cdir = pathlib.Path(cache_dir) if cache_dir else pathlib.Path(__file__).parent / "_cache"
+        cdir.mkdir(exist_ok=True)
+        self._cache_path = cdir / f"extract_{model.replace('/', '_').replace(':', '_')}.json"
         self._cache: dict = {}
+        if self._cache_path.exists():
+            try:
+                self._cache = json.loads(self._cache_path.read_text(encoding="utf-8"))
+                logger.info("Loaded %d cached extractions from %s", len(self._cache), self._cache_path.name)
+            except (OSError, json.JSONDecodeError):
+                self._cache = {}
+        self._dirty = 0
+
+    def _persist(self, force=False):
+        self._dirty += 1
+        if force or self._dirty >= 200:
+            try:
+                self._cache_path.write_text(json.dumps(self._cache), encoding="utf-8")
+                self._dirty = 0
+            except OSError as e:
+                logger.warning("extract cache write failed: %s", e)
 
     def _chat_json(self, message: str, context: Optional[List[str]]) -> str:
         ctx = ""
@@ -60,7 +83,8 @@ class OpenAIExtractor:
                 )
                 return resp.choices[0].message.content or "{}"
             except Exception as e:  # noqa: BLE001 — transient API errors: backoff + retry
-                wait = 2.0 * (2 ** attempt)
+                # 429s can be per-minute windows; back off long enough to outlast them.
+                wait = min(5.0 * (2 ** attempt), 120.0)
                 logger.warning("OpenAI extract failed (attempt %d/%d): %s; retry in %.0fs",
                                attempt + 1, self.max_retries, e, wait)
                 time.sleep(wait)
@@ -82,7 +106,12 @@ class OpenAIExtractor:
         except json.JSONDecodeError:
             facts = []
         self._cache[key] = facts
+        self._persist()
         return facts
+
+    def flush_cache(self):
+        """Write any unpersisted cache entries to disk."""
+        self._persist(force=True)
 
     def extract_facts_batch(self, messages, contexts=None):
         return [self.extract_facts(m, contexts[i] if contexts and i < len(contexts) else None)

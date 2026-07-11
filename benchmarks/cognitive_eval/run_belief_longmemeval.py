@@ -66,6 +66,8 @@ def prewarm_extraction(extractor, conversations, workers=12):
     logger.info("Pre-extracting %d unique messages concurrently (%d workers)...", len(msgs), workers)
     with ThreadPoolExecutor(max_workers=workers) as ex:
         list(ex.map(lambda t: extractor.extract_facts(t), msgs))
+    if hasattr(extractor, "flush_cache"):
+        extractor.flush_cache()
     logger.info("Pre-extraction done (extractor calls=%s).", getattr(extractor, "calls", "?"))
 
 _STOP = set((

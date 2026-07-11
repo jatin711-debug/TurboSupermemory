@@ -139,6 +139,9 @@ def main():
                     help="A2 GOLD STANDARD: LLM answers from the post-eviction retrieval and an "
                          "LLM grades vs gold — does the survival win convert to answers?")
     ap.add_argument("--judge-model", type=str, default=None)
+    ap.add_argument("--extractor-model", type=str, default=None,
+                    help="override the OpenAI extractor model (RPD limits are per-model; "
+                         "e.g. gpt-4.1-nano when gpt-4o-mini's daily quota is spent)")
     ap.add_argument("--workers", type=int, default=8)
     args = ap.parse_args()
 
@@ -151,7 +154,8 @@ def main():
         judge = create_judge(args.judge, **kw)
         logger.info("LLM-judge ENABLED (%s: %s)", args.judge, type(judge).__name__)
     from cognitive_eval.extraction import create_extractor
-    shared_extractor = create_extractor(args.extractor)
+    ekw = {"openai_model": args.extractor_model} if args.extractor_model else {}
+    shared_extractor = create_extractor(args.extractor, **ekw)
 
     convs = load_longmemeval(args.data_dir)
     if args.limit:

@@ -31,7 +31,7 @@ _JUDGE_SYS = (
 
 
 class OpenAIJudge:
-    def __init__(self, model="gpt-4o-mini", max_retries=4, request_timeout=30.0):
+    def __init__(self, model="gpt-4o-mini", max_retries=6, request_timeout=30.0):
         from .._secrets import ensure_openai_key, key_file_hint
         if not ensure_openai_key():
             raise RuntimeError("No OpenAI key. " + key_file_hint())
@@ -57,7 +57,7 @@ class OpenAIJudge:
                 )
                 return (resp.choices[0].message.content or "").strip()
             except Exception as e:  # noqa: BLE001 — transient API errors: backoff + retry
-                wait = 2.0 * (2 ** attempt)
+                wait = min(5.0 * (2 ** attempt), 120.0)
                 logger.warning("OpenAI call failed (attempt %d/%d): %s; retrying in %.0fs",
                                attempt + 1, self.max_retries, e, wait)
                 time.sleep(wait)
