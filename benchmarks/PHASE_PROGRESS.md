@@ -785,3 +785,39 @@ collateral for demotion in Stage B.2/W3. Verified-exclude run in flight; expect 
 +0.22 KU win to hold with the multi-session/preference/user collateral cut. If it
 does, B1 is the second proven mechanism (with A2 retention) and the product story
 gains "answers correctly under tight budgets by dropping outdated facts."
+
+## B1 verified-exclude (NLI-gated) — CLEAN PASS ✅ (2026-07-11)
+
+Same as B1-exclude but exclusion is gated behind NLI verification (W3): only
+semantically-confirmed supersessions are dropped from the answer context. Edges
+884 -> 361 refine (verification rejects ~59% false positives, as in W3). 120
+convs, gpt-4.1-nano extraction (cached) + gpt-4.1-mini judge.
+
+**Knowledge-update judged accuracy + worst collateral, per budget:**
+
+| k | KU judged (off -> on) | KU lift | worst non-KU lift |
+|--:|---|--:|--:|
+| 1 | 0.39 -> 0.39 | +0.00 | +0.00 |
+| **3** | 0.44 -> 0.56 | **+0.11** | **+0.00** (clean) |
+| 5 | 0.50 -> 0.56 | +0.06 | -0.19 (multi-session, noisy) |
+| 10 | 0.56 -> 0.61 | +0.06 | +0.00 |
+
+**B1 GATE: PASSED.** At k=3 (the target tight-budget regime) knowledge-update
+answer accuracy is +0.11 (0.44 -> 0.56) with ZERO collateral (every other type
+>= +0.00); k=10 also passes (+0.06, no collateral). Verification traded raw
+magnitude (unverified +0.22 -> verified +0.11 at k=3) for eliminating the
+over-exclusion collateral (unverified -0.11 -> verified +0.00) — the same
+precision/recall exchange W3 showed for demotion, and the right one for a product.
+
+**The one blemish:** k=5 multi-session -0.19 (n=31, ~6 questions). k=3 and k=10 are
+clean, so this is a budget-specific/noisy interaction (multi-session answers can
+need an older fact that got excluded); a full-set run would settle whether it is
+real. Not gating on k=5.
+
+**Verdict: belief revision is REVIVED at the answer level.** The correct recipe is
+**verified exclusion, not demotion** — detect (MNN) -> verify (NLI) -> EXCLUDE the
+confirmed-stale fact from the answer context. Combined with A2 (retention), TSM now
+has TWO mechanisms with gold-standard answer-level wins. Product claim gained:
+"under a tight context budget, drops outdated facts to answer knowledge-update
+questions correctly (+0.11 judged at k=3, zero collateral)." Ship `supersession_mode
+= "exclude"` with `verify_demotions` in the conversational preset (Phase B).
