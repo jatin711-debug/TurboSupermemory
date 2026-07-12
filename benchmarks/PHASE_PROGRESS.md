@@ -1203,3 +1203,43 @@ Implication: GPT-4o will NOT lift bounded absolutes (bounded genuinely loses inf
 the "do we reach the leaderboard ~0.6-0.7 range" question lives entirely on the UNBOUNDED
 GPT-4o run (Phase 2, in progress). LoCoMo (data present) and, if warranted, full GPT-4o
 parity (Mem0-internal + extraction) + full-set(500) are the remaining gate items.
+
+### LEADERBOARD GATE — Phase 2: GPT-4o reader LOWERS absolutes (the gap is NOT the reader)
+
+Unbounded head-to-head (keep-all, 2000-tok context) re-run with a GPT-4o reader+judge,
+workers throttled to 3 for the 30k-TPM ceiling (hardened backoff held — no crash). n=115.
+
+| system     | gpt-4.1-mini reader | GPT-4o reader |
+|------------|:-------------------:|:-------------:|
+| naive-RAG  | 0.583               | 0.548         |
+| TSM        | 0.591               | 0.522         |
+| Mem0       | 0.322               | 0.278         |
+| TSM - Mem0 | +0.269              | **+0.243**    |
+| TSM - naive| +0.009              | -0.026        |
+
+**GPT-4o LOWERED every score, in BOTH bounded and unbounded regimes.** A stronger
+reader+judge is STRICTER: it answers NO ANSWER rather than guess, and grades matches
+harder; the weaker mini guesses and a lenient mini-judge accepts more. So swapping the
+reader moves us AWAY from the published ~0.7, not toward it. **The gap between our ~0.55
+and the leaderboard ~0.7 is therefore NOT the reader model.** It is (a) extraction quality
+(gpt-4.1-nano vs GPT-4o — fewer/worse facts stored), (b) our strict judge prompt vs the
+published expert-written J-prompt, and (c) that LongMemEval's 0.92 "offline reading" feeds
+RAW FULL SESSIONS to GPT-4o, not lossy extracted facts. Matching absolutes would require
+reproducing their WHOLE pipeline (extraction + retrieval + judge prompt + full-context
+reading) — a reproduction project, not a model swap.
+
+**What is now BULLETPROOF is the RELATIVE story — stable across 6 configs** (mini/GPT-4o
+reader x 150/2000 tok x MiniLM/OpenAI embeddings):
+- Unbounded: TSM ~= naive (within +-0.03) >> Mem0. Both beat Mem0 by +0.24 to +0.27 in
+  EVERY config. Cognitive retrieval is commodity; keeping atomic facts beats Mem0's lossy
+  consolidation, always.
+- Bounded: TSM-compress > Mem0 > naive-delete; TSM-Mem0 gap +0.079 reader-invariant.
+- Per-type (GPT-4o unbounded): TSM still wins knowledge-update (0.56 vs naive 0.44,
+  belief revision survives a strong reader); naive wins multi-session/assistant.
+
+**STRATEGIC CONCLUSION:** chasing leaderboard-comparable ABSOLUTES via GPT-4o is a dead end
+(it lowers our scores) and full parity is a harness-reproduction rabbit hole. The
+defensible product claim is the RELATIVE one, already robust: TSM beats Mem0 by ~+0.24-0.27
+unbounded and wins the bounded compression moat. Recommend SKIP the expensive Phase 3
+(full GPT-4o parity) as framed; keep LoCoMo (generalization to a 2nd dataset) and a
+full-set(500) run for statistical robustness of the RELATIVE claim (not absolute parity).
