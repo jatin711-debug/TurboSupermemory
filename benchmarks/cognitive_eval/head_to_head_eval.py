@@ -172,6 +172,9 @@ def main():
     ap.add_argument("--pool-k", type=int, default=20, help="retrieval pool size before packing")
     ap.add_argument("--model", type=str, default="sentence-transformers/all-MiniLM-L6-v2",
                     help="local embedding model for naive/tsm")
+    ap.add_argument("--tsm-embedder", choices=["local", "openai"], default="local",
+                    help="embedding backend for naive/TSM: local MiniLM (384-d) or OpenAI "
+                         "(uses --embed-model, matches Mem0's — levels the field)")
     ap.add_argument("--extractor", type=str, default="openai")
     ap.add_argument("--extractor-model", type=str, default="gpt-4.1-nano")
     ap.add_argument("--mem0-model", type=str, default="gpt-4.1-nano", help="Mem0 LLM")
@@ -208,6 +211,11 @@ def main():
     # (system, qtype, query, texts, gold) — judged concurrently at the end.
     tasks = []
     model, verifier = None, None
+    if args.tsm_embedder == "openai":
+        from cognitive_eval.openai_embedder import OpenAIEmbedder
+        model = OpenAIEmbedder(model=args.embed_model)  # shared by naive + TSM adapters
+        logger.info("naive/TSM embeddings: OpenAI %s (dim=%d) — leveled with Mem0",
+                    args.embed_model, model.get_sentence_embedding_dimension())
     n_conv = 0
     naive_roles = None if args.naive_facts == "all" else {"user"}
     for ci, conv in enumerate(convs):

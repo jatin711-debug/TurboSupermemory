@@ -967,3 +967,50 @@ belief/knowledge-update questions it targets. Combined with the isolated levers 
 retention +0.40, B4 compress +0.25, B1 verified-exclude +0.11 KU@k=3, B2 MMR
 +0.06@100tok — the story is coherent end-to-end: retain -> compress -> supersede ->
 pack beats both the naive floor and the market incumbent on real, judged answers.
+
+### A4 FOLLOW-UP — leveling the embeddings BREAKS the naive-vs-TSM story (honest)
+
+Caveat #3 above (naive/TSM on 384-d MiniLM, Mem0 on OpenAI 1536-d) turned out to be the
+whole ballgame. Re-ran naive + TSM on the SAME OpenAI `text-embedding-3-small` Mem0 uses
+(`--tsm-embedder openai`, `openai_embedder.py`, disk-cached vectors). Same 120 convs,
+same 150-token budget, same judge.
+
+| system     | local MiniLM (384-d) | OpenAI (1536-d) | embedder Δ |
+|------------|:--------------------:|:---------------:|:----------:|
+| naive-RAG  | 0.504                | **0.591**       | **+0.087** |
+| TSM stack  | 0.548                | 0.557           | +0.009     |
+| TSM − naive| **+0.043**           | **−0.035**      | REVERSED   |
+
+**The cognitive layer's edge over plain RAG does not survive a strong retriever — it
+reverses.** Naive top-k gained +0.087 from better embeddings; TSM gained almost nothing
+(+0.009). So most of the earlier +0.043 was the cognitive layer COMPENSATING for a weak
+embedder, not adding retrieval intelligence. With OpenAI embeddings, plain RAG (0.591)
+BEATS the full TSM stack (0.557) by 0.035.
+
+Per-type (OpenAI embeddings): knowledge-update TSM 0.61 vs naive 0.56 (**+0.05** — belief
+revision still helps, but a fraction of the +0.17 it showed on MiniLM); multi-session
+naive 0.65 vs TSM 0.55 (−0.10); preference naive 0.78 vs TSM 0.56 (−0.22, n=9 noisy);
+temporal/user/assistant tied. The regressions cluster where TSM's cognitive recall
+(spreading activation + `cognitive_alpha=0.7` graph blend + MMR) OVERRIDES the raw cosine
+signal — thresholds tuned for MiniLM's similarity distribution misfire on OpenAI's
+sharper one, so the better embedding's gains are diluted away.
+
+**What this does and does NOT overturn:**
+- Market number vs Mem0 STILL holds — and widens: plain RAG on OpenAI embeddings 0.591
+  and TSM 0.557 both crush Mem0 0.330. But the honest reading is "keep every atomic fact +
+  a good embedder beats Mem0's lossy consolidation," NOT "our cognitive retrieval is the
+  differentiator."
+- B1 (exclude) and B2 (MMR) are RETRIEVAL/RANKING levers measured on MiniLM — they are
+  now SUSPECT and must be re-validated on OpenAI embeddings before any claim.
+- A2 (retention) and B4 (compress) are a DIFFERENT axis — what survives under storage/
+  budget PRESSURE. A strong embedder cannot retrieve a fact you EVICTED, so these should
+  survive the embedder upgrade — but that is a hypothesis to TEST, not assume.
+
+**Diagnosis / next step (open, needs a decision):** the precise failure is that TSM's
+recall blend overrides a now-excellent raw signal. Two paths: (a) re-tune `cognitive_
+alpha`/spreading/thresholds for OpenAI's cosine distribution and gate the cognitive boost
+to only fire when raw retrieval is uncertain; (b) re-validate the WHOLE scoreboard (A2,
+B1, B2, B4) on OpenAI embeddings, since the differentiator may be the retention/
+compression axis (what to keep) rather than the retrieval axis (how to rank) — the former
+is exactly what a better embedder cannot fix. Until (b) is done, treat the MiniLM-based
+lever magnitudes as embedder-inflated.
