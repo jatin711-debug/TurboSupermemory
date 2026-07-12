@@ -132,6 +132,11 @@ def main():
     ap.add_argument("--budget", type=int, default=10, help="max_records cap (facts above this are evicted)")
     ap.add_argument("--top-k", type=int, default=10)
     ap.add_argument("--model", type=str, default="sentence-transformers/all-MiniLM-L6-v2")
+    ap.add_argument("--tsm-embedder", choices=["local", "openai"], default="local",
+                    help="embedding backend: local MiniLM (384-d) or OpenAI (--embed-model). "
+                         "Use openai to re-validate the retention lift without the weak-embedder confound.")
+    ap.add_argument("--embed-model", type=str, default="text-embedding-3-small",
+                    help="OpenAI embedding model when --tsm-embedder openai")
     ap.add_argument("--extractor", type=str, default="mock",
                     choices=["mock", "ollama", "openai", "auto"],
                     help="fact extractor; 'auto' = Ollama if reachable else OpenAI")
@@ -167,10 +172,17 @@ def main():
                  "huggingface_hub", "sentence_transformers", "transformers"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
+    init_model = None
+    if args.tsm_embedder == "openai":
+        from cognitive_eval.openai_embedder import OpenAIEmbedder
+        init_model = OpenAIEmbedder(model=args.embed_model)
+        logger.info("Embeddings: OpenAI %s (dim=%d) — retention re-validation",
+                    args.embed_model, init_model.get_sentence_embedding_dimension())
+
     logger.info("Running OFF arm (access_aware_eviction=False — naive FIFO)...")
     off, off_p, model = run_arm(False, convs, args.budget, args.model, args.top_k, args.extractor,
-                                judge=judge, extractor_instance=shared_extractor,
-                                judge_workers=args.workers)
+                                shared_model=init_model, judge=judge,
+                                extractor_instance=shared_extractor, judge_workers=args.workers)
     logger.info("Running ON arm (access_aware_eviction=True — retain-what-is-used)...")
     on, on_p, _ = run_arm(True, convs, args.budget, args.model, args.top_k, args.extractor,
                           shared_model=model, judge=judge, extractor_instance=shared_extractor,
@@ -217,6 +229,7 @@ def main():
         logger.info("VERDICT: access-aware eviction shows ~no retention lift over FIFO (honest negative).")
     summary = {
         "budget": args.budget,
+        "embedder": args.embed_model if args.tsm_embedder == "openai" else "minilm-384",
         "pressured_convs_on": on_p,
         "scored_queries": n,
         "survival_lift": round(surv_lift, 4),

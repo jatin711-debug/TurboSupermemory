@@ -1014,3 +1014,47 @@ B1, B2, B4) on OpenAI embeddings, since the differentiator may be the retention/
 compression axis (what to keep) rather than the retrieval axis (how to rank) — the former
 is exactly what a better embedder cannot fix. Until (b) is done, treat the MiniLM-based
 lever magnitudes as embedder-inflated.
+
+### A4 RESOLUTION — the retention/compression axis SURVIVES the embedder (A2 & B4)
+
+Ran the decisive test from path (b): A2 (retention) and B4 (compress) on local MiniLM vs
+OpenAI `text-embedding-3-small`, matched params (limit 120, budget 10/8, judged by
+gpt-4.1-mini). ONLY the embedder varies. `--tsm-embedder` added to both evals.
+
+| lever                              | local MiniLM | OpenAI 1536-d | verdict |
+|------------------------------------|:------------:|:-------------:|---------|
+| **A2** retain-vs-FIFO judged lift  | +0.43        | **+0.52**     | SURVIVES (grows) |
+| A2 FIFO (OFF) baseline             | 0.06         | 0.06          | embedder-IMMUNE |
+| A2 retain (ON)                     | 0.49         | 0.58          | rises with embedder |
+| **B4** compress overall judged lift| +0.25        | **+0.24**     | SURVIVES (stable) |
+| B4 evicted-subset lift             | +0.47        | +0.42         | SURVIVES |
+| B4 delete (evicted) baseline       | 0.00         | 0.00          | embedder-IMMUNE |
+
+**This resolves the A4 crisis and REFRAMES the product.** The two axes behave OPPOSITELY
+under a stronger embedder:
+- **Retrieval/ranking levers (cognitive search, B1 exclude, B2 MMR)** — embedder-
+  DEPENDENT. A great embedder does the job; the cognitive blend adds nothing and slightly
+  hurts (naive 0.591 > TSM-stack 0.557). Commodity.
+- **Retention/compression levers (A2, B4)** — embedder-INDEPENDENT and DECISIVE. Their
+  OFF/delete baselines sit at ~0-0.06 in BOTH embedders because you cannot retrieve a fact
+  you EVICTED — no embedder fixes that. The ON/compress arms hold (B4) or even improve
+  (A2: 0.49 -> 0.58) with better embeddings, because once the RIGHT facts survive, a good
+  embedder retrieves them better. The moat AMPLIFIES with embedder quality instead of
+  being erased by it.
+
+**Honest scoping — the moat is conditional on BOUNDED storage.** A2/B4 impose a storage
+cap (`max_records`) that FORCES eviction; A4's naive-RAG kept every fact (only the 150-tok
+CONTEXT was capped) and did fine. So: when you can afford to keep everything, a great
+embedder + keep-all wins and TSM retrieval is redundant. When storage is BOUNDED (long-
+lived agents, millions of memories, cost/latency caps) you MUST evict/compress — and there
+retain-what-is-used (0.06 -> 0.58) and gist-don't-delete (+0.25) are decisive and
+embedder-proof. **Product thesis, corrected: "when you can't keep everything, TSM keeps
+the RIGHT things."** That is exactly what Mem0's lossy consolidation gets wrong (it
+deletes facts -> 0.33) and what a commodity embedder cannot buy.
+
+**Scoreboard, embedder-honest:** LEAD with the retention/compression axis (A2 +0.52, B4
++0.24 on OpenAI embeddings — confirmed embedder-independent). DE-EMPHASIZE the cognitive
+retrieval blend (embedder-inflated; make it embedder-adaptive or off by default on strong
+embeddings). B1/B2 still pending a formal OpenAI re-run but expected to follow the
+retrieval pattern (suspect). Next: full-set (~500) + LoCoMo on the retention/compression
+story; make cognitive_alpha embedder-adaptive.

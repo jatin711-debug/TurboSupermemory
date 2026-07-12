@@ -84,6 +84,11 @@ def main():
     ap.add_argument("--budget", type=int, default=8, help="#facts kept (survivors = budget-1)")
     ap.add_argument("--token-budget", type=int, default=150, help="answer-context token budget")
     ap.add_argument("--model", type=str, default="sentence-transformers/all-MiniLM-L6-v2")
+    ap.add_argument("--tsm-embedder", choices=["local", "openai"], default="local",
+                    help="embedding backend: local MiniLM (384-d) or OpenAI (--embed-model). "
+                         "Use openai to re-validate compress without the weak-embedder confound.")
+    ap.add_argument("--embed-model", type=str, default="text-embedding-3-small",
+                    help="OpenAI embedding model when --tsm-embedder openai")
     ap.add_argument("--extractor", type=str, default="openai")
     ap.add_argument("--extractor-model", type=str, default=None)
     ap.add_argument("--gist-model", type=str, default="gpt-4.1-nano")
@@ -110,6 +115,11 @@ def main():
 
     tasks = []  # (arm, in_evicted, query, texts, gold)
     model = None
+    if args.tsm_embedder == "openai":
+        from cognitive_eval.openai_embedder import OpenAIEmbedder
+        model = OpenAIEmbedder(model=args.embed_model)
+        logger.info("Embeddings: OpenAI %s (dim=%d) — compress re-validation",
+                    args.embed_model, model.get_sentence_embedding_dimension())
     pressured = 0
     for conv in convs:
         facts = conv_user_facts(extractor, conv)
@@ -188,6 +198,7 @@ def main():
         logger.info("B4 VERDICT: gist does not recover evicted answers over deletion (honest negative — "
                     "the summary is too lossy for specific-fact recall).")
     logger.info("GATE_SUMMARY: %s", json.dumps({"budget": args.budget, "token_budget": args.token_budget,
+                "embedder": args.embed_model if args.tsm_embedder == "openai" else "minilm-384",
                 "pressured_convs": pressured, "by_subset": summary,
                 "gist_calls": gister.calls, "judge_calls": judge.calls}))
 
