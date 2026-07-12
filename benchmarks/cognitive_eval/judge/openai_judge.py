@@ -13,9 +13,30 @@ module never receives, stores, or logs the raw key.
 
 import logging
 import os
+import random
 import time
 
 logger = logging.getLogger("cognitive_eval.judge.openai")
+
+
+def _retry_wait(exc, attempt):
+    """Backoff that RESPECTS the server's rate-limit hint (retry-after header or
+    'try again in Xs' message), else jittered exponential. Critical for GPT-4o's
+    low TPM ceiling — a fixed exp backoff crashes when the bucket stays saturated."""
+    hinted = None
+    try:
+        ra = getattr(getattr(exc, "response", None), "headers", {}).get("retry-after")
+        if ra:
+            hinted = float(ra)
+    except Exception:  # noqa: BLE001
+        hinted = None
+    if hinted is None:
+        import re
+        m = re.search(r"try again in ([\d.]+)s", str(exc))
+        if m:
+            hinted = float(m.group(1))
+    base = hinted if hinted is not None else min(4.0 * (2 ** attempt), 60.0)
+    return base + random.uniform(0.5, 3.0)  # jitter to de-sync concurrent workers
 
 _ANSWER_SYS = (
     "You answer a question using ONLY the numbered memory snippets provided. "
@@ -31,7 +52,7 @@ _JUDGE_SYS = (
 
 
 class OpenAIJudge:
-    def __init__(self, model="gpt-4o-mini", max_retries=6, request_timeout=30.0):
+    def __init__(self, model="gpt-4o-mini", max_retries=10, request_timeout=60.0):
         from .._secrets import ensure_openai_key, key_file_hint
         if not ensure_openai_key():
             raise RuntimeError("No OpenAI key. " + key_file_hint())
@@ -57,8 +78,8 @@ class OpenAIJudge:
                 )
                 return (resp.choices[0].message.content or "").strip()
             except Exception as e:  # noqa: BLE001 — transient API errors: backoff + retry
-                wait = min(5.0 * (2 ** attempt), 120.0)
-                logger.warning("OpenAI call failed (attempt %d/%d): %s; retrying in %.0fs",
+                wait = _retry_wait(e, attempt)
+                logger.warning("OpenAI call failed (attempt %d/%d): %s; retrying in %.1fs",
                                attempt + 1, self.max_retries, e, wait)
                 time.sleep(wait)
         raise RuntimeError("OpenAI call failed after retries")

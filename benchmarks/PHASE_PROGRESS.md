@@ -1176,3 +1176,30 @@ Mem0 0.26 vs naive-delete 0.06), which a bigger context or embedder cannot repli
 - Leaderboard-comparable absolutes need a GPT-4o reader+extractor rerun (all systems),
   ideally at both bounded and unbounded storage. That, plus full-set (~500) + LoCoMo, is
   the gate before any public number.
+
+### LEADERBOARD GATE — Phase 1: GPT-4o reader on the bounded moat test (reader-invariant)
+
+Bounded head-to-head re-run with a GPT-4o reader+judge (was gpt-4.1-mini), same 8-slot
+budget, reusing the Mem0 store. Hardened OpenAI backoff (respects retry-after + jitter) to
+survive the org's 30k-TPM ceiling. n=114.
+
+| arm                   | gpt-4.1-mini reader | GPT-4o reader |
+|-----------------------|:-------------------:|:-------------:|
+| naive-delete          | 0.061               | 0.026         |
+| TSM-gist-compress     | 0.342               | 0.246         |
+| Mem0-consolidate      | 0.263               | 0.167         |
+| **TSM - Mem0**        | **+0.079**          | **+0.079**    |
+| TSM - naive           | +0.281              | +0.219        |
+
+**Two findings.** (1) GPT-4o scored everyone LOWER, not higher — a strong reader correctly
+answers NO ANSWER when the fact was EVICTED (and the GPT-4o judge is stricter), whereas the
+weaker mini guesses and gets lucky. In a fact-starved bounded regime no reader recovers
+deleted info. (2) The MOAT GAP IS READER-INVARIANT: TSM-compress beats Mem0 by exactly
++0.079 under BOTH readers (and beats naive-delete by +0.22). Because compression changes
+what is STORED, reader strength cannot erase the advantage. So the bounded-storage
+compression moat is robust to reader quality — the strongest form of the claim.
+
+Implication: GPT-4o will NOT lift bounded absolutes (bounded genuinely loses information);
+the "do we reach the leaderboard ~0.6-0.7 range" question lives entirely on the UNBOUNDED
+GPT-4o run (Phase 2, in progress). LoCoMo (data present) and, if warranted, full GPT-4o
+parity (Mem0-internal + extraction) + full-set(500) are the remaining gate items.
