@@ -852,3 +852,40 @@ B1 verified-exclude +0.11 KU @k=3 (clean), B2 MMR +0.06 @budget=100 (modest). Th
 product is now a genuine stack: retain what matters -> drop what is stale -> pack the
 budget diversely. Next: B3 ACT-R activation, B4 compress-instead-of-delete, B5
 write-gating, then A4 vs Mem0. Full-set (~500) confirmation before public numbers.
+
+## B4 (compress-instead-of-delete) — STRONG PASS ✅ (2026-07-11)
+
+Rate-distortion retention: when over budget, replace the evicted tail with ONE
+gist memory instead of deleting it. Fair-budget isolation — both arms hold
+`budget=8` slots sharing the same 7 recent survivors; DELETE fills the last slot
+with one more recent fact, COMPRESS with a gist of the whole older tail (gpt-4.1-nano
+gister). Retrieve under a 150-token budget (MMR), gold-judged (gpt-4.1-mini).
+106 pressured convs, n=101.
+
+| subset | delete | compress | lift |
+|---|--:|--:|--:|
+| all | 0.21 | 0.46 | **+0.25** |
+| **answer-in-evicted** (gold was in the dropped tail) | 0.00 | 0.42 | **+0.42** |
+| answer-in-survivors (control) | 0.34 | 0.48 | +0.13 |
+
+**B4 GATE: PASSED emphatically.** On the subset whose gold fact was in the deleted
+tail (n=40), deletion answers **0%** (the fact is gone) while the gist recovers
+**42%** — a lossy summary of many facts still answers nearly half the questions their
+exact fact would have. Overall accuracy more than doubles (0.21 -> 0.46, +0.25,
+n=101). This is the clearest rate-distortion result: forget the detail, keep the gist,
+and still answer.
+
+**Honest framing.** (1) The gist is LOSSY — 42% not 100% on evicted-answers; specific
+buried values are lost, so compression is a recall-breadth win, not perfect recovery.
+(2) The delete baseline here is RECENCY (keep newest `budget`), a weak policy for
+long-term questions; B4's +0.25 is over that. The product move is to compose B4 with
+A2: when access-aware eviction picks a low-salience victim, GIST it rather than delete
+it. A compress-on-top-of-A2 eval is the natural follow-up. (3) budget=8 is aggressive;
+the effect shrinks at larger budgets (less gets evicted). Full-set + LoCoMo confirm
+before public numbers.
+
+**Scoreboard — FOUR composing answer-level levers:** A2 retention +0.40 (keep what
+matters), B4 compress +0.25 (gist what you evict, don't delete it), B1 verified-exclude
++0.11 KU@k=3 (drop what's stale), B2 MMR +0.06@100tok (pack the budget diversely). The
+product is a coherent budget-aware memory: retain -> compress -> supersede -> pack,
+each proven at the answer level on LongMemEval. Next: B5 write-gating, then A4 vs Mem0.
