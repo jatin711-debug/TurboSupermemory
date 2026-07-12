@@ -99,14 +99,16 @@ def to_mem0_messages(conv):
     return out
 
 
-def make_mem0(model_name, embed_model):
-    """Build one Mem0 Memory instance (per-conv scoping via user_id)."""
+def make_mem0(model_name, embed_model, path=None):
+    """Build one Mem0 Memory instance (per-conv scoping via user_id). A fixed
+    `path` persists the chroma store across runs so a killed run can RESUME
+    (skip already-ingested convs) instead of re-paying the long ingestion."""
     from mem0 import Memory
     cfg = {
         "llm": {"provider": "openai", "config": {"model": model_name, "temperature": 0.0}},
         "embedder": {"provider": "openai", "config": {"model": embed_model}},
         "vector_store": {"provider": "chroma", "config": {
-            "path": tempfile.mkdtemp(prefix="mem0_h2h_"), "collection_name": "mem0eval"}},
+            "path": path or tempfile.mkdtemp(prefix="mem0_h2h_"), "collection_name": "mem0eval"}},
     }
     return Memory.from_config(cfg)
 
@@ -181,6 +183,9 @@ def main():
     ap.add_argument("--embed-model", type=str, default="text-embedding-3-small", help="Mem0 embedder")
     ap.add_argument("--mem0-ingest", choices=["incremental", "oneshot"], default="incremental",
                     help="how to feed Mem0: per-exchange (fair, default) vs single bulk add")
+    ap.add_argument("--mem0-path", type=str, default=None,
+                    help="persistent chroma dir for Mem0; RESUMES (skips already-ingested convs) "
+                         "so a run can reuse a store built by an earlier/bounded run")
     ap.add_argument("--systems", type=str, default="naive,tsm,mem0")
     ap.add_argument("--naive-facts", choices=["all", "user"], default="all",
                     help="fact supply for the naive-RAG floor: all roles (fair, matches "
@@ -206,7 +211,18 @@ def main():
                  "mem0", "huggingface_hub", "sentence_transformers", "transformers"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
-    mem0 = make_mem0(args.mem0_model, args.embed_model) if "mem0" in systems else None
+    mem0 = done_ids = done_path = None
+    if "mem0" in systems:
+        mem0 = make_mem0(args.mem0_model, args.embed_model, path=args.mem0_path)
+        done_ids = set()
+        if args.mem0_path:
+            done_path = os.path.join(args.mem0_path, "_completed.json")
+            if os.path.exists(done_path):
+                try:
+                    done_ids = set(json.load(open(done_path)))
+                    logger.info("Mem0 RESUME: %d convs already ingested at %s", len(done_ids), args.mem0_path)
+                except Exception:  # noqa: BLE001
+                    done_ids = set()
 
     # (system, qtype, query, texts, gold) — judged concurrently at the end.
     tasks = []
@@ -223,11 +239,17 @@ def main():
         facts = conv_facts(shared_extractor, conv, roles=naive_roles)  # cached supply
 
         # If Mem0 can't ingest this conv, drop it from ALL systems so n stays
-        # matched (a fair paired comparison).
-        if "mem0" in systems:
+        # matched (a fair paired comparison). Resume: skip convs already ingested.
+        if "mem0" in systems and conv.conv_id not in done_ids:
             if not mem0_ingest(mem0, conv, args.mem0_ingest):
                 logger.warning("skipping conv %s (mem0 ingest failed)", conv.conv_id)
                 continue
+            done_ids.add(conv.conv_id)
+            if done_path:
+                try:
+                    json.dump(sorted(done_ids), open(done_path, "w"))
+                except Exception:  # noqa: BLE001
+                    pass
 
         naive_ad = tsm_ad = None
         if "naive" in systems:
