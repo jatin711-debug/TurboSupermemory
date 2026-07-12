@@ -1133,3 +1133,46 @@ LongMemEval), claiming +26% relative J over OpenAI. Our 150-tok + small-model ha
 pushes everyone far below leaderboard numbers, so our results are RELATIVE (same-condition
 system-vs-system), not leaderboard-comparable absolutes. A generous-context (2k tok) +
 gpt-4.1-reader run is underway to place all three on leaderboard-like footing.
+
+### LEADERBOARD-COMPARABILITY RUN — context budget was NOT the bottleneck (surprising)
+
+Re-ran the UNBOUNDED head-to-head (keep-all) at a generous 2000-token context (13x the
+150-tok default), pool_k=50, OpenAI embeddings, gpt-4.1-mini reader (gpt-4.1 full crashed
+on a 30k-TPM org rate limit; mini is the reliable strong-ish reader). Reused the bounded
+run's Mem0 store (resume). n=115.
+
+| system     | 150-tok context | 2000-tok context | Δ from 13x context |
+|------------|:---------------:|:----------------:|:------------------:|
+| naive-RAG  | 0.591           | 0.583            | -0.008             |
+| TSM        | 0.557           | 0.591            | +0.034             |
+| Mem0       | 0.330           | 0.322            | -0.008             |
+
+**Giving everyone 13x more context barely moved anything.** This OVERTURNS the earlier
+hypothesis that the tight 150-tok budget was suppressing scores. It wasn't: at 150 tokens
+you already fit the ~3-5 facts a typical LongMemEval question needs; more context can't
+recover a fact that was never retrieved or never stored. So the reason our absolutes sit
+below the leaderboard's ~0.58-0.71 is NOT the context budget — it is the **model strength**
+(we run gpt-4.1-nano extraction + gpt-4.1-mini reader throughout; leaderboards use GPT-4o
+for extraction AND reading).
+
+**Mem0 = 0.32 is robust across 150-tok AND 2000-tok context** — so its low score in our
+harness is NOT a tight-budget artifact; it is genuine underperformance with weak LLMs
+(gpt-4.1-nano doing its extraction/consolidation). Given GPT-4o (its published config),
+Mem0 would climb toward its ~0.6 leaderboard range. Our TSM-vs-Mem0 gap (+0.27) is a
+same-weak-LLM comparison; a GPT-4o rerun would lift BOTH and likely narrow it.
+
+**Per-type (2000-tok):** TSM still wins knowledge-update (0.61 vs naive 0.50) and temporal
+(0.29 vs 0.21); naive wins single-session-assistant (0.73 vs 0.64) and preference; overall
+TSM 0.591 vs naive 0.583 = **+0.009 (a tie).** Consistent with the whole arc: with good
+embeddings + unbounded storage, cognitive RETRIEVAL is commodity (TSM ≈ naive), and both
+crush Mem0. TSM's genuine, separable win is the BOUNDED-storage COMPRESSION axis (0.34 vs
+Mem0 0.26 vs naive-delete 0.06), which a bigger context or embedder cannot replicate.
+
+**Net picture across all conditions:**
+- Unbounded storage, generous context, good embedder: TSM ≈ naive-RAG (~0.59) >> Mem0
+  (0.32). Retrieval smarts add ~0. Model strength (not budget) sets the absolute level.
+- Bounded storage: TSM-compress (0.34) > Mem0 (0.26) > naive-delete (0.06). Compression
+  is the moat.
+- Leaderboard-comparable absolutes need a GPT-4o reader+extractor rerun (all systems),
+  ideally at both bounded and unbounded storage. That, plus full-set (~500) + LoCoMo, is
+  the gate before any public number.
