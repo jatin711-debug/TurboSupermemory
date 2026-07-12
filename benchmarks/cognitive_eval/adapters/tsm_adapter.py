@@ -512,6 +512,61 @@ class TSMAdapter:
             except Exception:  # engine without the method (older .pyd)
                 self._superseded_cache = set()
         return self._superseded_cache
+
+    def recall_under_budget(self, query, user_id=None, token_budget=100,
+                            method="mmr", pool_k=20, lam=0.7, pool=None):
+        """B2: return the best SET of memory texts whose total tokens fit
+        `token_budget`, chosen from a retrieved candidate pool.
+
+        `method="truncate"`: greedy by relevance only (score order, skip items
+        that don't fit) — the naive baseline. `method="mmr"`: greedy submodular
+        Maximal-Marginal-Relevance — each step adds the candidate maximizing
+        `lam*relevance - (1-lam)*max_redundancy` to the already-selected set, so
+        near-duplicates are penalized and coverage improves (PACMS, 2026). Both
+        pack the same budget, so a difference isolates the diversity term.
+        Returns list[str] of the selected memory texts (in selection order)."""
+        # Retrieve a pool (supersession_mode is honored via search()). A
+        # precomputed pool lets a caller select multiple ways without re-querying.
+        if pool is None:
+            pool = self.search(query, user_id=user_id, top_k=pool_k, use_cognitive=True)
+        if not pool:
+            return []
+        texts = [p["text"] or "" for p in pool]
+        rel = np.array([float(p["score"]) for p in pool], dtype=np.float32)
+        toks = np.array([max(1, len(t) // 4) for t in texts], dtype=np.int32)
+
+        if method == "truncate":
+            order = list(np.argsort(-rel))
+            sel, used = [], 0
+            for i in order:
+                if used + int(toks[i]) <= token_budget:
+                    sel.append(i)
+                    used += int(toks[i])
+            return [texts[i] for i in sel]
+
+        # MMR: needs pairwise similarity → embed the pool once (unit vectors).
+        embs = self.model.encode(texts)
+        embs = np.asarray(embs, dtype=np.float32)
+        norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-9
+        embs = embs / norms
+        sim = embs @ embs.T  # cosine, since unit-normed
+
+        selected, used, remaining = [], 0, list(range(len(texts)))
+        while remaining:
+            best_i, best_gain = None, -1e9
+            for i in remaining:
+                if used + int(toks[i]) > token_budget:
+                    continue
+                red = max((float(sim[i, j]) for j in selected), default=0.0)
+                gain = lam * float(rel[i]) - (1.0 - lam) * red
+                if gain > best_gain:
+                    best_gain, best_i = gain, i
+            if best_i is None:
+                break  # nothing else fits the budget
+            selected.append(best_i)
+            used += int(toks[best_i])
+            remaining.remove(best_i)
+        return [texts[i] for i in selected]
     
     def search_ann(self, query: str, user_id: Optional[str] = None, top_k: int = 3) -> List[Dict]:
         """Pure ANN search without cognitive layer (for comparison).
