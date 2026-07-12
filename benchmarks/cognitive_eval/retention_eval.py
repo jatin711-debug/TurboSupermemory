@@ -61,7 +61,7 @@ def gold_memory_ids(answer, id_to_text):
 
 
 def run_arm(access_aware, conversations, budget, model_name, top_k, extractor, shared_model=None,
-            judge=None, extractor_instance=None, judge_workers=8):
+            judge=None, extractor_instance=None, judge_workers=8, rehearse=True):
     """Identical operations in both arms; only `access_aware_eviction` differs.
     With `judge`, each post-eviction answer is additionally scored by the
     GOLD-STANDARD metric (LLM answers from the retrieved memories, LLM grades
@@ -88,11 +88,17 @@ def run_arm(access_aware, conversations, budget, model_name, top_k, extractor, s
 
             # Rehearse: the facts a user keeps needing get accessed. Search each
             # query's text a few times to bump access on its gold fact(s).
-            for q in conv.queries:
-                if q.is_abstention:
-                    continue
-                for _ in range(3):
-                    adapter.search(q.query_text, user_id=conv.conv_id, top_k=top_k, use_cognitive=False)
+            # NOTE: this uses the EVAL QUERIES as the access signal — an ORACLE
+            # (you don't know future queries at eviction time in production).
+            # `--no-rehearse` disables it so eviction relies only on the engine's
+            # INTRINSIC salience (importance_auto_scoring / reinforcement) — the
+            # honest, deployable signal.
+            if rehearse:
+                for q in conv.queries:
+                    if q.is_abstention:
+                        continue
+                    for _ in range(3):
+                        adapter.search(q.query_text, user_id=conv.conv_id, top_k=top_k, use_cognitive=False)
 
             adapter.trigger_consolidation()  # eviction fires under the budget
 
@@ -137,6 +143,9 @@ def main():
                          "Use openai to re-validate the retention lift without the weak-embedder confound.")
     ap.add_argument("--embed-model", type=str, default="text-embedding-3-small",
                     help="OpenAI embedding model when --tsm-embedder openai")
+    ap.add_argument("--no-rehearse", action="store_true",
+                    help="disable the ORACLE query-rehearsal; eviction then relies only on "
+                         "the engine's intrinsic salience (the honest, deployable signal)")
     ap.add_argument("--extractor", type=str, default="mock",
                     choices=["mock", "ollama", "openai", "auto"],
                     help="fact extractor; 'auto' = Ollama if reachable else OpenAI")
@@ -179,14 +188,17 @@ def main():
         logger.info("Embeddings: OpenAI %s (dim=%d) — retention re-validation",
                     args.embed_model, init_model.get_sentence_embedding_dimension())
 
+    rehearse = not args.no_rehearse
+    logger.info("Rehearsal (oracle query access): %s", "ON" if rehearse else "OFF (intrinsic salience only)")
     logger.info("Running OFF arm (access_aware_eviction=False — naive FIFO)...")
     off, off_p, model = run_arm(False, convs, args.budget, args.model, args.top_k, args.extractor,
                                 shared_model=init_model, judge=judge,
-                                extractor_instance=shared_extractor, judge_workers=args.workers)
+                                extractor_instance=shared_extractor, judge_workers=args.workers,
+                                rehearse=rehearse)
     logger.info("Running ON arm (access_aware_eviction=True — retain-what-is-used)...")
     on, on_p, _ = run_arm(True, convs, args.budget, args.model, args.top_k, args.extractor,
                           shared_model=model, judge=judge, extractor_instance=shared_extractor,
-                          judge_workers=args.workers)
+                          judge_workers=args.workers, rehearse=rehearse)
 
     n = max(on["n"], off["n"]) or 1
     logger.info("=" * 92)
@@ -230,6 +242,7 @@ def main():
     summary = {
         "budget": args.budget,
         "embedder": args.embed_model if args.tsm_embedder == "openai" else "minilm-384",
+        "rehearse": rehearse,
         "pressured_convs_on": on_p,
         "scored_queries": n,
         "survival_lift": round(surv_lift, 4),

@@ -1058,3 +1058,35 @@ retrieval blend (embedder-inflated; make it embedder-adaptive or off by default 
 embeddings). B1/B2 still pending a formal OpenAI re-run but expected to follow the
 retrieval pattern (suspect). Next: full-set (~500) + LoCoMo on the retention/compression
 story; make cognitive_alpha embedder-adaptive.
+
+### A2 IS MOSTLY ORACLE — the retention lift collapses without query-rehearsal (honest)
+
+Before building a bounded-storage head-to-head on the retention win, checked the A2 access
+signal. retention_eval REHEARSED each eval query 3x before eviction (`adapter.search(q.
+query_text...)`) — bumping access-scores on exactly the gold facts. That is an ORACLE: at
+eviction time in production you do NOT know future queries. Added `--no-rehearse` (eviction
+then relies only on the engine's INTRINSIC salience: importance_auto_scoring / reinforce-
+ment) and re-ran on OpenAI embeddings, judged, limit 120.
+
+| A2 retention (OpenAI emb, judged)     | gold survival | judged acc lift |
+|---------------------------------------|:-------------:|:---------------:|
+| WITH oracle query-rehearsal           | 0.13 -> 0.63  | **+0.52**       |
+| WITHOUT (intrinsic salience only)     | 0.13 -> 0.26  | **+0.08**       |
+
+**~85% of the A2 retention win was the eval peeking at its own test queries.** The honest,
+deployable lift is +0.08 judged (0.06 -> 0.14). Not worthless — intrinsic salience still
+DOUBLES the odds the right fact survives (0.13 -> 0.26) — but from a low base, and nowhere
+near the advertised +0.52. Treat +0.52 as an UPPER bound (perfect foreknowledge), +0.08 as
+a LOWER bound (single-conversation intrinsic salience); a real long-lived deployment with
+genuine repeated-access signals sits somewhere between.
+
+**B4 (compression) is NOT affected** — it never rehearses queries; survivors are recency-
+based and the compress-vs-delete gap (+0.24 overall, delete 0.00 -> compress 0.42 on
+evicted answers) rests on a fixed, non-oracle eviction set. So the CLEAN moat is
+compression (gist-don't-delete), not smart-eviction. Corrected lead: **"under bounded
+storage, gist what you evict instead of deleting it"** — real, embedder-independent, and
+oracle-free. Smart-eviction (A2) is a secondary, salience-quality-dependent lever.
+
+**Bounded head-to-head (in progress) is therefore built on B4, not A2:** naive-delete vs
+TSM-gist-compress vs Mem0-native-consolidation, one shared storage budget, judged — does
+TSM's compression beat Mem0's consolidation and naive's deletion at equal memory size?
