@@ -748,3 +748,40 @@ carry: oracle-rehearsal design (we access exactly the query-relevant facts —
 models "used facts get kept", which is the mechanism claim, not a usage-
 pattern claim); budget=10 is aggressive pressure; full-set + LoCoMo
 confirmation before any public number.
+
+## B1 (exclusion-not-demotion) — judged eval ✅ REVIVES belief revision at k<=3 (2026-07-11)
+
+The A-TMA "ghost memory" fix: at recall, EXCLUDE superseded facts from the answer
+context instead of only rank-demoting them (reusing the W3 NLI-verified
+supersession graph via `graph.superseded_ids()`). 120 convs, gpt-4.1-nano
+extraction (disk-cached from A1) + gpt-4.1-mini judge, belief-exclude vs OFF,
+judged at truncated k. ON edges: refine 874 / contra 10.
+
+**Knowledge-update judged answer accuracy (exclude vs OFF):**
+
+| k | ctx tok | KU judged (off -> on) | lift |
+|--:|--:|---|--:|
+| 1 | ~16 | 0.44 -> 0.39 | -0.06 |
+| **3** | ~50 | **0.44 -> 0.67** | **+0.22** |
+| 5 | ~85 | 0.50 -> 0.56 | +0.06 |
+| 10 | ~177 | 0.56 -> 0.56 | +0.00 |
+
+**This is the A1 revival.** Where DEMOTION gave a null/negative KU judged lift at
+every budget, EXCLUSION gives **+0.22 at k=3** (0.44 -> 0.67, a 51% relative gain)
+and +0.06 at k=5 — exactly the tight-budget regime the roadmap targets. The
+mechanism was one design decision away from working, and the July-2026 literature
+named it: stale facts in-context mislead the model regardless of rank; removing
+them is what helps.
+
+**Honest caveat — over-exclusion collateral (unverified).** At k=3, other types go
+NEGATIVE: multi-session -0.10, single-session-preference -0.11, single-session-user
+-0.11. Raw MNN supersessions include false positives; excluding a wrongly-flagged
+fact removes something a non-KU question needed. So B1-exclude UNVERIFIED clears the
+KU half of the gate (+0.22 >> +0.05) but FAILS the "no type < -0.05" half.
+
+**The fix is already built (W3): gate exclusion behind NLI verification** so only
+semantically-confirmed supersessions are excluded — which eliminated exactly this
+collateral for demotion in Stage B.2/W3. Verified-exclude run in flight; expect the
++0.22 KU win to hold with the multi-session/preference/user collateral cut. If it
+does, B1 is the second proven mechanism (with A2 retention) and the product story
+gains "answers correctly under tight budgets by dropping outdated facts."
