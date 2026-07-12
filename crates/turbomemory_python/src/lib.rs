@@ -913,6 +913,16 @@ impl PyMemoryEngine {
         }))
     }
 
+    /// All SUPERSEDED memory ids — the older side of every Refines/Contradicts
+    /// edge to a live newer memory (B1). Exclude these from the answer context
+    /// (or tag them outdated) instead of merely rank-demoting them.
+    fn superseded_ids(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        Ok(py.allow_threads(|| {
+            let guard = self.inner.read_graph();
+            guard.graph().superseded_ids()
+        }))
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (id, text, embedding, importance_score, concepts, payload=None, scope=None, source_role=None))]
     fn update(

@@ -105,7 +105,7 @@ def hit_at(answer, texts, k):
 def run_arm(belief_on, conversations, model_name, top_k, extractor, shared_model=None,
             store_roles=None, belief_source_roles=None, verify_demotions=False,
             shared_verifier=None, judge=None, extractor_instance=None, judge_workers=8,
-            judge_ks=None):
+            judge_ks=None, supersession_mode="demote"):
     """One fresh engine PER conversation (belief detection stays within a user,
     matching a properly-scoped store and isolating the mechanism). The embedding
     model is loaded once and shared across all engines.
@@ -132,7 +132,8 @@ def run_arm(belief_on, conversations, model_name, top_k, extractor, shared_model
                              extractor_instance=extractor_instance,
                              cognitive_features=True, belief_revision=belief_on, model=model,
                              store_roles=store_roles, belief_source_roles=belief_source_roles,
-                             verify_demotions=(belief_on and verify_demotions), verifier=verifier)
+                             verify_demotions=(belief_on and verify_demotions), verifier=verifier,
+                             supersession_mode=(supersession_mode if belief_on else "demote"))
         model = adapter.model  # reuse the loaded model for the next conversation
         try:
             adapter.add(conv.messages, user_id=conv.conv_id)
@@ -201,12 +202,19 @@ def main():
     ap.add_argument("--verify-demotions", action="store_true",
                     help="W3: gate each proposed supersession through a local NLI cross-encoder "
                          "before the destructive demotion (propose -> verify -> commit).")
+    ap.add_argument("--supersession-mode", choices=["demote", "exclude", "tag"], default="demote",
+                    help="B1: how the belief (ON) arm handles superseded facts at recall. "
+                         "'demote' (default) = rank only; 'exclude' = drop from the answer "
+                         "context; 'tag' = prefix with [OUTDATED]. Applies to the ON arm only.")
     ap.add_argument("--judge", choices=["none", "auto", "ollama", "openai"], default="none",
                     help="W6 GOLD-STANDARD metric: score answers with an LLM judge "
                          "(retrieve -> LLM answers from memories -> LLM grades vs gold), not just "
                          "the retrieval proxy. 'auto' = Ollama if reachable (free) else OpenAI.")
     ap.add_argument("--judge-model", type=str, default=None,
                     help="override judge model (default: qwen2.5:3b for ollama, gpt-4o-mini for openai)")
+    ap.add_argument("--extractor-model", type=str, default=None,
+                    help="override the OpenAI extractor model (RPD limits are per-model; "
+                         "e.g. gpt-4.1-nano when gpt-4o-mini's daily quota is spent)")
     ap.add_argument("--judge-ks", type=str, default=None,
                     help="comma-separated ks to judge at by TRUNCATING the top_k retrieval "
                          "(e.g. '1,3,5,10'). One retrieval pass gives the whole accuracy-vs-"
@@ -234,7 +242,8 @@ def main():
     # Build ONE extractor and share it across both arms so its cross-arm cache
     # means the identical corpus is only extracted once (halves LLM cost/time).
     from cognitive_eval.extraction import create_extractor
-    shared_extractor = create_extractor(args.extractor)
+    ekw = {"openai_model": args.extractor_model} if args.extractor_model else {}
+    shared_extractor = create_extractor(args.extractor, **ekw)
 
     convs = load_longmemeval(args.data_dir)
     if args.limit:
@@ -265,7 +274,8 @@ def main():
         shared_model=model, store_roles=store_roles,
         belief_source_roles=belief_source_roles,
         verify_demotions=args.verify_demotions, judge=judge,
-        extractor_instance=shared_extractor, judge_workers=args.workers, judge_ks=judge_ks)
+        extractor_instance=shared_extractor, judge_workers=args.workers, judge_ks=judge_ks,
+        supersession_mode=args.supersession_mode)
 
     logger.info("Belief edges built — OFF: %s   ON: %s", off_edges, on_edges)
     logger.info("=" * 100)

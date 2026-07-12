@@ -123,6 +123,10 @@ class TSMAdapter:
         max_records=None,          # W5: bounded-storage cap (forces eviction).
         access_aware_eviction=None,# W5: cognitive retain-what-is-used eviction (True)
                                    # vs naive FIFO baseline (False). None = default(on).
+        supersession_mode="demote",# B1: what to do with superseded facts at recall.
+                                   # "demote" = rank only (current); "exclude" = drop
+                                   # them from the answer context; "tag" = prefix
+                                   # their text with [OUTDATED].
         **kwargs,
     ):
         """Initialize the TSM adapter.
@@ -157,6 +161,9 @@ class TSMAdapter:
         # W5: retention/eviction knobs.
         self.max_records = max_records
         self.access_aware_eviction = access_aware_eviction
+        # B1: supersession handling at recall.
+        self.supersession_mode = supersession_mode
+        self._superseded_cache = None  # set[str], invalidated on add/consolidate
         # Stop-word set used by _extract_concepts.
         self._stop_words = _STOP_WORDS
 
@@ -419,7 +426,8 @@ class TSMAdapter:
                 )
         insert_time = (time.perf_counter() - insert_start) * 1000
         total_time = (time.perf_counter() - total_start) * 1000
-        
+        self._superseded_cache = None  # store changed → recompute on next recall
+
         # Log timing breakdown
         logger.info("  Add() timing: extract=%.1fms (%.1fms/fact), embed=%.1fms (%.1fms/fact), insert=%.1fms, total=%.1fms",
                     extract_time, extract_time / max(len(all_facts), 1),
@@ -456,34 +464,54 @@ class TSMAdapter:
                   Use this for production AI agents that need cognitive reasoning.
         """
         query_embedding = self.model.encode(query)
-        
+
+        # B1: in exclude/tag mode, over-fetch so that after dropping superseded
+        # facts we still return top_k CURRENT ones (a fair fixed-context compare).
+        fetch_k = top_k
+        if self.supersession_mode in ("exclude", "tag"):
+            fetch_k = top_k * 2 + 5
+
         if use_cognitive:
             # Full cognitive search (spreading activation, FOK gate, etc.)
             results = self.engine.search(
                 query_text=query,
                 query_embedding=query_embedding.astype(np.float32),
-                top_k=top_k,
+                top_k=fetch_k,
                 scope=user_id,
             )
         else:
             # Direct ANN search (fast, no cognitive overhead)
             results = self.engine.search_ann(
                 query_embedding.astype(np.float32),
-                top_k,
+                fetch_k,
             )
-        
+
         if not results:
             return []
-        
-        # Return results with text content from our mapping
-        return [
-            {
-                "id": r[0],
-                "score": float(r[1]),
-                "text": self._id_to_text.get(r[0], ""),
-            }
-            for r in results
-        ]
+
+        superseded = self._superseded_set() if self.supersession_mode in ("exclude", "tag") else set()
+        out = []
+        for r in results:
+            mid = r[0]
+            if self.supersession_mode == "exclude" and mid in superseded:
+                continue  # drop stale facts from the answer context (A-TMA)
+            text = self._id_to_text.get(mid, "")
+            if self.supersession_mode == "tag" and mid in superseded:
+                text = "[OUTDATED] " + text
+            out.append({"id": mid, "score": float(r[1]), "text": text})
+            if len(out) >= top_k:
+                break
+        return out
+
+    def _superseded_set(self):
+        """Cached set of superseded memory ids (B1). Recomputed after any
+        add()/consolidation, which is when the supersession graph can change."""
+        if self._superseded_cache is None:
+            try:
+                self._superseded_cache = set(self.engine.superseded_ids())
+            except Exception:  # engine without the method (older .pyd)
+                self._superseded_cache = set()
+        return self._superseded_cache
     
     def search_ann(self, query: str, user_id: Optional[str] = None, top_k: int = 3) -> List[Dict]:
         """Pure ANN search without cognitive layer (for comparison).
@@ -521,6 +549,7 @@ class TSMAdapter:
         happens until it is semantically confirmed.
         """
         self.engine.trigger_consolidation()
+        self._superseded_cache = None  # supersession edges may have changed
         if not self.verify_demotions:
             return
         proposed = self.engine.propose_supersessions()  # (old, new, kind, cosine)
@@ -529,6 +558,7 @@ class TSMAdapter:
         accepted = self.verifier.verify(proposed, self._id_to_text)
         if accepted:
             self.engine.commit_supersessions(accepted)
+            self._superseded_cache = None
         logger.info("verified demotion: proposed=%d accepted=%d",
                     len(proposed), len(accepted))
     

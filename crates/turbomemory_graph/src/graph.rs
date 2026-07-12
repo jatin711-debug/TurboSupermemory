@@ -1288,6 +1288,30 @@ impl MemoryGraph {
             .count()
     }
 
+    /// Every memory id that is SUPERSEDED — i.e. the source (older) side of a
+    /// `Refines` or `Contradicts` edge whose newer target memory is still live.
+    /// This is the set to EXCLUDE from (or tag as outdated in) the answer
+    /// context: unlike rank-demotion, removing a stale fact from the context is
+    /// what actually stops it misleading the answer model ("ghost memory",
+    /// A-TMA 2026). One graph pass; deduplicated.
+    pub fn superseded_ids(&self) -> Vec<String> {
+        use std::collections::HashSet;
+        let mut set: HashSet<String> = HashSet::new();
+        for e in &self.int_edges {
+            if !matches!(e.kind, EdgeKind::Refines | EdgeKind::Contradicts) {
+                continue;
+            }
+            let (Some(src), Some(tgt)) = (self.interner.get(e.source), self.interner.get(e.target))
+            else {
+                continue;
+            };
+            if matches!(src.kind, NodeKind::Memory) && matches!(tgt.kind, NodeKind::Memory) {
+                set.insert(src.external_id.clone());
+            }
+        }
+        set.into_iter().collect()
+    }
+
     pub fn contradicted_by(&self, id: &str) -> Vec<String> {
         let key = NodeId::memory(id).as_str();
         let Some(nid) = self.get_node_id(&key) else {
@@ -1649,6 +1673,24 @@ mod tests {
         let refined = g.refined_by("old");
         assert_eq!(refined, vec!["new".to_string()]);
         assert!(g.refined_by("new").is_empty());
+    }
+
+    #[test]
+    fn superseded_ids_returns_old_side_of_belief_edges() {
+        let mut g = MemoryGraph::new();
+        g.add_memory("old_r", "a", &["c".into()]);
+        g.add_memory("new_r", "b", &["c".into()]);
+        g.add_memory("old_c", "d", &["c".into()]);
+        g.add_memory("new_c", "e", &["c".into()]);
+        g.add_memory("plain", "f", &["c".into()]); // no belief edge
+        g.add_refinement("old_r", "new_r", 0.8);
+        g.add_contradiction("old_c", "new_c", 0.8, 0.5);
+        let mut ids = g.superseded_ids();
+        ids.sort();
+        assert_eq!(ids, vec!["old_c".to_string(), "old_r".to_string()]);
+        // Newer memories and unrelated memories are NOT superseded.
+        assert!(!ids.contains(&"new_r".to_string()));
+        assert!(!ids.contains(&"plain".to_string()));
     }
 
     #[test]
