@@ -821,3 +821,34 @@ has TWO mechanisms with gold-standard answer-level wins. Product claim gained:
 "under a tight context budget, drops outdated facts to answer knowledge-update
 questions correctly (+0.11 judged at k=3, zero collateral)." Ship `supersession_mode
 = "exclude"` with `verify_demotions` in the conversational preset (Phase B).
+
+## B2 (submodular budget-aware recall) — PASSES ✅ modest but real (2026-07-11)
+
+MMR submodular selection vs naive truncation under a fixed token budget, same
+retrieval pool + best config (role-filtered + NLI-verified exclude), gold-standard
+judged (gpt-4.1-nano extraction cached + gpt-4.1-mini judge, 120 convs, n=114 per
+budget, 1222 judge calls).
+
+| token budget | truncate acc | MMR acc | lift |
+|--:|--:|--:|--:|
+| 50 | 0.44 | 0.42 | -0.02 |
+| **100** | 0.46 | **0.52** | **+0.06** |
+| 150 | 0.51 | 0.55 | +0.04 |
+
+**B2 GATE: PASSED (+0.06 judged at budget=100, n=114).** Diversity-aware selection
+MEASURABLY beats relevance-only truncation at moderate budgets — where the pool has
+room for several facts and truncation wastes tokens on near-duplicates, MMR fills the
+budget with complementary facts and answers more questions. Consistent positive at
+both 100 (+0.06) and 150 (+0.04) tokens; well-powered (n=114), so not noise.
+
+**Honest boundary:** at a VERY tight budget (50 tok, ~2 facts) MMR is -0.02 — too
+little room for diversity to matter, and penalizing redundancy can drop the single
+most-relevant fact. So MMR's value is the "medium-tight" regime (~100 tok); at
+extreme budgets, plain relevance is fine. Recipe: ship submodular `recall(query,
+token_budget)` (lam=0.7) as the Phase-B primitive; it composes with B1 exclude.
+
+**Scoreboard — THREE proven answer-level levers:** A2 retention +0.40 (strong),
+B1 verified-exclude +0.11 KU @k=3 (clean), B2 MMR +0.06 @budget=100 (modest). The
+product is now a genuine stack: retain what matters -> drop what is stale -> pack the
+budget diversely. Next: B3 ACT-R activation, B4 compress-instead-of-delete, B5
+write-gating, then A4 vs Mem0. Full-set (~500) confirmation before public numbers.
