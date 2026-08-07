@@ -16,6 +16,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const RECORDS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("records");
 const META_TABLE: TableDefinition<&str, &str> = TableDefinition::new("meta");
+/// Binary metadata values (currently the cognitive-graph snapshot). Kept in a
+/// separate table because `META_TABLE` is string-valued and binary snapshots
+/// are not UTF-8.
+const META_BIN_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta_bin");
 /// Per-record supersession demotion factors (`offset -> factor`).
 ///
 /// Stored in a dedicated table rather than inside the bincode-serialized
@@ -25,6 +29,18 @@ const META_TABLE: TableDefinition<&str, &str> = TableDefinition::new("meta");
 /// and is recomputed idempotently on every consolidation cycle, so it is
 /// persisted only via the lazy redb snapshot (no WAL durability needed).
 const DEMOTION_TABLE: TableDefinition<u64, f32> = TableDefinition::new("supersession_demotion");
+/// Per-record ACT-R access-history rings (`offset -> bincode Vec<u64>` of
+/// ascending unix-second access timestamps, capped at the configured history
+/// length).
+///
+/// Stored in a dedicated table rather than inside the bincode-serialized
+/// `MetaRecord` for the same reason as `DEMOTION_TABLE`: bincode cannot
+/// tolerate a missing trailing field, so extending `MetaRecord` would make
+/// snapshots (and WAL entries) written by older builds unreadable. Records
+/// written by older builds simply have no entry here and load with an empty
+/// ring. Like the access counters themselves, history bumped since the last
+/// flush is lost on crash.
+const ACCESS_HISTORY_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("access_history");
 
 /// Default demotion factor for a record that has never been superseded.
 pub const NO_DEMOTION: f32 = 1.0;
@@ -42,6 +58,12 @@ pub struct MetadataStore {
     demotion: RwLock<HashMap<PointOffset, f32>>,
     /// Offsets whose demotion factor changed since the last flush.
     demotion_dirty: Mutex<HashSet<PointOffset>>,
+    /// Per-record ACT-R access-history rings. Absent entries mean an empty
+    /// ring. Populated from `ACCESS_HISTORY_TABLE` on open and flushed back
+    /// alongside records.
+    access_history: RwLock<HashMap<PointOffset, Vec<u64>>>,
+    /// Offsets whose access history changed since the last flush.
+    access_history_dirty: Mutex<HashSet<PointOffset>>,
     next_offset: AtomicU64,
     next_seq: AtomicU64,
     /// Number of live metadata records. Maintained incrementally so callers
@@ -58,6 +80,7 @@ impl MetadataStore {
         let records = Self::load_records(&db)?;
         let record_count = AtomicU64::new(records.len() as u64);
         let demotion = Self::load_demotion(&db)?;
+        let access_history = Self::load_access_history(&db)?;
         let next_offset = Self::load_meta(&db, "next_offset")
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| records.keys().copied().max().map(|m| m + 1).unwrap_or(0));
@@ -77,6 +100,8 @@ impl MetadataStore {
             dirty: Mutex::new(HashSet::new()),
             demotion: RwLock::new(demotion),
             demotion_dirty: Mutex::new(HashSet::new()),
+            access_history: RwLock::new(access_history),
+            access_history_dirty: Mutex::new(HashSet::new()),
             next_offset: AtomicU64::new(next_offset),
             next_seq: AtomicU64::new(next_seq),
             record_count,
@@ -108,6 +133,19 @@ impl MetadataStore {
             for item in table.iter()? {
                 let (k, v) = item?;
                 map.insert(k.value(), v.value());
+            }
+        }
+        Ok(map)
+    }
+
+    fn load_access_history(db: &Database) -> crate::Result<HashMap<PointOffset, Vec<u64>>> {
+        let txn = redb(db.begin_read())?;
+        let mut map = HashMap::new();
+        if let Ok(table) = txn.open_table(ACCESS_HISTORY_TABLE) {
+            for item in table.iter()? {
+                let (k, v) = item?;
+                let ring: Vec<u64> = bincode::deserialize(v.value())?;
+                map.insert(k.value(), ring);
             }
         }
         Ok(map)
@@ -178,6 +216,48 @@ impl MetadataStore {
         }
     }
 
+    /// Read the ACT-R access-history ring for a record (ascending unix-second
+    /// access timestamps, most recent last).
+    ///
+    /// Returns an empty Vec when the record has no recorded history —
+    /// including records written by builds predating `ACCESS_HISTORY_TABLE`.
+    pub fn access_history(&self, offset: PointOffset) -> Vec<u64> {
+        self.access_history
+            .read()
+            .get(&offset)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Snapshot every live access-history ring for batch scoring (eviction).
+    pub fn access_histories(&self) -> HashMap<PointOffset, Vec<u64>> {
+        self.access_history.read().clone()
+    }
+
+    /// Merge newly observed access timestamps into a record's ring and mark it
+    /// dirty. The merged ring is sorted ascending and truncated to the most
+    /// recent `max_len` timestamps.
+    pub fn append_access_history(
+        &self,
+        offset: PointOffset,
+        new_timestamps: &[u64],
+        max_len: usize,
+    ) {
+        if new_timestamps.is_empty() {
+            return;
+        }
+        let mut map = self.access_history.write();
+        let entry = map.entry(offset).or_default();
+        entry.extend_from_slice(new_timestamps);
+        entry.sort_unstable();
+        if entry.len() > max_len {
+            let excess = entry.len() - max_len;
+            entry.drain(..excess);
+        }
+        drop(map);
+        self.access_history_dirty.lock().insert(offset);
+    }
+
     /// Insert or update metadata from a full `Record`.  The embedding is *not*
     /// kept here; callers must write it to the `VectorStore` separately.
     pub fn put(&self, offset: PointOffset, record: &Record) -> crate::Result<()> {
@@ -233,6 +313,10 @@ impl MetadataStore {
         if self.demotion.write().remove(&offset).is_some() {
             self.demotion_dirty.lock().insert(offset);
         }
+        // Same for the ACT-R access-history ring.
+        if self.access_history.write().remove(&offset).is_some() {
+            self.access_history_dirty.lock().insert(offset);
+        }
         Ok(())
     }
 
@@ -241,8 +325,11 @@ impl MetadataStore {
     pub fn flush(&self, last_applied_seq: u64) -> crate::Result<()> {
         let dirty: HashSet<PointOffset> = std::mem::take(&mut *self.dirty.lock());
         let demotion_dirty: HashSet<PointOffset> = std::mem::take(&mut *self.demotion_dirty.lock());
+        let access_history_dirty: HashSet<PointOffset> =
+            std::mem::take(&mut *self.access_history_dirty.lock());
         if dirty.is_empty()
             && demotion_dirty.is_empty()
+            && access_history_dirty.is_empty()
             && self.last_applied_seq() == Some(last_applied_seq)
             && self.records.read().is_empty()
         {
@@ -274,6 +361,18 @@ impl MetadataStore {
                 }
             }
         }
+        if !access_history_dirty.is_empty() {
+            let access_history = self.access_history.read();
+            let mut table = redb(txn.open_table(ACCESS_HISTORY_TABLE))?;
+            for offset in &access_history_dirty {
+                if let Some(ring) = access_history.get(offset) {
+                    let bytes = bincode::serialize(ring)?;
+                    redb(table.insert(*offset, bytes.as_slice()))?;
+                } else {
+                    redb(table.remove(*offset))?;
+                }
+            }
+        }
         {
             let mut meta = redb(txn.open_table(META_TABLE))?;
             let next_offset_str = self.next_offset.load(Ordering::SeqCst).to_string();
@@ -299,6 +398,53 @@ impl MetadataStore {
 
     pub fn load_meta_str(&self, key: &str) -> Option<String> {
         Self::load_meta(&self.db, key)
+    }
+
+    /// Persist a binary metadata value (e.g. the graph snapshot) in its own
+    /// immediate transaction, mirroring [`save_meta`](Self::save_meta).
+    pub fn save_meta_bytes(&self, key: &str, value: &[u8]) -> crate::Result<()> {
+        let txn = redb(self.db.begin_write())?;
+        {
+            let mut table = redb(txn.open_table(META_BIN_TABLE))?;
+            redb(table.insert(key, value))?;
+        }
+        redb(txn.commit())?;
+        Ok(())
+    }
+
+    pub fn load_meta_bytes(&self, key: &str) -> Option<Vec<u8>> {
+        let txn = redb(self.db.begin_read()).ok()?;
+        let table = txn.open_table(META_BIN_TABLE).ok()?;
+        Some(table.get(key).ok()??.value().to_vec())
+    }
+
+    /// Remove a string metadata value. No-op when the key is absent, so the
+    /// steady state (nothing to remove) avoids a write transaction.
+    pub fn remove_meta(&self, key: &str) -> crate::Result<()> {
+        if Self::load_meta(&self.db, key).is_none() {
+            return Ok(());
+        }
+        let txn = redb(self.db.begin_write())?;
+        {
+            let mut table = redb(txn.open_table(META_TABLE))?;
+            redb(table.remove(key))?;
+        }
+        redb(txn.commit())?;
+        Ok(())
+    }
+
+    /// Remove a binary metadata value. No-op when the key is absent.
+    pub fn remove_meta_bytes(&self, key: &str) -> crate::Result<()> {
+        if self.load_meta_bytes(key).is_none() {
+            return Ok(());
+        }
+        let txn = redb(self.db.begin_write())?;
+        {
+            let mut table = redb(txn.open_table(META_BIN_TABLE))?;
+            redb(table.remove(key))?;
+        }
+        redb(txn.commit())?;
+        Ok(())
     }
 
     pub fn allocate_offset(&self) -> PointOffset {

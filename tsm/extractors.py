@@ -1,24 +1,20 @@
-"""OpenAI-based atomic-fact extractor (W6).
+"""OpenAI-based atomic-fact extractor (default extractor for ``tsm.Memory``).
 
-Replaces the mock sentence-splitter with a real LLM extractor over the OpenAI
-API — closing the biggest caveat in the eval record (mock extraction inflated
-near-duplicate "facts" from assistant chatter). Same interface as
-`OllamaExtractor` so it is a drop-in via the extractor factory.
-
-Uses JSON mode for reliable parsing and an in-memory cache keyed by message text
-so the identical corpus in the ON and OFF arms is only extracted once (halves
-cost + time). The key is read from OPENAI_API_KEY in the environment and never
-handled or logged.
+Uses JSON mode for reliable parsing and a persistent disk cache keyed by
+message text (+ recent context) so the same message is never extracted (paid
+for) twice. The API key is read from the ``OPENAI_API_KEY`` environment
+variable only — it is never handled or logged. The ``openai`` package is
+imported lazily, so ``tsm`` imports fine without it.
 """
 
-import json
 import hashlib
+import json
 import logging
 import os
 import time
 from typing import List, Optional
 
-logger = logging.getLogger("cognitive_eval.extraction.openai")
+logger = logging.getLogger("tsm.extractors")
 
 _SYS = (
     "You extract atomic facts from a single conversation message. An atomic fact "
@@ -31,7 +27,7 @@ _SYS = (
 )
 
 
-def extraction_cache_key(message, context=None):
+def _cache_key(message: str, context: Optional[List[str]] = None) -> str:
     key = message.strip()
     if not context:
         return key
@@ -41,28 +37,31 @@ def extraction_cache_key(message, context=None):
 
 
 class OpenAIExtractor:
-    def __init__(self, model: str = "gpt-4o-mini", max_retries: int = 6, request_timeout: float = 30.0,
-                 cache_dir: str = None):
-        from .._secrets import ensure_openai_key, key_file_hint
-        if not ensure_openai_key():
-            raise RuntimeError("No OpenAI key. " + key_file_hint())
+    def __init__(self, model: str = "gpt-4o-mini", max_retries: int = 6,
+                 request_timeout: float = 30.0, cache_dir: str = None):
+        if not os.environ.get("OPENAI_API_KEY"):
+            raise RuntimeError(
+                "OPENAI_API_KEY is not set. The default OpenAIExtractor needs "
+                "it; pass a custom extractor to tsm.Memory to use another "
+                "backend (see tsm.interfaces.Extractor)."
+            )
         from openai import OpenAI
 
         self._client = OpenAI(timeout=request_timeout)
         self.model = model
         self.max_retries = max_retries
         self.calls = 0
-        # Persistent disk cache: the same corpus must never be extracted (paid
-        # for) twice across runs. Keyed by message text; one file per model.
-        import pathlib
-        cdir = pathlib.Path(cache_dir) if cache_dir else pathlib.Path(__file__).parent / "_cache"
-        cdir.mkdir(exist_ok=True)
-        self._cache_path = cdir / f"extract_{model.replace('/', '_').replace(':', '_')}.json"
+        cdir = cache_dir or os.path.join(os.path.expanduser("~"), ".cache", "tsm")
+        os.makedirs(cdir, exist_ok=True)
+        self._cache_path = os.path.join(
+            cdir, f"extract_{model.replace('/', '_').replace(':', '_')}.json")
         self._cache: dict = {}
-        if self._cache_path.exists():
+        if os.path.exists(self._cache_path):
             try:
-                self._cache = json.loads(self._cache_path.read_text(encoding="utf-8"))
-                logger.info("Loaded %d cached extractions from %s", len(self._cache), self._cache_path.name)
+                with open(self._cache_path, encoding="utf-8") as f:
+                    self._cache = json.load(f)
+                logger.info("Loaded %d cached extractions from %s",
+                            len(self._cache), os.path.basename(self._cache_path))
             except (OSError, json.JSONDecodeError):
                 self._cache = {}
         self._dirty = 0
@@ -71,7 +70,8 @@ class OpenAIExtractor:
         self._dirty += 1
         if force or self._dirty >= 200:
             try:
-                self._cache_path.write_text(json.dumps(self._cache), encoding="utf-8")
+                with open(self._cache_path, "w", encoding="utf-8") as f:
+                    json.dump(self._cache, f)
                 self._dirty = 0
             except OSError as e:
                 logger.warning("extract cache write failed: %s", e)
@@ -101,10 +101,11 @@ class OpenAIExtractor:
                 time.sleep(wait)
         raise RuntimeError("OpenAI extraction failed after retries")
 
+    # Extractor protocol ----------------------------------------------------------
     def extract_facts(self, message: str, context: Optional[List[str]] = None) -> List[str]:
         if not message or not message.strip():
             return []
-        key = extraction_cache_key(message, context)
+        key = _cache_key(message, context)
         if key in self._cache:
             return self._cache[key]
         raw = self._chat_json(message, context)
@@ -123,10 +124,3 @@ class OpenAIExtractor:
     def flush_cache(self):
         """Write any unpersisted cache entries to disk."""
         self._persist(force=True)
-
-    def extract_facts_batch(self, messages, contexts=None):
-        return [self.extract_facts(m, contexts[i] if contexts and i < len(contexts) else None)
-                for i, m in enumerate(messages)]
-
-    def health_check(self) -> bool:
-        return bool(os.environ.get("OPENAI_API_KEY"))

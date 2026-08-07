@@ -12,6 +12,19 @@ import torch
 
 logger = logging.getLogger("cognitive_eval.embedding")
 
+# Process-level shared-provider caches. The 500-conversation eval harness used
+# to load one transformers model PER ADAPTER (one adapter per conversation);
+# every load allocates a fresh torch model that the caching allocator retains,
+# which is what OOMed the harness. The transformers provider cache is keyed by
+# (model_name, batch_size, device); the SentenceTransformer cache by model_name.
+#
+# Threading: plain dicts with NO locking, by design. Eval runners only run LLM
+# calls concurrently; adapters/providers are constructed and model.encode() runs
+# on the MAIN thread, one conversation at a time. If a future runner builds
+# adapters from multiple threads, warm the cache once on the main thread first.
+_PROVIDER_CACHE: dict = {}  # (model_name, batch_size, device) -> SimpleEmbeddingProvider
+_ST_CACHE: dict = {}        # model_name -> sentence_transformers.SentenceTransformer
+
 
 class SimpleEmbeddingProvider:
     """Embedding provider using transformers directly with batch support.
@@ -125,22 +138,14 @@ class SimpleEmbeddingProvider:
         return self.encode(texts)
 
 
-def create_embedding_provider(model_name: str = None, batch_size: int = 32) -> SimpleEmbeddingProvider:
-    """Create embedding provider with smart defaults for local hardware.
-    
-    Args:
-        model_name: Model name or None for auto-selection based on VRAM
-        batch_size: Batch size for encoding
-        
-    Returns:
-        SimpleEmbeddingProvider instance
-    """
+def _resolve_model_defaults(model_name: str, batch_size: int):
+    """Apply the smart local-hardware defaults (auto model selection by VRAM)."""
     if model_name is None:
         # Auto-select model based on available VRAM
         if torch.cuda.is_available():
             vram_mb = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
             logger.info("Detected VRAM: %.0f MB", vram_mb)
-            
+
             if vram_mb < 6000:  # Less than 6GB VRAM
                 model_name = "sentence-transformers/all-MiniLM-L6-v2"  # 384 dim, ~80MB
                 batch_size = min(batch_size, 64)  # Can use larger batch with small model
@@ -153,8 +158,61 @@ def create_embedding_provider(model_name: str = None, batch_size: int = 32) -> S
             model_name = "sentence-transformers/all-MiniLM-L6-v2"
             batch_size = min(batch_size, 32)
             logger.info("No GPU detected. Using lightweight model: %s", model_name)
-    
+    return model_name, batch_size
+
+
+def create_embedding_provider(model_name: str = None, batch_size: int = 32) -> SimpleEmbeddingProvider:
+    """Create embedding provider with smart defaults for local hardware.
+
+    Returns a NEW, privately-owned provider on every call. For the eval harness
+    (hundreds of per-conversation adapters), prefer get_shared_embedding_provider()
+    so the whole process shares one torch model.
+
+    Args:
+        model_name: Model name or None for auto-selection based on VRAM
+        batch_size: Batch size for encoding
+
+    Returns:
+        SimpleEmbeddingProvider instance
+    """
+    model_name, batch_size = _resolve_model_defaults(model_name, batch_size)
     return SimpleEmbeddingProvider(model_name=model_name, batch_size=batch_size)
+
+
+def get_shared_embedding_provider(model_name: str = None, batch_size: int = 32,
+                                  device: str = None) -> SimpleEmbeddingProvider:
+    """Return a process-wide shared provider, creating it on first use.
+
+    Same defaults/semantics as create_embedding_provider(), but the instance is
+    cached by (model_name, batch_size, device) so hundreds of per-conversation
+    adapters share ONE torch model (fixes the eval-harness OOM from per-adapter
+    model loads retained by torch's caching allocator). See the threading note
+    on _PROVIDER_CACHE above. Use create_embedding_provider() when a caller
+    genuinely needs an isolated instance.
+    """
+    model_name, batch_size = _resolve_model_defaults(model_name, batch_size)
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    key = (model_name, batch_size, device)
+    provider = _PROVIDER_CACHE.get(key)
+    if provider is None:
+        provider = SimpleEmbeddingProvider(model_name=model_name, device=device, batch_size=batch_size)
+        _PROVIDER_CACHE[key] = provider
+    return provider
+
+
+def get_shared_sentence_transformer(model_name: str):
+    """Return a process-wide shared SentenceTransformer, creating it on first use.
+
+    Same caching rationale as get_shared_embedding_provider(); keyed by
+    model_name. Import is deferred (sentence-transformers is broken on this
+    Windows setup and is only attempted on other platforms).
+    """
+    st = _ST_CACHE.get(model_name)
+    if st is None:
+        from sentence_transformers import SentenceTransformer
+        st = SentenceTransformer(model_name)
+        _ST_CACHE[model_name] = st
+    return st
 
 
 if __name__ == "__main__":

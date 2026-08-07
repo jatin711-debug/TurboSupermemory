@@ -31,7 +31,7 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cognitive_eval.adapters.tsm_adapter import TSMAdapter
 from cognitive_eval.benchmark_datasets.longmemeval import load_longmemeval
-from cognitive_eval.verification import NLIVerifier
+from cognitive_eval.verification import get_shared_verifier
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger("verify_supersessions")
@@ -49,7 +49,7 @@ def main():
         logging.getLogger(name).setLevel(logging.ERROR)
 
     convs = load_longmemeval()[:args.limit]
-    verifier = NLIVerifier()
+    verifier = get_shared_verifier()
     model = None
     labels = Counter()
     accepted_n = proposed_n = shown = 0

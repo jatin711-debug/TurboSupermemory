@@ -6,6 +6,7 @@
 use numpy::PyUntypedArrayMethods;
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use turbomemory_graph::{CognitiveCompressor, CompressedCognitiveState, DeterministicCompressor};
@@ -248,7 +249,11 @@ impl PyMemoryEngine {
         concept_evolution_max_pairs_per_cycle=None,
         belief_source_roles=None,
         defer_supersession_commit=None,
+        exclude_superseded=None,
         access_aware_eviction=None,
+        actr_activation=None,
+        actr_decay=None,
+        actr_history=None,
         incremental_supersession_detection=None,
         seed_hops_from=None,
         expansion_max_candidates=None,
@@ -305,7 +310,11 @@ impl PyMemoryEngine {
         concept_evolution_max_pairs_per_cycle: Option<usize>,
         belief_source_roles: Option<Vec<String>>,
         defer_supersession_commit: Option<bool>,
+        exclude_superseded: Option<bool>,
         access_aware_eviction: Option<bool>,
+        actr_activation: Option<bool>,
+        actr_decay: Option<f64>,
+        actr_history: Option<usize>,
         incremental_supersession_detection: Option<bool>,
         seed_hops_from: Option<usize>,
         expansion_max_candidates: Option<usize>,
@@ -536,8 +545,37 @@ impl PyMemoryEngine {
         if let Some(defer) = defer_supersession_commit {
             config.tier.defer_supersession_commit = defer;
         }
+        // - exclude_superseded: when true, memories superseded by a newer
+        //   belief (old side of a Refines/Contradicts edge) are EXCLUDED from
+        //   search/search_ann results entirely, not merely rank-demoted — the
+        //   A-TMA "ghost memory" fix proven in the B1 eval. Requires belief
+        //   revision to be active to have any effect: no supersession edges
+        //   means an empty superseded set and zero behavior change. Default
+        //   false.
+        if let Some(ex) = exclude_superseded {
+            config.tier.exclude_superseded = ex;
+        }
         if let Some(aae) = access_aware_eviction {
             config.tier.access_aware_eviction = aae;
+        }
+        // - actr_activation: rank eviction candidates by ACT-R base-level
+        //   activation — ln(Σ age^-actr_decay) over the last actr_history
+        //   access timestamps — instead of the legacy access_count × recency
+        //   heuristic, so spaced/repeated rehearsal outweighs a single recent
+        //   burst (power-law forgetting). Opt-in (default false); promotion
+        //   scoring stays legacy. Only meaningful with access-aware eviction
+        //   and max_records / evict_score_floor set.
+        // - actr_decay: decay exponent d. Default 0.5; higher forgets faster.
+        // - actr_history: ring length of retained access timestamps. Default
+        //   8, clamped to 1..=32.
+        if let Some(on) = actr_activation {
+            config.tier.actr_activation = on;
+        }
+        if let Some(d) = actr_decay {
+            config.tier.actr_decay = d;
+        }
+        if let Some(k) = actr_history {
+            config.tier.actr_history = k;
         }
         if let Some(inc) = incremental_supersession_detection {
             config.tier.incremental_supersession_detection = inc;
@@ -921,6 +959,27 @@ impl PyMemoryEngine {
             let guard = self.inner.read_graph();
             guard.graph().superseded_ids()
         }))
+    }
+
+    /// Resolve each id against the supersession graph — "what is true NOW" in
+    /// place of that memory, with lineage. Returns a list of dicts with keys
+    /// `id` / `current_id` / `superseded` / `chain` (chain = the full
+    /// supersession chain containing `id`, oldest first, head last). Works
+    /// without any cognitive config flags: with no supersession edges every id
+    /// resolves to itself (`superseded=False`, `chain=[id]`).
+    fn resolve_beliefs(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<Vec<Py<PyDict>>> {
+        let resolutions = py.allow_threads(|| self.inner.resolve_beliefs(&ids));
+        resolutions
+            .into_iter()
+            .map(|r| {
+                let d = PyDict::new(py);
+                d.set_item("id", r.id)?;
+                d.set_item("current_id", r.current_id)?;
+                d.set_item("superseded", r.superseded)?;
+                d.set_item("chain", r.chain)?;
+                Ok(d.unbind())
+            })
+            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -1243,3 +1243,205 @@ defensible product claim is the RELATIVE one, already robust: TSM beats Mem0 by 
 unbounded and wins the bounded compression moat. Recommend SKIP the expensive Phase 3
 (full GPT-4o parity) as framed; keep LoCoMo (generalization to a 2nd dataset) and a
 full-set(500) run for statistical robustness of the RELATIVE claim (not absolute parity).
+
+
+# Leak investigation — engine create/close lifecycle is CLEAN (2026-08-06)
+
+The flagged "native-memory leak across engine create/close cycles" (W3-era note:
+harness OOMs at the 500-conv set, `close()` suspected of not releasing
+mmap/redb/tantivy/usearch) was tested directly with a dedicated repro:
+`benchmarks/leak_repro.py` — creates/closes N engines in one process with
+Python GC between cycles, logging RSS + thread count (psutil).
+
+Three arms, all at adapter parity config (`auto_consolidation_secs=0`,
+cognitive features ON matching `tsm_adapter.py`):
+
+| arm | config | result |
+|---|---|---|
+| baseline | 40 cycles x 200 records, flush+close | RSS plateaus +3.6 MB by cycle 10; threads flat (19) |
+| heavy | 25 cycles x 500 records, cognitive ON + `trigger_consolidation()` | RSS plateaus +4.7 MB; threads flat |
+| full | heavy + 50 cognitive `search()`/cycle | RSS plateaus +4.6 MB; threads flat |
+
+**Verdict: the TSM engine lifecycle does NOT leak.** RSS stabilizes after a few
+cycles (allocator warmup), thread count never moves (optimizer/update workers
+stop on drop), and growth is absent across write, consolidation, and read
+paths. A reference-cycle leak (the classic `Arc` cycle failure mode) is
+excluded — the optimizer holds only a `Weak` engine ref and both worker Drop
+impls send Shutdown and join.
+
+**Re-attribution:** the 500-conv harness OOM is almost certainly in the
+eval-side ML stack, not TSM: `tsm_adapter.py` loads a transformers embedding
+model **per adapter/conversation** (`self.model = create_embedding_provider(...)`
+in `__init__`), and the NLI cross-encoder loads lazily per verifier — torch's
+caching allocator retains native memory across such cycles. Recommendation for
+the full-500 rerun: share ONE embedding provider and ONE `NLIVerifier` across
+all conversations (module-level singleton), and log `psutil` RSS per
+conversation to confirm. Phase B item 4 should be re-scoped from "fix engine
+leak" to "fix harness model-per-conversation loading".
+
+Also fixed this session: `GpuHnswIndex::search` no longer calls
+`init_backend()` per query (fresh CUDA context per search; the GPU branch
+could never succeed anyway — `ann_search` is `BackendNotCompiled` by design).
+Search now goes straight to the usearch fallback built alongside the GPU
+graph. Storage suite 79+3 green, clippy clean in both feature configs.
+
+
+# Bounded head-to-head re-confirmation — OpenAI pipeline, CUDA build (2026-08-07)
+
+After the 2026-08-06 stability work (binary graph snapshot, engine-level
+`exclude_superseded`, API hardening, harness model singletons, GPU per-query
+context fix), the moat claim was re-run end-to-end on the CUDA-enabled build
+with the full OpenAI pipeline: `text-embedding-3-small` (1536-d) embeddings,
+gpt-4.1-nano extraction (2,510 calls, disk-cached) + gist compression,
+gpt-4o-mini judge. Command:
+
+    python benchmarks/cognitive_eval/bounded_head_to_head.py --limit 120 \
+        --storage-budgets 64,128,256 --token-budget 150 --extractor openai \
+        --gister openai --judge openai --systems naive,tsm --workers 8
+
+TSM-compress vs naive-delete, judged answer accuracy (pressured n≈117-119/budget):
+
+| active-store budget | naive | TSM-compress | gap | evicted-subset TSM |
+|---|---|---|---|---|
+| 64 tokens | 0.018 | 0.088 | **+0.070** | 0.099 (n=81) |
+| 128 tokens | 0.009 | 0.170 | **+0.161** | 0.167 (n=78) |
+| 256 tokens | 0.054 | 0.366 | **+0.312** | 0.414 (n=70) |
+
+- The B4 moat **reproduces and scales with budget**: the gap widens as the
+  active store grows (more history evicted → more gists → better coverage).
+  On the answer-in-evicted subset TSM wins outright at every budget
+  (naive ≈ 0.00 — an evicted fact is unanswerable, confirming the roadmap's
+  core premise once more).
+- Consistent with prior runs: B4 +0.25 (MiniLM), +0.316 smoke (slots, mock
+  extraction), +0.312 here at 256-tok with the full OpenAI pipeline.
+- Honest caveats: absolute accuracies are low in the tightest regime (0.09 at
+  64-tok) — budgets are brutal by design; judge is gpt-4o-mini (mini reader),
+  so absolutes sit below a GPT-4o reader; mem0 arm not run (mem0ai not
+  installed on this machine).
+- Runner wiring fix this session: per-conversation adapters now receive the
+  runner-level extractor via `extractor_instance=` (the W6 shared kwarg)
+  instead of constructing an unused MockExtractor each. Cosmetic — facts were
+  always extracted by the runner-level extractor; `insert_facts` bypasses
+  `add()`.
+
+
+# B3 ACT-R retention eval — honest 3-arm, sources rehearsal (2026-08-07)
+
+First oracle-free run of the retention isolation eval: three arms differing
+ONLY in eviction ranking, rehearsal driven by the conversation's own past
+user-message texts (`--rehearse-mode sources`, the honest signal — users
+re-ask about their own facts), full OpenAI pipeline
+(`text-embedding-3-small` 1536-d, gpt-4.1-nano extraction fully disk-cached,
+gpt-4.1-mini judge, 505 judge calls). ACT-R arm: `actr_activation=True`
+(base-level `ln(Σ age^-0.5)` over the K=8 access ring) vs legacy
+count-decay access-aware vs naive FIFO. Command:
+
+    python benchmarks/cognitive_eval/retention_eval.py --limit 120 \
+        --judge openai --judge-model gpt-4.1-mini --extractor openai \
+        --extractor-model gpt-4.1-nano --rehearse-mode sources \
+        --tsm-embedder openai
+
+120 conversations (117 budget-pressured at max_records=10, 112 scored
+queries):
+
+| metric | FIFO | legacy access-aware | ACT-R |
+|---|---|---|---|
+| gold survival | 0.125 | 0.679 | 0.679 |
+| hit@1 | 0.089 | 0.313 | 0.313 |
+| hit@3 | 0.098 | 0.438 | 0.438 |
+| hit@k | 0.125 | 0.563 | 0.563 |
+| **judged accuracy** | 0.045 | **0.438** | **0.438** |
+
+- **Access-signal eviction is the entire effect**: +0.393 judged accuracy
+  over FIFO (0.438 vs 0.045). Under budget pressure, naive recency eviction
+  destroys the answerable store; one honest rehearsal pass over the user's
+  own past messages is enough to protect ~68% of gold facts vs ~13%.
+- **ACT-R exactly ties legacy at this scale** (+0.000 on every metric).
+  Per the roadmap kill/keep rule (ACT-R ≥ legacy → keep) the verdict is
+  KEEP, but the candid read is a null result: with a single rehearsal pass
+  immediately before consolidation, the access ring and the count-decay
+  score rank the same recently-rehearsed facts on top. This is a genuine
+  empirical tie, not a wiring bug — the engine test
+  `actr_eviction_prefers_spaced_over_burst` proves the two rankings diverge
+  (spaced-vs-burst histories), and the tie holds across 117 pressured
+  conversations because this workload has no spaced-rehearsal structure.
+- **Where ACT-R should matter**: workloads with repeated sessions over days
+  (spacing effect), interleaved topics, and budgets tighter than the gold
+  working set. LongMemEval-S at 120 convs with one-shot rehearsal has none
+  of that. A spaced-rehearsal variant (multiple rehearsal rounds with
+  simulated time gaps) is the natural follow-up before claiming ACT-R earns
+  its complexity.
+- Ceiling note: even under access-aware policies, ~32% of gold facts are
+  still evicted at budget=10 — headroom for better salience (ACT-R with
+  spacing, importance scoring) or compression (gist before evict, the B4
+  mechanism, which already showed +0.31 at 256-tok).
+- Benign run noise: transient embed-cache flush warnings (WinError 5/32,
+  concurrent writers racing the pickle swap); all 22,012 embeddings served
+  from cache, zero extractor calls.
+
+# B3 kill/keep — ACT-R activation vs legacy access-aware eviction, oracle-free ✅ KEEP (2026-08-07)
+
+The W5/A2 retention eval rehearsed with the EVAL QUERIES THEMSELVES as the
+access signal — an oracle leak (you don't know future queries at eviction
+time; the contaminated +0.41 survival lift collapsed to +0.08 without it).
+This run fixes the leak with a new `--rehearse-mode sources` (now the
+default): before consolidation we search an evenly-spaced sample of at most
+24 of each conversation's PAST USER-MESSAGE texts (2x each) — the fact
+SOURCE texts, modeling "users re-ask about their own facts over time". No
+eval query text is ever touched. `oracle` (old behavior, logs a
+contamination warning) and `none` modes are kept for comparison.
+
+Three arms, identical in every operation (same corpus, insertion order,
+budget=10 max_records, rehearsal, consolidation cadence, judge protocol),
+differing only in the eviction ranking policy:
+
+- FIFO:   `access_aware_eviction=False` — evict oldest-inserted first.
+- LEGACY: `access_aware_eviction=True` — `access_count x 2^(-age/half_life)`.
+- ACT-R:  `access_aware_eviction=True, actr_activation=True` — base-level
+  activation `ln(sum age^-d)` over the last K access timestamps (engine
+  defaults d=0.5, K=8). Access bumps come from search hits.
+
+Command:
+
+    PYTHONPATH=benchmarks python benchmarks/cognitive_eval/retention_eval.py \
+        --limit 120 --judge openai --judge-model gpt-4.1-mini \
+        --extractor openai --extractor-model gpt-4.1-nano \
+        --rehearse-mode sources --tsm-embedder openai --workers 8
+
+Extraction (gpt-4.1-nano) and embeddings (text-embedding-3-small, 1536-d)
+were fully disk-cached; marginal cost was the judge (508 gpt-4.1-mini calls
+incl. answer generation). 117 budget-pressured conversations, 112 scored
+queries per arm.
+
+| metric          | FIFO  | LEGACY | ACT-R |
+|---|---|---|---|
+| gold survival   | 0.125 | 0.679  | 0.679 |
+| hit@1           | 0.089 | 0.304  | 0.304 |
+| hit@3           | 0.098 | 0.438  | 0.438 |
+| hit@10          | 0.125 | 0.563  | 0.563 |
+| judged accuracy | 0.045 | 0.438  | **0.446** |
+
+- LEGACY - FIFO judged accuracy: **+0.393** — the retain-what-is-used
+  mechanism reproduces STRONGLY under the honest, deployable access signal
+  (the old +0.08 honest estimate was measured with NO access signal at all;
+  a realistic user re-access signal is what the mechanism needs).
+- ACT-R - LEGACY judged accuracy: **+0.009** (exactly one judged answer).
+  Survival and every hit@k are IDENTICAL — under this signal both policies
+  keep the same memories.
+- B3 VERDICT (per the roadmap kill/keep gate): **KEEP ACT-R** — parity-or-
+  better with legacy, and parity still simplifies the theory: ACT-R replaces
+  a hand-tuned count-times-exponential with the principled power-law
+  base-level activation, no half-life knob required.
+- Note: transient Windows embed-cache flush warnings (WinError 32) appeared
+  mid-run; they only delayed disk persistence of newly computed embeddings
+  and do not affect the numbers.
+
+GATE_SUMMARY: {"budget": 10, "embedder": "text-embedding-3-small",
+"rehearse_mode": "sources", "scored_queries": 112, "metric_for_verdict":
+"judged accuracy", "arms": {"fifo": {"pressured_convs": 117, "survival":
+0.125, "hit1": 0.0893, "hit3": 0.0982, "hitk": 0.125, "judged_acc": 0.0446},
+"legacy": {"pressured_convs": 117, "survival": 0.6786, "hit1": 0.3036,
+"hit3": 0.4375, "hitk": 0.5625, "judged_acc": 0.4375}, "actr":
+{"pressured_convs": 117, "survival": 0.6786, "hit1": 0.3036, "hit3": 0.4375,
+"hitk": 0.5625, "judged_acc": 0.4464}}, "legacy_minus_fifo": 0.3929,
+"actr_minus_legacy": 0.0089, "verdict": "keep"}

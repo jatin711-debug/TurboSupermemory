@@ -1,40 +1,34 @@
-"""NLI cross-encoder verification of proposed supersessions (W3).
+"""NLI cross-encoder verification of proposed supersessions.
 
-The geometric detector (`propose_supersessions`) is high-recall but imperfect:
-two *coexisting* facts about the same topic can be mutual-nearest neighbours and
-slip through the text/opposition gates. Committing a supersession there wrongly
-demotes a still-true memory. This verifier adds a semantic gate BEFORE the
-destructive demotion, using a small natural-language-inference cross-encoder that
-runs locally on CPU/GPU — no LLM server (ollama/API) required.
+The geometric detector (``engine.propose_supersessions``) is high-recall but
+imperfect: two *coexisting* facts about the same topic can be mutual-nearest
+neighbours and slip through the text/opposition gates. Committing a
+supersession there wrongly demotes a still-true memory. This verifier adds a
+semantic gate BEFORE the destructive demotion, using a small
+natural-language-inference cross-encoder that runs locally on CPU/GPU — no
+LLM server or API key required.
 
-For a candidate where `new` supersedes `old`, we run NLI with premise=`new`,
-hypothesis=`old`:
+For a candidate where ``new`` supersedes ``old``, NLI runs with
+premise=``new``, hypothesis=``old``:
 
   - **entailment**  — the new memory implies the old one: an update / more
-    complete version. Supersession is valid → commit (demote old).
-  - **contradiction** — the new memory opposes the old one: the belief changed.
-    Supersession is valid → commit (demote old).
-  - **neutral** — the two are independent (coexisting facts). This is exactly the
-    false positive we want to stop → reject (do NOT demote).
+    complete version. Supersession is valid -> commit (demote old).
+  - **contradiction** — the new memory opposes the old one: the belief
+    changed. Supersession is valid -> commit (demote old).
+  - **neutral** — the two are independent (coexisting facts). This is exactly
+    the false positive to stop -> reject (do NOT demote).
 
-So the default rule is simply *reject NEUTRAL* (above a confidence margin),
-which is the precise failure mode that hurt single-session retrieval. The accept
-set is configurable and can be calibrated on a labelled sample (see
-`verify_supersessions.py --dump`).
+So the default rule is simply *reject NEUTRAL*. ``torch``/``transformers``
+are imported lazily on first use, so ``tsm`` imports fine without them.
 """
 
 import logging
 import os
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Sequence
 
-logger = logging.getLogger("cognitive_eval.verification.nli")
+from .interfaces import CommitTriple, ProposedPair
 
-# Proposed pair as returned by MemoryEngine.propose_supersessions():
-#   (old_id, new_id, kind, cosine)
-ProposedPair = Tuple[str, str, str, float]
-# Commit triple accepted for MemoryEngine.commit_supersessions():
-#   (old_id, new_id, kind)
-CommitTriple = Tuple[str, str, str]
+logger = logging.getLogger("tsm.verification")
 
 _DEFAULT_MODEL = "cross-encoder/nli-deberta-v3-xsmall"
 # Fallback label order for cross-encoder/nli-* models when the model config does
@@ -75,14 +69,12 @@ class NLIVerifier:
     def _load(self):
         if self._model is not None:
             return
-        # NOTE: we deliberately use `transformers` directly rather than
-        # `sentence_transformers.CrossEncoder`. On this Windows setup importing
-        # sentence_transformers pulls in torchcodec, whose FFmpeg DLLs fail to
-        # load and abort the import (the embedding path sidesteps this the same
-        # way). An NLI cross-encoder is just an AutoModelForSequenceClassification.
-        #
-        # The embedding model runs offline; the NLI model may need a one-time
-        # fetch, so lift the offline flags just for this load if requested.
+        # NOTE: `transformers` is used directly rather than
+        # `sentence_transformers.CrossEncoder`: an NLI cross-encoder is just an
+        # AutoModelForSequenceClassification, and this avoids the heavier
+        # sentence-transformers dependency chain. The model may need a
+        # one-time fetch, so lift the offline flags just for this load if
+        # requested.
         saved = {}
         if self._allow_download:
             for k in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
@@ -114,8 +106,7 @@ class NLIVerifier:
         self, pairs: Sequence[ProposedPair], id_to_text: Dict[str, str]
     ) -> List[dict]:
         """Return one row per pair with the NLI label + per-label probabilities.
-        Rows for pairs whose text is missing are dropped. Used for both the
-        commit decision and offline calibration/labelling."""
+        Rows for pairs whose text is missing are dropped."""
         rows = [
             p for p in pairs
             if id_to_text.get(p[1]) and id_to_text.get(p[0])
@@ -148,6 +139,7 @@ class NLIVerifier:
                 })
         return out
 
+    # Verifier protocol -----------------------------------------------------------
     def verify(
         self, pairs: Sequence[ProposedPair], id_to_text: Dict[str, str]
     ) -> List[CommitTriple]:
@@ -158,45 +150,3 @@ class NLIVerifier:
             if r["label"] in self.accept_labels and r["margin"] >= self.min_margin:
                 accepted.append((r["old_id"], r["new_id"], r["kind"]))
         return accepted
-
-
-# Process-level shared-verifier cache. A 500-conversation harness run otherwise
-# lazy-loads one cross-encoder PER NLIVerifier instance (one per adapter /
-# conversation), and torch's caching allocator retains every allocation — the
-# eval-harness OOM this cache fixes. Keyed by (model_name, accept_labels,
-# min_margin) — the settings that change verification SEMANTICS.
-#
-# Threading: plain dict, NO locking, by design. Eval runners only run LLM calls
-# concurrently; verifiers are constructed and scoring runs on the MAIN thread,
-# one conversation at a time. If that ever changes, warm the cache on the main
-# thread first.
-_VERIFIER_CACHE: Dict[Tuple[str, Tuple[str, ...], float], NLIVerifier] = {}
-
-
-def get_shared_verifier(
-    model_name: str = _DEFAULT_MODEL,
-    accept_labels: Sequence[str] = ("contradiction", "entailment"),
-    min_margin: float = 0.0,
-    batch_size: int = 32,
-    allow_download: bool = True,
-) -> NLIVerifier:
-    """Return a process-wide shared NLIVerifier, creating it on first use.
-
-    Same constructor semantics as NLIVerifier, but instances are cached by
-    (model_name, accept_labels, min_margin) so hundreds of adapters share one
-    cross-encoder. batch_size/allow_download only take effect when the cached
-    instance is first created. Construct NLIVerifier(...) directly when an
-    isolated instance is required.
-    """
-    key = (model_name, tuple(sorted(s.lower() for s in accept_labels)), float(min_margin))
-    verifier = _VERIFIER_CACHE.get(key)
-    if verifier is None:
-        verifier = NLIVerifier(
-            model_name=model_name,
-            accept_labels=accept_labels,
-            min_margin=min_margin,
-            batch_size=batch_size,
-            allow_download=allow_download,
-        )
-        _VERIFIER_CACHE[key] = verifier
-    return verifier

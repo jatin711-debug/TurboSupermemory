@@ -16,11 +16,22 @@ import os
 
 logger = logging.getLogger("cognitive_eval.extraction")
 
-__all__ = ["OllamaExtractor", "MockExtractor", "OpenAIExtractor", "create_extractor"]
+__all__ = [
+    "OllamaExtractor",
+    "MockExtractor",
+    "OpenAIExtractor",
+    "MiniMaxExtractor",
+    "create_extractor",
+]
 
 
-def create_extractor(name: str = "auto", ollama_model: str = "qwen2.5:3b",
-                     openai_model: str = "gpt-4o-mini", shared=None):
+def create_extractor(
+    name: str = "auto",
+    ollama_model: str = "qwen2.5:3b",
+    openai_model: str = "gpt-4o-mini",
+    minimax_model: str = "MiniMax-M3",
+    shared=None,
+):
     """Build a fact extractor. `shared` (a prebuilt extractor) short-circuits so
     one instance — and its cross-arm cache — can be reused across adapters."""
     if shared is not None:
@@ -37,6 +48,11 @@ def create_extractor(name: str = "auto", ollama_model: str = "qwen2.5:3b",
     if name == "openai":
         from .openai_extractor import OpenAIExtractor
         return OpenAIExtractor(model=openai_model)
+
+    if name == "minimax":
+        from .minimax_extractor import MiniMaxExtractor
+
+        return MiniMaxExtractor(model=minimax_model)
 
     if name == "auto":
         # Prefer a reachable local Ollama server (free, private).

@@ -7,27 +7,43 @@ rehearsed) should survive eviction over one that doesn't — so the facts a user
 keeps coming back to stay available, and dead weight is forgotten. Nobody had
 tested that. This eval does, with the same disciplined ON-vs-OFF isolation.
 
-Both arms are IDENTICAL in every operation — same corpus, same insertion order,
-same rehearsals of the query-relevant facts, same budget (`max_records` forces
-eviction). They differ in ONE engine switch:
+All arms are IDENTICAL in every operation — same corpus, same insertion order,
+same budget (`max_records` forces eviction), same rehearsal access signal.
+They differ in ONE engine switch — the eviction ranking policy:
 
-  - ON  (`access_aware_eviction=True`):  evict by cognitive salience — a
-    rehearsed/retrieved memory (high access_count, recently accessed) survives.
-  - OFF (`access_aware_eviction=False`): naive FIFO — evict oldest-inserted
+  - FIFO   (`access_aware_eviction=False`): naive FIFO — evict oldest-inserted
     first, ignoring access entirely (the "database, not memory" baseline).
+  - LEGACY (`access_aware_eviction=True`):  evict by cognitive salience — a
+    rehearsed/retrieved memory (high access_count, recently accessed) survives.
+  - ACT-R  (`access_aware_eviction=True, actr_activation=True`): same salience
+    gate, but candidates are ranked by ACT-R base-level activation
+    ln(sum age^-d) over the last K access timestamps instead of the legacy
+    access_count x 2^(-age/half_life) score.
 
 Procedure per conversation (only those with > budget user-facts, so eviction
-actually bites): insert all user facts → rehearse each query's text a few times
-(bumps access on the facts that query needs, in BOTH arms) → consolidate (evict)
-→ measure. Metrics:
+actually bites): insert all user facts → rehearse (bump access on facts, in
+ALL arms) → consolidate (evict) → measure. Rehearsal modes:
 
+  - sources (DEFAULT, honest): search the conversation's PAST USER-MESSAGE
+    texts — users re-ask about their own facts over time, so the fact SOURCE
+    texts are the legitimate, deployable access signal.
+  - oracle (contaminated, comparison only): search the EVAL QUERY texts — you
+    don't know future queries at eviction time in production. The old +0.41
+    lift was mostly this leak (honest lift was +0.08).
+  - none: no rehearsal; eviction relies on the engine's intrinsic salience.
+
+Metrics:
   - survival: is the gold-answer fact still ALIVE after eviction?
   - hit@k:    is it still RETRIEVED (end-to-end retain + recall)?
+  - judged accuracy: an LLM answers from the retrieved memories and an LLM
+    grades vs gold (the GOLD STANDARD).
 
-Lift (ON - OFF) isolates whether access-aware retention keeps the right memories.
+B3 kill/keep: ACT-R >= LEGACY on judged retention → keep ACT-R (parity still
+simplifies the theory); a loss beyond noise (~0.05) is an honest negative.
 
 Usage:
-    python benchmarks/cognitive_eval/retention_eval.py --budget 10 --limit 200
+    python benchmarks/cognitive_eval/retention_eval.py --budget 10 --limit 120 \
+        --judge openai --rehearse-mode sources
 """
 
 import argparse
@@ -60,12 +76,30 @@ def gold_memory_ids(answer, id_to_text):
     return [mid for mid, text in id_to_text.items() if tok in (text or "").lower()]
 
 
+def rehearsal_texts(conv, cap=24):
+    """The honest (non-oracle) access signal: users re-ask about their own facts
+    over time, so rehearse with the conversation's PAST USER-MESSAGE texts (the
+    fact SOURCE texts) — never the eval query texts. To bound runtime we search
+    an evenly-spaced sample (every Nth user message) of at most `cap` texts per
+    conversation (all of them when there are fewer)."""
+    texts = [m.content for m in conv.messages
+             if m.role == "user" and m.content and m.content.strip()]
+    if len(texts) > cap:
+        step = len(texts) / cap
+        texts = [texts[int(i * step)] for i in range(cap)]
+    return texts
+
+
 def run_arm(access_aware, conversations, budget, model_name, top_k, extractor, shared_model=None,
-            judge=None, extractor_instance=None, judge_workers=8, rehearse=True):
-    """Identical operations in both arms; only `access_aware_eviction` differs.
-    With `judge`, each post-eviction answer is additionally scored by the
-    GOLD-STANDARD metric (LLM answers from the retrieved memories, LLM grades
-    vs gold) — Phase A2: does retention's survival win convert to answers?"""
+            judge=None, extractor_instance=None, judge_workers=8, rehearse_mode="oracle",
+            actr=False, actr_decay=None, actr_history=None):
+    """Identical operations in all arms; only the eviction policy differs.
+    `rehearse_mode`: 'oracle' (eval queries — CONTAMINATED, comparison only),
+    'sources' (past user-message texts — the honest signal), 'none'.
+    `actr=True` switches eviction ranking to ACT-R base-level activation
+    (requires access_aware=True). With `judge`, each post-eviction answer is
+    additionally scored by the GOLD-STANDARD metric (LLM answers from the
+    retrieved memories, LLM grades vs gold)."""
     agg = {"n": 0, "survived": 0, "h1": 0, "h3": 0, "hk": 0, "jn": 0, "jc": 0}
     judge_tasks = []  # (query, texts, gold)
     model = shared_model
@@ -76,7 +110,9 @@ def run_arm(access_aware, conversations, budget, model_name, top_k, extractor, s
                              extractor_instance=extractor_instance,
                              cognitive_features=True, belief_revision=True, model=model,
                              belief_source_roles=["user"], max_records=budget,
-                             access_aware_eviction=access_aware)
+                             access_aware_eviction=access_aware,
+                             actr_activation=True if actr else None,
+                             actr_decay=actr_decay, actr_history=actr_history)
         model = adapter.model
         try:
             adapter.add(conv.messages, user_id=conv.conv_id)
@@ -86,19 +122,27 @@ def run_arm(access_aware, conversations, budget, model_name, top_k, extractor, s
             pressured_convs += 1
             id_to_text = dict(adapter._id_to_text)
 
-            # Rehearse: the facts a user keeps needing get accessed. Search each
-            # query's text a few times to bump access on its gold fact(s).
-            # NOTE: this uses the EVAL QUERIES as the access signal — an ORACLE
-            # (you don't know future queries at eviction time in production).
-            # `--no-rehearse` disables it so eviction relies only on the engine's
-            # INTRINSIC salience (importance_auto_scoring / reinforcement) — the
-            # honest, deployable signal.
-            if rehearse:
+            # Rehearse: the facts a user keeps needing get accessed.
+            #   oracle:  search each EVAL QUERY text 3x — an ORACLE leak (you
+            #            don't know future queries at eviction time). Kept only
+            #            for comparison with the contaminated old numbers.
+            #   sources: search an evenly-spaced sample (<=24) of the
+            #            conversation's PAST USER-MESSAGE texts 2x each — the
+            #            honest, deployable signal (users re-ask about their
+            #            own facts over time).
+            #   none:    no rehearsal; eviction relies only on the engine's
+            #            INTRINSIC salience (importance_auto_scoring /
+            #            reinforcement).
+            if rehearse_mode == "oracle":
                 for q in conv.queries:
                     if q.is_abstention:
                         continue
                     for _ in range(3):
                         adapter.search(q.query_text, user_id=conv.conv_id, top_k=top_k, use_cognitive=False)
+            elif rehearse_mode == "sources":
+                for text in rehearsal_texts(conv):
+                    for _ in range(2):
+                        adapter.search(text, user_id=conv.conv_id, top_k=top_k, use_cognitive=False)
 
             adapter.trigger_consolidation()  # eviction fires under the budget
 
@@ -132,7 +176,8 @@ def run_arm(access_aware, conversations, budget, model_name, top_k, extractor, s
 
 
 def main():
-    ap = argparse.ArgumentParser(description="LongMemEval retention isolation (access-aware vs FIFO eviction)")
+    ap = argparse.ArgumentParser(description="LongMemEval retention isolation (B3: FIFO vs legacy "
+                                             "access-aware vs ACT-R eviction)")
     ap.add_argument("--data-dir", type=str, default=None)
     ap.add_argument("--limit", type=int, default=200, help="cap #conversations (full set OOMs, see W7)")
     ap.add_argument("--budget", type=int, default=10, help="max_records cap (facts above this are evicted)")
@@ -143,9 +188,18 @@ def main():
                          "Use openai to re-validate the retention lift without the weak-embedder confound.")
     ap.add_argument("--embed-model", type=str, default="text-embedding-3-small",
                     help="OpenAI embedding model when --tsm-embedder openai")
+    ap.add_argument("--rehearse-mode", choices=["oracle", "sources", "none"], default="sources",
+                    help="access-signal rehearsal before eviction: 'sources' (DEFAULT, honest) = "
+                         "search the conversation's PAST USER-MESSAGE texts (users re-ask about "
+                         "their own facts); 'oracle' = search the EVAL QUERIES themselves "
+                         "(CONTAMINATED — kept only for comparison with old numbers); "
+                         "'none' = no rehearsal (intrinsic salience only)")
     ap.add_argument("--no-rehearse", action="store_true",
-                    help="disable the ORACLE query-rehearsal; eviction then relies only on "
-                         "the engine's intrinsic salience (the honest, deployable signal)")
+                    help="alias for --rehearse-mode none")
+    ap.add_argument("--actr-decay", type=float, default=None,
+                    help="ACT-R decay exponent d for the ACT-R arm (default: engine 0.5)")
+    ap.add_argument("--actr-history", type=int, default=None,
+                    help="ACT-R access-timestamp ring length for the ACT-R arm (default: engine 8)")
     ap.add_argument("--extractor", type=str, default="mock",
                     choices=["mock", "ollama", "openai", "auto"],
                     help="fact extractor; 'auto' = Ollama if reachable else OpenAI")
@@ -188,72 +242,106 @@ def main():
         logger.info("Embeddings: OpenAI %s (dim=%d) — retention re-validation",
                     args.embed_model, init_model.get_sentence_embedding_dimension())
 
-    rehearse = not args.no_rehearse
-    logger.info("Rehearsal (oracle query access): %s", "ON" if rehearse else "OFF (intrinsic salience only)")
-    logger.info("Running OFF arm (access_aware_eviction=False — naive FIFO)...")
-    off, off_p, model = run_arm(False, convs, args.budget, args.model, args.top_k, args.extractor,
-                                shared_model=init_model, judge=judge,
-                                extractor_instance=shared_extractor, judge_workers=args.workers,
-                                rehearse=rehearse)
-    logger.info("Running ON arm (access_aware_eviction=True — retain-what-is-used)...")
-    on, on_p, _ = run_arm(True, convs, args.budget, args.model, args.top_k, args.extractor,
-                          shared_model=model, judge=judge, extractor_instance=shared_extractor,
-                          judge_workers=args.workers, rehearse=rehearse)
+    rehearse_mode = "none" if args.no_rehearse else args.rehearse_mode
+    if rehearse_mode == "oracle":
+        logger.warning("Rehearsal mode ORACLE: the access signal uses the EVAL QUERIES "
+                       "themselves — results are oracle-contaminated and kept only for "
+                       "comparison with the old (leaked) numbers.")
+    else:
+        logger.info("Rehearsal mode: %s", rehearse_mode.upper()
+                    + (" (past user-message texts — honest signal)" if rehearse_mode == "sources"
+                       else " (intrinsic salience only)"))
 
-    n = max(on["n"], off["n"]) or 1
-    logger.info("=" * 92)
-    logger.info("Budget-pressured conversations: OFF %d / ON %d | scored queries: %d", off_p, on_p, n)
-    logger.info("%-16s | %-10s | %-10s | %-10s", "metric", "OFF", "ON", "lift")
-    logger.info("-" * 92)
+    # B3 kill/keep: three arms, identical operations, differing only in the
+    # eviction ranking policy.
+    arms = [
+        ("fifo",   False, False),  # naive FIFO baseline
+        ("legacy", True,  False),  # access_count x 2^(-age/half_life)
+        ("actr",   True,  True),   # ACT-R base-level activation ln(sum age^-d)
+    ]
+    results = {}
+    model = init_model
+    for name, access_aware, actr in arms:
+        logger.info("Running %s arm (access_aware_eviction=%s, actr_activation=%s)...",
+                    name.upper(), access_aware, actr)
+        agg, pressured, model = run_arm(access_aware, convs, args.budget, args.model, args.top_k,
+                                        args.extractor, shared_model=model, judge=judge,
+                                        extractor_instance=shared_extractor,
+                                        judge_workers=args.workers, rehearse_mode=rehearse_mode,
+                                        actr=actr, actr_decay=args.actr_decay,
+                                        actr_history=args.actr_history)
+        results[name] = (agg, pressured)
+
+    n = max(r[0]["n"] for r in results.values()) or 1
+    logger.info("=" * 100)
+    logger.info("Budget-pressured conversations: %s | scored queries: %d",
+                " / ".join(f"{name.upper()} {p}" for name, (_, p) in results.items()), n)
+    logger.info("%-16s | %-10s | %-10s | %-10s", "metric", "FIFO", "LEGACY", "ACT-R")
+    logger.info("-" * 100)
+
+    def rate(agg, num_key, den_key="n"):
+        return agg[num_key] / (agg[den_key] or 1)
 
     def row(label, key):
-        of = off[key] / (off["n"] or 1)
-        oo = on[key] / (on["n"] or 1)
-        logger.info("%-16s | %-10.2f | %-10.2f | %+.2f", label, of, oo, oo - of)
-        return oo - of
+        vals = {name: rate(agg, key) for name, (agg, _) in results.items()}
+        logger.info("%-16s | %-10.2f | %-10.2f | %-10.2f",
+                    label, vals["fifo"], vals["legacy"], vals["actr"])
+        return vals
 
-    surv_lift = row("gold survival", "survived")
+    surv = row("gold survival", "survived")
     row("hit@1", "h1")
     row("hit@3", "h3")
-    hk_lift = row("hit@k", "hk")
-    judged_lift = None
-    if judge is not None and (off["jn"] or on["jn"]):
-        j_off = off["jc"] / (off["jn"] or 1)
-        j_on = on["jc"] / (on["jn"] or 1)
-        judged_lift = j_on - j_off
-        logger.info("%-16s | %-10.2f | %-10.2f | %+.2f   <== GOLD STANDARD (judge=%s, calls=%d)",
-                    "judged accuracy", j_off, j_on, judged_lift,
+    hk = row("hit@k", "hk")
+    judged = None
+    if judge is not None and any(agg["jn"] for agg, _ in results.values()):
+        judged = {name: rate(agg, "jc", "jn") for name, (agg, _) in results.items()}
+        logger.info("%-16s | %-10.2f | %-10.2f | %-10.2f   <== GOLD STANDARD (judge=%s, calls=%d)",
+                    "judged accuracy", judged["fifo"], judged["legacy"], judged["actr"],
                     getattr(judge, "model", "?"), judge.calls)
-    logger.info("=" * 92)
-    if judged_lift is not None:
-        if judged_lift > 0.10:
-            logger.info("GOLD VERDICT (A2): retention's survival win CONVERTS to LLM-judged answer "
-                        "accuracy — retain-what-is-used is real end-to-end product value.")
-        elif judged_lift > 0.0:
-            logger.info("GOLD VERDICT (A2): positive but modest judged-accuracy lift — inspect per-query.")
-        else:
-            logger.info("GOLD VERDICT (A2): survival win does NOT convert to judged answer accuracy "
-                        "(investigate — honest negative).")
-    if surv_lift > 0.05 or hk_lift > 0.05:
-        logger.info("VERDICT: access-aware eviction MEASURABLY retains the right memories under budget "
-                    "pressure — the retain/forget mechanism works.")
+    logger.info("=" * 100)
+
+    # B3 kill/keep verdict: ACT-R >= LEGACY on judged retention -> keep
+    # (parity still simplifies the theory); a loss beyond noise (~0.05) kills.
+    metric_name = "judged accuracy" if judged is not None else "hit@k"
+    metric = judged if judged is not None else hk
+    delta_al = metric["actr"] - metric["legacy"]
+    delta_lf = metric["legacy"] - metric["fifo"]
+    logger.info("LEGACY - FIFO %s: %+.4f | ACT-R - LEGACY %s: %+.4f (metric=%s)",
+                metric_name, delta_lf, metric_name, delta_al, metric_name)
+    if delta_al >= 0.0:
+        verdict = "keep"
+        logger.info("B3 VERDICT: KEEP ACT-R — it beats legacy access-aware eviction on %s "
+                    "(%+.4f).", metric_name, delta_al)
+    elif delta_al >= -0.05:
+        verdict = "keep"
+        logger.info("B3 VERDICT: KEEP ACT-R — parity with legacy within noise (%+.4f); "
+                    "the simpler, principled theory wins the tie.", delta_al)
     else:
-        logger.info("VERDICT: access-aware eviction shows ~no retention lift over FIFO (honest negative).")
+        verdict = "kill"
+        logger.info("B3 VERDICT: KILL ACT-R — it loses to legacy beyond noise (%+.4f). "
+                    "Honest negative.", delta_al)
+
     summary = {
         "budget": args.budget,
         "embedder": args.embed_model if args.tsm_embedder == "openai" else "minilm-384",
-        "rehearse": rehearse,
-        "pressured_convs_on": on_p,
+        "rehearse_mode": rehearse_mode,
         "scored_queries": n,
-        "survival_lift": round(surv_lift, 4),
-        "hitk_lift": round(hk_lift, 4),
-        "survival_off": round(off["survived"] / (off["n"] or 1), 4),
-        "survival_on": round(on["survived"] / (on["n"] or 1), 4),
+        "metric_for_verdict": metric_name,
+        "arms": {
+            name: {
+                "pressured_convs": p,
+                "survival": round(rate(agg, "survived"), 4),
+                "hit1": round(rate(agg, "h1"), 4),
+                "hit3": round(rate(agg, "h3"), 4),
+                "hitk": round(rate(agg, "hk"), 4),
+                **({"judged_acc": round(rate(agg, "jc", "jn"), 4)} if judged is not None else {}),
+            }
+            for name, (agg, p) in results.items()
+        },
+        "legacy_minus_fifo": round(delta_lf, 4),
+        "actr_minus_legacy": round(delta_al, 4),
+        "verdict": verdict,
     }
-    if judged_lift is not None:
-        summary["judged_acc_off"] = round(off["jc"] / (off["jn"] or 1), 4)
-        summary["judged_acc_on"] = round(on["jc"] / (on["jn"] or 1), 4)
-        summary["judged_acc_lift"] = round(judged_lift, 4)
     logger.info("GATE_SUMMARY: %s", json.dumps(summary))
 
 

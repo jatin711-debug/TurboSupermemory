@@ -133,73 +133,35 @@ impl VectorIndex for GpuHnswIndex {
     ) -> crate::Result<Vec<ScoredPoint>> {
         validate_dimension(query, self.dim)?;
 
-        // If there's a very selective filter, use exact scan
+        // For very selective filters, an exact scan over ONLY the allowed
+        // offsets is more reliable than HNSW with post-filtering (mirrors
+        // `UsearchIndex::search`). The bitmap must be applied here — scanning
+        // the whole segment unfiltered would leak filtered-out records.
         if let Some(bitmap) = allowed_offsets {
-            let selectivity = bitmap.len() as f32 / self.offsets.len() as f32;
+            let allowed_in_segment: Vec<PointOffset> = self
+                .offsets
+                .iter()
+                .copied()
+                .filter(|o| bitmap.contains(*o as u32))
+                .collect();
+            let selectivity = allowed_in_segment.len() as f32 / self.offsets.len() as f32;
             if selectivity < 0.05 {
-                return exact_search_over_offsets(query, top_k, vectors, &self.offsets, Tier::Hot);
-            }
-        }
-
-        // Use GPU index if available
-        #[cfg(feature = "cuda")]
-        {
-            if let Some(ref gpu_index) = self.gpu_index {
-                // Initialize GPU backend
-                let backend = turbomemory_gpu::init_backend();
-                log::info!(
-                    "GpuHnswIndex::search: gpu_index present, backend accelerated={}",
-                    turbomemory_gpu::is_gpu_accelerated(&backend)
+                return exact_search_over_offsets(
+                    query,
+                    top_k,
+                    vectors,
+                    &allowed_in_segment,
+                    Tier::Hot,
                 );
-                if turbomemory_gpu::is_gpu_accelerated(&backend) {
-                    match backend.ann_search(gpu_index, query, top_k) {
-                        Ok(results) => {
-                            log::info!(
-                                "GpuHnswIndex::search: GPU search returned {} results",
-                                results.len()
-                            );
-                            let mut scored: Vec<ScoredPoint> = results
-                                .into_iter()
-                                .map(|(idx, score)| {
-                                    let offset = self.offsets[idx];
-                                    ScoredPoint {
-                                        offset,
-                                        score,
-                                        tier: Tier::Hot,
-                                    }
-                                })
-                                .collect();
-
-                            // Apply filter if needed
-                            if let Some(bitmap) = allowed_offsets {
-                                scored.retain(|s| bitmap.contains(s.offset as u32));
-                            }
-
-                            scored.sort_by(|a, b| {
-                                b.score
-                                    .partial_cmp(&a.score)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            });
-                            scored.truncate(top_k);
-                            return Ok(scored);
-                        }
-                        Err(e) => {
-                            log::warn!("GPU HNSW search failed ({}), falling back to usearch", e);
-                        }
-                    }
-                } else {
-                    log::info!("GpuHnswIndex::search: GPU backend not accelerated, falling back");
-                }
-            } else {
-                log::info!("GpuHnswIndex::search: no gpu_index, falling back");
             }
         }
 
-        // Fallback to CPU index or exact scan
-        log::info!(
-            "GpuHnswIndex::search: using fallback, fallback present={}",
-            self.fallback.is_some()
-        );
+        // GPU-native HNSW search is deliberately not implemented
+        // (`GpuBackend::ann_search` returns `BackendNotCompiled`; see
+        // turbomemory_gpu). Do NOT call `init_backend()` here: it builds a
+        // fresh CUDA context per query, and the search always fell back
+        // anyway. The usearch index built alongside the GPU graph serves all
+        // searches.
         if let Some(ref fallback) = self.fallback {
             fallback.search(query, top_k, allowed_offsets, vectors)
         } else {

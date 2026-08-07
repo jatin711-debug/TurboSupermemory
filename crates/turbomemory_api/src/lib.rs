@@ -9,4 +9,4 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/turbomemory.rs"));
 }
 
-pub use service::{ApiError, MemoryService};
+pub use service::{ApiAuth, ApiError, MemoryService};

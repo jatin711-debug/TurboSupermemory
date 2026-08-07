@@ -213,6 +213,35 @@ pub struct MemoryGraph {
     suppressed_concepts: BTreeSet<String>,
 }
 
+/// Magic prefix identifying a binary graph snapshot. Legacy snapshots are
+/// JSON (they start with `{`), so the magic doubles as the format
+/// discriminator on the load path.
+const SNAPSHOT_MAGIC: [u8; 4] = *b"TMGR";
+/// Current binary snapshot format version. Bump when the payload layout
+/// changes; unknown versions are rejected on load.
+const SNAPSHOT_VERSION: u32 = 1;
+
+/// Compact binary snapshot of the full graph state (bincode payload behind a
+/// magic+version header). Serialized directly from the interned integer
+/// structures — no string-keyed `LegacyMemoryGraph` clone. Adjacency is not
+/// persisted; it is rebuilt from the edge list on load, matching the JSON path.
+#[derive(Debug, Serialize, Deserialize)]
+struct BinaryGraphSnapshot {
+    /// Live interner entries `(key, node)` in u32-id order. Tombstones left by
+    /// `remove_memory` are dropped, so on load each node's dense id is its
+    /// index here (the same compaction the JSON round-trip performs).
+    nodes: Vec<(String, InternalNode)>,
+    /// Edges remapped to the dense node ids in `nodes`, sorted with the
+    /// `compact()` comparator so snapshot bytes are deterministic.
+    edges: Vec<InternalEdge>,
+    last_memory_id: Option<String>,
+    co_occurrence: BTreeMap<String, usize>,
+    /// Vocabulary alias pairs sorted by alias (`HashMap` iteration order would
+    /// make snapshot bytes nondeterministic).
+    vocab_aliases: Vec<(String, String)>,
+    suppressed_concepts: BTreeSet<String>,
+}
+
 /// Legacy serialization format for backward compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LegacyMemoryGraph {
@@ -1312,6 +1341,128 @@ impl MemoryGraph {
         set.into_iter().collect()
     }
 
+    /// Outgoing supersession edges (`Refines`/`Contradicts`, memory -> memory)
+    /// of node `nid` as (edge index, target node) pairs. The edge index is an
+    /// insertion-order stamp: a higher index was inserted later.
+    fn supersession_successors(&self, nid: u32) -> Vec<(usize, u32)> {
+        self.int_adjacency
+            .get(nid)
+            .map(|idxs| {
+                idxs.iter()
+                    .filter(|&&i| {
+                        matches!(
+                            self.int_edges[i].kind,
+                            EdgeKind::Refines | EdgeKind::Contradicts
+                        )
+                    })
+                    .filter_map(|&i| {
+                        let target = self.int_edges[i].target;
+                        match self.interner.get(target) {
+                            Some(n) if matches!(n.kind, NodeKind::Memory) => Some((i, target)),
+                            _ => None,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The next hop in a supersession walk: the target of the LATEST-INSERTED
+    /// outgoing `Refines`/`Contradicts` edge. This is the branching rule: when
+    /// two newer memories both supersede the same older one, the walk follows
+    /// the edge committed most recently (deterministic, no string compares).
+    fn supersession_next(&self, nid: u32) -> Option<u32> {
+        self.supersession_successors(nid)
+            .into_iter()
+            .max_by_key(|(edge_idx, _)| *edge_idx)
+            .map(|(_, target)| target)
+    }
+
+    /// The NEWEST memory in `id`'s supersession chain — the head of the chain,
+    /// the memory nothing supersedes. Follows `Refines`/`Contradicts` edges
+    /// (old -> new) from `id`. Returns `id` unchanged when the id is unknown
+    /// or has no supersession edges. Cycle-safe: a visited-set stops the walk
+    /// and returns the node where the cycle is detected, so corrupted data
+    /// cannot hang a recall.
+    pub fn belief_head(&self, id: &str) -> String {
+        let key = NodeId::memory(id).as_str();
+        let Some(mut cur) = self.get_node_id(&key) else {
+            return id.to_string();
+        };
+        let mut visited: HashSet<u32> = HashSet::with_capacity(8);
+        visited.insert(cur);
+        while let Some(next) = self.supersession_next(cur) {
+            if !visited.insert(next) {
+                break; // cycle: stop at the node where it is detected
+            }
+            cur = next;
+        }
+        self.interner
+            .get(cur)
+            .map(|n| n.external_id.clone())
+            .unwrap_or_else(|| id.to_string())
+    }
+
+    /// The full supersession chain containing `id`, oldest first, head last.
+    /// Walks backward to the oldest ancestor (incoming `Refines`/`Contradicts`
+    /// edges, same latest-inserted-edge branching rule) then forward to the
+    /// head. Returns `[id]` when the id is unknown or has no supersession
+    /// edges. Cycle-safe via a visited-set shared by both walks.
+    pub fn belief_lineage(&self, id: &str) -> Vec<String> {
+        let key = NodeId::memory(id).as_str();
+        let Some(start) = self.get_node_id(&key) else {
+            return vec![id.to_string()];
+        };
+        let mut visited: HashSet<u32> = HashSet::with_capacity(8);
+        visited.insert(start);
+
+        // Forward: from `id` toward the chain head.
+        let mut chain: Vec<u32> = vec![start];
+        while let Some(next) = self.supersession_next(*chain.last().expect("non-empty")) {
+            if !visited.insert(next) {
+                break; // cycle
+            }
+            chain.push(next);
+        }
+
+        // Backward: incoming supersession edges, toward the oldest ancestor.
+        // The adjacency index is outgoing-only, so build the reverse view in
+        // one pass (memory -> memory edges only).
+        let mut predecessors: HashMap<u32, Vec<(usize, u32)>> = HashMap::new();
+        for (i, e) in self.int_edges.iter().enumerate() {
+            if !matches!(e.kind, EdgeKind::Refines | EdgeKind::Contradicts) {
+                continue;
+            }
+            let (Some(src), Some(tgt)) = (self.interner.get(e.source), self.interner.get(e.target))
+            else {
+                continue;
+            };
+            if matches!(src.kind, NodeKind::Memory) && matches!(tgt.kind, NodeKind::Memory) {
+                predecessors
+                    .entry(e.target)
+                    .or_default()
+                    .push((i, e.source));
+            }
+        }
+        let mut cur = start;
+        while let Some(prev) = predecessors
+            .get(&cur)
+            .and_then(|cands| cands.iter().max_by_key(|(edge_idx, _)| *edge_idx))
+            .map(|(_, source)| *source)
+        {
+            if !visited.insert(prev) {
+                break; // cycle
+            }
+            chain.insert(0, prev);
+            cur = prev;
+        }
+
+        chain
+            .iter()
+            .filter_map(|&nid| self.interner.get(nid).map(|n| n.external_id.clone()))
+            .collect()
+    }
+
     pub fn contradicted_by(&self, id: &str) -> Vec<String> {
         let key = NodeId::memory(id).as_str();
         let Some(nid) = self.get_node_id(&key) else {
@@ -1343,6 +1494,128 @@ impl MemoryGraph {
 
     pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
         let graph: Self = serde_json::from_str(s)?;
+        Ok(graph)
+    }
+
+    /// Serialize the graph to a compact, versioned binary snapshot.
+    ///
+    /// Unlike [`to_json`](Self::to_json) this writes the interned integer
+    /// structures directly (no string-keyed legacy clone), so snapshots are
+    /// far smaller. Bytes are deterministic for an unchanged graph: nodes are
+    /// written in u32-id order, edges are sorted with the
+    /// [`compact`](Self::compact) comparator, and vocabulary aliases are
+    /// sorted (`HashMap` iteration order is not stable).
+    pub fn to_snapshot_bytes(&self) -> Vec<u8> {
+        // Live nodes in id order; ids are reassigned densely on load.
+        let mut remap: HashMap<u32, u32> = HashMap::with_capacity(self.interner.id_to_key.len());
+        let mut nodes: Vec<(String, InternalNode)> = Vec::new();
+        for (old_id, key, node) in self.interner.iter() {
+            remap.insert(old_id, nodes.len() as u32);
+            nodes.push((key.clone(), node.clone()));
+        }
+        // Remap edges to the dense ids, skipping any that reference removed
+        // nodes (mirrors the legacy path, which drops edges with missing
+        // endpoints).
+        let mut edges: Vec<InternalEdge> = self
+            .int_edges
+            .iter()
+            .filter_map(|e| {
+                let source = *remap.get(&e.source)?;
+                let target = *remap.get(&e.target)?;
+                Some(InternalEdge {
+                    source,
+                    target,
+                    ..*e
+                })
+            })
+            .collect();
+        // Sort like compact() so bytes are stable regardless of insertion
+        // history, and a binary-restored graph iterates neighbors in the same
+        // order as a JSON-restored one.
+        edges.sort_by(|a, b| {
+            let a_src = &nodes[a.source as usize].1.external_id;
+            let b_src = &nodes[b.source as usize].1.external_id;
+            let a_tgt = &nodes[a.target as usize].1.external_id;
+            let b_tgt = &nodes[b.target as usize].1.external_id;
+            a_src
+                .cmp(b_src)
+                .then(a_tgt.cmp(b_tgt))
+                .then(a.kind.cmp(&b.kind))
+                .then(
+                    a.weight
+                        .partial_cmp(&b.weight)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+        });
+        let mut vocab_aliases: Vec<(String, String)> = self
+            .vocab
+            .aliases()
+            .iter()
+            .map(|(alias, canonical)| (alias.clone(), canonical.clone()))
+            .collect();
+        vocab_aliases.sort();
+        let snapshot = BinaryGraphSnapshot {
+            nodes,
+            edges,
+            last_memory_id: self.last_memory_id.clone(),
+            co_occurrence: self.co_occurrence.clone(),
+            vocab_aliases,
+            suppressed_concepts: self.suppressed_concepts.clone(),
+        };
+        let payload = bincode::serialize(&snapshot).unwrap_or_default();
+        let mut out = Vec::with_capacity(8 + payload.len());
+        out.extend_from_slice(&SNAPSHOT_MAGIC);
+        out.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    /// Returns true when `bytes` carries the binary snapshot magic. Anything
+    /// else (notably a legacy JSON snapshot) returns false so callers can fall
+    /// back to [`from_json`](Self::from_json).
+    pub fn is_snapshot_bytes(bytes: &[u8]) -> bool {
+        bytes.len() >= SNAPSHOT_MAGIC.len() && bytes[..SNAPSHOT_MAGIC.len()] == SNAPSHOT_MAGIC
+    }
+
+    /// Load a graph from a binary snapshot written by
+    /// [`to_snapshot_bytes`](Self::to_snapshot_bytes).
+    pub fn from_snapshot_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        let invalid =
+            |msg: &str| -> bincode::Error { Box::new(bincode::ErrorKind::Custom(msg.to_string())) };
+        if !Self::is_snapshot_bytes(bytes) {
+            return Err(invalid("missing graph snapshot magic"));
+        }
+        let header_len = SNAPSHOT_MAGIC.len() + 4;
+        if bytes.len() < header_len {
+            return Err(invalid("truncated graph snapshot header"));
+        }
+        let version =
+            u32::from_le_bytes(bytes[SNAPSHOT_MAGIC.len()..header_len].try_into().unwrap());
+        if version != SNAPSHOT_VERSION {
+            return Err(invalid("unsupported graph snapshot version"));
+        }
+        let snapshot: BinaryGraphSnapshot = bincode::deserialize(&bytes[header_len..])?;
+        let mut graph = MemoryGraph {
+            interner: NodeInterner::default(),
+            int_edges: Vec::new(),
+            int_adjacency: IntAdjacency::default(),
+            last_memory_id: snapshot.last_memory_id,
+            co_occurrence: snapshot.co_occurrence,
+            vocab: ConceptVocabulary::from_alias_pairs(snapshot.vocab_aliases),
+            suppressed_concepts: snapshot.suppressed_concepts,
+        };
+        for (key, node) in snapshot.nodes {
+            graph.interner.intern(key, node);
+        }
+        // Drop edges referencing out-of-range nodes (corrupt snapshot) rather
+        // than panicking later in `edges()`/`neighbors()`.
+        let node_bound = graph.interner.id_to_node.len() as u32;
+        graph.int_edges = snapshot
+            .edges
+            .into_iter()
+            .filter(|e| e.source < node_bound && e.target < node_bound)
+            .collect();
+        graph.int_adjacency.rebuild(&graph.int_edges);
         Ok(graph)
     }
 
@@ -1621,6 +1894,114 @@ mod tests {
     }
 
     #[test]
+    fn graph_roundtrips_through_binary_with_learned_state() {
+        let mut g = MemoryGraph::new();
+        g.add_memory_with_importance("m1", "Rust is safe", &["rust".into(), "safety".into()], 2.0);
+        g.add_memory_with_importance("m2", "Rust is fast", &["rust".into(), "speed".into()], 1.5);
+        g.add_memory("m3", "Rust ownership", &["rust".into(), "ownership".into()]);
+        g.reinforce("m1", 1234);
+        g.build_abstractions(1);
+        g.add_refinement("m1", "m2", 0.8);
+        g.vocab_mut().add_alias("coding", "programming");
+        g.suppressed_concepts.insert("hub".into());
+        g.remove_memory("m3"); // leave an interner tombstone to compact over
+        g.compact();
+
+        let bytes = g.to_snapshot_bytes();
+        assert!(MemoryGraph::is_snapshot_bytes(&bytes));
+        let restored = MemoryGraph::from_snapshot_bytes(&bytes).expect("binary roundtrip");
+
+        // Reinforcement timestamps survive.
+        let m1_edges: Vec<Edge> = restored
+            .neighbors(&NodeId::memory("m1").as_str())
+            .into_iter()
+            .filter(|e| e.kind == EdgeKind::Association)
+            .collect();
+        assert!(
+            m1_edges.iter().any(|e| e.last_reinforced_at == 1234),
+            "reinforcement timestamp should survive binary roundtrip"
+        );
+        // Node/edge counts match; the removed memory stays removed.
+        assert_eq!(restored.node_count(), g.node_count());
+        assert_eq!(restored.edge_count(), g.edge_count());
+        assert!(restored.memory_node_id("m3").is_none());
+        // Abstractions and belief edges survive.
+        assert_eq!(restored.abstraction_count(), g.abstraction_count());
+        assert_eq!(restored.refinement_count(), 1);
+        assert_eq!(restored.refined_by("m1"), vec!["m2".to_string()]);
+        // Co-occurrence counters, vocab aliases, suppression survive.
+        assert_eq!(restored.co_occurrence, g.co_occurrence);
+        assert_eq!(restored.vocab().aliases(), g.vocab().aliases());
+        assert!(restored.is_concept_suppressed("hub"));
+        assert_eq!(restored.last_memory_id, g.last_memory_id);
+        // The full edge list is identical (both sides compact-sorted).
+        assert_eq!(
+            serde_json::to_string(&g.edges()).unwrap(),
+            serde_json::to_string(&restored.edges()).unwrap()
+        );
+        // Determinism: re-saving the restored graph yields identical bytes.
+        assert_eq!(restored.to_snapshot_bytes(), bytes);
+    }
+
+    #[test]
+    fn json_snapshot_loads_then_resaves_as_binary() {
+        let mut g = MemoryGraph::new();
+        g.add_memory_with_importance("m1", "Rust is safe", &["rust".into(), "safety".into()], 2.0);
+        g.add_memory_with_importance("m2", "Rust is fast", &["rust".into(), "speed".into()], 1.5);
+        g.reinforce("m1", 1234);
+        g.build_abstractions(1);
+
+        // Legacy on-disk format: JSON produced by the old save path.
+        let json = g.to_json();
+        assert!(!MemoryGraph::is_snapshot_bytes(json.as_bytes()));
+        let from_json = MemoryGraph::from_json(&json).expect("legacy json loads");
+
+        // Saving going forward produces a binary snapshot that reloads to the
+        // same state.
+        let bytes = from_json.to_snapshot_bytes();
+        let restored = MemoryGraph::from_snapshot_bytes(&bytes).expect("binary reload");
+        assert_eq!(restored.node_count(), from_json.node_count());
+        assert_eq!(restored.edge_count(), from_json.edge_count());
+        assert_eq!(restored.abstraction_count(), from_json.abstraction_count());
+        assert_eq!(restored.co_occurrence, from_json.co_occurrence);
+        assert_eq!(
+            serde_json::to_string(&from_json.edges()).unwrap(),
+            serde_json::to_string(&restored.edges()).unwrap()
+        );
+        // The binary form is stable across further save/load cycles.
+        assert_eq!(restored.to_snapshot_bytes(), bytes);
+    }
+
+    #[test]
+    fn binary_snapshot_is_far_smaller_than_json() {
+        // Representative graph: 1k memories, a handful of concepts each drawn
+        // from a shared pool so concept nodes are reused.
+        let mut g = MemoryGraph::new();
+        for i in 0..1000usize {
+            let concepts: Vec<String> = (0..4)
+                .map(|j| format!("concept-{}", (i * 7 + j * 13) % 200))
+                .collect();
+            g.add_memory(
+                &format!("mem-{i}"),
+                &format!("representative text for memory number {i}"),
+                &concepts,
+            );
+        }
+        let json_len = g.to_json().len();
+        let bin_len = g.to_snapshot_bytes().len();
+        let json_per_record = json_len as f64 / 1000.0;
+        let bin_per_record = bin_len as f64 / 1000.0;
+        assert!(
+            bin_len * 5 < json_len,
+            "binary ({bin_len} B) should be at least 5x smaller than json ({json_len} B)"
+        );
+        assert!(
+            bin_per_record < 2048.0,
+            "binary should be well under 2 KB/record, got {bin_per_record:.0} B (json {json_per_record:.0} B)"
+        );
+    }
+
+    #[test]
     fn add_refinement_creates_directed_edge() {
         let mut g = MemoryGraph::new();
         g.add_memory("old", "Rust uses a borrow checker", &["rust".into()]);
@@ -1691,6 +2072,94 @@ mod tests {
         // Newer memories and unrelated memories are NOT superseded.
         assert!(!ids.contains(&"new_r".to_string()));
         assert!(!ids.contains(&"plain".to_string()));
+    }
+
+    /// Build the linear A -> B -> C supersession chain exactly as detection
+    /// commits it (Refines edges, old -> new).
+    fn chain_graph() -> MemoryGraph {
+        let mut g = MemoryGraph::new();
+        g.add_memory("a", "fact v1", &["c".into()]);
+        g.add_memory("b", "fact v2", &["c".into()]);
+        g.add_memory("c", "fact v3", &["c".into()]);
+        g.add_refinement("a", "b", 0.8);
+        g.add_refinement("b", "c", 0.8);
+        g
+    }
+
+    #[test]
+    fn belief_head_walks_linear_chain_to_newest() {
+        let g = chain_graph();
+        assert_eq!(g.belief_head("a"), "c");
+        assert_eq!(g.belief_head("b"), "c");
+        assert_eq!(g.belief_head("c"), "c", "head resolves to itself");
+    }
+
+    #[test]
+    fn belief_lineage_returns_full_chain_oldest_first() {
+        let g = chain_graph();
+        let want = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(g.belief_lineage("a"), want, "from the oldest");
+        assert_eq!(g.belief_lineage("b"), want, "from the middle");
+        assert_eq!(g.belief_lineage("c"), want, "from the head");
+    }
+
+    #[test]
+    fn belief_chain_follows_contradiction_edges_too() {
+        let mut g = MemoryGraph::new();
+        g.add_memory("old", "a", &["c".into()]);
+        g.add_memory("new", "b", &["c".into()]);
+        g.add_contradiction("old", "new", 0.8, 0.5);
+        assert_eq!(g.belief_head("old"), "new");
+        assert_eq!(
+            g.belief_lineage("old"),
+            vec!["old".to_string(), "new".to_string()]
+        );
+    }
+
+    #[test]
+    fn belief_head_branching_follows_latest_inserted_edge() {
+        // Two newer memories both refine the same old one: the walk follows
+        // the edge committed most recently (deterministic branching rule).
+        let mut g = MemoryGraph::new();
+        g.add_memory("old", "a", &["c".into()]);
+        g.add_memory("first", "b", &["c".into()]);
+        g.add_memory("second", "c", &["c".into()]);
+        g.add_refinement("old", "first", 0.8);
+        g.add_refinement("old", "second", 0.8);
+        assert_eq!(g.belief_head("old"), "second");
+        assert_eq!(
+            g.belief_lineage("old"),
+            vec!["old".to_string(), "second".to_string()]
+        );
+    }
+
+    #[test]
+    fn belief_walk_survives_cycles() {
+        // Corrupted data (a -> b -> a) must not hang recall: the walk stops
+        // at the node where the cycle is detected.
+        let mut g = MemoryGraph::new();
+        g.add_memory("a", "x", &["c".into()]);
+        g.add_memory("b", "y", &["c".into()]);
+        g.add_refinement("a", "b", 0.8);
+        g.add_refinement("b", "a", 0.8);
+        assert_eq!(
+            g.belief_head("a"),
+            "b",
+            "b's successor a is already visited"
+        );
+        assert_eq!(g.belief_head("b"), "a");
+        assert_eq!(
+            g.belief_lineage("a"),
+            vec!["a".to_string(), "b".to_string()],
+            "lineage terminates instead of looping"
+        );
+    }
+
+    #[test]
+    fn belief_resolution_of_unknown_id_is_identity() {
+        let g = MemoryGraph::new();
+        assert_eq!(g.belief_head("ghost"), "ghost");
+        assert_eq!(g.belief_lineage("ghost"), vec!["ghost".to_string()]);
     }
 
     #[test]

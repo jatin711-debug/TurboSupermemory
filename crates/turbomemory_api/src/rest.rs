@@ -1,12 +1,31 @@
 //! REST service implementation (Axum).
 
-use crate::service::{json_filter_to_storage, map_results, ApiError, MemoryService};
+use crate::service::{
+    json_filter_to_storage, map_results, unauthenticated_response, validate_batch_lengths, ApiAuth,
+    ApiError, MemoryService,
+};
 use axum::{
-    extract::State,
+    extract::{Request, State},
+    middleware::{self, Next},
+    response::Response,
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+
+/// Middleware enforcing `Authorization: Bearer <key>` on every route when auth
+/// is enabled; passes every request when it is not.
+async fn require_auth(State(auth): State<ApiAuth>, request: Request, next: Next) -> Response {
+    let header = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    if auth.is_authorized(header) {
+        next.run(request).await
+    } else {
+        unauthenticated_response()
+    }
+}
 
 #[derive(Serialize)]
 struct HealthResponse {
@@ -172,6 +191,16 @@ async fn insert_batch(
     State(service): State<MemoryService>,
     Json(req): Json<InsertBatchReq>,
 ) -> Result<Json<InsertBatchResp>, ApiError> {
+    validate_batch_lengths(
+        req.ids.len(),
+        req.texts.len(),
+        req.embeddings.len(),
+        req.scores.len(),
+        req.concepts.len(),
+        req.payloads.len(),
+        req.scopes.len(),
+        req.source_roles.len(),
+    )?;
     let payloads: Vec<Option<String>> = if req.payloads.is_empty() {
         Vec::new()
     } else {
@@ -323,7 +352,7 @@ async fn flush(State(service): State<MemoryService>) -> Result<Json<()>, ApiErro
     Ok(Json(()))
 }
 
-pub fn router(service: MemoryService) -> Router {
+pub fn router(service: MemoryService, auth: ApiAuth) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/insert", post(insert))
@@ -336,5 +365,116 @@ pub fn router(service: MemoryService) -> Router {
         .route("/step_session", post(step_session))
         .route("/trigger_consolidation", post(trigger_consolidation))
         .route("/flush", post(flush))
+        .layer(middleware::from_fn_with_state(auth, require_auth))
         .with_state(service)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, StatusCode};
+    use tower::ServiceExt;
+
+    fn test_service() -> (tempfile::TempDir, MemoryService) {
+        let dir = tempfile::tempdir().unwrap();
+        let service = MemoryService::open(dir.path(), 4).unwrap();
+        (dir, service)
+    }
+
+    fn get_health() -> Request<Body> {
+        Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_token_when_key_set() {
+        let (_dir, service) = test_service();
+        let app = router(service, ApiAuth::new(Some("key".into())));
+        let response = app.oneshot(get_health()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+            "Bearer"
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "unauthenticated");
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_token_when_key_set() {
+        let (_dir, service) = test_service();
+        let app = router(service, ApiAuth::new(Some("key".into())));
+        let request = Request::builder()
+            .uri("/health")
+            .header(header::AUTHORIZATION, "Bearer nope")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn accepts_valid_token() {
+        let (_dir, service) = test_service();
+        let app = router(service, ApiAuth::new(Some("key".into())));
+        let request = Request::builder()
+            .uri("/health")
+            .header(header::AUTHORIZATION, "Bearer key")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn open_when_no_key_set() {
+        let (_dir, service) = test_service();
+        let app = router(service, ApiAuth::new(None));
+        let response = app.oneshot(get_health()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn storage_error_maps_to_json_body() {
+        // Wrong embedding dimension -> 400 with a JSON error body.
+        let (_dir, service) = test_service();
+        let app = router(service, ApiAuth::new(None));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/insert")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"id":"a","text":"t","embedding":[1.0,2.0,3.0]}"#,
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_argument");
+    }
+
+    #[tokio::test]
+    async fn batch_length_mismatch_maps_to_json_400() {
+        let (_dir, service) = test_service();
+        let app = router(service, ApiAuth::new(None));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/insert_batch")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"ids":["a","b"],"texts":["t"],"embeddings":[[1.0,2.0,3.0,4.0],[1.0,2.0,3.0,4.0]],"scores":[0.5,0.5],"concepts":[[],[]]}"#,
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_argument");
+        assert!(body["error"]["message"].as_str().unwrap().contains("texts"));
+    }
 }

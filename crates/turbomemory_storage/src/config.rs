@@ -309,6 +309,17 @@ pub struct TierConfig {
     /// an external verifier (e.g. an NLI cross-encoder, W3) can vet each
     /// demotion before it happens. No-op unless belief revision is enabled.
     pub defer_supersession_commit: bool,
+    /// Exclude superseded memories from search results entirely (B1). When
+    /// `false` (default), a memory on the old side of a Refines/Contradicts
+    /// edge is only rank-demoted via `supersession_demotion_factor`. When
+    /// `true`, both cognitive `search` and `search_ann` over-fetch a
+    /// `top_k * 2 + 5` candidate pool, drop every id in the graph's
+    /// superseded set (snapshotted once per query), and truncate back to
+    /// `top_k` — the stale belief never reaches the caller. This is the
+    /// engine-level form of the A-TMA "ghost memory" fix proven in the B1
+    /// eval at adapter level. No-op unless belief revision has created
+    /// supersession edges (empty superseded set = zero behavior change).
+    pub exclude_superseded: bool,
     /// Whether eviction ranks records by cognitive salience (retrieval-driven
     /// `access_score` = access_count × recency, with a grace window for
     /// recently-accessed records) or by pure insertion order. `true` (default)
@@ -318,6 +329,27 @@ pub struct TierConfig {
     /// used to isolate the retention mechanism (W5 OFF arm). No effect unless
     /// eviction is active (`max_records`/`evict_score_floor` set).
     pub access_aware_eviction: bool,
+    /// Use ACT-R base-level activation (power-law forgetting) instead of the
+    /// legacy `access_count × recency` heuristic for access-aware eviction
+    /// ranking. When `true`, eviction scores each record as
+    /// `ln(Σ_j age_j^-actr_decay)` over its last `actr_history` access
+    /// timestamps, so spaced/repeated rehearsal outweighs a single recent
+    /// burst (Anderson & Schooler base-level learning). `false` (default)
+    /// keeps the legacy heuristic. Promotion scoring always stays on the
+    /// legacy path. No effect unless `access_aware_eviction` is on and
+    /// eviction is active (`max_records`/`evict_score_floor` set); with
+    /// `evict_score_floor` the floor then compares against the ACT-R
+    /// log-activation. The grace window (`recency_half_life_secs / 8`)
+    /// applies unchanged.
+    pub actr_activation: bool,
+    /// Decay exponent `d` for ACT-R base-level activation. Default 0.5 —
+    /// Anderson & Schooler's fit to human forgetting data. Higher values
+    /// forget faster. Negative values are clamped to 0 at scoring time.
+    pub actr_decay: f64,
+    /// Number of per-record access timestamps retained for ACT-R activation
+    /// (ring buffer length, ~8 B per timestamp). Default 8; clamped to
+    /// 1..=32 at runtime.
+    pub actr_history: usize,
     /// Only run supersession detection (refinement + contradiction) over records
     /// inserted SINCE the last consolidation, via a seq-cursor watermark, rather
     /// than re-scanning every live record every cycle. `false` (default) keeps
@@ -407,9 +439,19 @@ impl TierConfig {
         // Consolidation auto-commits supersessions by default. Set true to
         // defer to an explicit propose -> verify -> commit flow (W3).
         defer_supersession_commit: false,
+        // Superseded facts are rank-demoted but still returned by default.
+        // Set true to exclude them from results entirely (B1 ghost-memory fix).
+        exclude_superseded: false,
         // Cognitive retain-what-is-used eviction by default. Set false for the
         // naive FIFO baseline (W5 isolation).
         access_aware_eviction: true,
+        // ACT-R activation for eviction ranking: opt-in; default keeps the
+        // legacy recency heuristic. The access-history ring is recorded
+        // regardless, so enabling this later (even across restarts) already
+        // has history to score.
+        actr_activation: false,
+        actr_decay: 0.5,
+        actr_history: 8,
         // Full-scan supersession detection by default; set true for the
         // seq-cursor incremental path (W7 scale fix).
         incremental_supersession_detection: false,

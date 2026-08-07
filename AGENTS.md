@@ -1,365 +1,76 @@
-# Agent Guide — TurboSuperMemory
+# TurboSuperMemory Agent Notes
 
-TurboSuperMemory is a high-performance, production-oriented AI Memory Engine written in Rust with PyO3 Python bindings. It treats memory as a first-class persistent intelligence layer for AI agents: dense vector retrieval (HNSW + exact fallback), BM25 lexical triggers, an episodic-semantic graph with spreading activation, tiered storage (Hot/Warm/Cold), and a Compressed Cognitive State (CCS) working-memory stub.
+## Toolchain And Shell
 
-This guide is written for AI coding agents that need to build, test, and modify the project. Assume the reader knows nothing about the repository.
+- This is a Rust 2021 workspace with six crates. There is no pinned `rust-toolchain`; the README targets stable Rust 1.96+ and the PyO3 extension uses `abi3-py312`.
+- Python extension and evaluation work must use Python 3.12. Set both `PYO3_PYTHON` and `PYTHON` when overriding the interpreter; the Windows Makefile default is the machine-specific `C:\Users\User\AppData\Local\Programs\Python\Python312\python.exe`.
+- Make recipes use POSIX `export`, `cp`, and `rm` even on Windows. Run them under GNU Make with a POSIX shell (for example Git Bash/MSYS), not `nmake` or a PowerShell-only shell.
+- Building `turbomemory_api` runs `tonic-build` over `crates/turbomemory_api/proto/turbomemory.proto`; `protoc` must be installed and on `PATH`.
+- CUDA is opt-in: `make build-python FEATURES=cuda`. The feature propagates from `turbomemory_python` through storage to `turbomemory_gpu`; the normal build always uses the CPU fallback.
 
----
+## Workspace Boundaries
 
-## 1. Technology Stack
+- `turbomemory_core`: vector math, SIMD/FWHT, quantizers, and quantized scoring. Keep I/O and persistence out.
+- `turbomemory_graph`: BM25, concept extraction, graph/reinforcement/belief semantics, spreading activation, FOK, and CCS/compressors.
+- `turbomemory_gpu`: the `GpuBackend` abstraction, CPU fallback, and optional CUDA implementation.
+- `turbomemory_storage`: the central `StorageEngine`, persistence, indexes, tier lifecycle, filtering, and background workers. Start at `engine.rs`; tier decisions live in `config.rs`, `segment_holder.rs`, and `optimizer.rs`.
+- `turbomemory_python`: the `MemoryEngine` PyO3 facade. Keep it thin and preserve `py.allow_threads(...)` around heavy engine calls and zero-copy contiguous `float32` NumPy paths.
+- `turbomemory_api`: shared behavior belongs in `service.rs`; transport conversion belongs in `grpc.rs`/`rest.rs`. Edit the proto source, never generated files under `target/`.
 
-| Layer | Technology |
-|-------|------------|
-| Language | Rust (edition 2021, tested on 1.96+) |
-| Python bindings | PyO3 0.25 + numpy 0.25, `abi3-py312` |
-| Build system | Cargo workspace + GNU Make |
-| Vector index | `usearch` 2.25 (HNSW) for sealed Hot segments; plain brute-force for mutable Hot segment |
-| Vector storage | mmap-backed `VectorStore` (`vectors.bin`) with CRC-validated header |
-| Metadata durability | `redb` 4.1 for lazy snapshots; append-only WAL (`wal/wal_meta.bin`) is the runtime source of truth |
-| Quantization | FWHT preconditioning, Lloyd-Max tables, scalar quantizer, 1-bit sign quantizer, and TurboQuant MSE/prod quantizers (configurable per tier) |
-| Full-text search | Tantivy 0.22 (`text_index/`) |
-| Payload filtering | In-memory Roaring bitmap index (`payload_index.rs`) |
-| Concurrency | `parking_lot` RwLock/Mutex inside `StorageEngine`; Python binding holds `Arc<StorageEngine>` directly |
-| Parallelism | Rayon for cross-segment search |
-| API server | `tokio` + `tonic` (gRPC) + `axum` (REST) |
+## Focused Commands
 
----
-
-## 2. Workspace Layout
-
-```text
-crates/
-├── turbomemory_core/      # Vector math, SIMD kernels, FWHT, Lloyd-Max, scalar/sign/TurboQuant quantization, LUT search
-├── turbomemory_storage/   # MemoryStore/StorageEngine, tiered segments, HNSW, WAL, redb persistence, payload/text indexes
-├── turbomemory_graph/     # BM25, episodic-semantic graph, spreading activation, FOK gate, CCS stub
-├── turbomemory_python/    # PyO3 bindings exposing MemoryEngine
-└── turbomemory_api/       # gRPC (tonic) + REST (axum) server and shared service layer
-```
-
-Key root files:
-
-- `Cargo.toml` — workspace manifest and shared dependencies.
-- `Makefile` — build/test/verify orchestration.
-- `verify.py` — E2E integration tests for the Python binding.
-- `audit_recall.py` — recall + restart-correctness audit.
-- `benchmark.py` — performance benchmark harness (optionally compares Chroma/Qdrant/flat NumPy).
-- `TODO.md` — engineering backlog with status and execution phases.
-
----
-
-## 3. Build & Test Commands
-
-All commands should be run from the project root (`D:/personal-projects/TurboSuperMemory`).
-
-### Prerequisites
-
-- Latest stable Rust (1.96+ recommended).
-- Python 3.12 with development libraries.
-- Set `PYO3_PYTHON` if Python is not at the default path. The Makefile defaults to `C:\Users\User\AppData\Local\Programs\Python\Python312\python.exe`.
-
-### Rust
+Run commands from the workspace root.
 
 ```bash
-# Build the whole workspace (excludes Python extension by default)
-cargo build --workspace
+# Fast feedback
+cargo test -p turbomemory_storage search_ann_batch_matches_single_query
+cargo test -p turbomemory_storage --test crash_recovery reopen_replays_unflushed_wal
+cargo test -p turbomemory_graph
 
-# Run all Rust tests (excluding the PyO3 crate, which needs Python libs)
-cargo test --workspace --exclude turbomemory_python
-
-# Linting (must pass before merging)
+# Rust verification used by the regression gate
+cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all
-```
-
-### Python Bindings
-
-```bash
-make build-python
-```
-
-Produces `target/release/turbomemory.dll`; the verify/audit/benchmark scripts copy it to `turbomemory.pyd`.
-
-### End-to-End Verification
-
-```bash
-make verify       # build-python + copy DLL + python benchmarks/verify.py
-make audit        # build-python + copy DLL + python benchmarks/audit_recall.py
-make benchmark    # build-python + copy DLL + python benchmarks/benchmark.py --tsm-only
-make benchmark-gpu # build-python + copy DLL + python benchmarks/benchmark_gpu.py
-make cognitive-benchmark # build-python + copy DLL + python benchmarks/cognitive_benchmark.py
-make batch-test   # build-python + copy DLL + python benchmarks/test_batch_search.py
-```
-
-### Regression gate — run before every commit that touches the engine/cognitive layer
-
-```bash
-make gate          # fmt + clippy + Rust tests + synthetic belief + LongMemEval
-                   # smoke (role-filtered) + recall floor. Exits nonzero on any regression.
-make gate GATE_ARGS=--quick   # smaller LongMemEval limit (faster, noisier)
-```
-
-`make gate` (W2) is the automated guard for the cognitive-layer wins. It fails if
-formatting/clippy/tests break, if synthetic belief lift drops below +0.9 or any
-coexisting fact is falsely demoted, if the LongMemEval knowledge-update lift goes
-negative, if belief detection over-fires (edge-count ceiling — the Stage-A / broken
-mutual-NN guard), if any single-session type regresses, or if ANN recall falls below
-its floor. A refactor that silently no-ops cognition (as happened on 2026-06-29) or
-reintroduces belief over-firing (Stage A) is caught here.
-
-### API Server
-
-```bash
-make build-api    # builds target/release/turbomemory-server.exe
-make api-server   # runs with env defaults: TURBO_DB_PATH=./turbo_db, TURBO_DIMENSION=768,
-                  # TURBO_GRPC_ADDR=0.0.0.0:50051, TURBO_REST_ADDR=0.0.0.0:8080
-```
-
-### Cleanup
-
-```bash
-make clean        # cargo clean + remove turbomemory.pyd
-```
-
----
-
-## 4. Architecture Overview
-
-### 4.1 Durability Model
-
-1. Full embeddings are written to the mmap-backed `VectorStore` first.
-2. A metadata-only WAL entry is appended; the WAL is the source of truth for record metadata and ordering.
-3. `redb` (`memory.redb`) is a lazy snapshot; it is flushed only on explicit `flush()` / background consolidation.
-4. On open, un-flushed WAL entries are replayed into the metadata cache, the snapshot is persisted, and the id index, graph, payload/text indexes, and tiered segments are rebuilt from the snapshot.
-
-### 4.2 Storage Engine
-
-`StorageEngine` in `crates/turbomemory_storage/src/engine.rs` is the central type. It is internally synchronized with `parking_lot` locks and is wrapped in `Arc<_>` for sharing:
-
-- `vectors: Arc<VectorStore>` — mmap-backed dense f32 storage keyed by `PointOffset`.
-- `segments: Arc<RwLock<SegmentHolder>>` — Hot, SealedHot, Warm, and Cold segments.
-- `graph: Arc<RwLock<SpreadingActivation>>` — cognitive graph + BM25 + spreading activation.
-- `ccs: Arc<Mutex<Option<CompressedCognitiveState>>>` — compressed cognitive state.
-- `id_index: Arc<RwLock<AHashMap<Arc<str>, PointOffset>>>` — O(1) id lookup.
-- `payload_index: Arc<RwLock<PayloadIndex>>` — Roaring-bitmap payload filter index.
-- `text_index: Arc<TextIndex>` — Tantivy full-text index over memory text.
-- `wal: Arc<Mutex<Wal>>` — append-only metadata WAL.
-- `optimizer: Arc<BackgroundOptimizer>` — background seal/build/flush worker.
-
-`StorageEngine` is `Clone` by cloning the `Arc`s; it does **not** require an external mutex.
-
-### 4.3 Tiered Segments
-
-| Tier | Mutability | Backing | Search |
-|------|-----------|---------|--------|
-| Hot | Appendable | Plain offset list + shared `VectorStore` | Exact scan (SIMD batched) |
-| SealedHot | Immutable | `usearch` HNSW index file + manifest | HNSW; selective filters fall back to exact scan |
-| Warm | Immutable | Quantized mmap data + manifest (scalar or TurboQuant prod) | Quantized LUT scan + full-f32 rerank |
-| Cold | Immutable | Quantized mmap data + manifest (sign or TurboQuant MSE) | Binary/quantized LUT scan + full-f32 rerank |
-
-Lifecycle: records land in Hot; when `hot_capacity` is reached the Hot segment is sealed. Large sealed segments become SealedHot (HNSW); smaller ones become Warm. When total Warm records exceed `warm_capacity`, all Warm segments are merged into a Cold segment. Frequently accessed records can be promoted back to Hot via `promote_hot`.
-
-### 4.4 Retrieval Pipeline
-
-1. `search_ann` / `search_ann_candidates` searches tiered segments (parallel across segments) and reranks with full f32 embeddings.
-2. For collections ≤ 4,096 records the engine uses an exact flat scan for determinism.
-3. `search` fuses ANN seeds with BM25 lexical triggers and propagates activation through the memory graph.
-4. The Feeling-of-Knowing (FOK) gate returns `None` if peak activation is below the configured threshold.
-
-### 4.5 API Server
-
-`crates/turbomemory_api/src/main.rs` starts a single binary that serves:
-
-- gRPC on `TURBO_GRPC_ADDR` (default `0.0.0.0:50051`) — see `proto/turbomemory.proto`.
-- REST on `TURBO_REST_ADDR` (default `0.0.0.0:8080`) — see `rest.rs` for routes.
-
-Shared service logic lives in `service.rs`, including filter conversion for both frontends.
-
----
-
-## 5. Code Organization Conventions
-
-### Crate Responsibilities
-
-- `turbomemory_core`: pure math/quantization; no I/O, no concurrency, no persistence.
-- `turbomemory_graph`: in-memory graph, BM25, spreading activation, CCS; serde JSON for state.
-- `turbomemory_storage`: all persistence, indexing, concurrency, and the public `StorageEngine` API.
-- `turbomemory_python`: thin PyO3 wrapper translating Python types/exceptions to the storage API.
-- `turbomemory_api`: gRPC/REST frontends and shared service layer.
-
-### Module Naming
-
-- `lib.rs` is the crate root.
-- Error enums are named `<Crate>Error` and live in `lib.rs`.
-- `Result<T>` aliases are crate-local.
-- Tests live in `#[cfg(test)] mod tests` inside source files or under `tests/` for integration tests.
-
-### Key Types
-
-- `PointOffset = u64` — stable dense offset used inside vector segments and the WAL.
-- `Record` — full record including embedding (`Arc<[f32]>`).
-- `MetaRecord` — record without embedding; kept in metadata cache and WAL.
-
----
-
-## 6. Coding Style & Conventions
-
-### Error Handling
-
-- Use `thiserror` enums per crate (`TurboError`, `StorageError`, `ApiError`).
-- Convert storage errors to Python exceptions in `turbomemory_python::storage_err`:
-  - `DuplicateId` / `DimensionMismatch` / `InvalidArgument` → `ValueError`
-  - `NotFound` → `KeyError`
-  - everything else → `RuntimeError`
-- API errors map to `tonic::Status` and `axum::http::StatusCode` in `service.rs`.
-
-### Persistence
-
-- `redb` is the durable source of truth for metadata snapshots, sequence counters, graph JSON, and CCS JSON.
-- The WAL is the runtime source of truth and is replayed on open.
-- Full embeddings live only in `VectorStore`; metadata records never duplicate them.
-
-### Determinism
-
-- Graph nodes and edges use `BTreeMap`/`Vec` sorted by key so reloads reproduce the same retrieval ranking.
-- WAL entries carry monotonic `seq` and stable `PointOffset`.
-- `SegmentHolder::search` deduplicates by offset, keeping the highest score.
-
-### Concurrency
-
-- `StorageEngine` uses internal locking; callers (Python, API server) hold `Arc<StorageEngine>` directly.
-- Use `py.allow_threads(...)` in PyO3 methods for every heavy Rust call.
-- Segment search runs in parallel with Rayon when there are multiple segments; it falls back to sequential for a single segment.
-- The background optimizer uses a `Weak<StorageEngine>` so it does not keep the engine alive.
-
-### Quantization
-
-- Keep compression as a pluggable metric/tier trait (`Quantizer`).
-- The MVP uses FP32 Hot storage with scalar-quantized Warm and sign-quantized Cold tiers by default.
-- TurboQuant MSE and inner-product-optimal (`prod`) quantizers are available via `QuantizerKind` and can be assigned to Warm/Cold tiers.
-- Quantized scoring uses LUT-based kernels in `metrics_quantized.rs` for scalar/sign quantizers and rotated/projected query buffers for TurboQuant.
-
-### Simplicity
-
-- Prefer exact correctness for small N (≤ 4,096 records uses exact scan).
-- Add approximations only when they are benchmarked and gated by thresholds.
-
-### Formatting & Linting
-
-- Run `cargo fmt --all` before finishing changes.
-- Run `cargo clippy --workspace --all-targets -- -D warnings`; warnings are treated as errors in CI-like local checks.
-
----
-
-## 7. Testing Strategy
-
-### Rust Unit Tests
-
-Every crate uses `#[cfg(test)] mod tests` in source files. Run with:
-
-```bash
 cargo test --workspace --exclude turbomemory_python
-```
 
-Notable test areas:
+# Python extension and E2E
+make build-python
+make verify
 
-- `turbomemory_core`: SIMD distance kernels against reference implementations, quantizer round-trips (scalar/sign/TurboQuant), FWHT invertibility, TurboQuant distortion vs paper bounds.
-- `turbomemory_storage`: insert/search, tier sealing/reload, WAL replay, crash recovery, payload/text filtering, promotion/demotion, batch idempotency.
-- `turbomemory_graph`: graph construction, BM25 scoring, spreading activation, FOK gating.
-
-### Integration Tests
-
-- `crates/turbomemory_storage/tests/crash_recovery.rs` — process-restart scenarios: WAL replay, tier reload, truncated WAL tolerance.
-
-### Python Verification
-
-- `verify.py` — structured E2E tests: ingest, spreading-activation search, FOK gate, CCS step, consolidation.
-- `audit_recall.py` — measures recall@k against flat NumPy ground truth and checks restart correctness.
-- `benchmark.py` — performance comparison; `--tsm-only` skips optional Chroma/Qdrant baselines.
-
-### Benchmarks
-
-- `crates/turbomemory_storage/benches/vector_search.rs` — Criterion benchmark for exact/HNSW/Warm/Cold paths.
-
-### Manual API Server Smoke Test
-
-```bash
+# API
 make build-api
 make api-server
-# In another terminal:
-curl -X POST http://localhost:8080/health
 ```
 
----
+- `make test` includes the PyO3 crate and therefore needs a working Python development/link environment; use the explicit workspace command above for the normal Rust suite.
+- `make verify` rebuilds the release extension and places it at repo-root `turbomemory.pyd`/`.so`. Python benchmark scripts share that artifact; run them sequentially because a loaded `.pyd` cannot be replaced on Windows.
+- On Windows, storage test linking can fail with `LNK1102`; set `CARGO_PROFILE_DEV_DEBUG=0` and `CARGO_PROFILE_TEST_DEBUG=0` for the test command. The regression gate sets these automatically.
+- `benchmarks/audit_recall.py` currently hardcodes Windows paths (`target/release/turbomemory.dll` and `turbomemory.pyd`), so `make audit` and the gate's recall step are not portable without fixing that script.
 
-## 8. Deployment Processes
+## Required Verification
 
-There is no automated CI/CD in this repository (no `.github/workflows`). Deployment is currently manual:
+- For local iteration, run the narrow crate/test first, then format check, clippy, and the Rust suite.
+- For storage-engine or cognitive-layer changes, finish with `make gate`; use `make gate GATE_ARGS=--quick` only for a faster, noisier pass. The gate rebuilds the extension and runs formatting, clippy, Rust tests, synthetic belief checks, a role-filtered LongMemEval smoke test, and an ANN recall floor.
+- `make gate` must run under Python 3.12 and expects the checked-in LongMemEval data plus a locally cached embedding model to be usable offline (`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`).
+- Full cognitive evaluations and performance benchmarks are expensive and are not substitutes for the regression gate. Their runners and prerequisites are documented in `benchmarks/cognitive_eval/README.md` and `setup.sh`.
+- There is no CI workflow in this repository; local verification is the merge gate.
 
-1. Build the Python extension with `make build-python`.
-2. Build the server with `make build-api`.
-3. Run the full verification matrix before releasing:
-   - `cargo test --workspace --exclude turbomemory_python`
-   - `cargo clippy --workspace --all-targets -- -D warnings`
-   - `make verify`
-   - `make audit`
-   - `make benchmark`
-4. Run the API server via `make api-server` or directly:
-   ```bash
-   TURBO_DB_PATH=./turbo_db TURBO_DIMENSION=768 \
-     TURBO_GRPC_ADDR=0.0.0.0:50051 TURBO_REST_ADDR=0.0.0.0:8080 \
-     ./target/release/turbomemory-server.exe
-   ```
+## Engine Invariants
 
-Database state is stored in the directory passed to `MemoryEngine`/server:
+- `StorageEngine::open` returns `Arc<StorageEngine>` and the engine owns its synchronization. Do not add an external mutex around it; clones share internal `Arc`s.
+- Durability order is vector mmap write, metadata-only WAL append, then lazy `redb` snapshot. `flush()` drains pending seals/access counters, syncs vectors/text/metadata/segments/graph/CCS, and only then clears the WAL. Preserve this order and cover persistence changes with restart/crash tests.
+- Full embeddings live in `vectors.bin`; `MetaRecord`/WAL/redb metadata must not duplicate them. Derived id, scope, payload, text, graph, and segment indexes are rebuilt or reloaded on open. Graph snapshots are stored binary (`meta_bin` table, `TMGR` magic) with legacy JSON snapshots still readable on open; the next flush rewrites them as binary.
+- Search uses an exact scan at 4,096 records or fewer. Above that, immutable segment snapshots search Hot/SealedHot/Warm/Cold candidates and rerank against full-f32 vectors.
+- Hot sealing only swaps the mutable segment into a pending queue. The optimizer later chooses HNSW SealedHot or quantized Warm based on thresholds/resource budget; Warm compacts to Cold after `warm_capacity`.
+- Default Warm and Cold quantizers are both scalar 8-bit. TurboQuant variants require a power-of-two dimension, so they are invalid with the default dimension 768 and must return `InvalidArgument`, not panic.
+- Belief revision, abstraction, auto-importance, vocabulary evolution, eviction, and deduplication are opt-in. Do not assume the README's cognitive examples are default behavior.
+- Cognitive `search` may return no result when the FOK gate rejects a query; ANN search does not have that optional-result contract.
+- GPU failures deliberately fall back to CPU. CUDA currently accelerates bounded HNSW construction and batched full-f32 reranking; GPU-native HNSW search and quantized-tier CUDA scan are not implemented.
 
-```text
-<db_path>/
-├── memory.redb          # redb metadata snapshot
-├── vectors.bin          # mmap-backed f32 vector store
-├── wal/
-│   └── wal_meta.bin     # append-only metadata WAL
-├── text_index/          # Tantivy index
-└── segments/
-    ├── sealed_hot/      # persisted usearch HNSW segments
-    ├── warm/            # quantized segments (scalar or TurboQuant prod)
-    └── cold/            # quantized segments (sign or TurboQuant MSE)
-```
+## Change Routing
 
----
-
-## 9. Security Considerations
-
-- **Secrets/credentials**: never commit `.env`, API keys, or credentials. There are no secret-handling files in the project currently.
-- **Python extension loading**: `verify.py`, `audit_recall.py`, and `benchmark.py` copy the compiled DLL into `turbomemory.pyd` in the project root. Ensure the source DLL is trusted and built from source.
-- **API server**: the gRPC/REST server currently has no authentication, TLS, CORS, or request-size limits. Do not expose it to untrusted networks.
-- **Payload parsing**: JSON payloads are validated as syntactically correct JSON on insert, but the engine does not enforce a schema beyond top-level field indexing.
-- **File permissions**: the engine creates database directories and mmap files with default OS permissions. On multi-user systems, restrict access to the database directory.
-- **Crash safety**: the WAL uses CRC32-C framed records and tolerates trailing truncation. Always call `flush()` or use the Python context manager/`close()` before shutdown to avoid losing un-snapshotted metadata.
-- **Resource limits**: `VectorStore` grows the backing file geometrically. Monitor disk space; out-of-disk errors propagate as `StorageError::Io`.
-
----
-
-## 10. Common Gotchas for Agents
-
-- **Dimension must be a power of two for FWHT preconditioning**, but the storage engine does not require FWHT for normal operation; it normalizes embeddings on insert.
-- **Do not wrap `StorageEngine` in an external `Mutex`** in new bindings; use `Arc<StorageEngine>` and rely on internal locks.
-- **HNSW is only built for sealed segments**; the mutable Hot segment is always plain brute-force.
-- **`flush()` must be called explicitly** (or via `close()`/context manager) to durably persist metadata and clear the WAL.
-- **The Python binding releases the GIL** on every heavy call; do not reintroduce GIL-held Rust work.
-- **`search` can return `None`** when the FOK gate rejects the query; handle it in callers.
-
----
-
-## 11. Where to Start When Modifying
-
-| Task | Start in |
-|------|----------|
-| Add a distance metric or SIMD kernel | `crates/turbomemory_core/src/metrics.rs` |
-| Add a quantizer | `crates/turbomemory_core/src/quantization.rs` + `metrics_quantized.rs` |
-| Change storage/concurrency behavior | `crates/turbomemory_storage/src/engine.rs` |
-| Change tier policy or segment lifecycle | `crates/turbomemory_storage/src/segment_holder.rs` + `optimizer.rs` |
-| Change HNSW build/search | `crates/turbomemory_storage/src/segments/sealed_hot.rs` |
-| Change graph/retrieval semantics | `crates/turbomemory_graph/src/activation.rs` + `graph.rs` |
-| Change Python API | `crates/turbomemory_python/src/lib.rs` |
-| Change gRPC/REST surface | `crates/turbomemory_api/proto/turbomemory.proto` + `service.rs` + `rest.rs` + `grpc.rs` |
-| Change build/test orchestration | `Makefile` + `Cargo.toml` |
+- Distance/SIMD/FWHT/quantization: `crates/turbomemory_core/src/{metrics,quantization,turbo_quant,metrics_quantized}.rs`.
+- Retrieval, durability, filtering, or concurrency: `crates/turbomemory_storage/src/engine.rs` plus the relevant index/store module.
+- Tier lifecycle/HNSW: `crates/turbomemory_storage/src/{segment_holder,optimizer}.rs` and `src/segments/`.
+- Cognitive behavior: `crates/turbomemory_graph/src/{activation,graph,extract,ccs}.rs`; belief orchestration also exists in storage consolidation.
+- Public Python behavior: `crates/turbomemory_python/src/lib.rs`; preserve storage-to-Python exception mapping (`ValueError` for invalid/duplicate/dimension, `KeyError` for missing ids, `RuntimeError` otherwise).
+- Public server behavior: `crates/turbomemory_api/proto/turbomemory.proto` plus `src/{service,grpc,rest}.rs`. The server starts gRPC and REST together with graceful shutdown (Ctrl-C or one server's failure stops both); defaults come from `TURBO_DB_PATH`, `TURBO_DIMENSION`, `TURBO_GRPC_ADDR`, and `TURBO_REST_ADDR` in `main.rs`. Setting `TURBO_API_KEY` enables bearer-token auth on both transports; unset means open access (a wildcard bind logs a warning). REST errors are JSON (`{"error":{code,message}}`), the JSON filter DSL caps nesting at `MAX_FILTER_DEPTH = 32`, and batch inserts validate parallel-array lengths.

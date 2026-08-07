@@ -1,14 +1,45 @@
 //! gRPC service implementation.
 
+use crate::pb::memory_server::{Memory, MemoryServer};
 use crate::pb::{
-    memory_server::Memory, DeleteRequest, DeleteResponse, FlushRequest, FlushResponse,
-    GetPayloadRequest, GetPayloadResponse, HealthRequest, HealthResponse, InsertBatchRequest,
-    InsertBatchResponse, InsertRequest, InsertResponse, SearchAnnRequest, SearchRequest,
-    SearchResponse, StepSessionRequest, StepSessionResponse, TriggerConsolidationRequest,
+    DeleteRequest, DeleteResponse, FlushRequest, FlushResponse, GetPayloadRequest,
+    GetPayloadResponse, HealthRequest, HealthResponse, InsertBatchRequest, InsertBatchResponse,
+    InsertRequest, InsertResponse, SearchAnnRequest, SearchRequest, SearchResponse,
+    StepSessionRequest, StepSessionResponse, TriggerConsolidationRequest,
     TriggerConsolidationResponse, UpdateRequest, UpdateResponse,
 };
-use crate::service::{map_results, pb_filter_to_storage, to_pb_results, ApiError, MemoryService};
+use crate::service::{
+    map_results, pb_filter_to_storage, to_pb_results, validate_batch_lengths, ApiAuth, ApiError,
+    MemoryService,
+};
+use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Response, Status};
+
+/// Build the gRPC `Memory` service, enforcing bearer-token authentication on
+/// every call according to `auth`.
+// tonic::Status is a large Err variant, but the Interceptor signature is fixed by tonic.
+#[allow(clippy::result_large_err)]
+pub fn server(
+    service: MemoryService,
+    auth: ApiAuth,
+) -> InterceptedService<MemoryServer<MemoryService>, impl tonic::service::Interceptor + Clone> {
+    MemoryServer::with_interceptor(service, move |request| auth_interceptor(&auth, request))
+}
+
+/// Interceptor rejecting calls without a valid `authorization: Bearer <key>`
+/// metadata entry when auth is enabled; passes every call when it is not.
+#[allow(clippy::result_large_err)]
+pub fn auth_interceptor(auth: &ApiAuth, request: Request<()>) -> Result<Request<()>, Status> {
+    let header = request
+        .metadata()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok());
+    if auth.is_authorized(header) {
+        Ok(request)
+    } else {
+        Err(Status::unauthenticated("missing or invalid bearer token"))
+    }
+}
 
 #[tonic::async_trait]
 impl Memory for MemoryService {
@@ -47,6 +78,16 @@ impl Memory for MemoryService {
         request: Request<InsertBatchRequest>,
     ) -> Result<Response<InsertBatchResponse>, Status> {
         let req = request.into_inner();
+        validate_batch_lengths(
+            req.ids.len(),
+            req.texts.len(),
+            req.embeddings.len(),
+            req.scores.len(),
+            req.concepts.len(),
+            req.payloads.len(),
+            req.scopes.len(),
+            req.source_roles.len(),
+        )?;
         let ids = req.ids;
         let texts = req.texts;
         let embeddings: Vec<Vec<f32>> = req.embeddings.into_iter().map(|e| e.values).collect();
@@ -238,5 +279,44 @@ impl Memory for MemoryService {
     ) -> Result<Response<FlushResponse>, Status> {
         self.engine().flush().map_err(ApiError::from)?;
         Ok(Response::new(FlushResponse { success: true }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_with_token(token: &str) -> Request<()> {
+        let mut request = Request::new(());
+        request
+            .metadata_mut()
+            .insert("authorization", token.parse().unwrap());
+        request
+    }
+
+    #[test]
+    fn interceptor_rejects_missing_token() {
+        let auth = ApiAuth::new(Some("key".into()));
+        let err = auth_interceptor(&auth, Request::new(())).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn interceptor_rejects_wrong_token() {
+        let auth = ApiAuth::new(Some("key".into()));
+        let err = auth_interceptor(&auth, request_with_token("Bearer nope")).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn interceptor_accepts_valid_token() {
+        let auth = ApiAuth::new(Some("key".into()));
+        assert!(auth_interceptor(&auth, request_with_token("Bearer key")).is_ok());
+    }
+
+    #[test]
+    fn interceptor_open_when_disabled() {
+        let auth = ApiAuth::new(None);
+        assert!(auth_interceptor(&auth, Request::new(())).is_ok());
     }
 }

@@ -123,8 +123,9 @@ impl BackgroundOptimizer {
     /// Spawn the background optimizer.
     ///
     /// `weak_engine` is used so the worker does not keep the engine alive by
-    /// itself. The thread exits when it can no longer upgrade the weak reference
-    /// or when `Shutdown` is received.
+    /// itself. The thread exits when `Shutdown` is received or `running` is
+    /// cleared (both happen in `stop`, called from `Drop`). If the engine is
+    /// gone the loop simply idles until then.
     pub fn new(
         weak_engine: Weak<StorageEngine>,
         interval: Option<Duration>,

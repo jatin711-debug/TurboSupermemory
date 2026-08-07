@@ -6,6 +6,6 @@ the destructive demotion is committed, a verifier vets each pair semantically.
 `NLIVerifier` uses a local NLI cross-encoder — no LLM server required.
 """
 
-from .nli import NLIVerifier
+from .nli import NLIVerifier, get_shared_verifier
 
-__all__ = ["NLIVerifier"]
+__all__ = ["NLIVerifier", "get_shared_verifier"]

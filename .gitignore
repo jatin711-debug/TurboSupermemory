@@ -58,4 +58,10 @@ ResearchPapers
 bench_results
 openai_key.txt
 .openai_key
+kimi_key.txt
+.kimi_key
+minimax_key.txt
+.minimax_key
 benchmarks/cognitive_eval/extraction/_cache/
+benchmarks/cognitive_eval/embedding/_cache/
+test_db_*

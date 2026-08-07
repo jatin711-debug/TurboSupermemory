@@ -14,6 +14,7 @@ module never receives, stores, or logs the raw key.
 import logging
 import os
 import random
+import threading
 import time
 
 logger = logging.getLogger("cognitive_eval.judge.openai")
@@ -64,18 +65,30 @@ class OpenAIJudge:
         self.model = model
         self.max_retries = max_retries
         self.calls = 0
+        self._calls_lock = threading.Lock()
+        self.extra_body = None
+        self.input_tokens = 0
+        self.output_tokens = 0
 
     def _chat(self, system, user, max_tokens):
         for attempt in range(self.max_retries):
             try:
-                self.calls += 1
-                resp = self._client.chat.completions.create(
-                    model=self.model,
-                    messages=[{"role": "system", "content": system},
-                              {"role": "user", "content": user}],
-                    temperature=0.0,
-                    max_tokens=max_tokens,
-                )
+                with self._calls_lock:
+                    self.calls += 1
+                kwargs = {
+                    "model": self.model,
+                    "messages": [{"role": "system", "content": system},
+                                 {"role": "user", "content": user}],
+                    "temperature": 0.0,
+                    "max_tokens": max_tokens,
+                }
+                if self.extra_body:
+                    kwargs["extra_body"] = self.extra_body
+                resp = self._client.chat.completions.create(**kwargs)
+                if resp.usage:
+                    with self._calls_lock:
+                        self.input_tokens += resp.usage.prompt_tokens or 0
+                        self.output_tokens += resp.usage.completion_tokens or 0
                 return (resp.choices[0].message.content or "").strip()
             except Exception as e:  # noqa: BLE001 — transient API errors: backoff + retry
                 wait = _retry_wait(e, attempt)

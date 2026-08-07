@@ -236,9 +236,12 @@ impl StorageEngine {
             .map(|(offset, rec)| (Arc::from(rec.id.as_str()), *offset))
             .collect();
         // Load the persisted graph (if any) so learned edge weights and
-        // abstraction nodes survive restart. Falls back to a full rebuild
-        // when the graph JSON is absent or unparseable.
-        let saved_graph = meta.load_meta_str("graph");
+        // abstraction nodes survive restart. Binary snapshots are preferred;
+        // legacy JSON snapshots written by older builds still load via
+        // fallback. Falls back to a full rebuild when no snapshot parses.
+        let saved_graph = meta
+            .load_meta_bytes("graph")
+            .or_else(|| meta.load_meta_str("graph").map(String::into_bytes));
         let graph = rebuild_graph(&records_vec, saved_graph, &config.spreading);
         let ccs = meta
             .load_meta_str("ccs")
@@ -319,7 +322,7 @@ impl StorageEngine {
         let budget = Arc::new(crate::optimizer::ResourceBudget::new(
             config.optimizer_budget.clone(),
         ));
-        let access_counters = Arc::new(AccessCounters::new());
+        let access_counters = Arc::new(AccessCounters::new(config.tier.actr_history));
         let compressor: Arc<RwLock<Arc<dyn CognitiveCompressor>>> =
             Arc::new(RwLock::new(Arc::new(DeterministicCompressor)));
         // Snapshot before `meta` is moved into the cyclic closure.
@@ -842,11 +845,18 @@ impl StorageEngine {
                 None => scope_bitmap,
             });
         }
+        // B1: with superseded exclusion enabled, snapshot the superseded id
+        // set once and over-fetch so the stale ids can be dropped while still
+        // filling top_k. `None` (flag off / no supersessions) keeps fetch_k
+        // == top_k and skips the filter entirely.
+        let exclusion = self.superseded_exclusion_set();
+        let fetch_k = Self::exclusion_fetch_k(&exclusion, top_k);
         if self.record_count() <= EXACT_FALLBACK_THRESHOLD {
-            let results = match &allowed_offsets {
-                Some(bitmap) => self.exact_top_k_filtered(query_embedding, top_k, bitmap),
-                None => self.exact_top_k(query_embedding, top_k),
+            let mut results = match &allowed_offsets {
+                Some(bitmap) => self.exact_top_k_filtered(query_embedding, fetch_k, Some(bitmap)),
+                None => self.exact_top_k(query_embedding, fetch_k),
             };
+            Self::apply_superseded_exclusion(&mut results, top_k, exclusion.as_ref());
             for (id, _) in &results {
                 self.bump_access_by_id(id);
             }
@@ -856,7 +866,7 @@ impl StorageEngine {
         let gpu = self.gpu_backend();
         let scored = snapshot.search_gpu(
             query_embedding,
-            top_k,
+            fetch_k,
             ef,
             &self.vectors,
             allowed_offsets.as_ref(),
@@ -865,10 +875,16 @@ impl StorageEngine {
         let mut results = Vec::with_capacity(scored.len());
         for c in scored {
             if let Some(meta_rec) = self.meta.get(c.offset)? {
+                if let Some(set) = &exclusion {
+                    if set.contains(&meta_rec.id) {
+                        continue;
+                    }
+                }
                 self.bump_access(c.offset);
                 results.push((meta_rec.id, c.score));
             }
         }
+        results.truncate(top_k);
         Ok(results)
     }
 
@@ -905,15 +921,20 @@ impl StorageEngine {
                 None => scope_bitmap,
             });
         }
+        // B1: superseded exclusion applies identically to every query in the
+        // batch — one snapshot for the whole batch, same over-fetch pool.
+        let exclusion = self.superseded_exclusion_set();
+        let fetch_k = Self::exclusion_fetch_k(&exclusion, top_k);
 
         // Small collection: batch the exact scan (per-query, but cheap).
         if self.record_count() <= EXACT_FALLBACK_THRESHOLD {
             let mut out = Vec::with_capacity(m);
             for q in queries {
-                let results = match &allowed_offsets {
-                    Some(bitmap) => self.exact_top_k_filtered(q, top_k, bitmap),
-                    None => self.exact_top_k(q, top_k),
+                let mut results = match &allowed_offsets {
+                    Some(bitmap) => self.exact_top_k_filtered(q, fetch_k, Some(bitmap)),
+                    None => self.exact_top_k(q, fetch_k),
                 };
+                Self::apply_superseded_exclusion(&mut results, top_k, exclusion.as_ref());
                 for (id, _) in &results {
                     self.bump_access_by_id(id);
                 }
@@ -927,7 +948,7 @@ impl StorageEngine {
         let gpu = self.gpu_backend();
         let batch_scored = snapshot.search_gpu_batch(
             queries,
-            top_k,
+            fetch_k,
             ef,
             &self.vectors,
             allowed_offsets.as_ref(),
@@ -940,30 +961,41 @@ impl StorageEngine {
             let mut results = Vec::with_capacity(scored.len());
             for c in scored {
                 if let Some(meta_rec) = self.meta.get(c.offset)? {
+                    if let Some(set) = &exclusion {
+                        if set.contains(&meta_rec.id) {
+                            continue;
+                        }
+                    }
                     self.bump_access(c.offset);
                     results.push((meta_rec.id, c.score));
                 }
             }
+            results.truncate(top_k);
             out.push(results);
         }
         Ok(out)
     }
 
     fn exact_top_k(&self, query: &[f32], top_k: usize) -> Vec<(String, f32)> {
-        self.exact_top_k_filtered(query, top_k, &RoaringBitmap::new())
+        self.exact_top_k_filtered(query, top_k, None)
     }
 
     fn exact_top_k_filtered(
         &self,
         query: &[f32],
         top_k: usize,
-        allowed_offsets: &RoaringBitmap,
+        allowed_offsets: Option<&RoaringBitmap>,
     ) -> Vec<(String, f32)> {
         let view = self.vectors.read_view();
         let mut all: Vec<(String, f32)> = Vec::new();
         let _ = self.meta.for_each_record(|offset, rec| {
-            if !allowed_offsets.is_empty() && !allowed_offsets.contains(offset as u32) {
-                return;
+            // `Some` always filters, even when empty: a filter/scope that
+            // resolves to zero offsets must match NOTHING (previously an empty
+            // bitmap was treated as "unfiltered", leaking other scopes).
+            if let Some(bitmap) = allowed_offsets {
+                if !bitmap.contains(offset as u32) {
+                    return;
+                }
             }
             if let Some(v) = view.get(offset) {
                 let score = cosine_similarity(query, v);
@@ -973,6 +1005,55 @@ impl StorageEngine {
         all.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         all.truncate(top_k);
         all
+    }
+
+    /// Snapshot of the graph's superseded-id set for one query (B1: the A-TMA
+    /// "ghost memory" fix — memories on the old side of a Refines/Contradicts
+    /// edge are dropped from results instead of merely rank-demoted). Read-locks
+    /// the graph exactly once. Returns `None` when exclusion is disabled or the
+    /// graph has no supersessions, so the common case pays nothing and behaves
+    /// exactly as before.
+    fn superseded_exclusion_set(&self) -> Option<HashSet<String>> {
+        if !self.config.tier.exclude_superseded {
+            return None;
+        }
+        let set: HashSet<String> = self
+            .graph
+            .read()
+            .graph()
+            .superseded_ids()
+            .into_iter()
+            .collect();
+        if set.is_empty() {
+            None
+        } else {
+            Some(set)
+        }
+    }
+
+    /// Candidate-pool size used when superseded exclusion is active: over-fetch
+    /// `top_k * 2 + 5` so that dropping the stale ids still leaves enough
+    /// candidates to fill `top_k` (the pool size proven in the B1 eval adapter).
+    fn exclusion_fetch_k(exclusion: &Option<HashSet<String>>, top_k: usize) -> usize {
+        if exclusion.is_some() {
+            top_k * 2 + 5
+        } else {
+            top_k
+        }
+    }
+
+    /// Drop superseded ids from an over-fetched result list and truncate back
+    /// to `top_k`. No-op when `exclusion` is `None` (flag off or no
+    /// supersessions), preserving the exact prior behavior.
+    fn apply_superseded_exclusion(
+        results: &mut Vec<(String, f32)>,
+        top_k: usize,
+        exclusion: Option<&HashSet<String>>,
+    ) {
+        if let Some(set) = exclusion {
+            results.retain(|(id, _)| !set.contains(id));
+            results.truncate(top_k);
+        }
     }
 
     pub fn search(
@@ -1024,11 +1105,16 @@ impl StorageEngine {
     /// the recall floor. `alpha` controls how much the graph may nudge the
     /// ranking: `1.0` = pure cosine (graph only decides which candidates
     /// exist); lower values give the graph delta more of a vote.
+    ///
+    /// `exclusion` is the per-query superseded-id snapshot (B1): when `Some`,
+    /// those ids are dropped before the top-k truncation (the callers already
+    /// over-fetch the graph candidate pool to compensate).
     fn hydrate_and_fuse(
         &self,
         results: Vec<(String, f32)>,
         query_embedding: &[f32],
         top_k: usize,
+        exclusion: Option<&HashSet<String>>,
     ) -> crate::Result<Vec<(String, f32)>> {
         if results.is_empty() {
             return Ok(Vec::new());
@@ -1069,6 +1155,11 @@ impl StorageEngine {
                 })
             })
             .collect();
+        // B1: drop superseded memories entirely rather than merely demoting
+        // them. No-op when `exclusion` is `None` (flag off / no supersessions).
+        if let Some(set) = exclusion {
+            hydrated.retain(|(id, _)| !set.contains(id));
+        }
         hydrated.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         hydrated.truncate(top_k);
         Ok(hydrated)
@@ -1103,17 +1194,37 @@ impl StorageEngine {
         )?;
 
         let graph = self.graph.read();
+        // B1: snapshot the superseded id set while the graph read lock is
+        // already held (once per query). `None` when exclusion is disabled
+        // or the graph has no supersessions — the zero-cost fast path.
+        let exclusion: Option<HashSet<String>> = if self.config.tier.exclude_superseded {
+            let set: HashSet<String> = graph.graph().superseded_ids().into_iter().collect();
+            if set.is_empty() {
+                None
+            } else {
+                Some(set)
+            }
+        } else {
+            None
+        };
         // Request more candidates from the graph than the final top_k so
         // that memories reached through multi-hop traversal (abstraction
         // edges, refinement edges) have a chance to be in the candidate
         // set even if their graph activation is lower than direct matches.
         // The fusion step (hydrate_and_fuse) will then re-rank using the
         // combination of cosine + graph activation and truncate to top_k.
-        let graph_k = (top_k * 3).max(top_k + 5);
+        // With superseded exclusion active, over-fetch at least the
+        // B1-proven `top_k * 2 + 5` pool so dropping stale ids still
+        // leaves enough candidates to fill top_k.
+        let mut graph_k = (top_k * 3).max(top_k + 5);
+        if exclusion.is_some() {
+            graph_k = graph_k.max(top_k * 2 + 5);
+        }
         let activated = graph.search(query_text, &seeds, graph_k);
         drop(graph);
         if let Some(results) = activated {
-            let hydrated = self.hydrate_and_fuse(results, query_embedding, top_k)?;
+            let hydrated =
+                self.hydrate_and_fuse(results, query_embedding, top_k, exclusion.as_ref())?;
             if hydrated.is_empty() {
                 return Ok(None);
             }
@@ -1177,11 +1288,28 @@ impl StorageEngine {
             scope,
         )?;
         let graph = self.graph.read();
-        let graph_k = (top_k * 3).max(top_k + 5);
+        // B1: snapshot the superseded id set while the graph read lock is
+        // already held (once per query). `None` when exclusion is disabled
+        // or the graph has no supersessions — the zero-cost fast path.
+        let exclusion: Option<HashSet<String>> = if self.config.tier.exclude_superseded {
+            let set: HashSet<String> = graph.graph().superseded_ids().into_iter().collect();
+            if set.is_empty() {
+                None
+            } else {
+                Some(set)
+            }
+        } else {
+            None
+        };
+        let mut graph_k = (top_k * 3).max(top_k + 5);
+        if exclusion.is_some() {
+            graph_k = graph_k.max(top_k * 2 + 5);
+        }
         let activated = graph.search(query_text, &seeds, graph_k);
         drop(graph);
         if let Some(results) = activated {
-            let hydrated = self.hydrate_and_fuse(results, query_embedding, top_k)?;
+            let hydrated =
+                self.hydrate_and_fuse(results, query_embedding, top_k, exclusion.as_ref())?;
             if hydrated.is_empty() {
                 return Ok(None);
             }
@@ -1315,8 +1443,11 @@ impl StorageEngine {
     }
 
     fn save_graph(&self) -> crate::Result<()> {
-        let json = self.graph.read().graph().to_json();
-        self.meta.save_meta("graph", &json)?;
+        let bytes = self.graph.read().graph().to_snapshot_bytes();
+        self.meta.save_meta_bytes("graph", &bytes)?;
+        // Reclaim the legacy JSON snapshot (pre-binary databases) once the
+        // binary snapshot is durable. No-op when already gone.
+        self.meta.remove_meta("graph")?;
         Ok(())
     }
 
@@ -1401,7 +1532,8 @@ impl StorageEngine {
     /// falls below `evict_score_floor`. Returns the number of records evicted.
     ///
     /// Both triggers are opt-in; when neither is configured this is a no-op.
-    /// Salience is the same recency-weighted `access_score` used for promotion.
+    /// Salience is the same recency-weighted `access_score` used for promotion,
+    /// or ACT-R base-level activation when `actr_activation` is enabled.
     /// A grace period protects freshly inserted records that simply have not
     /// been queried yet from being evicted on their first consolidation.
     pub fn evict(&self) -> crate::Result<usize> {
@@ -1418,23 +1550,43 @@ impl StorageEngine {
         let now = now_secs();
         let half_life = tier.recency_half_life_secs.max(1);
         let access_aware = tier.access_aware_eviction;
+        // ACT-R base-level activation (opt-in) replaces the legacy
+        // access_count × recency heuristic for eviction ranking only;
+        // promotion scoring (`segment_holder::promote_hot`) always stays on
+        // the legacy path.
+        let use_actr = tier.actr_activation;
+        let actr_decay = tier.actr_decay.max(0.0);
         // Grace window: never evict a record whose last access is more recent
         // than this. Guards against evicting a just-rehearsed record before it
         // has been queried. Only meaningful for access-aware eviction; the naive
-        // FIFO baseline ignores access entirely.
+        // FIFO baseline ignores access entirely. Same semantics under ACT-R.
         let grace = half_life / 8;
 
         // Snapshot (offset, id, score) for every live record. Lower score =
         // evicted first. Access-aware: score = access_count × recency (a
-        // rehearsed memory scores high and survives). FIFO baseline: score =
-        // insert_seq (oldest-inserted evicted first), access ignored.
+        // rehearsed memory scores high and survives), or ACT-R
+        // `ln(Σ age^-decay)` over the persisted access-history ring when
+        // `actr_activation` is on (spaced rehearsal outweighs one recent
+        // burst). FIFO baseline: score = insert_seq (oldest-inserted evicted
+        // first), access ignored.
+        let histories = if use_actr {
+            self.meta.access_histories()
+        } else {
+            std::collections::HashMap::new()
+        };
         let mut scored: Vec<(PointOffset, String, f64)> = Vec::new();
         let mut protected: Vec<(PointOffset, String)> = Vec::new();
         self.meta.for_each_record(|offset, rec| {
             if access_aware && now.saturating_sub(rec.last_accessed) < grace {
                 protected.push((offset, rec.id.clone()));
             } else if access_aware {
-                scored.push((offset, rec.id.clone(), access_score(rec, now, half_life)));
+                let score = if use_actr {
+                    let history = histories.get(&offset).map(Vec::as_slice).unwrap_or(&[]);
+                    crate::access_counters::actr_activation(history, now, actr_decay)
+                } else {
+                    access_score(rec, now, half_life)
+                };
+                scored.push((offset, rec.id.clone(), score));
             } else {
                 scored.push((offset, rec.id.clone(), rec.insert_seq as f64));
             }
@@ -1872,6 +2024,28 @@ impl StorageEngine {
                 .collect()
         };
         self.commit_supersessions(&props)
+    }
+
+    /// Resolve each id against the supersession graph: "what is true NOW" in
+    /// place of that memory, plus its lineage. One graph read-lock for the
+    /// whole batch. Usable without enabling any cognitive config flags — the
+    /// graph exists regardless, so with no supersession edges every id
+    /// resolves to itself (`superseded = false`, `chain = [id]`). Unknown ids
+    /// also resolve to themselves.
+    pub fn resolve_beliefs(&self, ids: &[String]) -> Vec<BeliefResolution> {
+        let guard = self.graph.read();
+        let graph = guard.graph();
+        ids.iter()
+            .map(|id| {
+                let current_id = graph.belief_head(id);
+                BeliefResolution {
+                    id: id.clone(),
+                    superseded: current_id != *id,
+                    current_id,
+                    chain: graph.belief_lineage(id),
+                }
+            })
+            .collect()
     }
 
     /// Merge the older memory's concepts (that the newer one lacks) into the
@@ -2396,23 +2570,32 @@ fn build_graph(records: &[(PointOffset, Record)], config: &SpreadingConfig) -> S
 /// Rebuild the cognitive graph, preserving learned edge weights and
 /// abstraction nodes from a previously-saved graph when available.
 ///
-/// The persisted graph JSON (written by `save_graph`) captures learned state
-/// that is not reconstructable from records alone: reinforced edge weights,
-/// reinforcement timestamps, and abstraction (parent concept) nodes. If the
-/// persisted graph is present, we load it and add only records that are not
-/// already memory nodes in it (using `insert_seq` ordering to decide which
-/// records are new). If the persisted graph is absent or fails to parse, we
-/// fall back to a full rebuild from records — this preserves the pre-learning
+/// The persisted graph snapshot (written by `save_graph`) captures learned
+/// state that is not reconstructable from records alone: reinforced edge
+/// weights, reinforcement timestamps, and abstraction (parent concept) nodes.
+/// Snapshots are binary (magic-prefixed bincode); snapshots without the magic
+/// are treated as legacy JSON from pre-binary databases. If the persisted
+/// graph is present, we load it and add only records that are not already
+/// memory nodes in it (using `insert_seq` ordering to decide which records
+/// are new). If the persisted graph is absent or fails to parse, we fall
+/// back to a full rebuild from records — this preserves the pre-learning
 /// behavior and is always correct, just without learned state.
 fn rebuild_graph(
     records: &[(PointOffset, Record)],
-    saved_graph_json: Option<String>,
+    saved_graph: Option<Vec<u8>>,
     config: &SpreadingConfig,
 ) -> SpreadingActivation {
-    let Some(json) = saved_graph_json else {
+    let Some(bytes) = saved_graph else {
         return build_graph(records, config);
     };
-    let Ok(mut graph) = MemoryGraph::from_json(&json) else {
+    let parsed = if MemoryGraph::is_snapshot_bytes(&bytes) {
+        MemoryGraph::from_snapshot_bytes(&bytes).ok()
+    } else {
+        std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|json| MemoryGraph::from_json(json).ok())
+    };
+    let Some(mut graph) = parsed else {
         return build_graph(records, config);
     };
     // Add records that are not already memory nodes in the persisted graph.
@@ -2516,6 +2699,23 @@ pub struct ProposedSupersession {
     pub kind: SupersessionKind,
     /// Cosine similarity between the two memories at detection time.
     pub cosine: f32,
+}
+
+/// The resolution of one memory id against the supersession graph — the
+/// "revises beliefs" read contract: what is believed NOW in place of `id`,
+/// and the lineage that led there. Produced by `StorageEngine::resolve_beliefs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeliefResolution {
+    /// The queried id.
+    pub id: String,
+    /// Head of `id`'s supersession chain — the current belief. Equals `id`
+    /// when nothing supersedes it (or the id is unknown to the graph).
+    pub current_id: String,
+    /// True when `id` has been superseded by a newer memory.
+    pub superseded: bool,
+    /// The full supersession chain containing `id`, oldest first, head last.
+    /// `[id]` when `id` has no supersession edges.
+    pub chain: Vec<String>,
 }
 
 /// Whether a memory's provenance `role` may participate in belief revision
@@ -3012,6 +3212,101 @@ mod tests {
         );
     }
 
+    #[test]
+    fn graph_state_survives_restart_via_binary_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = small_config(8);
+        let (edge_count, refinement_count);
+        {
+            let engine = StorageEngine::open(tmp.path(), config.clone()).unwrap();
+            engine
+                .insert(
+                    "old",
+                    "Rust memory safety",
+                    &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    1.0,
+                    &["rust".to_string()],
+                )
+                .unwrap();
+            engine
+                .insert(
+                    "new",
+                    "Rust borrow checker safety",
+                    &[0.9f32, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    1.0,
+                    &["rust".to_string()],
+                )
+                .unwrap();
+            // Learn state that only the persisted snapshot can preserve.
+            engine.graph.write().add_refinement("old", "new", 0.8);
+            engine.graph.write().reinforce("old", 1234);
+            engine.flush().unwrap();
+            {
+                let graph = engine.graph.read();
+                let graph = graph.graph();
+                edge_count = graph.edge_count();
+                refinement_count = graph.refinement_count();
+            }
+            // The persisted snapshot must be the binary format.
+            let bytes = engine
+                .meta
+                .load_meta_bytes("graph")
+                .expect("binary graph snapshot persisted");
+            assert!(MemoryGraph::is_snapshot_bytes(&bytes));
+        }
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        let graph = engine.graph.read();
+        let graph = graph.graph();
+        assert_eq!(graph.edge_count(), edge_count);
+        assert_eq!(graph.refinement_count(), refinement_count);
+        assert_eq!(graph.refined_by("old"), vec!["new".to_string()]);
+        let reinforced = graph
+            .neighbors(&turbomemory_graph::NodeId::memory("old").as_str())
+            .iter()
+            .any(|e| e.last_reinforced_at == 1234);
+        assert!(reinforced, "reinforcement timestamp should survive restart");
+    }
+
+    #[test]
+    fn legacy_json_graph_snapshot_still_loads_on_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = small_config(8);
+        {
+            let engine = StorageEngine::open(tmp.path(), config.clone()).unwrap();
+            engine
+                .insert(
+                    "m1",
+                    "Rust memory safety",
+                    &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    1.0,
+                    &["rust".to_string()],
+                )
+                .unwrap();
+            engine.flush().unwrap();
+            // Simulate a pre-binary database: keep only a legacy JSON snapshot
+            // under the old string meta key.
+            let json = engine.graph.read().graph().to_json();
+            engine.meta.save_meta("graph", &json).unwrap();
+            engine.meta.remove_meta_bytes("graph").unwrap();
+        }
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        {
+            let graph = engine.graph.read();
+            let graph = graph.graph();
+            assert_eq!(graph.memory_count(), 1);
+            assert!(graph.nodes().contains_key("concept:rust"));
+        }
+        // The next flush rewrites the snapshot in binary form and reclaims the
+        // legacy JSON entry.
+        engine.flush().unwrap();
+        let bytes = engine
+            .meta
+            .load_meta_bytes("graph")
+            .expect("binary snapshot after flush");
+        assert!(MemoryGraph::is_snapshot_bytes(&bytes));
+        assert!(engine.meta.load_meta_str("graph").is_none());
+    }
+
     /// The propose/commit split (W3): `propose_*` detects pairs WITHOUT
     /// mutating the graph or demoting; `commit_supersessions` is what applies
     /// the edge + demotion. A verifier can drop pairs between the two steps.
@@ -3071,6 +3366,109 @@ mod tests {
         );
     }
 
+    /// Belief-state resolution: after committing the A <- B <- C supersession
+    /// chain, `resolve_beliefs` maps every chain element to the CURRENT head
+    /// with the full lineage — with `exclude_superseded` off (resolution is an
+    /// annotation contract, independent of the exclusion flag).
+    #[test]
+    fn resolve_beliefs_walks_supersession_chain_to_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = small_config(8);
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        for (id, text) in [
+            ("a", "Rust memory safety v1"),
+            ("b", "Rust memory safety v2"),
+            ("c", "Rust memory safety v3"),
+        ] {
+            engine
+                .insert(
+                    id,
+                    text,
+                    &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    1.0,
+                    &["rust".to_string()],
+                )
+                .unwrap();
+        }
+        let committed = engine
+            .commit_supersessions_by_id(&[
+                (
+                    "a".to_string(),
+                    "b".to_string(),
+                    SupersessionKind::Refinement,
+                ),
+                (
+                    "b".to_string(),
+                    "c".to_string(),
+                    SupersessionKind::Refinement,
+                ),
+            ])
+            .unwrap();
+        assert_eq!(committed, 2);
+
+        let res = engine.resolve_beliefs(&[
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "ghost".to_string(),
+        ]);
+        assert_eq!(res.len(), 4);
+
+        assert_eq!(res[0].id, "a");
+        assert_eq!(res[0].current_id, "c", "a resolves to the chain head");
+        assert!(res[0].superseded);
+        assert_eq!(
+            res[0].chain,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            "lineage is oldest-first with the head last"
+        );
+
+        assert_eq!(res[1].current_id, "c");
+        assert!(res[1].superseded);
+        assert_eq!(
+            res[1].chain,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+
+        assert_eq!(res[2].current_id, "c", "the head resolves to itself");
+        assert!(!res[2].superseded);
+        assert_eq!(
+            res[2].chain,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            "the lineage of the head is the full chain containing it"
+        );
+
+        assert_eq!(
+            res[3].current_id, "ghost",
+            "unknown ids resolve to themselves"
+        );
+        assert!(!res[3].superseded);
+        assert_eq!(res[3].chain, vec!["ghost".to_string()]);
+    }
+
+    /// With no supersession edges at all (no cognitive flags enabled),
+    /// every id resolves to itself.
+    #[test]
+    fn resolve_beliefs_without_edges_is_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = small_config(8);
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        engine
+            .insert(
+                "plain",
+                "an ordinary fact",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+        let res = engine.resolve_beliefs(&["plain".to_string()]);
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].current_id, "plain");
+        assert!(!res[0].superseded);
+        assert_eq!(res[0].chain, vec!["plain".to_string()]);
+    }
+
     #[test]
     fn supersession_demotion_makes_new_refinement_outrank_old_at_alpha_one() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3113,6 +3511,194 @@ mod tests {
             .expect("search should return candidates");
         assert_eq!(results[0].0, "new", "demotion should lower stale memory");
         assert!(results[0].1 > results[1].1);
+    }
+
+    /// B1 OFF arm (default): superseded memories are rank-demoted but still
+    /// returned. With `exclude_superseded` at its default `false`, the engine
+    /// must behave exactly as before.
+    #[test]
+    fn exclude_superseded_off_keeps_superseded_memory_in_results() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        config.cognitive_alpha = 1.0;
+        config.tier.refinement_cosine_threshold = Some(0.5);
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        assert!(!engine.config.tier.exclude_superseded);
+
+        engine
+            .insert(
+                "old",
+                "Rust memory safety",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+        engine
+            .insert(
+                "new",
+                "Rust memory safety updated",
+                &[0.95f32, 0.3122499, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+        assert_eq!(engine.check_refinements().unwrap(), 1);
+
+        let results = engine
+            .search(
+                "rust memory safety",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                2,
+            )
+            .unwrap()
+            .expect("search should return candidates");
+        let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(ids.contains(&"old"), "OFF: stale memory is only demoted");
+        assert!(ids.contains(&"new"));
+
+        let ann = engine
+            .search_ann(&[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 2)
+            .unwrap();
+        let ann_ids: Vec<&str> = ann.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(ann_ids.contains(&"old"), "OFF: ANN keeps the stale memory");
+        assert!(ann_ids.contains(&"new"));
+    }
+
+    /// B1 ON arm: with `exclude_superseded = true`, the stale memory is
+    /// dropped from BOTH cognitive search and ANN search (single + batch),
+    /// while the current memory remains.
+    #[test]
+    fn exclude_superseded_on_removes_stale_memory_from_all_search_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        config.cognitive_alpha = 1.0;
+        config.tier.refinement_cosine_threshold = Some(0.5);
+        config.tier.exclude_superseded = true;
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+
+        engine
+            .insert(
+                "old",
+                "Rust memory safety",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+        engine
+            .insert(
+                "new",
+                "Rust memory safety updated",
+                &[0.95f32, 0.3122499, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &["rust".to_string()],
+            )
+            .unwrap();
+        assert_eq!(engine.check_refinements().unwrap(), 1);
+        assert_eq!(
+            engine.graph.read().graph().superseded_ids(),
+            vec!["old".to_string()],
+            "old must be on the superseded side of the Refines edge"
+        );
+
+        let results = engine
+            .search(
+                "rust memory safety",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                2,
+            )
+            .unwrap()
+            .expect("search should return candidates");
+        let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(ids.contains(&"new"), "current memory must remain");
+        assert!(
+            !ids.contains(&"old"),
+            "ON: stale memory must be excluded from cognitive search"
+        );
+
+        let ann = engine
+            .search_ann(&[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 2)
+            .unwrap();
+        let ann_ids: Vec<&str> = ann.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(ann_ids.contains(&"new"));
+        assert!(
+            !ann_ids.contains(&"old"),
+            "ON: stale memory must be excluded from search_ann"
+        );
+
+        let batch = engine
+            .search_ann_batch(
+                &[&[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0][..]],
+                2,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let batch_ids: Vec<&str> = batch[0].iter().map(|(id, _)| id.as_str()).collect();
+        assert!(batch_ids.contains(&"new"));
+        assert!(
+            !batch_ids.contains(&"old"),
+            "ON: stale memory must be excluded from search_ann_batch"
+        );
+    }
+
+    /// B1 fast path: exclusion enabled but the graph has NO supersessions —
+    /// results must be byte-identical to the flag-OFF engine.
+    #[test]
+    fn exclude_superseded_on_without_supersessions_matches_off() {
+        let insert_all = |engine: &StorageEngine| {
+            engine
+                .insert(
+                    "a",
+                    "alpha fact",
+                    &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    1.0,
+                    &["misc".to_string()],
+                )
+                .unwrap();
+            engine
+                .insert(
+                    "b",
+                    "beta fact",
+                    &[0.9f32, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    1.0,
+                    &["misc".to_string()],
+                )
+                .unwrap();
+            engine
+                .insert(
+                    "c",
+                    "gamma fact",
+                    &[0.0f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    1.0,
+                    &["misc".to_string()],
+                )
+                .unwrap();
+        };
+
+        let tmp_off = tempfile::tempdir().unwrap();
+        let engine_off = StorageEngine::open(tmp_off.path(), small_config(8)).unwrap();
+        insert_all(&engine_off);
+
+        let tmp_on = tempfile::tempdir().unwrap();
+        let mut config_on = small_config(8);
+        config_on.tier.exclude_superseded = true;
+        let engine_on = StorageEngine::open(tmp_on.path(), config_on).unwrap();
+        insert_all(&engine_on);
+
+        let query: &[f32] = &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        assert_eq!(
+            engine_on.search_ann(query, 2).unwrap(),
+            engine_off.search_ann(query, 2).unwrap(),
+            "no supersessions: ANN results must be identical"
+        );
+        assert_eq!(
+            engine_on.search("misc fact", query, 2).unwrap(),
+            engine_off.search("misc fact", query, 2).unwrap(),
+            "no supersessions: cognitive results must be identical"
+        );
     }
 
     #[test]
@@ -3791,6 +4377,92 @@ mod tests {
         assert_eq!(engine.record_count(), 3);
     }
 
+    /// ACT-R eviction (opt-in): a record whose accesses were spaced out over
+    /// time outranks a record with the same-ish count crammed into one recent
+    /// burst, because base-level activation sums the power-law decay of every
+    /// access instead of just count × last-access recency.
+    #[test]
+    fn actr_eviction_prefers_spaced_over_burst() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        config.tier.max_records = Some(1);
+        config.tier.recency_half_life_secs = 3600; // grace = 450s
+        config.tier.actr_activation = true;
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        engine
+            .insert("mem_burst", "text burst", &make_vec(8, 0), 1.0, &[])
+            .unwrap();
+        engine
+            .insert("mem_spaced", "text spaced", &make_vec(8, 1), 1.0, &[])
+            .unwrap();
+
+        let now = now_secs();
+        let burst_off = *engine.id_index.read().get("mem_burst").unwrap();
+        let spaced_off = *engine.id_index.read().get("mem_spaced").unwrap();
+        // One burst: three accesses crammed into a single moment 600s ago.
+        for _ in 0..3 {
+            engine.access_counters.bump(burst_off, now - 600);
+        }
+        // Spaced rehearsal: six accesses spread over the last hour.
+        for age in [500u64, 600, 800, 1200, 2000, 3500] {
+            engine.access_counters.bump(spaced_off, now - age);
+        }
+        // Both last accesses (600s / 500s) are outside the 450s grace window,
+        // so ranking — not protection — decides. ACT-R scores:
+        //   burst  = ln(3 × 600^-0.5)                 ≈ -2.10
+        //   spaced = ln(500^-0.5 + … + 3500^-0.5)     ≈ -1.67
+        let evicted = engine.evict().unwrap();
+        assert_eq!(evicted, 1, "exactly one record over the cap");
+        assert!(
+            engine.find_record_by_id("mem_spaced").is_some(),
+            "spaced rehearsal must survive ACT-R eviction"
+        );
+        assert!(
+            engine.find_record_by_id("mem_burst").is_none(),
+            "single recent burst must be evicted first"
+        );
+        // The evicted record's access-history ring is cleaned up too.
+        assert!(engine.meta.access_history(burst_off).is_empty());
+    }
+
+    /// The access-history ring drains through flush and reloads on open, so
+    /// ACT-R scoring keeps working across restarts.
+    #[test]
+    fn access_history_survives_flush_and_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = small_config(8);
+        {
+            let engine = StorageEngine::open(tmp.path(), config.clone()).unwrap();
+            engine
+                .insert("mem_0", "text 0", &make_vec(8, 0), 1.0, &[])
+                .unwrap();
+            // Three real searches → three access bumps at real timestamps.
+            let q = make_vec(8, 0);
+            for _ in 0..3 {
+                assert_eq!(engine.search_ann(&q, 1).unwrap()[0].0, "mem_0");
+            }
+            engine.flush().unwrap();
+        }
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        let offset = *engine.id_index.read().get("mem_0").unwrap();
+        let history = engine.meta.access_history(offset);
+        assert_eq!(
+            history.len(),
+            3,
+            "access history should persist across restart"
+        );
+        assert!(history.iter().all(|&ts| ts > 0));
+        assert!(history.windows(2).all(|w| w[0] <= w[1]));
+        // ACT-R activation over the reloaded history is finite.
+        assert!(crate::access_counters::actr_activation(&history, now_secs(), 0.5).is_finite());
+        // A record with no recorded accesses loads with an empty ring.
+        engine
+            .insert("mem_1", "text 1", &make_vec(8, 1), 1.0, &[])
+            .unwrap();
+        let offset1 = *engine.id_index.read().get("mem_1").unwrap();
+        assert!(engine.meta.access_history(offset1).is_empty());
+    }
+
     #[test]
     fn dedup_merges_near_duplicates_keeping_salient() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4417,6 +5089,43 @@ mod tests {
         assert!(b_results.contains(&"global_mem".to_string()));
         assert!(!b_results.contains(&"agent_a_mem".to_string()));
         assert!(b_results.contains(&"agent_b_mem".to_string()));
+    }
+
+    #[test]
+    fn scoped_search_with_empty_scope_matches_nothing() {
+        // Regression: an empty filter/scope bitmap was treated as "unfiltered"
+        // by `exact_top_k_filtered`, leaking every scope's records to a scoped
+        // query that legitimately matches zero records.
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+
+        for (id, scope) in [("a_mem", "agent_a"), ("b_mem", "agent_b")] {
+            engine
+                .insert_with_payload(
+                    id,
+                    "private note",
+                    &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    1.0,
+                    &[],
+                    None,
+                    Some(scope.into()),
+                )
+                .unwrap();
+        }
+
+        let q = &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        // No global records exist, so a scope that has never been written must
+        // return NOTHING (previously returned every record in the store).
+        let results = engine
+            .search_ann_scoped(q, 10, None, Some("agent_never_written"))
+            .unwrap();
+        assert!(results.is_empty(), "empty scope leaked: {results:?}");
+
+        // Batch path shares the same choke point and must agree.
+        let batch = engine
+            .search_ann_batch(&[q.as_slice()], 10, None, None, Some("agent_never_written"))
+            .unwrap();
+        assert!(batch[0].is_empty(), "batch empty scope leaked: {batch:?}");
     }
 
     #[test]

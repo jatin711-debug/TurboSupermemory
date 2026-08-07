@@ -110,6 +110,10 @@ class TSMAdapter:
         belief_revision: bool = True,  # Build Contradicts/Refines edges + demotion
         dimension: Optional[int] = None,
         model=None,  # Preloaded embedding model to share across adapters
+        shared_embedding=True,     # Share ONE process-level embedding model across
+                                   # all adapters (fixes eval-harness OOM from
+                                   # per-conversation torch model loads). False =
+                                   # load a private model for this adapter.
         store_roles=None,  # e.g. {"user"} to store only user facts; None = all roles
         belief_source_roles=None,  # e.g. ["user"]: store ALL roles but role-scope
                                    # belief detection in the engine (mode b). Every
@@ -123,6 +127,12 @@ class TSMAdapter:
         max_records=None,          # W5: bounded-storage cap (forces eviction).
         access_aware_eviction=None,# W5: cognitive retain-what-is-used eviction (True)
                                    # vs naive FIFO baseline (False). None = default(on).
+        actr_activation=None,      # B3: rank eviction by ACT-R base-level activation
+                                   # ln(sum age^-d) over the recent access ring instead of
+                                   # legacy access_count decay. Requires
+                                   # access_aware_eviction=True. None = engine default.
+        actr_decay=None,           # B3: ACT-R decay exponent d (None = engine 0.5).
+        actr_history=None,         # B3: ACT-R access-timestamp ring len (None = eng. 8).
         supersession_mode="demote",# B1: what to do with superseded facts at recall.
                                    # "demote" = rank only (current); "exclude" = drop
                                    # them from the answer context; "tag" = prefix
@@ -138,6 +148,8 @@ class TSMAdapter:
             extractor_model: Ollama model name (if using Ollama)
             cognitive_features: Enable cognitive layer features (slow, for production only)
             dimension: Embedding dimension (auto-detected if None)
+            shared_embedding: Share one process-level embedding model across
+                adapters (default True). False loads a private model per adapter.
         """
         self.db_path = db_path
         self.embedding_model_name = embedding_model
@@ -154,13 +166,19 @@ class TSMAdapter:
         self.verify_demotions = bool(verify_demotions)
         self.verifier = verifier
         if self.verify_demotions and self.verifier is None:
-            from ..verification import NLIVerifier
-            self.verifier = NLIVerifier()
+            from ..verification import get_shared_verifier
+            # Shared process-level verifier: one cross-encoder per process, not
+            # one per adapter/conversation (same OOM fix as the embedding model).
+            self.verifier = get_shared_verifier()
         # W4: concept/abstraction graph expansion toggle (None = engine default).
         self.concept_expansion = concept_expansion
         # W5: retention/eviction knobs.
         self.max_records = max_records
         self.access_aware_eviction = access_aware_eviction
+        # B3: ACT-R eviction-ranking knobs.
+        self.actr_activation = actr_activation
+        self.actr_decay = actr_decay
+        self.actr_history = actr_history
         # B1: supersession handling at recall.
         self.supersession_mode = supersession_mode
         self._superseded_cache = None  # set[str], invalidated on add/consolidate
@@ -180,10 +198,14 @@ class TSMAdapter:
             self.dim = dim_attr() if callable(dim_attr) else dim_attr
 
         # Try sentence-transformers first (only if not on Windows or if explicitly requested)
-        if sys.platform != "win32":
+        if self.model is None and sys.platform != "win32":
             try:
-                from sentence_transformers import SentenceTransformer
-                self.model = SentenceTransformer(embedding_model)
+                if shared_embedding:
+                    from ..embedding import get_shared_sentence_transformer
+                    self.model = get_shared_sentence_transformer(embedding_model)
+                else:
+                    from sentence_transformers import SentenceTransformer
+                    self.model = SentenceTransformer(embedding_model)
                 self.dim = dimension or self.model.get_sentence_embedding_dimension()
                 logger.info("Loaded embedding model: %s (dim=%d)", embedding_model, self.dim)
             except Exception as e:
@@ -192,10 +214,15 @@ class TSMAdapter:
         # Fallback to transformers directly
         if self.model is None:
             logger.info("Using transformers fallback for embeddings")
-            from ..embedding import create_embedding_provider
+            from ..embedding import create_embedding_provider, get_shared_embedding_provider
             # Pass batch_size if provided in kwargs
             batch_size = kwargs.get('batch_size', 32)
-            self.model = create_embedding_provider(embedding_model, batch_size=batch_size)
+            if shared_embedding:
+                # Process-level shared provider: a 500-conversation harness run
+                # shares ONE torch model instead of loading one per adapter.
+                self.model = get_shared_embedding_provider(embedding_model, batch_size=batch_size)
+            else:
+                self.model = create_embedding_provider(embedding_model, batch_size=batch_size)
             # Handle both property (SimpleEmbeddingProvider) and method (SentenceTransformer)
             dim_attr = self.model.get_sentence_embedding_dimension
             self.dim = dimension or (dim_attr() if callable(dim_attr) else dim_attr)
@@ -276,6 +303,12 @@ class TSMAdapter:
             config["max_records"] = int(self.max_records)
         if self.access_aware_eviction is not None:
             config["access_aware_eviction"] = bool(self.access_aware_eviction)
+        if self.actr_activation is not None:
+            config["actr_activation"] = bool(self.actr_activation)
+        if self.actr_decay is not None:
+            config["actr_decay"] = float(self.actr_decay)
+        if self.actr_history is not None:
+            config["actr_history"] = int(self.actr_history)
         self.engine = self.tsm.MemoryEngine(**config)
         logger.info("TSM engine initialized (cognitive=%s, belief_revision=%s)",
                     cognitive_features, belief_revision)

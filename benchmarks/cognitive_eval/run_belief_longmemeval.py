@@ -47,25 +47,33 @@ def _msg_content(m):
     return m.content if hasattr(m, "content") else (m.get("content", "") if isinstance(m, dict) else "")
 
 
-def prewarm_extraction(extractor, conversations, workers=12):
+def prewarm_extraction(extractor, conversations, workers=12, contextual=True):
     """Extract every unique message CONCURRENTLY up front to fill the extractor's
     cache, so the per-conversation add() (and the second arm) hit the cache
     instead of paying serial LLM latency. No-op for extractors without a cache
     (e.g. mock)."""
     if not hasattr(extractor, "_cache"):
         return
-    seen, msgs = set(), []
+    seen, requests = set(), []
     for conv in conversations:
+        context = []
         for m in conv.messages:
             c = _msg_content(m)
-            if c and c.strip() and c not in seen:
-                seen.add(c)
-                msgs.append(c)
-    if not msgs:
+            recent = tuple(context[-3:]) if contextual else ()
+            cache_identity = (c, recent)
+            if c and c.strip() and cache_identity not in seen:
+                seen.add(cache_identity)
+                requests.append((c, list(recent)))
+            if c and c.strip():
+                context.append(c)
+    if not requests:
         return
-    logger.info("Pre-extracting %d unique messages concurrently (%d workers)...", len(msgs), workers)
+    logger.info(
+        "Pre-extracting %d unique messages concurrently (%d workers, contextual=%s)...",
+        len(requests), workers, contextual,
+    )
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        list(ex.map(lambda t: extractor.extract_facts(t), msgs))
+        list(ex.map(lambda request: extractor.extract_facts(request[0], request[1]), requests))
     if hasattr(extractor, "flush_cache"):
         extractor.flush_cache()
     logger.info("Pre-extraction done (extractor calls=%s).", getattr(extractor, "calls", "?"))
@@ -124,8 +132,8 @@ def run_arm(belief_on, conversations, model_name, top_k, extractor, shared_model
     model = shared_model
     verifier = shared_verifier
     if belief_on and verify_demotions and verifier is None:
-        from cognitive_eval.verification import NLIVerifier
-        verifier = NLIVerifier()
+        from cognitive_eval.verification import get_shared_verifier
+        verifier = get_shared_verifier()
     for conv in conversations:
         db_path = tempfile.mkdtemp(prefix="tsm_lme_")
         adapter = TSMAdapter(db_path=db_path, embedding_model=model_name, extractor=extractor,

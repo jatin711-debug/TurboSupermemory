@@ -321,6 +321,15 @@ impl ConceptVocabulary {
     pub fn aliases(&self) -> &HashMap<String, String> {
         &self.aliases
     }
+
+    /// Rebuild a vocabulary from raw alias pairs without chain resolution.
+    /// Used by snapshot restore, where the pairs were captured verbatim and
+    /// must round-trip exactly.
+    pub(crate) fn from_alias_pairs(pairs: Vec<(String, String)>) -> Self {
+        Self {
+            aliases: pairs.into_iter().collect(),
+        }
+    }
 }
 
 /// Tokenize text into clean, filtered tokens.

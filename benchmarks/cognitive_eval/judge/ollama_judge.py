@@ -6,6 +6,7 @@ falls back to OpenAI otherwise (see judge.create_judge).
 """
 
 import logging
+import threading
 
 logger = logging.getLogger("cognitive_eval.judge.ollama")
 
@@ -28,9 +29,11 @@ class OllamaJudge:
         self._client = ollama.Client(host=host)
         self.model = model
         self.calls = 0
+        self._calls_lock = threading.Lock()
 
     def _chat(self, system, user):
-        self.calls += 1
+        with self._calls_lock:
+            self.calls += 1
         resp = self._client.chat(
             model=self.model,
             messages=[{"role": "system", "content": system},

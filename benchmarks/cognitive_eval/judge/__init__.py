@@ -18,15 +18,24 @@ from .openai_judge import OpenAIJudge
 
 logger = logging.getLogger("cognitive_eval.judge")
 
-__all__ = ["OpenAIJudge", "OllamaJudge", "create_judge"]
+__all__ = ["OpenAIJudge", "OllamaJudge", "MiniMaxJudge", "create_judge"]
 
 
-def create_judge(name="auto", ollama_model="qwen2.5:3b", openai_model="gpt-4o-mini"):
+def create_judge(
+    name="auto",
+    ollama_model="qwen2.5:3b",
+    openai_model="gpt-4o-mini",
+    minimax_model="MiniMax-M3",
+):
     if name == "openai":
         return OpenAIJudge(model=openai_model)
     if name == "ollama":
         from .ollama_judge import OllamaJudge
         return OllamaJudge(model=ollama_model)
+    if name == "minimax":
+        from .minimax_judge import MiniMaxJudge
+
+        return MiniMaxJudge(model=minimax_model)
     if name == "auto":
         try:
             from .ollama_judge import OllamaJudge

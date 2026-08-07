@@ -31,6 +31,7 @@ anyhow = "1.0"
 log = "0.4"
 env_logger = "0.11"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1.38", features = ["full"] }
 tempfile = "3.10"
 redb = "4.1"

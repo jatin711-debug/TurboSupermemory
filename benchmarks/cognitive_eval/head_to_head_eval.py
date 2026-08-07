@@ -41,6 +41,7 @@ from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cognitive_eval.adapters.tsm_adapter import TSMAdapter
 from cognitive_eval.benchmark_datasets.longmemeval import load_longmemeval
+from cognitive_eval.budgeting import truncate_to_budget
 from cognitive_eval.compress_eval import insert_facts
 from cognitive_eval.run_belief_longmemeval import _msg_content, prewarm_extraction
 
@@ -51,40 +52,46 @@ logger = logging.getLogger("head_to_head_eval")
 SYSTEMS = ("naive", "tsm", "mem0")
 
 
+def conv_facts_with_roles(extractor, conv, roles=None):
+    """Ordered, de-duplicated ``{"text", "role"}`` facts from a conversation."""
+    facts, ctx = [], []
+    for message in conv.messages:
+        role = getattr(message, "role", None) or (
+            message.get("role") if isinstance(message, dict) else "user"
+        )
+        content = _msg_content(message)
+        if not content or not content.strip():
+            continue
+        if roles is None or role in roles:
+            facts.extend(
+                {"text": fact, "role": role}
+                for fact in extractor.extract_facts(content, ctx)
+                if fact
+            )
+        ctx.append(content)
+
+    records = {}
+    for order, fact in enumerate(facts):
+        text = fact["text"]
+        current = records.get(text)
+        if current is None:
+            records[text] = {**fact, "order": order}
+        elif fact["role"] == "user":
+            # A user reassertion owns the fact and refreshes its recency.
+            records[text] = {**fact, "order": order}
+    return [
+        {"text": fact["text"], "role": fact["role"]}
+        for fact in sorted(records.values(), key=lambda item: item["order"])
+    ]
+
+
 def conv_facts(extractor, conv, roles=None):
     """Ordered, de-duplicated atomic facts from messages whose role is in `roles`
     (None = all roles). Cache-backed (key is message content), so with a warmed
     extractor this is free. `roles={"user"}` reproduces conv_user_facts; the
     default all-role supply is the fair naive-RAG floor — the same fact SUPPLY the
     TSM stack ingests (TSM stores every role; belief detection is user-scoped)."""
-    facts, ctx = [], []
-    for m in conv.messages:
-        role = getattr(m, "role", None) or (m.get("role") if isinstance(m, dict) else "user")
-        c = _msg_content(m)
-        if not c or not c.strip():
-            continue
-        if roles is None or role in roles:
-            facts.extend(extractor.extract_facts(c, ctx))
-        ctx.append(c)
-    seen, out = set(), []
-    for f in facts:
-        if f and f not in seen:
-            seen.add(f); out.append(f)
-    return out
-
-
-def truncate_to_budget(texts, token_budget):
-    """Greedy pack in the given order until the token budget is spent (a text is
-    ~len//4 tokens). Shared by naive-RAG and Mem0 so budget accounting matches."""
-    out, used = [], 0
-    for t in texts:
-        if not t or not t.strip():
-            continue
-        n = max(1, len(t) // 4)
-        if used + n <= token_budget:
-            out.append(t)
-            used += n
-    return out
+    return [fact["text"] for fact in conv_facts_with_roles(extractor, conv, roles)]
 
 
 def to_mem0_messages(conv):
@@ -99,18 +106,79 @@ def to_mem0_messages(conv):
     return out
 
 
-def make_mem0(model_name, embed_model, path=None):
+def make_mem0(
+    model_name,
+    embed_model,
+    path=None,
+    llm_provider="openai",
+    embed_provider="openai",
+    embed_dim=1536,
+    ollama_base_url="http://localhost:11434",
+):
     """Build one Mem0 Memory instance (per-conv scoping via user_id). A fixed
     `path` persists the chroma store across runs so a killed run can RESUME
     (skip already-ingested convs) instead of re-paying the long ingestion."""
     from mem0 import Memory
-    cfg = {
-        "llm": {"provider": "openai", "config": {"model": model_name, "temperature": 0.0}},
-        "embedder": {"provider": "openai", "config": {"model": embed_model}},
-        "vector_store": {"provider": "chroma", "config": {
-            "path": path or tempfile.mkdtemp(prefix="mem0_h2h_"), "collection_name": "mem0eval"}},
+
+    if llm_provider == "minimax":
+        from cognitive_eval._secrets import ensure_minimax_key, minimax_key_file_hint
+        from cognitive_eval.minimax_provider import MiniMaxMem0LLM
+        from mem0.llms.openai import OpenAIConfig
+        from mem0.utils.factory import LlmFactory
+
+        if not ensure_minimax_key():
+            raise RuntimeError("No MiniMax key. " + minimax_key_file_hint())
+        LlmFactory.register_provider(
+            "openai",
+            "cognitive_eval.minimax_provider.MiniMaxMem0LLM",
+            OpenAIConfig,
+        )
+        # Keep an explicit reference so static analysis and package tools retain
+        # the dynamically loaded provider module.
+        _ = MiniMaxMem0LLM
+
+    store_path = path or tempfile.mkdtemp(prefix="mem0_h2h_")
+    provider_usage = {"calls": 0, "input_tokens": 0, "output_tokens": 0}
+
+    def record_usage(_llm, response, _params):
+        usage = getattr(response, "usage", None)
+        provider_usage["calls"] += 1
+        if usage:
+            provider_usage["input_tokens"] += usage.prompt_tokens or 0
+            provider_usage["output_tokens"] += usage.completion_tokens or 0
+
+    llm_config = {
+        "model": model_name,
+        "temperature": 0.0,
+        "response_callback": record_usage,
     }
-    return Memory.from_config(cfg)
+    if llm_provider == "minimax":
+        llm_config.update({
+            "api_key": os.environ["MINIMAX_API_KEY"],
+            "openai_base_url": "https://api.minimax.io/v1",
+            "max_tokens": 4000,
+        })
+    if embed_provider == "ollama":
+        embedder = {
+            "provider": "ollama",
+            "config": {
+                "model": embed_model,
+                "embedding_dims": embed_dim,
+                "ollama_base_url": ollama_base_url,
+            },
+        }
+    else:
+        embedder = {"provider": "openai", "config": {"model": embed_model}}
+    cfg = {
+        "llm": {"provider": "openai", "config": llm_config},
+        "embedder": embedder,
+        "vector_store": {"provider": "chroma", "config": {
+            "path": store_path, "collection_name": "mem0eval"}},
+        "history_db_path": os.path.join(store_path, "history.db"),
+    }
+    memory = Memory.from_config(cfg)
+    memory._provider_usage = provider_usage
+    return memory
 
 
 def mem0_add(mem0, messages, user_id, max_retries=4):
@@ -174,13 +242,17 @@ def main():
     ap.add_argument("--pool-k", type=int, default=20, help="retrieval pool size before packing")
     ap.add_argument("--model", type=str, default="sentence-transformers/all-MiniLM-L6-v2",
                     help="local embedding model for naive/tsm")
-    ap.add_argument("--tsm-embedder", choices=["local", "openai"], default="local",
+    ap.add_argument("--tsm-embedder", choices=["local", "openai", "ollama"], default="local",
                     help="embedding backend for naive/TSM: local MiniLM (384-d) or OpenAI "
                          "(uses --embed-model, matches Mem0's — levels the field)")
     ap.add_argument("--extractor", type=str, default="openai")
     ap.add_argument("--extractor-model", type=str, default="gpt-4.1-nano")
     ap.add_argument("--mem0-model", type=str, default="gpt-4.1-nano", help="Mem0 LLM")
     ap.add_argument("--embed-model", type=str, default="text-embedding-3-small", help="Mem0 embedder")
+    ap.add_argument("--embedding-dims", type=int, default=None)
+    ap.add_argument("--ollama-base-url", default="http://localhost:11434")
+    ap.add_argument("--mem0-llm-provider", choices=["openai", "minimax"], default="openai")
+    ap.add_argument("--mem0-embed-provider", choices=["openai", "ollama"], default="openai")
     ap.add_argument("--mem0-ingest", choices=["incremental", "oneshot"], default="incremental",
                     help="how to feed Mem0: per-exchange (fair, default) vs single bulk add")
     ap.add_argument("--mem0-path", type=str, default=None,
@@ -190,17 +262,29 @@ def main():
     ap.add_argument("--naive-facts", choices=["all", "user"], default="all",
                     help="fact supply for the naive-RAG floor: all roles (fair, matches "
                          "TSM's supply) or user-only")
-    ap.add_argument("--judge", choices=["auto", "ollama", "openai"], default="openai")
+    ap.add_argument("--judge", choices=["auto", "ollama", "openai", "minimax"], default="openai")
     ap.add_argument("--judge-model", type=str, default=None)
     ap.add_argument("--workers", type=int, default=10)
     args = ap.parse_args()
     systems = [s for s in args.systems.split(",") if s.strip() in SYSTEMS]
 
     from cognitive_eval.judge import create_judge
-    jkw = {"ollama_model": args.judge_model, "openai_model": args.judge_model} if args.judge_model else {}
+    jkw = (
+        {
+            "ollama_model": args.judge_model,
+            "openai_model": args.judge_model,
+            "minimax_model": args.judge_model,
+        }
+        if args.judge_model
+        else {}
+    )
     judge = create_judge(args.judge, **jkw)
     from cognitive_eval.extraction import create_extractor
-    ekw = {"openai_model": args.extractor_model} if args.extractor_model else {}
+    ekw = (
+        {"openai_model": args.extractor_model, "minimax_model": args.extractor_model}
+        if args.extractor_model
+        else {}
+    )
     shared_extractor = create_extractor(args.extractor, **ekw)
 
     convs = load_longmemeval(args.data_dir)[:args.limit]
@@ -213,7 +297,15 @@ def main():
 
     mem0 = done_ids = done_path = None
     if "mem0" in systems:
-        mem0 = make_mem0(args.mem0_model, args.embed_model, path=args.mem0_path)
+        mem0 = make_mem0(
+            args.mem0_model,
+            args.embed_model,
+            path=args.mem0_path,
+            llm_provider=args.mem0_llm_provider,
+            embed_provider=args.mem0_embed_provider,
+            embed_dim=args.embedding_dims or (1024 if args.mem0_embed_provider == "ollama" else 1536),
+            ollama_base_url=args.ollama_base_url,
+        )
         done_ids = set()
         if args.mem0_path:
             done_path = os.path.join(args.mem0_path, "_completed.json")
@@ -232,6 +324,19 @@ def main():
         model = OpenAIEmbedder(model=args.embed_model)  # shared by naive + TSM adapters
         logger.info("naive/TSM embeddings: OpenAI %s (dim=%d) — leveled with Mem0",
                     args.embed_model, model.get_sentence_embedding_dimension())
+    elif args.tsm_embedder == "ollama":
+        from cognitive_eval.ollama_embedder import OllamaEmbedder
+
+        model = OllamaEmbedder(
+            model=args.embed_model,
+            dim=args.embedding_dims or 1024,
+            host=args.ollama_base_url,
+        )
+        logger.info(
+            "naive/TSM embeddings: Ollama %s (dim=%d)",
+            args.embed_model,
+            model.get_sentence_embedding_dimension(),
+        )
     n_conv = 0
     naive_roles = None if args.naive_facts == "all" else {"user"}
     for ci, conv in enumerate(convs):
@@ -356,7 +461,15 @@ def main():
         "systems": systems, "overall": {s: round(overall[s], 4) for s in systems},
         "judge_calls": judge.calls,
         "mem0_model": args.mem0_model, "mem0_ingest": args.mem0_ingest,
+        "mem0_llm_provider": args.mem0_llm_provider,
+        "mem0_embed_provider": args.mem0_embed_provider,
+        "mem0_usage": getattr(mem0, "_provider_usage", {}) if mem0 else {},
         "naive_facts": args.naive_facts, "extractor_model": args.extractor_model,
+        "extractor_calls": getattr(shared_extractor, "calls", 0),
+        "extractor_input_tokens": getattr(shared_extractor, "input_tokens", 0),
+        "extractor_output_tokens": getattr(shared_extractor, "output_tokens", 0),
+        "judge_input_tokens": getattr(judge, "input_tokens", 0),
+        "judge_output_tokens": getattr(judge, "output_tokens", 0),
         "judge_model": getattr(judge, "model", "?")}))
 
 
