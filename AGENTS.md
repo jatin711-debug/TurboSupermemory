@@ -44,7 +44,7 @@ make api-server
 - `make test` includes the PyO3 crate and therefore needs a working Python development/link environment; use the explicit workspace command above for the normal Rust suite.
 - `make verify` rebuilds the release extension and places it at repo-root `turbomemory.pyd`/`.so`. Python benchmark scripts share that artifact; run them sequentially because a loaded `.pyd` cannot be replaced on Windows.
 - On Windows, storage test linking can fail with `LNK1102`; set `CARGO_PROFILE_DEV_DEBUG=0` and `CARGO_PROFILE_TEST_DEBUG=0` for the test command. The regression gate sets these automatically.
-- `benchmarks/audit_recall.py` currently hardcodes Windows paths (`target/release/turbomemory.dll` and `turbomemory.pyd`), so `make audit` and the gate's recall step are not portable without fixing that script.
+- `benchmarks/audit_recall.py` discovers the built library per-platform (`.dll`/`.so`/`.dylib`) and inserts the repo root into `sys.path`, so `make audit` is portable. Makefile recipes quote `"$(PYTHON)"`; do not unquote — POSIX shells otherwise mangle Windows paths with backslashes.
 
 ## Required Verification
 

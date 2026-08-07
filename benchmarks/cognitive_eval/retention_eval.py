@@ -19,6 +19,15 @@ They differ in ONE engine switch — the eviction ranking policy:
     gate, but candidates are ranked by ACT-R base-level activation
     ln(sum age^-d) over the last K access timestamps instead of the legacy
     access_count x 2^(-age/half_life) score.
+  - LEGACY+GIST (optional, `--gist`): legacy access-aware eviction PLUS the
+    two survival-gap closers combined — belief resolution at recall
+    (`supersession_mode="exclude"`, stale facts never reach the answer
+    context) and gist-before-evict (B4): eviction victims are compressed
+    into chunked gists that are re-inserted into the store, so evicted
+    CONTENT stays retrievable instead of being dropped. For this arm the
+    survival metric means content survival: the gold fact is alive OR its
+    distinctive token survives inside a gist (for the other arms the gist
+    set is empty, so the metric is unchanged).
 
 Procedure per conversation (only those with > budget user-facts, so eviction
 actually bites): insert all user facts → rehearse (bump access on facts, in
@@ -56,6 +65,8 @@ import tempfile
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cognitive_eval.adapters.tsm_adapter import TSMAdapter
 from cognitive_eval.benchmark_datasets.longmemeval import load_longmemeval
@@ -69,11 +80,41 @@ logger = logging.getLogger("retention_eval")
 def gold_memory_ids(answer, id_to_text):
     """Ids of inserted facts whose text carries the gold answer's distinctive
     token — the memories that must survive for the query to be answerable."""
-    kts = key_tokens(answer)
-    if not kts:
+    tok = gold_key_token(answer)
+    if tok is None:
         return []
-    tok = kts[0]
     return [mid for mid, text in id_to_text.items() if tok in (text or "").lower()]
+
+
+def gold_key_token(answer):
+    """The gold answer's distinctive token (None when the answer has none)."""
+    kts = key_tokens(answer)
+    return kts[0] if kts else None
+
+
+def gist_evicted(adapter, evicted_texts, conv_id, gister, chunk_facts, max_tokens):
+    """B4 gist-before-evict: compress eviction victims into chunked gists and
+    re-insert them into the store so their CONTENT stays retrievable. Returns
+    the list of inserted gist texts (empty when nothing was evicted)."""
+    if not evicted_texts or gister is None:
+        return []
+    chunks = [evicted_texts[i:i + chunk_facts]
+              for i in range(0, len(evicted_texts), chunk_facts)]
+    gists = []
+    for chunk in chunks:
+        gist = (gister.summarize(chunk, max_tokens=max_tokens) or "").strip()
+        if gist:
+            gists.append(gist)
+    if not gists:
+        return []
+    embs = np.asarray(adapter.model.encode(gists), dtype=np.float32)
+    for i, gist in enumerate(gists):
+        adapter.engine.insert(id=f"{conv_id}_gist{i}", text=gist,
+                              embedding=embs[i].astype(np.float32),
+                              importance_score=1.0,
+                              concepts=adapter._extract_concepts(gist),
+                              payload=None, scope=conv_id, source_role="user")
+    return gists
 
 
 def rehearsal_texts(conv, cap=24):
@@ -92,15 +133,20 @@ def rehearsal_texts(conv, cap=24):
 
 def run_arm(access_aware, conversations, budget, model_name, top_k, extractor, shared_model=None,
             judge=None, extractor_instance=None, judge_workers=8, rehearse_mode="oracle",
-            actr=False, actr_decay=None, actr_history=None):
+            actr=False, actr_decay=None, actr_history=None,
+            gist_victims=False, gister=None, gist_chunk_facts=24, gist_max_tokens=120,
+            supersession_exclude=False):
     """Identical operations in all arms; only the eviction policy differs.
     `rehearse_mode`: 'oracle' (eval queries — CONTAMINATED, comparison only),
     'sources' (past user-message texts — the honest signal), 'none'.
     `actr=True` switches eviction ranking to ACT-R base-level activation
     (requires access_aware=True). With `judge`, each post-eviction answer is
     additionally scored by the GOLD-STANDARD metric (LLM answers from the
-    retrieved memories, LLM grades vs gold)."""
-    agg = {"n": 0, "survived": 0, "h1": 0, "h3": 0, "hk": 0, "jn": 0, "jc": 0}
+    retrieved memories, LLM grades vs gold). `gist_victims=True` re-inserts
+    eviction victims as compressed gists after consolidation (B4);
+    `supersession_exclude=True` resolves belief state at recall by dropping
+    superseded facts from the answer context (B1 exclusion)."""
+    agg = {"n": 0, "survived": 0, "h1": 0, "h3": 0, "hk": 0, "jn": 0, "jc": 0, "gists": 0}
     judge_tasks = []  # (query, texts, gold)
     model = shared_model
     pressured_convs = 0
@@ -112,7 +158,8 @@ def run_arm(access_aware, conversations, budget, model_name, top_k, extractor, s
                              belief_source_roles=["user"], max_records=budget,
                              access_aware_eviction=access_aware,
                              actr_activation=True if actr else None,
-                             actr_decay=actr_decay, actr_history=actr_history)
+                             actr_decay=actr_decay, actr_history=actr_history,
+                             supersession_mode="exclude" if supersession_exclude else "demote")
         model = adapter.model
         try:
             adapter.add(conv.messages, user_id=conv.conv_id)
@@ -146,13 +193,27 @@ def run_arm(access_aware, conversations, budget, model_name, top_k, extractor, s
 
             adapter.trigger_consolidation()  # eviction fires under the budget
 
+            # Gist-before-evict (B4): compress the victims, keep the content.
+            gist_texts = []
+            if gist_victims:
+                evicted = [text for mid, text in id_to_text.items()
+                           if not adapter.engine.contains_id(mid)]
+                gist_texts = gist_evicted(adapter, evicted, conv.conv_id, gister,
+                                          gist_chunk_facts, gist_max_tokens)
+                agg["gists"] += len(gist_texts)
+
             for q in conv.queries:
                 if q.is_abstention:
                     continue
                 agg["n"] += 1
                 golds = gold_memory_ids(q.answer_text, id_to_text)
                 # survival: did any gold-bearing memory stay alive post-eviction?
+                # Under gist-before-evict this is CONTENT survival: the raw fact
+                # survives, or its distinctive token lives on inside a gist.
                 survived = any(adapter.engine.contains_id(mid) for mid in golds) if golds else False
+                if not survived and gist_texts:
+                    tok = gold_key_token(q.answer_text)
+                    survived = bool(tok) and any(tok in g.lower() for g in gist_texts)
                 agg["survived"] += int(survived)
                 res = adapter.search(q.query_text, user_id=conv.conv_id, top_k=top_k, use_cognitive=True)
                 texts = [r.get("text", "") for r in res]
@@ -210,6 +271,18 @@ def main():
     ap.add_argument("--extractor-model", type=str, default=None,
                     help="override the OpenAI extractor model (RPD limits are per-model; "
                          "e.g. gpt-4.1-nano when gpt-4o-mini's daily quota is spent)")
+    ap.add_argument("--gist", choices=["none", "extractive", "ollama", "openai", "minimax"],
+                    default="none",
+                    help="add a LEGACY+GIST arm: legacy access-aware eviction + belief "
+                         "resolution at recall (supersession exclude) + gist-before-evict "
+                         "(B4) — eviction victims are compressed into gists that stay "
+                         "retrievable instead of being dropped")
+    ap.add_argument("--gist-model", type=str, default=None,
+                    help="gister model (default: gpt-4.1-nano for --gist openai)")
+    ap.add_argument("--gist-chunk-facts", type=int, default=24,
+                    help="evicted facts per gist call (chunk size)")
+    ap.add_argument("--gist-max-tokens", type=int, default=120,
+                    help="max tokens per generated gist")
     ap.add_argument("--workers", type=int, default=8)
     args = ap.parse_args()
 
@@ -224,6 +297,14 @@ def main():
     from cognitive_eval.extraction import create_extractor
     ekw = {"openai_model": args.extractor_model} if args.extractor_model else {}
     shared_extractor = create_extractor(args.extractor, **ekw)
+
+    gister = None
+    if args.gist != "none":
+        from cognitive_eval.gist import create_gister
+        gister = create_gister(args.gist, model=args.gist_model)
+        logger.info("Gist-before-evict ENABLED (%s: %s, chunk=%d facts, max_tokens=%d)",
+                    args.gist, getattr(gister, "model", "?"),
+                    args.gist_chunk_facts, args.gist_max_tokens)
 
     convs = load_longmemeval(args.data_dir)
     if args.limit:
@@ -253,39 +334,49 @@ def main():
                        else " (intrinsic salience only)"))
 
     # B3 kill/keep: three arms, identical operations, differing only in the
-    # eviction ranking policy.
+    # eviction ranking policy. With --gist, a fourth arm combines the two
+    # survival-gap closers on top of the legacy champion: belief resolution
+    # at recall (supersession exclude) + gist-before-evict (B4).
     arms = [
-        ("fifo",   False, False),  # naive FIFO baseline
-        ("legacy", True,  False),  # access_count x 2^(-age/half_life)
-        ("actr",   True,  True),   # ACT-R base-level activation ln(sum age^-d)
+        ("fifo",   False, False, False),  # naive FIFO baseline
+        ("legacy", True,  False, False),  # access_count x 2^(-age/half_life)
+        ("actr",   True,  True,  False),  # ACT-R base-level activation ln(sum age^-d)
     ]
+    if gister is not None:
+        arms.append(("legacy+gist", True, False, True))
     results = {}
     model = init_model
-    for name, access_aware, actr in arms:
-        logger.info("Running %s arm (access_aware_eviction=%s, actr_activation=%s)...",
-                    name.upper(), access_aware, actr)
+    for name, access_aware, actr, gist_victims in arms:
+        logger.info("Running %s arm (access_aware_eviction=%s, actr_activation=%s, gist=%s)...",
+                    name.upper(), access_aware, actr, gist_victims)
         agg, pressured, model = run_arm(access_aware, convs, args.budget, args.model, args.top_k,
                                         args.extractor, shared_model=model, judge=judge,
                                         extractor_instance=shared_extractor,
                                         judge_workers=args.workers, rehearse_mode=rehearse_mode,
                                         actr=actr, actr_decay=args.actr_decay,
-                                        actr_history=args.actr_history)
+                                        actr_history=args.actr_history,
+                                        gist_victims=gist_victims, gister=gister,
+                                        gist_chunk_facts=args.gist_chunk_facts,
+                                        gist_max_tokens=args.gist_max_tokens,
+                                        supersession_exclude=gist_victims)
         results[name] = (agg, pressured)
 
+    names = list(results.keys())
+
     n = max(r[0]["n"] for r in results.values()) or 1
-    logger.info("=" * 100)
+    logger.info("=" * 110)
     logger.info("Budget-pressured conversations: %s | scored queries: %d",
                 " / ".join(f"{name.upper()} {p}" for name, (_, p) in results.items()), n)
-    logger.info("%-16s | %-10s | %-10s | %-10s", "metric", "FIFO", "LEGACY", "ACT-R")
-    logger.info("-" * 100)
+    logger.info("%-16s | %s", "metric", " | ".join(f"{name.upper():<12}" for name in names))
+    logger.info("-" * 110)
 
     def rate(agg, num_key, den_key="n"):
         return agg[num_key] / (agg[den_key] or 1)
 
     def row(label, key):
         vals = {name: rate(agg, key) for name, (agg, _) in results.items()}
-        logger.info("%-16s | %-10.2f | %-10.2f | %-10.2f",
-                    label, vals["fifo"], vals["legacy"], vals["actr"])
+        logger.info("%-16s | %s", label,
+                    " | ".join(f"{vals[name]:<12.2f}" for name in names))
         return vals
 
     surv = row("gold survival", "survived")
@@ -295,10 +386,15 @@ def main():
     judged = None
     if judge is not None and any(agg["jn"] for agg, _ in results.values()):
         judged = {name: rate(agg, "jc", "jn") for name, (agg, _) in results.items()}
-        logger.info("%-16s | %-10.2f | %-10.2f | %-10.2f   <== GOLD STANDARD (judge=%s, calls=%d)",
-                    "judged accuracy", judged["fifo"], judged["legacy"], judged["actr"],
+        logger.info("%-16s | %s   <== GOLD STANDARD (judge=%s, calls=%d)",
+                    "judged accuracy",
+                    " | ".join(f"{judged[name]:<12.2f}" for name in names),
                     getattr(judge, "model", "?"), judge.calls)
-    logger.info("=" * 100)
+    if gister is not None:
+        gist_agg = results["legacy+gist"][0]
+        logger.info("gists inserted (legacy+gist arm): %d across %d pressured convs",
+                    gist_agg["gists"], results["legacy+gist"][1])
+    logger.info("=" * 110)
 
     # B3 kill/keep verdict: ACT-R >= LEGACY on judged retention -> keep
     # (parity still simplifies the theory); a loss beyond noise (~0.05) kills.
@@ -308,6 +404,15 @@ def main():
     delta_lf = metric["legacy"] - metric["fifo"]
     logger.info("LEGACY - FIFO %s: %+.4f | ACT-R - LEGACY %s: %+.4f (metric=%s)",
                 metric_name, delta_lf, metric_name, delta_al, metric_name)
+    gist_deltas = None
+    if "legacy+gist" in results:
+        gist_deltas = {
+            "gist_minus_legacy_survival": round(surv["legacy+gist"] - surv["legacy"], 4),
+            "gist_minus_legacy": round(metric["legacy+gist"] - metric["legacy"], 4),
+        }
+        logger.info("LEGACY+GIST - LEGACY survival: %+.4f | %s: %+.4f",
+                    gist_deltas["gist_minus_legacy_survival"],
+                    metric_name, gist_deltas["gist_minus_legacy"])
     if delta_al >= 0.0:
         verdict = "keep"
         logger.info("B3 VERDICT: KEEP ACT-R — it beats legacy access-aware eviction on %s "
@@ -335,11 +440,13 @@ def main():
                 "hit3": round(rate(agg, "h3"), 4),
                 "hitk": round(rate(agg, "hk"), 4),
                 **({"judged_acc": round(rate(agg, "jc", "jn"), 4)} if judged is not None else {}),
+                **({"gists": agg["gists"]} if agg["gists"] else {}),
             }
             for name, (agg, p) in results.items()
         },
         "legacy_minus_fifo": round(delta_lf, 4),
         "actr_minus_legacy": round(delta_al, 4),
+        **(gist_deltas or {}),
         "verdict": verdict,
     }
     logger.info("GATE_SUMMARY: %s", json.dumps(summary))

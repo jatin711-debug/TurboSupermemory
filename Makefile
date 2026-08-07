@@ -50,27 +50,27 @@ test:
 
 verify: build-python
 	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
-	$(PYTHON) benchmarks/verify.py
+	"$(PYTHON)" benchmarks/verify.py
 
 audit: build-python
 	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
-	$(PYTHON) benchmarks/audit_recall.py
+	"$(PYTHON)" benchmarks/audit_recall.py
 
 benchmark: build-python
 	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
-	$(PYTHON) benchmarks/benchmark.py --tsm-only
+	"$(PYTHON)" benchmarks/benchmark.py --tsm-only
 
 benchmark-gpu: build-python
 	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
-	$(PYTHON) benchmarks/benchmark_gpu.py
+	"$(PYTHON)" benchmarks/benchmark_gpu.py
 
 cognitive-benchmark: build-python
 	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
-	$(PYTHON) benchmarks/cognitive_benchmark.py
+	"$(PYTHON)" benchmarks/cognitive_benchmark.py
 
 batch-test: build-python
 	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
-	$(PYTHON) benchmarks/test_batch_search.py
+	"$(PYTHON)" benchmarks/test_batch_search.py
 
 clippy:
 	export PYO3_PYTHON="$(PYO3_PYTHON)" && cargo clippy --workspace --all-targets $(CARGO_FEATURES) -- -D warnings
@@ -84,7 +84,7 @@ fmt:
 # current code.
 gate: build-python
 	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
-	export PYO3_PYTHON="$(PYO3_PYTHON)" && $(PYTHON) benchmarks/regression_gate.py $(GATE_ARGS)
+	export PYO3_PYTHON="$(PYO3_PYTHON)" && "$(PYTHON)" benchmarks/regression_gate.py $(GATE_ARGS)
 
 clean:
 	cargo clean
@@ -99,19 +99,19 @@ api-server: build-api
 
 # Cognitive evaluation benchmarks (LongMemEval, LoCoMo)
 download-eval-data:
-	$(PYTHON) benchmarks/cognitive_eval/benchmark_datasets/download.py
+	"$(PYTHON)" benchmarks/cognitive_eval/benchmark_datasets/download.py
 
 longmemeval: build-python
 	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
-	$(PYTHON) benchmarks/cognitive_eval/run_longmemeval.py --quick
+	"$(PYTHON)" benchmarks/cognitive_eval/run_longmemeval.py --quick
 
 locomoco: build-python
 	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
-	$(PYTHON) benchmarks/cognitive_eval/run_locomo.py --quick
+	"$(PYTHON)" benchmarks/cognitive_eval/run_locomo.py --quick
 
 compare: build-python
 	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
-	$(PYTHON) benchmarks/cognitive_eval/run_comparison.py --quick --output benchmarks/cognitive_eval/results/
+	"$(PYTHON)" benchmarks/cognitive_eval/run_comparison.py --quick --output benchmarks/cognitive_eval/results/
 
 report:
-	$(PYTHON) benchmarks/cognitive_eval/report.py --input benchmarks/cognitive_eval/results/ --output benchmarks/cognitive_eval/results/report.md
+	"$(PYTHON)" benchmarks/cognitive_eval/report.py --input benchmarks/cognitive_eval/results/ --output benchmarks/cognitive_eval/results/report.md

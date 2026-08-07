@@ -12,13 +12,24 @@ import time
 import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DLL = os.path.join(ROOT, "target", "release", "turbomemory.dll")
-PYD = os.path.join(ROOT, "turbomemory.pyd")
+EXT = ".pyd" if os.name == "nt" else ".so"
+PYD = os.path.join(ROOT, f"turbomemory{EXT}")
+DLL_CANDIDATES = [
+    os.path.join(ROOT, "target", "release", name)
+    for name in ("turbomemory.dll", "libturbomemory.so", "libturbomemory.dylib", "turbomemory.so")
+]
 
-if not os.path.exists(DLL):
-    print(f"Release DLL not found: {DLL}")
+dll = next((c for c in DLL_CANDIDATES if os.path.exists(c)), None)
+if dll is None and not os.path.exists(PYD):
+    print(f"Release library not found in target/release (tried: {DLL_CANDIDATES})")
     sys.exit(1)
-shutil.copy(DLL, PYD)
+if dll is not None and (
+    not os.path.exists(PYD) or os.path.getmtime(dll) > os.path.getmtime(PYD)
+):
+    shutil.copy(dll, PYD)
+
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 import turbomemory
 

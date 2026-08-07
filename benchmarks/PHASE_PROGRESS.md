@@ -1378,70 +1378,71 @@ queries):
 - Benign run noise: transient embed-cache flush warnings (WinError 5/32,
   concurrent writers racing the pickle swap); all 22,012 embeddings served
   from cache, zero extractor calls.
+- **Independent reproduction**: a second full run of the identical protocol
+  (concurrent process, same caches, 508 judge calls) landed within judge
+  noise: ACT-R judged 0.446 vs legacy 0.438 (+0.009 = exactly one judged
+  answer; hit1 0.304 both). Verdict and every survival/hit number
+  reproduced exactly; the ±0.009 band is the gpt-4.1-mini judge's
+  run-to-run variance, i.e. deltas below ~0.01 are noise at n=112.
 
-# B3 kill/keep — ACT-R activation vs legacy access-aware eviction, oracle-free ✅ KEEP (2026-08-07)
+Design context for the record: the pre-2026-08-06 retention eval rehearsed
+with the EVAL QUERIES THEMSELVES — an oracle leak (the contaminated +0.41
+survival lift collapsed to +0.08 without it). `--rehearse-mode sources` is
+now the default: an evenly-spaced sample of ≤24 past user-message texts,
+searched 2x each before consolidation. The +0.393 honest lift here vs the
+old +0.08 honest estimate (measured with NO access signal) shows the
+retain-what-is-used mechanism needs exactly the realistic re-access signal
+this mode provides.
 
-The W5/A2 retention eval rehearsed with the EVAL QUERIES THEMSELVES as the
-access signal — an oracle leak (you don't know future queries at eviction
-time; the contaminated +0.41 survival lift collapsed to +0.08 without it).
-This run fixes the leak with a new `--rehearse-mode sources` (now the
-default): before consolidation we search an evenly-spaced sample of at most
-24 of each conversation's PAST USER-MESSAGE texts (2x each) — the fact
-SOURCE texts, modeling "users re-ask about their own facts over time". No
-eval query text is ever touched. `oracle` (old behavior, logs a
-contamination warning) and `none` modes are kept for comparison.
 
-Three arms, identical in every operation (same corpus, insertion order,
-budget=10 max_records, rehearsal, consolidation cadence, judge protocol),
-differing only in the eviction ranking policy:
+# Survival-gap closer — belief resolution + gist-before-evict under budget-10 (2026-08-07)
 
-- FIFO:   `access_aware_eviction=False` — evict oldest-inserted first.
-- LEGACY: `access_aware_eviction=True` — `access_count x 2^(-age/half_life)`.
-- ACT-R:  `access_aware_eviction=True, actr_activation=True` — base-level
-  activation `ln(sum age^-d)` over the last K access timestamps (engine
-  defaults d=0.5, K=8). Access bumps come from search hits.
+The B3 run left ~32% of gold facts evicted even under access-aware eviction.
+This run tests the two closers COMBINED as a fourth arm on the identical
+protocol (120 convs, budget=10, sources rehearsal, OpenAI pipeline,
+gpt-4.1-mini judge, 702 judge calls): `legacy+gist` = legacy access-aware
+eviction + belief resolution at recall (`supersession_mode="exclude"` — NLI-
+verified superseded facts never reach the answer context) + gist-before-
+evict (B4: eviction victims chunked 24-facts/call, compressed by
+gpt-4.1-nano, re-inserted as searchable gists; 193 gists across 117 convs,
+≈1.65/conv). Survival for this arm is CONTENT survival: raw gold fact alive
+OR its distinctive token inside a gist. Command:
 
-Command:
+    python benchmarks/cognitive_eval/retention_eval.py --limit 120 \
+        --judge openai --judge-model gpt-4.1-mini --extractor openai \
+        --extractor-model gpt-4.1-nano --rehearse-mode sources \
+        --tsm-embedder openai --gist openai --gist-model gpt-4.1-nano
 
-    PYTHONPATH=benchmarks python benchmarks/cognitive_eval/retention_eval.py \
-        --limit 120 --judge openai --judge-model gpt-4.1-mini \
-        --extractor openai --extractor-model gpt-4.1-nano \
-        --rehearse-mode sources --tsm-embedder openai --workers 8
+| metric | FIFO | LEGACY | ACT-R | LEGACY+GIST |
+|---|---|---|---|---|
+| gold survival | 0.125 | 0.679 | 0.679 | **0.795** |
+| hit@1 | 0.089 | 0.304 | 0.304 | 0.348 |
+| hit@3 | 0.098 | 0.438 | 0.438 | 0.464 |
+| hit@k | 0.125 | 0.563 | 0.563 | 0.616 |
+| **judged accuracy** | 0.036 | 0.446 | 0.438 | **0.518** |
 
-Extraction (gpt-4.1-nano) and embeddings (text-embedding-3-small, 1536-d)
-were fully disk-cached; marginal cost was the judge (508 gpt-4.1-mini calls
-incl. answer generation). 117 budget-pressured conversations, 112 scored
-queries per arm.
-
-| metric          | FIFO  | LEGACY | ACT-R |
-|---|---|---|---|
-| gold survival   | 0.125 | 0.679  | 0.679 |
-| hit@1           | 0.089 | 0.304  | 0.304 |
-| hit@3           | 0.098 | 0.438  | 0.438 |
-| hit@10          | 0.125 | 0.563  | 0.563 |
-| judged accuracy | 0.045 | 0.438  | **0.446** |
-
-- LEGACY - FIFO judged accuracy: **+0.393** — the retain-what-is-used
-  mechanism reproduces STRONGLY under the honest, deployable access signal
-  (the old +0.08 honest estimate was measured with NO access signal at all;
-  a realistic user re-access signal is what the mechanism needs).
-- ACT-R - LEGACY judged accuracy: **+0.009** (exactly one judged answer).
-  Survival and every hit@k are IDENTICAL — under this signal both policies
-  keep the same memories.
-- B3 VERDICT (per the roadmap kill/keep gate): **KEEP ACT-R** — parity-or-
-  better with legacy, and parity still simplifies the theory: ACT-R replaces
-  a hand-tuned count-times-exponential with the principled power-law
-  base-level activation, no half-life knob required.
-- Note: transient Windows embed-cache flush warnings (WinError 32) appeared
-  mid-run; they only delayed disk persistence of newly computed embeddings
-  and do not affect the numbers.
-
-GATE_SUMMARY: {"budget": 10, "embedder": "text-embedding-3-small",
-"rehearse_mode": "sources", "scored_queries": 112, "metric_for_verdict":
-"judged accuracy", "arms": {"fifo": {"pressured_convs": 117, "survival":
-0.125, "hit1": 0.0893, "hit3": 0.0982, "hitk": 0.125, "judged_acc": 0.0446},
-"legacy": {"pressured_convs": 117, "survival": 0.6786, "hit1": 0.3036,
-"hit3": 0.4375, "hitk": 0.5625, "judged_acc": 0.4375}, "actr":
-{"pressured_convs": 117, "survival": 0.6786, "hit1": 0.3036, "hit3": 0.4375,
-"hitk": 0.5625, "judged_acc": 0.4464}}, "legacy_minus_fifo": 0.3929,
-"actr_minus_legacy": 0.0089, "verdict": "keep"}
+- **The survival gap closed by a third**: 0.679 → 0.795 (+0.116). Roughly
+  one in three of the facts that access-aware eviction still lost are now
+  recovered as gists.
+- **Judged accuracy +0.071 over legacy** (0.446 → 0.518, 8 of 112 answers) —
+  ~7x the measured judge noise band (±0.01, see the B3 reproduction note),
+  so a real effect, not variance. vs FIFO the combined stack is +0.482
+  judged (0.518 vs 0.036) — a 14x answer-accuracy multiplier under budget
+  pressure.
+- ACT-R − LEGACY this run: −0.009 — third independent run, third verdict:
+  the ACT-R/legacy delta oscillates in {+0.009, 0.000, −0.009}, all inside
+  noise. KEEP per the gate; the theory contribution is parsimony, not lift.
+- Caveat — attribution: the arm fuses supersession-exclude and gisting by
+  design, so +0.071 is the COMBINED effect. A two-factor ablation
+  (exclude-only vs gist-only) would split it; the survival jump (+0.116)
+  is almost entirely gist-driven (exclusion cannot resurrect evicted
+  facts), so the judged lift is likely mostly gist as well, with exclusion
+  contributing precision on the supersession-heavy queries.
+- Remaining headroom: 20.5% of gold content still unreachable — either not
+  captured by the gist (compression loss) or not retrieved (gist ranking).
+  Natural next lever: retrieve-aware gisting (chunk by topic, not just
+  chronology) or a small gist-token budget share with re-gist on access.
+- Harness note: `--gist {extractive,ollama,openai,minimax}` keeps the old
+  3-arm behavior when unset; GATE_SUMMARY now reports
+  `gist_minus_legacy_survival` / `gist_minus_legacy` alongside the B3
+  verdict fields.
