@@ -48,6 +48,17 @@ const WAL_DIR: &str = "wal";
 /// supersession so belief revision can never bury a memory below 30% of score.
 const SUPERSESSION_DEMOTION_FLOOR: f32 = 0.3;
 
+/// Compresses one chunk of eviction-victim texts into a single gist plus the
+/// embedding to store it under (B4 gist-before-evict). Returning `None` skips
+/// the chunk (the victims are then dropped outright). Install via
+/// `StorageEngine::set_gist_compressor`; only consulted when
+/// `TierConfig::gist_before_evict` is enabled. Typically backed by an LLM
+/// call plus an embedder — both live outside the engine, so the callback
+/// supplies the vector, mirroring how `insert` takes caller embeddings.
+pub trait GistCompressor: Send + Sync {
+    fn compress(&self, texts: &[String]) -> Option<(String, Vec<f32>)>;
+}
+
 /// The main storage engine.
 pub struct StorageEngine {
     config: Arc<StoreConfig>,
@@ -66,6 +77,14 @@ pub struct StorageEngine {
     /// types without additional wrapper boilerplate. The compressor is
     /// swapped rarely (once at setup), so the lock overhead is negligible.
     compressor: Arc<RwLock<Arc<dyn CognitiveCompressor>>>,
+    /// Optional gist compressor for B4 gist-before-evict. `None` (default)
+    /// means eviction victims are dropped outright even when
+    /// `TierConfig::gist_before_evict` is on. Same `Arc<RwLock<...>>` pattern
+    /// as `compressor`: installed once at setup, shared across engine clones.
+    gist_compressor: Arc<RwLock<Option<Arc<dyn GistCompressor>>>>,
+    /// Monotonic counter for gist record ids (`gist:{scope}:{now}:{n}`), so
+    /// ids are unique within a process run; `now` disambiguates across runs.
+    gist_seq: Arc<AtomicU64>,
     id_index: Arc<RwLock<AHashMap<Arc<str>, PointOffset>>>,
     payload_index: Arc<RwLock<PayloadIndex>>,
     scope_index: Arc<RwLock<ScopeIndex>>,
@@ -95,6 +114,8 @@ impl Clone for StorageEngine {
             graph: self.graph.clone(),
             ccs: self.ccs.clone(),
             compressor: self.compressor.clone(),
+            gist_compressor: self.gist_compressor.clone(),
+            gist_seq: self.gist_seq.clone(),
             id_index: self.id_index.clone(),
             payload_index: self.payload_index.clone(),
             scope_index: self.scope_index.clone(),
@@ -350,6 +371,8 @@ impl StorageEngine {
                 graph,
                 ccs: Arc::new(Mutex::new(ccs)),
                 compressor,
+                gist_compressor: Arc::new(RwLock::new(None)),
+                gist_seq: Arc::new(AtomicU64::new(0)),
                 id_index,
                 payload_index,
                 scope_index,
@@ -1374,7 +1397,9 @@ impl StorageEngine {
         Some(meta.with_embedding(Arc::from(Vec::from(vec))))
     }
 
-    fn find_record_by_id(&self, id: &str) -> Option<Record> {
+    /// Look up a live record by its caller-supplied id, hydrated with its
+    /// embedding. `None` when the id is unknown or the record was deleted.
+    pub fn find_record_by_id(&self, id: &str) -> Option<Record> {
         let idx = self.id_index.read();
         idx.get(id)
             .copied()
@@ -1433,6 +1458,13 @@ impl StorageEngine {
     /// keyword extractor.
     pub fn set_compressor(&self, compressor: Arc<dyn CognitiveCompressor>) {
         *self.compressor.write() = compressor;
+    }
+
+    /// Install (or clear) the gist compressor used by B4 gist-before-evict.
+    /// Only consulted by `evict` when `TierConfig::gist_before_evict` is on;
+    /// `None` restores drop-outright eviction.
+    pub fn set_gist_compressor(&self, compressor: Option<Arc<dyn GistCompressor>>) {
+        *self.gist_compressor.write() = compressor;
     }
 
     fn save_ccs(&self) -> crate::Result<()> {
@@ -1630,6 +1662,16 @@ impl StorageEngine {
             }
         }
 
+        // B4 gist-before-evict: compress the victims into searchable gist
+        // records BEFORE deleting them, so evicted content stays retrievable.
+        // No-op unless the flag is on AND a GistCompressor is installed.
+        if tier.gist_before_evict && !victims.is_empty() {
+            let compressor = self.gist_compressor.read().clone();
+            if let Some(compressor) = compressor {
+                self.gist_victims(&victim_offsets, compressor.as_ref(), tier.gist_chunk_facts)?;
+            }
+        }
+
         let mut evicted = 0usize;
         for id in &victims {
             if self.delete_by_id(id)? {
@@ -1637,6 +1679,72 @@ impl StorageEngine {
             }
         }
         Ok(evicted)
+    }
+
+    /// Compress eviction victims into gist records (B4). Victims are grouped
+    /// by scope (a gist never crosses scope boundaries), chunked to
+    /// `chunk_facts` texts per compressor call, and each non-empty gist is
+    /// inserted as an ordinary record under `source_role = "gist"` with a
+    /// `{"gist": true, "victims": n}` payload. The role keeps gists out of
+    /// belief-revision detection (`belief_source_roles` gating) while scope-
+    /// based retrieval keeps them visible to the memories they summarize.
+    fn gist_victims(
+        &self,
+        victim_offsets: &HashSet<PointOffset>,
+        compressor: &dyn GistCompressor,
+        chunk_facts: usize,
+    ) -> crate::Result<()> {
+        // Collect victim (scope, seq, text), then compress per scope in
+        // chronological (insert_seq) order — for_each_record does not
+        // iterate in insertion order.
+        let mut by_scope: std::collections::HashMap<Option<String>, Vec<(u64, String)>> =
+            std::collections::HashMap::new();
+        self.meta.for_each_record(|offset, rec| {
+            if victim_offsets.contains(&offset) {
+                by_scope
+                    .entry(rec.scope.clone())
+                    .or_default()
+                    .push((rec.insert_seq, rec.text.clone()));
+            }
+        })?;
+
+        let chunk_facts = chunk_facts.max(1);
+        let now = now_secs();
+        for (scope, mut texts) in by_scope {
+            texts.sort_by_key(|(seq, _)| *seq);
+            let texts: Vec<String> = texts.into_iter().map(|(_, text)| text).collect();
+            for chunk in texts.chunks(chunk_facts) {
+                let Some((gist, embedding)) = compressor.compress(chunk) else {
+                    continue;
+                };
+                if gist.trim().is_empty() {
+                    continue;
+                }
+                let n = self.gist_seq.fetch_add(1, Ordering::Relaxed) + 1;
+                let gist_id = format!(
+                    "gist:{}:{}:{}",
+                    scope.as_deref().unwrap_or("global"),
+                    now,
+                    n
+                );
+                let payload = format!("{{\"gist\":true,\"victims\":{}}}", chunk.len());
+                // A failed gist insert must not abort eviction — the victims
+                // are being deleted either way. Log and continue.
+                if let Err(e) = self.insert_with_payload_role(
+                    &gist_id,
+                    &gist,
+                    &embedding,
+                    1.0,
+                    &[],
+                    Some(payload),
+                    scope.clone(),
+                    Some("gist".to_string()),
+                ) {
+                    log::warn!("gist-before-evict: failed to insert {gist_id}: {e}");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Semantic consolidation: merge near-duplicate records.
@@ -1768,11 +1876,12 @@ impl StorageEngine {
                         }
                     }
                     let mut graph = self.graph.write();
-                    graph.add_memory_with_importance(
+                    graph.add_memory_scoped(
                         survivor_id,
                         &survivor.text,
                         &concepts,
                         survivor.importance,
+                        survivor.scope.as_deref(),
                     );
                     drop(graph);
                 }
@@ -2091,7 +2200,13 @@ impl StorageEngine {
         )?;
         let mut graph = self.graph.write();
         if let Some(r) = self.find_record_by_id(new_id) {
-            graph.add_memory_with_importance(new_id, &r.text, &r.concepts, r.importance);
+            graph.add_memory_scoped(
+                new_id,
+                &r.text,
+                &r.concepts,
+                r.importance,
+                r.scope.as_deref(),
+            );
         }
         Ok(())
     }
@@ -2562,7 +2677,13 @@ impl StorageEngine {
 fn build_graph(records: &[(PointOffset, Record)], config: &SpreadingConfig) -> SpreadingActivation {
     let mut graph = MemoryGraph::new();
     for (_, rec) in records {
-        graph.add_memory_with_importance(&rec.id, &rec.text, &rec.concepts, rec.importance);
+        graph.add_memory_scoped(
+            &rec.id,
+            &rec.text,
+            &rec.concepts,
+            rec.importance,
+            rec.scope.as_deref(),
+        );
     }
     SpreadingActivation::new(graph, config.clone())
 }
@@ -2627,7 +2748,13 @@ fn rebuild_graph(
         if existing_mem_ids.contains(&rec.id) {
             continue;
         }
-        graph.add_memory_with_importance(&rec.id, &rec.text, &rec.concepts, rec.importance);
+        graph.add_memory_scoped(
+            &rec.id,
+            &rec.text,
+            &rec.concepts,
+            rec.importance,
+            rec.scope.as_deref(),
+        );
         added_any = true;
     }
     let _ = added_any; // suppress unused warning when no new records
@@ -4423,6 +4550,176 @@ mod tests {
         );
         // The evicted record's access-history ring is cleaned up too.
         assert!(engine.meta.access_history(burst_off).is_empty());
+    }
+
+    /// B4 gist-before-evict: victims are compressed into a gist record before
+    /// deletion, so their content stays retrievable under the same scope.
+    struct JoinCompressor;
+    impl GistCompressor for JoinCompressor {
+        fn compress(&self, texts: &[String]) -> Option<(String, Vec<f32>)> {
+            Some((texts.join(" | "), make_vec(8, 7)))
+        }
+    }
+
+    struct NullCompressor;
+    impl GistCompressor for NullCompressor {
+        fn compress(&self, _texts: &[String]) -> Option<(String, Vec<f32>)> {
+            None
+        }
+    }
+
+    /// (id, text, scope, role, payload) of every record with role "gist".
+    type GistRow = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+
+    fn find_gist_records(engine: &StorageEngine) -> Vec<GistRow> {
+        let mut out = Vec::new();
+        engine
+            .meta
+            .for_each_record(|_offset, rec| {
+                if rec.source_role.as_deref() == Some("gist") {
+                    out.push((
+                        rec.id.clone(),
+                        rec.text.clone(),
+                        rec.scope.clone(),
+                        rec.source_role.clone(),
+                        rec.payload.clone(),
+                    ));
+                }
+            })
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn gist_before_evict_compresses_victims() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        config.tier.max_records = Some(1);
+        config.tier.access_aware_eviction = false; // FIFO: oldest evicted first
+        config.tier.gist_before_evict = true;
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        engine.set_gist_compressor(Some(Arc::new(JoinCompressor)));
+        for i in 0..3usize {
+            engine
+                .insert(
+                    &format!("mem_{i}"),
+                    &format!("text {i}"),
+                    &make_vec(8, i),
+                    1.0,
+                    &[],
+                )
+                .unwrap();
+        }
+        let evicted = engine.evict().unwrap();
+        assert_eq!(evicted, 2, "mem_0 and mem_1 are the FIFO victims");
+        assert!(engine.contains_id("mem_2"));
+        // One gist record carries the victims' content: 1 survivor + 1 gist.
+        assert_eq!(engine.record_count(), 2);
+        let gists = find_gist_records(&engine);
+        assert_eq!(gists.len(), 1);
+        let (id, text, scope, role, payload) = &gists[0];
+        assert!(id.starts_with("gist:global:"));
+        assert_eq!(text, "text 0 | text 1");
+        assert_eq!(scope, &None);
+        assert_eq!(role.as_deref(), Some("gist"));
+        assert!(payload.as_deref().unwrap().contains("\"victims\":2"));
+        // The gist is retrievable through the normal ANN path.
+        let hits = engine.search_ann(&make_vec(8, 7), 1).unwrap();
+        assert_eq!(hits[0].0, *id);
+    }
+
+    #[test]
+    fn gist_before_evict_respects_scope_isolation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        config.tier.max_records = Some(0); // evict everything
+        config.tier.access_aware_eviction = false;
+        config.tier.gist_before_evict = true;
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        engine.set_gist_compressor(Some(Arc::new(JoinCompressor)));
+        for (scope, i) in [("a", 0usize), ("a", 1), ("b", 2), ("b", 3)] {
+            engine
+                .insert_with_payload_role(
+                    &format!("mem_{i}"),
+                    &format!("text {i}"),
+                    &make_vec(8, i),
+                    1.0,
+                    &[],
+                    None,
+                    Some(scope.to_string()),
+                    None,
+                )
+                .unwrap();
+        }
+        let evicted = engine.evict().unwrap();
+        assert_eq!(evicted, 4);
+        // One gist per scope; no gist mixes texts across scopes.
+        let gists = find_gist_records(&engine);
+        assert_eq!(gists.len(), 2);
+        assert_eq!(engine.record_count(), 2);
+        let gist_a = gists.iter().find(|g| g.2.as_deref() == Some("a")).unwrap();
+        let gist_b = gists.iter().find(|g| g.2.as_deref() == Some("b")).unwrap();
+        assert_eq!(gist_a.1, "text 0 | text 1");
+        assert_eq!(gist_b.1, "text 2 | text 3");
+        assert!(gist_a.0.starts_with("gist:a:"));
+        assert!(gist_b.0.starts_with("gist:b:"));
+    }
+
+    #[test]
+    fn gist_before_evict_off_by_default_drops_victims() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        config.tier.max_records = Some(1);
+        config.tier.access_aware_eviction = false;
+        // gist_before_evict defaults to false — no compressor consulted.
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        for i in 0..3usize {
+            engine
+                .insert(
+                    &format!("mem_{i}"),
+                    &format!("text {i}"),
+                    &make_vec(8, i),
+                    1.0,
+                    &[],
+                )
+                .unwrap();
+        }
+        let evicted = engine.evict().unwrap();
+        assert_eq!(evicted, 2);
+        assert_eq!(engine.record_count(), 1);
+        assert!(find_gist_records(&engine).is_empty());
+    }
+
+    #[test]
+    fn gist_before_evict_skips_chunk_when_compressor_abstains() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        config.tier.max_records = Some(1);
+        config.tier.access_aware_eviction = false;
+        config.tier.gist_before_evict = true;
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        engine.set_gist_compressor(Some(Arc::new(NullCompressor)));
+        for i in 0..3usize {
+            engine
+                .insert(
+                    &format!("mem_{i}"),
+                    &format!("text {i}"),
+                    &make_vec(8, i),
+                    1.0,
+                    &[],
+                )
+                .unwrap();
+        }
+        let evicted = engine.evict().unwrap();
+        assert_eq!(evicted, 2, "compressor abstention must not block eviction");
+        assert_eq!(engine.record_count(), 1);
+        assert!(find_gist_records(&engine).is_empty());
     }
 
     /// The access-history ring drains through flush and reloads on open, so

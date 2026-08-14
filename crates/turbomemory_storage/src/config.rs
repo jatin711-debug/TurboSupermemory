@@ -360,6 +360,19 @@ pub struct TierConfig {
     /// was ~70s at 10k because it re-scanned all N every cycle). Recommended for
     /// production / large stores; the one-time bulk-load cost is unchanged.
     pub incremental_supersession_detection: bool,
+    /// B4 gist-before-evict: before victims are deleted, compress each per-scope
+    /// chunk of their texts into a single gist record (inserted with
+    /// `source_role = "gist"`) so evicted CONTENT stays retrievable instead of
+    /// being dropped. Requires a `GistCompressor` installed via
+    /// `StorageEngine::set_gist_compressor`; without one this flag is a no-op.
+    /// Opt-in (default false) — the compressor usually makes an LLM call per
+    /// chunk. Gist records are ordinary records: they persist via the normal
+    /// insert path, participate in retrieval under their scope, and may
+    /// themselves be evicted and re-gisted (hierarchical forgetting).
+    pub gist_before_evict: bool,
+    /// Number of evicted texts per gist-compressor call (per scope chunk).
+    /// Default 24. Clamped to >= 1 at eviction time.
+    pub gist_chunk_facts: usize,
 }
 
 impl TierConfig {
@@ -455,6 +468,9 @@ impl TierConfig {
         // Full-scan supersession detection by default; set true for the
         // seq-cursor incremental path (W7 scale fix).
         incremental_supersession_detection: false,
+        // Gist-before-evict: opt-in; default drops eviction victims outright.
+        gist_before_evict: false,
+        gist_chunk_facts: 24,
     };
 
     /// Recommended thresholds for a given vector dimension.

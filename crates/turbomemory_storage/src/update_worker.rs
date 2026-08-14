@@ -67,7 +67,13 @@ impl IndexApplier {
         {
             let mut graph = self.graph.write();
             for (_, rec) in records {
-                graph.add_memory_with_importance(&rec.id, &rec.text, &rec.concepts, rec.importance);
+                graph.add_memory_scoped(
+                    &rec.id,
+                    &rec.text,
+                    &rec.concepts,
+                    rec.importance,
+                    rec.scope.as_deref(),
+                );
             }
         }
 

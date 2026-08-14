@@ -185,8 +185,9 @@ class TSMAdapter:
         # Stop-word set used by _extract_concepts.
         self._stop_words = _STOP_WORDS
 
-        # Store mapping of id -> text for retrieval
+        # Store mapping of id -> text and id -> metadata for retrieval
         self._id_to_text = {}
+        self._id_to_meta = {}
         
         # Load embedding model (with fallback for sentence-transformers issues)
         # We try sentence-transformers first, but on Windows it often fails
@@ -382,15 +383,19 @@ class TSMAdapter:
         
         # Normalize messages to dicts
         msg_dicts = []
-        for msg in messages:
+        for msg_idx, msg in enumerate(messages):
             if hasattr(msg, 'content'):
                 msg_dicts.append({
                     'content': msg.content,
                     'role': getattr(msg, 'role', 'user'),
                     'timestamp': getattr(msg, 'timestamp', ''),
+                    'turn_index': getattr(msg, 'turn_index', msg_idx),
                 })
             else:
-                msg_dicts.append(msg)
+                d = dict(msg)
+                if 'turn_index' not in d:
+                    d['turn_index'] = msg_idx
+                msg_dicts.append(d)
         
         # Extract all facts first
         extract_start = time.perf_counter()
@@ -414,6 +419,7 @@ class TSMAdapter:
                 fact_metadata.append({
                     'role': msg.get("role", "user"),
                     'timestamp': msg.get("timestamp", ""),
+                    'turn_index': msg.get("turn_index", 0),
                     'content': content,
                 })
         extract_time = (time.perf_counter() - extract_start) * 1000
@@ -437,6 +443,7 @@ class TSMAdapter:
                 memory_id = f"{user_id}_{self._insert_counter}" if user_id else f"mem_{self._insert_counter}"
                 
                 self._id_to_text[memory_id] = fact
+                self._id_to_meta[memory_id] = meta
                 
                 # Extract simple concepts from the fact (nouns and key phrases)
                 # For now, use simple word extraction - in production this would use NLP
@@ -512,6 +519,20 @@ class TSMAdapter:
                 top_k=fetch_k,
                 scope=user_id,
             )
+            # Multi-session & entity candidate augmentation
+            if query and results is not None:
+                q_words = [w.lower().strip("?,.!") for w in query.split() if len(w) > 3 and w.lower() not in self._stop_words]
+                if q_words:
+                    seen = {r[0] for r in results}
+                    for mid, fact_text in self._id_to_text.items():
+                        if mid in seen:
+                            continue
+                        if user_id and not mid.startswith(f"{user_id}_"):
+                            continue
+                        fact_lower = fact_text.lower()
+                        matches = sum(1 for w in q_words if w in fact_lower)
+                        if matches >= 1:
+                            results.append((mid, 0.45 + 0.10 * matches))
         else:
             # Direct ANN search (fast, no cognitive overhead)
             results = self.engine.search_ann(
@@ -529,6 +550,36 @@ class TSMAdapter:
             if self.supersession_mode == "exclude" and mid in superseded:
                 continue  # drop stale facts from the answer context (A-TMA)
             text = self._id_to_text.get(mid, "")
+            
+            # Temporal context anchoring
+            meta = self._id_to_meta.get(mid) or {}
+            ts = meta.get("timestamp")
+            turn_idx = meta.get("turn_index")
+            clean_ts = ""
+            if ts is not None:
+                if isinstance(ts, (float, int)):
+                    if not (isinstance(ts, float) and np.isnan(ts)):
+                        if ts > 100000000:
+                            import datetime
+                            try:
+                                clean_ts = datetime.datetime.fromtimestamp(float(ts), datetime.timezone.utc).strftime("%Y-%m-%d")
+                            except Exception:
+                                clean_ts = ""
+                        elif ts >= 0:
+                            clean_ts = f"Turn {int(ts) + 1}"
+                else:
+                    ts_str = str(ts).strip()
+                    if ts_str and ts_str.lower() not in ("nan", "none", ""):
+                        c = ts_str.replace("T", " ").split("+")[0].split("Z")[0].strip()
+                        if len(c) >= 10:
+                            clean_ts = c[:10]
+                        else:
+                            clean_ts = c
+            if not clean_ts and turn_idx is not None:
+                clean_ts = f"Turn {int(turn_idx) + 1}"
+            if clean_ts:
+                text = f"[{clean_ts}] {text}"
+
             if self.supersession_mode == "tag" and mid in superseded:
                 text = "[OUTDATED] " + text
             out.append({"id": mid, "score": float(r[1]), "text": text})

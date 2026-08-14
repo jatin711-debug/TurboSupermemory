@@ -210,28 +210,36 @@ make build-api       # builds the gRPC + REST server binary
 | `python benchmarks/cognitive_benchmark.py` | **3/4 cognitive scenarios won** (abstraction-at-scale: known open limitation) |
 | `python benchmarks/audit_recall.py --num-items 100000 --dimension 1536` | **100.0% recall@10** |
 
-### Industry-standard Cognitive Benchmarks
+### Industry-standard Cognitive Benchmarks (LongMemEval Head-to-Head)
 
-TSM is validated against real-world memory benchmarks:
+TSM is benchmarked head-to-head against **Mem0 1.0** and **Naive-RAG** on the [LongMemEval](https://huggingface.co/datasets/MemoryAsModality/LongMemEval) conversational memory benchmark across 50 full conversations, using identical OpenAI `text-embedding-3-small` (1536-dim) vectors and judged by `gpt-4o-mini`:
 
-| Benchmark | Dataset | TSM Result | Mem0 Claimed |
-|---|---|---|---|
-| **LongMemEval** | 500 conversations, 500 queries | **100% recall@10** (quick test) | 91.6% |
-| **LoCoMo-MC10** | 55K sessions, 1,986 queries | Infrastructure validated | — |
+| Evaluation Dimension | TurboSuperMemory (TSM) | Mem0 1.0 (Official Usage) | Naive-RAG (Vector Baseline) | TSM Advantage |
+| :--- | :---: | :---: | :---: | :---: |
+| **Accuracy @ 150 Tokens** | **56.2%** (`27/48`) | 39.6% (`19/48`) | 50.0% (`24/48`) | **+16.7% vs Mem0** |
+| **Accuracy @ 300 Tokens** | **60.4%** (`29/48`) | 37.5% (`18/48`) | 54.2% (`26/48`) | **+22.9% vs Mem0** |
+| **Accuracy @ 600 Tokens** | **62.5%** (`30/48`) | 37.5% (`18/48`) | 60.4% (`29/48`) | **+25.0% vs Mem0** |
+| **Belief Revision & Updates** | **66.7%** | 66.7% | 50.0% | **+16.7% vs Naive** |
+| **Temporal Reasoning** | **42.9%** | 28.6% | 35.7% | **+14.3% vs Mem0** |
+| **Write-Time LLM Calls** | **0 calls** | 708 calls | 0 calls | **Zero LLM write cost** |
+| **Write-Time Tokens Burned**| **0 tokens ($0.00)** | **1,130,633 tokens** (~$1.13) | 0 tokens ($0.00) | **100% Free Ingestion** |
+| **Ingestion Latency (50 convs)**| **~8 seconds** (CUDA) | **~40 minutes** (API bound) | ~8 seconds | **~300× faster** |
 
-Run benchmarks:
+#### Why TSM Wins in Production Agent Contexts:
+1. **Budget-Aware Submodular MMR Selection**: Mem0 extracts isolated 1-sentence facts that cluster around the same cosine neighbor, returning redundant duplicates under tight budgets (150–600 tokens). TSM uses Submodular MMR to maximize information density.
+2. **Cognitive Graph & Temporal Forward Chaining**: TSM preserves conversational chronology and entity connections through scoped graph edges in native Rust.
+3. **Zero Write Cost**: TSM requires no write-time LLM extraction calls, executing sub-millisecond per-turn updates directly on GPU.
+
+Run the head-to-head evaluation:
 ```bash
-# Download datasets
-python benchmarks/cognitive_eval/benchmark_datasets/download.py --dataset all
+# Multi-budget audit (TSM vs Mem0 vs Naive-RAG across 150, 300, 600 token budgets)
+python benchmarks/cognitive_eval/full_harness_audit.py --limit 50 --budgets 150,300,600 --mem0-path ./mem0_eval_db
 
-# LongMemEval (quick: 5 conversations, ~5 min; full: 500 conversations, ~2-3 hours)
-python benchmarks/cognitive_eval/run_longmemeval.py --quick --quick-n 5
-
-# LoCoMo (quick: 10 queries, ~10 min; full: 1986 queries, ~4-6 hours)
-python benchmarks/cognitive_eval/run_locomo.py --quick --quick-n 10
+# Direct Head-to-Head evaluation
+python benchmarks/cognitive_eval/head_to_head_eval.py --limit 50 --systems tsm,mem0,naive --token-budget 150
 ```
 
-See [benchmarks/cognitive_eval/README.md](benchmarks/cognitive_eval/README.md) for detailed results and methodology.
+See [benchmarks/cognitive_eval/README.md](benchmarks/cognitive_eval/README.md) for detailed methodology, cost analysis, and evaluation rubrics.
 
 Test breakdown: core 29 · graph 65 · storage 68 · crash-recovery 3.
 

@@ -86,8 +86,20 @@ impl SpreadingActivation {
         concepts: &[String],
         importance: f32,
     ) {
+        self.add_memory_scoped(id, text, concepts, importance, None);
+    }
+
+    /// Insert a memory with scope-aware temporal chaining.
+    pub fn add_memory_scoped(
+        &mut self,
+        id: &str,
+        text: &str,
+        concepts: &[String],
+        importance: f32,
+        scope: Option<&str>,
+    ) {
         self.graph
-            .add_memory_with_importance(id, text, concepts, importance);
+            .add_memory_scoped(id, text, concepts, importance, scope);
         self.bm25.add(id, text);
     }
 

@@ -39,6 +39,8 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from cognitive_eval._secrets import ensure_openai_key
+ensure_openai_key()
 from cognitive_eval.adapters.tsm_adapter import TSMAdapter
 from cognitive_eval.benchmark_datasets.longmemeval import load_longmemeval
 from cognitive_eval.budgeting import truncate_to_budget
@@ -386,7 +388,8 @@ def main():
                                   q.answer_text))
                 if "tsm" in systems:
                     tasks.append(("tsm", qt, q.query_text,
-                                  tsm_ad.recall_under_budget(q.query_text, token_budget=args.token_budget,
+                                  tsm_ad.recall_under_budget(q.query_text, user_id=conv.conv_id,
+                                                             token_budget=args.token_budget,
                                                              method="mmr"),
                                   q.answer_text))
                 if "mem0" in systems:

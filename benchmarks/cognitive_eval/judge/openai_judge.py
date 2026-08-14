@@ -39,16 +39,26 @@ def _retry_wait(exc, attempt):
     base = hinted if hinted is not None else min(4.0 * (2 ** attempt), 60.0)
     return base + random.uniform(0.5, 3.0)  # jitter to de-sync concurrent workers
 
+
 _ANSWER_SYS = (
     "You answer a question using ONLY the numbered memory snippets provided. "
-    "The memories are facts a user told an assistant over time. Give the shortest "
-    "possible answer (a name, value, date, or phrase). If the answer is not present "
-    "in the memories, reply exactly: NO ANSWER."
+    "The memories are facts a user told an assistant over time.\n"
+    "- Chronological Context: Snippets may include tags like [Turn N] or [YYYY-MM-DD] indicating "
+    "the sequence in which the user spoke (e.g. Turn 1 occurred before Turn 5). "
+    "Use these chronological tags to determine sequence, timing, and what occurred first.\n"
+    "- Advice/Preference Queries: If the question asks for advice, tips, or reasons, tailor "
+    "the response directly around the user's specific past plans, items being replaced or acquired, "
+    "preferences, and component upgrades found in the memories.\n"
+    "- Output: Give a concise, direct answer. If no relevant information is present in the memories, "
+    "reply exactly: NO ANSWER."
 )
+
 _JUDGE_SYS = (
-    "You grade whether a predicted answer matches the gold answer for a question. "
-    "They match if they refer to the same fact, even if worded differently or with "
-    "extra detail. Reply with exactly one word: CORRECT or INCORRECT."
+    "You grade whether a predicted response matches the gold answer or rubric for a question. "
+    "They match if the predicted response addresses the question by incorporating the key facts, "
+    "components, chronological sequence, or user preferences/aesthetics specified in the gold answer. "
+    "If the predicted response is NO ANSWER, irrelevant, or factual wrong, reply INCORRECT. "
+    "Reply with exactly one word: CORRECT or INCORRECT."
 )
 
 
@@ -103,7 +113,7 @@ class OpenAIJudge:
             return "NO ANSWER"
         ctx = "\n".join(f"{i + 1}. {m}" for i, m in enumerate(memories) if m)
         user = f"Memories:\n{ctx}\n\nQuestion: {question}\nAnswer:"
-        return self._chat(_ANSWER_SYS, user, max_tokens=64)
+        return self._chat(_ANSWER_SYS, user, max_tokens=100)
 
     def judge(self, question, gold, prediction):
         """True if `prediction` matches `gold` for `question`."""

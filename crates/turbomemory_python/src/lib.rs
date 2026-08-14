@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use turbomemory_graph::{CognitiveCompressor, CompressedCognitiveState, DeterministicCompressor};
 use turbomemory_storage::config::{QuantizerKind, StoreConfig};
-use turbomemory_storage::engine::{StorageEngine, SupersessionKind};
+use turbomemory_storage::engine::{GistCompressor, StorageEngine, SupersessionKind};
 
 /// Map storage errors to specific Python exception types.
 fn storage_err(e: turbomemory_storage::StorageError) -> PyErr {
@@ -255,6 +255,8 @@ impl PyMemoryEngine {
         actr_decay=None,
         actr_history=None,
         incremental_supersession_detection=None,
+        gist_before_evict=None,
+        gist_chunk_facts=None,
         seed_hops_from=None,
         expansion_max_candidates=None,
         concept_expansion=None
@@ -316,6 +318,8 @@ impl PyMemoryEngine {
         actr_decay: Option<f64>,
         actr_history: Option<usize>,
         incremental_supersession_detection: Option<bool>,
+        gist_before_evict: Option<bool>,
+        gist_chunk_facts: Option<usize>,
         seed_hops_from: Option<usize>,
         expansion_max_candidates: Option<usize>,
         concept_expansion: Option<bool>,
@@ -580,6 +584,17 @@ impl PyMemoryEngine {
         if let Some(inc) = incremental_supersession_detection {
             config.tier.incremental_supersession_detection = inc;
         }
+        // - gist_before_evict: compress eviction victims into searchable gist
+        //   records (source_role "gist", scope-isolated) instead of dropping
+        //   them outright (B4). Opt-in (default false); requires a gist
+        //   compressor installed via `set_gist_compressor`, otherwise a no-op.
+        // - gist_chunk_facts: evicted texts per compressor call. Default 24.
+        if let Some(on) = gist_before_evict {
+            config.tier.gist_before_evict = on;
+        }
+        if let Some(n) = gist_chunk_facts {
+            config.tier.gist_chunk_facts = n;
+        }
 
         let inner = StorageEngine::open(db_path, config).map_err(storage_err)?;
         Ok(Self { inner })
@@ -811,6 +826,32 @@ impl PyMemoryEngine {
         Ok(())
     }
 
+    /// Install a Python callable as the gist compressor for B4
+    /// gist-before-evict. Only consulted when the engine was constructed with
+    /// `gist_before_evict=True`. The callable receives one argument — a list
+    /// of evicted fact texts (one chunk, same scope, chronological order) —
+    /// and must return either `None` (drop this chunk) or a
+    /// `(gist_text, embedding)` tuple: the compressed gist plus the vector to
+    /// store it under (typically from the same embedder used for facts). If
+    /// the callable raises or returns a malformed value, the chunk is dropped
+    /// and eviction proceeds.
+    ///
+    /// Example:
+    /// ```python
+    /// def my_gister(texts):
+    ///     gist = llm_summarize(texts)                 # your LLM call
+    ///     return gist, embedder.encode([gist])[0]     # (text, embedding)
+    ///
+    /// engine.set_gist_compressor(my_gister)
+    /// ```
+    fn set_gist_compressor(&self, callable: Py<PyAny>) -> PyResult<()> {
+        let compressor = Arc::new(PythonGistCompressor {
+            callable: Mutex::new(callable),
+        });
+        self.inner.set_gist_compressor(Some(compressor));
+        Ok(())
+    }
+
     fn trigger_consolidation(&self, py: Python<'_>) -> PyResult<(usize, usize, usize)> {
         py.allow_threads(|| self.inner.trigger_consolidation().map_err(storage_err))
     }
@@ -863,6 +904,13 @@ impl PyMemoryEngine {
     /// by the retention eval (W5) to measure gold-fact survival after eviction.
     fn contains_id(&self, py: Python<'_>, id: String) -> PyResult<bool> {
         Ok(py.allow_threads(|| self.inner.contains_id(&id)))
+    }
+
+    /// Return the stored text for `id`, or None when the id is unknown. Lets
+    /// callers render engine-generated records (e.g. gist-before-evict gist
+    /// records) whose ids they did not mint themselves.
+    fn get_text(&self, py: Python<'_>, id: String) -> PyResult<Option<String>> {
+        Ok(py.allow_threads(|| self.inner.find_record_by_id(&id).map(|r| r.text)))
     }
 
     /// Returns True if the engine is using GPU acceleration for distance
@@ -1114,6 +1162,28 @@ impl CognitiveCompressor for PythonCompressor {
             Ok(parsed) => parsed,
             Err(_) => DeterministicCompressor.compress(ccs, user_input, assistant_response),
         }
+    }
+}
+
+/// Gist compressor backed by a Python callable (B4 gist-before-evict). The
+/// callable maps a chunk of evicted texts to `(gist_text, embedding)` or
+/// `None`; any exception or malformed return skips the chunk so eviction is
+/// never blocked by a compressor failure.
+struct PythonGistCompressor {
+    callable: Mutex<Py<PyAny>>,
+}
+
+impl GistCompressor for PythonGistCompressor {
+    fn compress(&self, texts: &[String]) -> Option<(String, Vec<f32>)> {
+        Python::with_gil(|py| {
+            let callable = self.callable.lock().ok()?;
+            let output = callable.call1(py, (texts.to_vec(),)).ok()?;
+            if output.is_none(py) {
+                return None;
+            }
+            let (text, embedding): (String, Vec<f32>) = output.extract(py).ok()?;
+            Some((text, embedding))
+        })
     }
 }
 

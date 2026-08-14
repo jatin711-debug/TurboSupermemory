@@ -208,6 +208,7 @@ pub struct MemoryGraph {
     int_edges: Vec<InternalEdge>,
     int_adjacency: IntAdjacency,
     last_memory_id: Option<String>,
+    last_memory_by_scope: HashMap<String, String>,
     co_occurrence: BTreeMap<String, usize>,
     vocab: ConceptVocabulary,
     suppressed_concepts: BTreeSet<String>,
@@ -264,6 +265,7 @@ impl From<LegacyMemoryGraph> for MemoryGraph {
             int_edges: Vec::new(),
             int_adjacency: IntAdjacency::default(),
             last_memory_id: legacy.last_memory_id,
+            last_memory_by_scope: HashMap::new(),
             co_occurrence: legacy.co_occurrence,
             vocab: legacy.vocab,
             suppressed_concepts: legacy.suppressed_concepts,
@@ -409,7 +411,7 @@ impl MemoryGraph {
     }
 
     pub fn add_memory(&mut self, id: &str, text: &str, concepts: &[String]) {
-        self.add_memory_with_importance(id, text, concepts, 1.0);
+        self.add_memory_scoped(id, text, concepts, 1.0, None);
     }
 
     pub fn add_memory_with_importance(
@@ -418,6 +420,17 @@ impl MemoryGraph {
         text: &str,
         concepts: &[String],
         importance: f32,
+    ) {
+        self.add_memory_scoped(id, text, concepts, importance, None);
+    }
+
+    pub fn add_memory_scoped(
+        &mut self,
+        id: &str,
+        text: &str,
+        concepts: &[String],
+        importance: f32,
+        scope: Option<&str>,
     ) {
         let mem_key = NodeId::memory(id).as_str();
         let imp = importance_factor(importance);
@@ -465,14 +478,27 @@ impl MemoryGraph {
             }
         }
 
-        // Temporal chaining between consecutive memories.
-        if let Some(prev) = self.last_memory_id.take() {
+        // Temporal chaining between consecutive memories in the same scope.
+        let scope_key = scope.unwrap_or("").to_string();
+        let prev_opt = if let Some(prev) = self.last_memory_by_scope.remove(&scope_key) {
+            Some(prev)
+        } else if scope.is_none() {
+            self.last_memory_id.take()
+        } else {
+            None
+        };
+
+        if let Some(prev) = prev_opt {
             let prev_key = NodeId::memory(&prev).as_str();
             if let Some(prev_id) = self.get_node_id(&prev_key) {
+                // Forward temporal chaining: prev -> mem
                 self.add_int_edge(prev_id, mem_id, EdgeKind::Temporal, 0.5 * imp);
             }
         }
-        self.last_memory_id = Some(id.to_string());
+        self.last_memory_by_scope.insert(scope_key, id.to_string());
+        if scope.is_none() {
+            self.last_memory_id = Some(id.to_string());
+        }
     }
 
     pub fn remove_memory(&mut self, id: &str) {
@@ -1600,6 +1626,7 @@ impl MemoryGraph {
             int_edges: Vec::new(),
             int_adjacency: IntAdjacency::default(),
             last_memory_id: snapshot.last_memory_id,
+            last_memory_by_scope: HashMap::new(),
             co_occurrence: snapshot.co_occurrence,
             vocab: ConceptVocabulary::from_alias_pairs(snapshot.vocab_aliases),
             suppressed_concepts: snapshot.suppressed_concepts,

@@ -16,6 +16,7 @@ pub mod vector_store;
 pub mod visited_pool;
 pub mod wal;
 
+pub use engine::GistCompressor;
 pub use engine::StorageEngine;
 
 pub type Result<T> = std::result::Result<T, StorageError>;

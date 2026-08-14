@@ -283,6 +283,10 @@ def main():
                     help="evicted facts per gist call (chunk size)")
     ap.add_argument("--gist-max-tokens", type=int, default=120,
                     help="max tokens per generated gist")
+    ap.add_argument("--ablate", action="store_true",
+                    help="with --gist: add the two ablation arms — legacy+excl (belief "
+                         "resolution at recall only) and gist-only (gists, supersession "
+                         "demote) — attributing the combined LEGACY+GIST effect")
     ap.add_argument("--workers", type=int, default=8)
     args = ap.parse_args()
 
@@ -336,19 +340,25 @@ def main():
     # B3 kill/keep: three arms, identical operations, differing only in the
     # eviction ranking policy. With --gist, a fourth arm combines the two
     # survival-gap closers on top of the legacy champion: belief resolution
-    # at recall (supersession exclude) + gist-before-evict (B4).
+    # at recall (supersession exclude) + gist-before-evict (B4). --ablate
+    # adds the two single-factor arms that attribute the combined effect.
     arms = [
-        ("fifo",   False, False, False),  # naive FIFO baseline
-        ("legacy", True,  False, False),  # access_count x 2^(-age/half_life)
-        ("actr",   True,  True,  False),  # ACT-R base-level activation ln(sum age^-d)
+        ("fifo",   False, False, False, False),  # naive FIFO baseline
+        ("legacy", True,  False, False, False),  # access_count x 2^(-age/half_life)
+        ("actr",   True,  True,  False, False),  # ACT-R base-level activation ln(sum age^-d)
     ]
+    if gister is not None and args.ablate:
+        arms += [
+            ("legacy+excl", True, False, False, True),   # belief resolution only
+            ("gist-only",   True, False, True,  False),  # gists only (demote)
+        ]
     if gister is not None:
-        arms.append(("legacy+gist", True, False, True))
+        arms.append(("legacy+gist", True, False, True, True))  # combined
     results = {}
     model = init_model
-    for name, access_aware, actr, gist_victims in arms:
-        logger.info("Running %s arm (access_aware_eviction=%s, actr_activation=%s, gist=%s)...",
-                    name.upper(), access_aware, actr, gist_victims)
+    for name, access_aware, actr, gist_victims, exclude in arms:
+        logger.info("Running %s arm (access_aware_eviction=%s, actr_activation=%s, gist=%s, exclude=%s)...",
+                    name.upper(), access_aware, actr, gist_victims, exclude)
         agg, pressured, model = run_arm(access_aware, convs, args.budget, args.model, args.top_k,
                                         args.extractor, shared_model=model, judge=judge,
                                         extractor_instance=shared_extractor,
@@ -358,7 +368,7 @@ def main():
                                         gist_victims=gist_victims, gister=gister,
                                         gist_chunk_facts=args.gist_chunk_facts,
                                         gist_max_tokens=args.gist_max_tokens,
-                                        supersession_exclude=gist_victims)
+                                        supersession_exclude=exclude)
         results[name] = (agg, pressured)
 
     names = list(results.keys())
@@ -404,15 +414,17 @@ def main():
     delta_lf = metric["legacy"] - metric["fifo"]
     logger.info("LEGACY - FIFO %s: %+.4f | ACT-R - LEGACY %s: %+.4f (metric=%s)",
                 metric_name, delta_lf, metric_name, delta_al, metric_name)
-    gist_deltas = None
+    gist_deltas = {}
+    for extra in (x for x in names if x not in ("fifo", "legacy", "actr")):
+        gist_deltas[f"{extra}_minus_legacy_survival"] = round(surv[extra] - surv["legacy"], 4)
+        gist_deltas[f"{extra}_minus_legacy"] = round(metric[extra] - metric["legacy"], 4)
+        logger.info("%s - LEGACY survival: %+.4f | %s: %+.4f",
+                    extra.upper(), gist_deltas[f"{extra}_minus_legacy_survival"],
+                    metric_name, gist_deltas[f"{extra}_minus_legacy"])
+    # Back-compat keys for the combined arm (the original gist fields).
     if "legacy+gist" in results:
-        gist_deltas = {
-            "gist_minus_legacy_survival": round(surv["legacy+gist"] - surv["legacy"], 4),
-            "gist_minus_legacy": round(metric["legacy+gist"] - metric["legacy"], 4),
-        }
-        logger.info("LEGACY+GIST - LEGACY survival: %+.4f | %s: %+.4f",
-                    gist_deltas["gist_minus_legacy_survival"],
-                    metric_name, gist_deltas["gist_minus_legacy"])
+        gist_deltas["gist_minus_legacy_survival"] = gist_deltas["legacy+gist_minus_legacy_survival"]
+        gist_deltas["gist_minus_legacy"] = gist_deltas["legacy+gist_minus_legacy"]
     if delta_al >= 0.0:
         verdict = "keep"
         logger.info("B3 VERDICT: KEEP ACT-R — it beats legacy access-aware eviction on %s "
@@ -446,7 +458,7 @@ def main():
         },
         "legacy_minus_fifo": round(delta_lf, 4),
         "actr_minus_legacy": round(delta_al, 4),
-        **(gist_deltas or {}),
+        **gist_deltas,
         "verdict": verdict,
     }
     logger.info("GATE_SUMMARY: %s", json.dumps(summary))

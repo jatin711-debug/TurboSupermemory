@@ -22,7 +22,7 @@ OpenAI-backed and read the key from ``OPENAI_API_KEY``.
 import json
 import logging
 import re
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 
@@ -119,12 +119,12 @@ class Memory:
             results = mem.recall("Where does Alice live?", user_id="alice")
             mem.consolidate()                          # verified belief revision
 
-    The id->text map used to render results and to feed the verifier is kept
-    in memory only (matching the proven eval adapter): after reopening a
-    database, recall still returns ids/scores from the engine but ``text``
-    fields are empty for pre-existing memories, and the verifier only vets
-    pairs whose texts are known in this process. Persist your own mapping if
-    you need cross-process text rendering.
+    The id->text map used to feed the verifier is kept in memory only
+    (matching the proven eval adapter): after reopening a database, recall
+    renders ``text`` via the engine's stored-text lookup (``get_text``)
+    instead of the in-memory map, and the verifier only vets pairs whose
+    texts are known in this process. Persist your own mapping if you need
+    cross-process verified consolidation.
 
     Scope guard: the engine's exact-scan path treats an EMPTY scope bitmap
     (a scope with no records yet) as "unfiltered" and would leak other
@@ -142,6 +142,7 @@ class Memory:
         embedder: Optional[Embedder] = None,
         extractor: Optional[Extractor] = None,
         verifier: Optional[Verifier] = None,
+        gist_summarizer: Optional[Callable[[List[str]], str]] = None,
         **engine_kwargs,
     ):
         """
@@ -158,6 +159,12 @@ class Memory:
                 defers supersession commitment so ``consolidate()`` runs
                 propose -> verify -> commit. ``NLIVerifier`` (local
                 cross-encoder) is available in ``tsm.verification``.
+            gist_summarizer: optional callable mapping a list of evicted fact
+                texts to a single gist string (typically an LLM call). When
+                provided, the engine's B4 gist-before-evict is enabled:
+                eviction victims are compressed into searchable gist records
+                (same scope, chronological chunks) instead of being dropped.
+                The gist embedding comes from this Memory's ``embedder``.
             **engine_kwargs: forwarded to ``turbomemory.MemoryEngine``.
         """
         cache_dir = None
@@ -185,13 +192,24 @@ class Memory:
             config["defer_supersession_commit"] = verifier is not None
         elif profile is not None:
             raise ValueError(f"unknown profile: {profile!r} (use 'conversational' or None)")
+        if gist_summarizer is not None:
+            config["gist_before_evict"] = True
         config.update(engine_kwargs)  # explicit kwargs win over the profile
         self.profile = profile
+        self._gist_summarizer = gist_summarizer
 
         turbomemory = load_turbomemory()
         self.engine = turbomemory.MemoryEngine(
             db_path=db_path, dimension=self.dim, **config
         )
+        if gist_summarizer is not None:
+            set_compressor = getattr(self.engine, "set_gist_compressor", None)
+            if set_compressor is None:
+                raise ValueError(
+                    "gist_summarizer requires an engine build with gist-before-evict "
+                    "support (set_gist_compressor); rebuild the turbomemory extension"
+                )
+            set_compressor(self._compress_gist)
 
         # In-memory id -> fact text (see class docstring for the limitation).
         self._id_to_text: Dict[str, str] = {}
@@ -262,6 +280,36 @@ class Memory:
             )
         return len(facts)
 
+    def _compress_gist(self, texts: List[str]):
+        """Gist-compressor callback handed to the engine (B4).
+
+        Summarizes one chunk of eviction victims with the user-supplied
+        ``gist_summarizer`` and embeds the gist with this Memory's embedder.
+        Returns ``(gist_text, embedding)`` or ``None`` — any failure abstains
+        so eviction is never blocked by the summarizer.
+        """
+        try:
+            gist = (self._gist_summarizer(texts) or "").strip()
+            if not gist:
+                return None
+            emb = np.asarray(self.embedder.encode([gist]), dtype=np.float32)[0]
+            return gist, emb.tolist()
+        except Exception as e:  # noqa: BLE001 — never block eviction
+            logger.warning("gist summarizer failed for %d texts: %s", len(texts), e)
+            return None
+
+    def _engine_text(self, memory_id: str) -> str:
+        """Engine-side text lookup for records this process did not mint
+        (gist records, or facts from an earlier process). Empty string on
+        older engines without ``get_text``."""
+        get_text = getattr(self.engine, "get_text", None)
+        if get_text is None:
+            return ""
+        try:
+            return get_text(memory_id) or ""
+        except Exception:  # noqa: BLE001 — text is best-effort rendering
+            return ""
+
     # reads -----------------------------------------------------------------------
     def recall(
         self,
@@ -313,7 +361,7 @@ class Memory:
                 known_scope = self._id_to_scope.get(mid)
                 if known_scope is not None and known_scope != user_id:
                     continue
-            pool.append({"id": mid, "text": self._id_to_text.get(mid, ""),
+            pool.append({"id": mid, "text": self._id_to_text.get(mid) or self._engine_text(mid),
                          "score": float(score)})
         if not pool:
             return []

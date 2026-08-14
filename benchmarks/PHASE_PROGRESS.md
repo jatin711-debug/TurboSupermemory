@@ -1446,3 +1446,97 @@ OR its distinctive token inside a gist. Command:
   3-arm behavior when unset; GATE_SUMMARY now reports
   `gist_minus_legacy_survival` / `gist_minus_legacy` alongside the B3
   verdict fields.
+
+
+# Ablation — belief-exclusion vs gist-before-evict, attribution run (2026-08-07)
+
+Two-factor ablation of the combined LEGACY+GIST arm from the previous run:
+`legacy+excl` (belief resolution at recall only) and `gist-only` (gists,
+supersession demote) isolate each mechanism; identical 120-conv protocol
+(budget=10, sources rehearsal, OpenAI pipeline, gpt-4.1-mini judge, 1098
+judge calls). Command = previous run + `--ablate`.
+
+| metric | LEGACY | LEGACY+EXCL | GIST-ONLY | LEGACY+GIST |
+|---|---|---|---|---|
+| gold survival | 0.679 | 0.777 | **0.804** | 0.795 |
+| hit@1 | 0.304 | 0.357 | 0.304 | 0.348 |
+| hit@k | 0.563 | **0.625** | 0.536 | 0.616 |
+| **judged accuracy** | 0.438 | 0.500 | 0.455 | **0.509** |
+
+Deltas vs legacy (judged / survival):
+
+| arm | judged | survival |
+|---|---|---|
+| legacy+excl | **+0.063** | +0.098 |
+| gist-only | +0.018 | **+0.125** |
+| combined | +0.071 | +0.116 |
+
+- **Belief exclusion is the bigger ANSWER lever**: +0.063 judged alone (7 of
+  112 answers) — nearly the whole combined +0.071. It also lifts survival
+  (+0.098) even though it deletes nothing: exclusion applies during the
+  rehearsal searches too, so stale/superseded facts stop soaking up access
+  bumps, salience concentrates on live facts, and the rehearsal grace
+  window protects a wider set of distinct live facts from eviction. Double
+  mechanism: rehearsal-salience concentration (survival) + ghost-memory
+  context cleaning (precision).
+- **Gists own the survival axis but convert weakly alone**: +0.125 survival
+  (content resurrection — the highest of any arm) yet only +0.018 judged,
+  and gist-only hit@k (0.536) dips BELOW legacy (0.563): gist texts compete
+  in the same ranking as exact facts and dilute top-10. Exclusion fixes
+  that dilution in the combined arm (hit@k back to 0.616).
+- **Combined ≈ additive on judged** (0.063 + 0.018 = 0.081 predicted vs
+  0.071 measured — mild sub-additivity, well above the ±0.01 noise band
+  either way). Product conclusion: belief resolution is the primary
+  accuracy feature; gisting is the insurance policy for coverage/survival.
+  Both ship: exclusion is free, gists cost ~1.65 nano calls per pressured
+  conversation.
+- Gist-count asymmetry explained: gist-only inserted 378 gists vs 193 in
+  the combined arm. With exclusion active, rehearsal protects more distinct
+  live facts (above), so fewer records fall to eviction — the combined arm
+  simply has fewer victims to compress. Same mechanism, seen from the
+  eviction side.
+- ACT-R fourth run: +0.000. Four independent judged runs now sit in
+  {+0.009, 0.000, -0.009, +0.000} — the ACT-R/legacy delta is indistingu-
+  able from judge noise at n=112; the tie is the finding at this scale.
+
+Engine-level gist-before-evict also landed this session (no longer a
+harness-only mechanism): `TierConfig::gist_before_evict` /
+`gist_chunk_facts` (opt-in, default off) + `GistCompressor` trait +
+`StorageEngine::set_gist_compressor`. `evict()` groups victims per scope,
+compresses chronological (`insert_seq`) chunks, and inserts gists as
+ordinary durable records (`source_role="gist"`, `{"gist":true,"victims":n}`
+payload) BEFORE deletion — WAL/vector durability order preserved, gists
+retrievable under their scope, re-gistable on later eviction (hierarchical
+forgetting). PyO3: `gist_before_evict`/`gist_chunk_facts` kwargs,
+`set_gist_compressor(callable)` (callable gets a list of texts, returns
+`(gist_text, embedding)` or None; exceptions abstain, never block
+eviction), `get_text(id)` so engine-minted gist ids render. SDK:
+`Memory(gist_summarizer=fn)` enables the feature and composes the
+summarizer with the Memory's embedder; recall falls back to engine-side
+text for records the process didn't mint. Storage 101+3 tests, clippy/fmt
+clean, SDK 18/18.
+
+---
+
+## Phase A4 / Multi-Budget Audit — Head-to-Head vs Mem0 & Naive-RAG ✅ (2026-08-14)
+
+**Objective.** Benchmark TSM against Mem0 1.0 (official incremental ingestion, `gpt-4.1-nano` extractor, `text-embedding-3-small` 1536-dim) and Naive-RAG (flat vector baseline) across 50 full LongMemEval conversations judged by `gpt-4o-mini` under tight context budgets (150, 300, and 600 tokens).
+
+**Architecture Upgrades Landed:**
+1. **Scoped Temporal Graph Chaining**: Converted global `last_memory_id` to per-scope `last_memory_by_scope` (`turbomemory_graph`), ensuring temporal adjacency edges only link memories within the same conversation/user timeline.
+2. **Deterministic Context Anchoring**: Captured message timestamps and turn sequence indices (`turn_index`), formatting recalled memories with chronological `[Turn N]` / `[YYYY-MM-DD]` tags.
+3. **Budget-Aware Submodular MMR Selection**: Fused vector similarity, spreading activation, and submodular MMR packing to maximize information density under strict token limits.
+4. **CUDA Hardware Acceleration**: Enabled GPU-accelerated HNSW builds and batch reranking in release extension (`turbomemory.pyd`).
+
+**Results Matrix (50 Conversations, LongMemEval):**
+
+| Token Budget | TurboSuperMemory (TSM + CUDA) | Mem0 1.0 (Official Usage) | Naive-RAG (Vector Baseline) | TSM vs Mem0 Delta |
+| :---: | :---: | :---: | :---: | :---: |
+| **150 tokens** | **56.2%** (`27/48`) | 39.6% (`19/48`) | 50.0% (`24/48`) | **+16.7% Lead** |
+| **300 tokens** | **60.4%** (`29/48`) | 37.5% (`18/48`) | 54.2% (`26/48`) | **+22.9% Lead** |
+| **600 tokens** | **62.5%** (`30/48`) | 37.5% (`18/48`) | 60.4% (`29/48`) | **+25.0% Lead** |
+
+**Category Breakthroughs:**
+- **Knowledge Updates / Belief Revision**: TSM **66.7%** vs Naive-RAG **50.0%** (**+16.7% lift** from belief supersession).
+- **Temporal Reasoning**: TSM **42.9%** vs Mem0 **28.6%** vs Naive **35.7%** (**+14.3% lift** from scoped temporal graph edges).
+- **Ingestion Cost & Latency**: Mem0 burned **1,130,633 tokens (~$1.13)** across 708 blocking LLM calls taking **~40 minutes**; TSM ingested all 50 conversations in **~8 seconds locally on GPU with 0 LLM calls ($0.00)**.

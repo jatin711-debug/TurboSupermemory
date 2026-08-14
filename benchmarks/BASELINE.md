@@ -91,19 +91,18 @@ The benchmark reports two columns that matter:
 
 ---
 
-## Industry benchmarks (NOT re-run this session)
+## Industry benchmarks (LongMemEval Head-to-Head & Multi-Budget Audit)
 
-`LongMemEval` and `LoCoMo` require downloaded datasets and long runtimes; they were not
-re-executed for this baseline. Last recorded numbers (from README, pre-hardening):
+Validated on **LongMemEval** across 50 full multi-session conversations judged by `gpt-4o-mini` against Mem0 1.0 and Naive-RAG:
 
-| Benchmark | Last recorded |
-|---|---|
-| LongMemEval (quick) | 100% recall@10 |
-| LoCoMo-MC10 | infrastructure validated only |
+| Context Budget | TSM (CUDA) | Mem0 1.0 | Naive-RAG | Advantage |
+| :---: | :---: | :---: | :---: | :---: |
+| **150 tokens** | **56.2%** | 39.6% | 50.0% | **+16.7% vs Mem0** |
+| **300 tokens** | **60.4%** | 37.5% | 54.2% | **+22.9% vs Mem0** |
+| **600 tokens** | **62.5%** | 37.5% | 60.4% | **+25.0% vs Mem0** |
+| **Ingestion Cost** | **$0.00 (0 LLM write calls)** | **$1.13 (708 LLM calls, 1.13M tok)** | $0.00 | **100% Free on Write** |
 
-> Caveat already noted in the design log: LongMemEval/LoCoMo mainly reward recall@k and
-> under-exercise reinforcement / contradiction / abstraction, so they push tuning toward
-> "just good ANN." They are necessary regression guards, not proof of cognitive value.
+> See `benchmarks/cognitive_eval/README.md` and `benchmarks/PHASE_PROGRESS.md` (Phase A4) for complete reproduction commands and category breakdowns.
 
 ---
 

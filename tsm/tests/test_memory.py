@@ -316,5 +316,52 @@ class TestMmrBudgetRecall(MemoryTestBase):
         self.assertTrue(all({"id", "text", "score"} == set(r) for r in results))
 
 
+class TestGistBeforeEvict(MemoryTestBase):
+    def test_eviction_victims_become_searchable_gists(self):
+        captured = []
+
+        def summarizer(texts):
+            captured.append(list(texts))
+            return " ; ".join(texts)
+
+        mem = self.make_memory(gist_summarizer=summarizer, max_records=2)
+        facts = [
+            "alice adopted a beagle named rex",
+            "bob bakes sourdough every morning",
+            "carol moved to lisbon in spring",
+            "dave runs marathons twice yearly",
+        ]
+        mem.add([{"role": "user", "content": f + "."} for f in facts], user_id="alice")
+
+        evicted = mem.engine.evict()
+        self.assertEqual(evicted, 2, "max_records=2 over 4 facts evicts exactly 2")
+        # 2 survivors + 1 gist record.
+        self.assertEqual(mem.engine.record_count(), 3)
+        # The summarizer saw exactly the two victim texts, in one chunk.
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(len(captured[0]), 2)
+        self.assertTrue(all(any(t in f for f in facts) for t in captured[0]))
+
+        # The gist is retrievable through the scoped recall path, and its text
+        # renders via the engine fallback (this process never minted its id).
+        results = mem.recall("beagle rex", user_id="alice", top_k=5)
+        gists = [r for r in results if r["id"].startswith("gist:")]
+        self.assertTrue(gists, f"no gist record in recall results: {results}")
+        self.assertTrue(gists[0]["text"], "gist text did not render")
+        self.assertIn(" ; ", gists[0]["text"])
+
+    def test_gist_disabled_without_summarizer(self):
+        mem = self.make_memory(max_records=2)
+        mem.add(
+            [{"role": "user", "content": f"fact number {i} about topic {i}."} for i in range(4)],
+            user_id="alice",
+        )
+        evicted = mem.engine.evict()
+        self.assertEqual(evicted, 2)
+        self.assertEqual(mem.engine.record_count(), 2)
+        results = mem.recall("fact topic", user_id="alice", top_k=10)
+        self.assertFalse(any(r["id"].startswith("gist:") for r in results))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
