@@ -25,7 +25,7 @@ TSM pairs a fast, tiered HNSW vector index with a **cognitive retrieval graph** 
 
 At the heart of TSM is the **Cognitive Score Fusion Formula**, which fuses exact vector spatial similarity with topological graph diffusion and temporal state resolution at query time:
 
-$$\text{Final Score}(M) = \Big[ \underbrace{\text{CosineSimilarity}(Q, M)}_{\text{Semantic Vector Floor}} + \underbrace{(1 - \alpha_{\text{cognitive}}) \cdot \sigma(\Delta_{\text{graph}}(M))}_{\text{Cognitive Graph Boost}} \Big] \cdot \underbrace{\Big(1 + \lambda_{\text{recency}} \cdot \frac{\text{seq}(M)}{\text{max\_seq}}\Big)}_{\text{Temporal Recency Multiplier}} \cdot \underbrace{D(M)}_{\text{Truth Demotion}}$$
+$$\text{Final Score}(M) = \Big[ \underbrace{\text{CosineSimilarity}(Q, M)}_{\text{Semantic Vector Floor}} + \underbrace{(1 - \alpha_{\text{cognitive}}) \cdot \sigma(\Delta_{\text{graph}}(M))}_{\text{Cognitive Graph Boost}} \Big] \cdot \underbrace{\Big(1 + \lambda_{\text{recency}} \cdot \frac{\text{seq}(M)}{\text{seq}_{\max}}\Big)}_{\text{Temporal Recency Multiplier}} \cdot \underbrace{D(M)}_{\text{Truth Demotion}}$$
 
 - **Semantic Vector Floor**: Guarantees that high-similarity nearest neighbors are never dropped just because a node lacks graph connections.
 - **Cognitive Graph Boost**: Injects Hill-saturated ($\sigma(x) = \frac{x}{1+x}$) spreading activation across multi-hop concept and entity relations.
