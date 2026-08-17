@@ -66,9 +66,14 @@ impl Metric for EuclideanMetric {
 }
 
 /// Dot product with runtime SIMD dispatch.
+///
+/// # Panics
+/// Panics if `a` and `b` have different lengths — the SIMD kernels index
+/// both slices without bounds checks, so a mismatch would be UB, not a
+/// wrong answer. Callers must validate dimensions upstream.
 #[inline]
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), b.len(), "dot_product: slice length mismatch");
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
@@ -89,9 +94,12 @@ pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Squared L2 distance with runtime SIMD dispatch.
+///
+/// # Panics
+/// Panics on length mismatch (see [`dot_product`]).
 #[inline]
 pub fn l2_distance_sq(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), b.len(), "l2_distance_sq: slice length mismatch");
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
@@ -109,9 +117,12 @@ pub fn l2_distance_sq(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Dot product plus per-vector squared norms, used by cosine similarity.
+///
+/// # Panics
+/// Panics on length mismatch (see [`dot_product`]).
 #[inline]
 pub fn dot_and_norms(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
-    debug_assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), b.len(), "dot_and_norms: slice length mismatch");
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
@@ -193,6 +204,10 @@ fn finalize_cosine(dot: f32, norm_sq_a: f32, norm_sq_b: f32) -> f32 {
 /// Returns `[(dot, ||v||^2); 4]`.  All five slices must have the same length.
 #[inline]
 fn dot_and_nb_x4(q: &[f32], v0: &[f32], v1: &[f32], v2: &[f32], v3: &[f32]) -> [(f32, f32); 4] {
+    assert!(
+        v0.len() == q.len() && v1.len() == q.len() && v2.len() == q.len() && v3.len() == q.len(),
+        "dot_and_nb_x4: slice length mismatch"
+    );
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
@@ -432,6 +447,7 @@ mod x86 {
     }
 
     #[inline]
+    #[target_feature(enable = "avx2,fma")]
     unsafe fn hsum256(v: __m256) -> f32 {
         let mut tmp = [0.0f32; 8];
         _mm256_storeu_ps(tmp.as_mut_ptr(), v);
@@ -500,6 +516,7 @@ mod x86 {
     }
 
     #[inline]
+    #[target_feature(enable = "sse")]
     unsafe fn hsum128(v: __m128) -> f32 {
         let mut tmp = [0.0f32; 4];
         _mm_storeu_ps(tmp.as_mut_ptr(), v);

@@ -50,7 +50,7 @@ make api-server
 
 - For local iteration, run the narrow crate/test first, then format check, clippy, and the Rust suite.
 - For storage-engine or cognitive-layer changes, finish with `make gate`; use `make gate GATE_ARGS=--quick` only for a faster, noisier pass. The gate rebuilds the extension and runs formatting, clippy, Rust tests, synthetic belief checks, a role-filtered LongMemEval smoke test, and an ANN recall floor.
-- `make gate` must run under Python 3.12 and expects the checked-in LongMemEval data plus a locally cached embedding model to be usable offline (`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`).
+- `make gate` must run under Python 3.12 and expects the LongMemEval data (download it with `make download-eval-data` — the datasets are too large to check in, so a fresh clone has none until downloaded) plus a locally cached embedding model to be usable offline (`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`).
 - Full cognitive evaluations and performance benchmarks are expensive and are not substitutes for the regression gate. Their runners and prerequisites are documented in `benchmarks/cognitive_eval/README.md` and `setup.sh`.
 - There is no CI workflow in this repository; local verification is the merge gate.
 

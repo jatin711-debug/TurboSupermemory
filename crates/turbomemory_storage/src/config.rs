@@ -373,6 +373,11 @@ pub struct TierConfig {
     /// Number of evicted texts per gist-compressor call (per scope chunk).
     /// Default 24. Clamped to >= 1 at eviction time.
     pub gist_chunk_facts: usize,
+    /// Dynamic temporal recency weight (0.0 to 1.0) applied during cognitive search.
+    /// When > 0.0, newer memories are boosted over older memories sharing
+    /// similar semantic relevance, resolving stale knowledge update conflicts.
+    /// Default 0.0 (disabled, pure semantic + graph boost).
+    pub temporal_recency_weight: f32,
 }
 
 impl TierConfig {
@@ -471,6 +476,7 @@ impl TierConfig {
         // Gist-before-evict: opt-in; default drops eviction victims outright.
         gist_before_evict: false,
         gist_chunk_facts: 24,
+        temporal_recency_weight: 0.0,
     };
 
     /// Recommended thresholds for a given vector dimension.

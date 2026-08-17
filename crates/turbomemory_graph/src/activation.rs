@@ -103,6 +103,19 @@ impl SpreadingActivation {
         self.bm25.add(id, text);
     }
 
+    /// Add concept edges to an existing memory — and nothing else. Belief
+    /// revision uses this instead of the full insert path, which would
+    /// duplicate edges, recount co-occurrence, and move the temporal head.
+    /// See [`MemoryGraph::add_concepts_to_memory`].
+    pub fn add_concepts_to_memory(
+        &mut self,
+        id: &str,
+        concepts: &[String],
+        importance: f32,
+    ) -> bool {
+        self.graph.add_concepts_to_memory(id, concepts, importance)
+    }
+
     pub fn remove_memory(&mut self, id: &str) {
         self.graph.remove_memory(id);
         self.bm25.remove(id);

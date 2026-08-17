@@ -41,6 +41,7 @@ def setup_environment():
         print(f"Error: Could not find {lib_filename}")
         sys.exit(1)
     shutil.copy(resolved, pyd_path)
+    sys.path.insert(0, project_root)
 
 setup_environment()
 import turbomemory

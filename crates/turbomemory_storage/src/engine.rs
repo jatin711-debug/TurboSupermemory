@@ -90,6 +90,14 @@ pub struct StorageEngine {
     scope_index: Arc<RwLock<ScopeIndex>>,
     text_index: Arc<TextIndex>,
     wal: Arc<Mutex<Wal>>,
+    /// Serializes `flush()` against in-flight writes. WAL-writing ops
+    /// (insert / batch insert / delete) hold a read guard across
+    /// `seq allocate → vectors.put → wal.append → meta apply`; `flush()`
+    /// holds the write guard for its whole body, so its
+    /// `{snapshot meta → wal.clear()}` sequence can never interleave with a
+    /// write whose WAL entry it is about to truncate (which would silently
+    /// drop the record on restart).
+    flush_barrier: Arc<RwLock<()>>,
     optimizer: Arc<BackgroundOptimizer>,
     update_worker: Arc<UpdateWorker>,
     access_counters: Arc<AccessCounters>,
@@ -121,6 +129,7 @@ impl Clone for StorageEngine {
             scope_index: self.scope_index.clone(),
             text_index: self.text_index.clone(),
             wal: self.wal.clone(),
+            flush_barrier: self.flush_barrier.clone(),
             optimizer: self.optimizer.clone(),
             update_worker: self.update_worker.clone(),
             access_counters: self.access_counters.clone(),
@@ -378,6 +387,7 @@ impl StorageEngine {
                 scope_index,
                 text_index,
                 wal: Arc::new(Mutex::new(wal)),
+                flush_barrier: Arc::new(RwLock::new(())),
                 optimizer: Arc::new(optimizer),
                 update_worker: Arc::new(update_worker),
                 access_counters,
@@ -448,7 +458,16 @@ impl StorageEngine {
         scope: Option<String>,
         source_role: Option<String>,
     ) -> crate::Result<bool> {
+        // Held across seq allocation → vectors.put → wal.append → meta apply
+        // so a concurrent flush cannot truncate this record's WAL entry
+        // before it reaches the redb snapshot.
+        let _flush_guard = self.flush_barrier.read();
         validate_dimension(embedding, self.config.dimension)?;
+        if !importance.is_finite() {
+            return Err(StorageError::InvalidArgument(
+                "importance_score must be finite".into(),
+            ));
+        }
         if self.id_index.read().contains_key(id) {
             return Err(StorageError::DuplicateId(id.to_string()));
         }
@@ -545,6 +564,9 @@ impl StorageEngine {
         scopes: &[Option<String>],
         source_roles: &[Option<String>],
     ) -> crate::Result<usize> {
+        // See `insert_with_payload_role`: hold off flush for the whole
+        // allocate → put → append → apply sequence.
+        let _flush_guard = self.flush_barrier.read();
         let n = ids.len();
         if n == 0 {
             return Ok(0);
@@ -563,6 +585,11 @@ impl StorageEngine {
         }
         for &emb in embeddings {
             validate_dimension(emb, self.config.dimension)?;
+        }
+        if importances.iter().any(|i| !i.is_finite()) {
+            return Err(StorageError::InvalidArgument(
+                "importance scores must be finite".into(),
+            ));
         }
 
         // Idempotent batch insert: skip existing ids and duplicate ids within the
@@ -666,6 +693,9 @@ impl StorageEngine {
     /// disappear from results immediately.  Physical reclamation is deferred to
     /// the vacuum optimizer.
     pub fn delete_by_id(&self, id: &str) -> crate::Result<bool> {
+        // Same flush barrier as inserts: the WAL delete entry and the
+        // metadata removal must not straddle a flush's snapshot + truncate.
+        let _flush_guard = self.flush_barrier.read();
         let offset = {
             let idx = self.id_index.read();
             match idx.get(id).copied() {
@@ -1144,6 +1174,16 @@ impl StorageEngine {
         }
 
         let alpha = self.config.cognitive_alpha.clamp(0.0, 1.0);
+        let temporal_recency_weight = self.config.tier.temporal_recency_weight.clamp(0.0, 2.0);
+        let max_seq = if temporal_recency_weight > 0.0 {
+            results
+                .iter()
+                .filter_map(|(id, _)| self.find_meta_by_id(id).map(|m| m.insert_seq))
+                .max()
+                .unwrap_or(1)
+        } else {
+            1
+        };
 
         let mut hydrated: Vec<(String, f32)> = results
             .into_iter()
@@ -1152,22 +1192,20 @@ impl StorageEngine {
                     let cos = cosine_similarity(query_embedding, rec.embedding_f32());
                     // Absolute, saturating graph boost: `act / (1 + act)` depends
                     // on the candidate's OWN graph signal, not the result-set
-                    // maximum. This lets a cosine-far but graph-reached memory
-                    // (e.g. an abstraction target) surface on its own delta, and
-                    // stops a weak incidental signal (e.g. a temporal successor on
-                    // an empty query) from being inflated to full strength just
-                    // because every delta in the set is small.
-                    //   final = cos + (1 - alpha) * act/(1+act)
-                    // At alpha = 1.0 ranking is pure cosine (graph only decides
-                    // which candidates exist); lower alpha gives the graph a vote.
+                    // maximum.
                     let graph_boost = (1.0 - alpha) * (act / (1.0 + act));
-                    let fused = cos + graph_boost;
+                    let base_fused = cos + graph_boost;
+
+                    let recency_boost = if temporal_recency_weight > 0.0 && max_seq > 0 {
+                        let seq = self.find_meta_by_id(&id).map(|m| m.insert_seq).unwrap_or(0);
+                        1.0 + temporal_recency_weight * (seq as f32 / max_seq as f32)
+                    } else {
+                        1.0
+                    };
+                    let fused = base_fused * recency_boost;
+
                     // Supersession demotion: a memory superseded by a newer one
-                    // (Contradicts/Refines edge created during consolidation)
-                    // carries a persisted factor < 1.0. Applying it
-                    // multiplicatively to the final score demotes the stale
-                    // belief even at alpha = 1.0, where the additive graph
-                    // boost has no effect. Default 1.0 (no demotion).
+                    // carries a persisted factor < 1.0.
                     let demotion = self
                         .id_index
                         .read()
@@ -1253,8 +1291,11 @@ impl StorageEngine {
             }
             for (id, _) in &hydrated {
                 self.bump_access_by_id(id);
-                self.reinforce_graph_by_id(id);
             }
+            // One graph write lock for the whole batch of hits (rehearsal),
+            // not one per hit.
+            let hit_ids: Vec<&str> = hydrated.iter().map(|(id, _)| id.as_str()).collect();
+            self.reinforce_graph_ids(&hit_ids);
             Ok(Some(hydrated))
         } else {
             Ok(None)
@@ -1338,8 +1379,11 @@ impl StorageEngine {
             }
             for (id, _) in &hydrated {
                 self.bump_access_by_id(id);
-                self.reinforce_graph_by_id(id);
             }
+            // One graph write lock for the whole batch of hits (rehearsal),
+            // not one per hit.
+            let hit_ids: Vec<&str> = hydrated.iter().map(|(id, _)| id.as_str()).collect();
+            self.reinforce_graph_ids(&hit_ids);
             Ok(Some(hydrated))
         } else {
             Ok(None)
@@ -1406,6 +1450,14 @@ impl StorageEngine {
             .and_then(|offset| self.get_record(offset))
     }
 
+    /// Look up metadata for a record by its caller-supplied id (without embedding).
+    pub fn find_meta_by_id(&self, id: &str) -> Option<MetaRecord> {
+        let idx = self.id_index.read();
+        idx.get(id)
+            .copied()
+            .and_then(|offset| self.meta.get(offset).ok().flatten())
+    }
+
     /// Bump the access score for the record with the given offset.
     ///
     /// Writes go to the fast in-memory `AccessCounters` instead of the metadata
@@ -1427,9 +1479,18 @@ impl StorageEngine {
     /// so that frequently-recalled memories get stronger graph links over
     /// time. This is the "retain what matters" learning loop: retrieval
     /// itself is the signal that a memory was useful.
-    fn reinforce_graph_by_id(&self, id: &str) {
+    fn reinforce_graph_ids(&self, ids: &[&str]) {
+        if ids.is_empty() {
+            return;
+        }
+        // One write lock for the whole batch instead of one per hit: a
+        // cognitive search previously serialized against every other search
+        // and against consolidation top_k times.
+        let now = now_secs();
         let mut graph = self.graph.write();
-        graph.reinforce(id, now_secs());
+        for id in ids {
+            graph.reinforce(id, now);
+        }
     }
 
     pub fn step_session(
@@ -1475,7 +1536,7 @@ impl StorageEngine {
     }
 
     fn save_graph(&self) -> crate::Result<()> {
-        let bytes = self.graph.read().graph().to_snapshot_bytes();
+        let bytes = self.graph.read().graph().to_snapshot_bytes()?;
         self.meta.save_meta_bytes("graph", &bytes)?;
         // Reclaim the legacy JSON snapshot (pre-binary databases) once the
         // binary snapshot is durable. No-op when already gone.
@@ -2200,13 +2261,10 @@ impl StorageEngine {
         )?;
         let mut graph = self.graph.write();
         if let Some(r) = self.find_record_by_id(new_id) {
-            graph.add_memory_scoped(
-                new_id,
-                &r.text,
-                &r.concepts,
-                r.importance,
-                r.scope.as_deref(),
-            );
+            // Not add_memory_scoped: the memory node already exists, and the
+            // full insert path would duplicate its existing edges, recount
+            // co-occurrence, and re-point the temporal chain head.
+            graph.add_concepts_to_memory(new_id, &r.concepts, r.importance);
         }
         Ok(())
     }
@@ -2598,10 +2656,18 @@ impl StorageEngine {
     }
 
     pub fn flush(&self) -> crate::Result<()> {
+        // Exclusive flush barrier: wait for in-flight writes to finish and
+        // hold off new ones until the snapshot is durable and the WAL is
+        // truncated. Without this, an insert racing steps 4–7 could have its
+        // WAL entry cleared without ever reaching the redb snapshot — silent
+        // record loss on restart.
+        let _flush_guard = self.flush_barrier.write();
+
         // 1. Build any pending plain segments so the durable snapshot captures
         //    them as persisted HNSW / quantized segments rather than in-memory
-        //    plain indexes.
-        while self.optimizer.process_one_seal(self).unwrap_or(false) {}
+        //    plain indexes. Seal failures propagate: swallowing them here
+        //    would masquerade as "no more seals" and skip needed work.
+        while self.optimizer.process_one_seal(self)? {}
 
         // 2. Drain access counters into the metadata cache before snapshotting it.
         self.access_counters.drain_into(&self.meta)?;

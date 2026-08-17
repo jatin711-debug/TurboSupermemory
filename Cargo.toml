@@ -45,7 +45,7 @@ tonic = "0.12"
 prost = "0.13"
 axum = "0.7"
 # GPU support
-cudarc = { version = "0.19", features = ["cuda-12080"] }
+cudarc = { version = "0.19", features = ["cuda-12080", "nvrtc", "cublas", "cusparse"] }
 fastrand = "2"
 
 [profile.release]

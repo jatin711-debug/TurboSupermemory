@@ -159,9 +159,24 @@ impl ApiAuth {
             Self::Disabled => true,
             Self::Required(key) => header
                 .and_then(|h| h.strip_prefix("Bearer "))
-                .is_some_and(|token| token == key.as_ref()),
+                .is_some_and(|token| constant_time_eq(token.as_bytes(), key.as_bytes())),
         }
     }
+}
+
+/// Compare the bearer token against the configured key without
+/// data-dependent branching — a short-circuiting `==` would leak the length
+/// of the correct prefix through timing. Length mismatch is an early-out
+/// (same behavior as `subtle::ConstantTimeEq` for slices).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Shared memory service.
@@ -262,10 +277,17 @@ pub fn pb_filter_to_storage(
     filter: Option<&super::pb::Filter>,
 ) -> Result<Option<StorageFilter>, ApiError> {
     let Some(f) = filter else { return Ok(None) };
-    Ok(Some(convert_pb_filter(f)?))
+    Ok(Some(convert_pb_filter(f, 0)?))
 }
 
-fn convert_pb_filter(filter: &super::pb::Filter) -> Result<StorageFilter, ApiError> {
+fn convert_pb_filter(filter: &super::pb::Filter, depth: usize) -> Result<StorageFilter, ApiError> {
+    // Same nesting cap as the JSON path — prost's decode-time recursion
+    // limit is implicit and differently sized, so enforce ours explicitly.
+    if depth >= MAX_FILTER_DEPTH {
+        return Err(ApiError::InvalidFilter(format!(
+            "filter nesting exceeds the maximum depth of {MAX_FILTER_DEPTH}"
+        )));
+    }
     use super::pb::filter::Kind;
     let kind = filter
         .kind
@@ -308,16 +330,16 @@ fn convert_pb_filter(filter: &super::pb::Filter) -> Result<StorageFilter, ApiErr
         Kind::And(list) => StorageFilter::And(
             list.filters
                 .iter()
-                .map(convert_pb_filter)
+                .map(|f| convert_pb_filter(f, depth + 1))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
         Kind::Or(list) => StorageFilter::Or(
             list.filters
                 .iter()
-                .map(convert_pb_filter)
+                .map(|f| convert_pb_filter(f, depth + 1))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
-        Kind::Not(inner) => StorageFilter::Not(Box::new(convert_pb_filter(inner)?)),
+        Kind::Not(inner) => StorageFilter::Not(Box::new(convert_pb_filter(inner, depth + 1)?)),
     })
 }
 
@@ -483,6 +505,35 @@ mod tests {
         assert!(json_filter_to_storage(serde_json::Value::Null)
             .unwrap()
             .is_none());
+    }
+
+    fn nested_not_pb_filter(depth: usize) -> crate::pb::Filter {
+        let mut filter = crate::pb::Filter {
+            kind: Some(crate::pb::filter::Kind::Eq(crate::pb::EqFilter {
+                field: "f".into(),
+                value_json: "1".into(),
+            })),
+        };
+        for _ in 0..depth {
+            filter = crate::pb::Filter {
+                kind: Some(crate::pb::filter::Kind::Not(Box::new(filter))),
+            };
+        }
+        filter
+    }
+
+    #[test]
+    fn pb_filter_at_depth_limit_parses() {
+        let filter = nested_not_pb_filter(MAX_FILTER_DEPTH - 1);
+        assert!(pb_filter_to_storage(Some(&filter)).unwrap().is_some());
+    }
+
+    #[test]
+    fn pb_filter_beyond_depth_limit_rejected() {
+        let filter = nested_not_pb_filter(MAX_FILTER_DEPTH);
+        let err = pb_filter_to_storage(Some(&filter)).unwrap_err();
+        assert!(matches!(err, ApiError::InvalidFilter(_)));
+        assert!(err.to_string().contains("depth"));
     }
 
     #[test]
@@ -660,5 +711,25 @@ mod tests {
         assert!(!auth.is_authorized(Some("Bearer s3cret extra")));
         assert!(!auth.is_authorized(Some("s3cret")));
         assert!(!auth.is_authorized(Some("bearer s3cret")));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_identical_inputs() {
+        assert!(constant_time_eq(b"s3cret", b"s3cret"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"s3cret", b"s3crex"));
+        assert!(!constant_time_eq(b"s3cret", b"s3cre"));
+        assert!(!constant_time_eq(b"s3cret", b"s3crets"));
+        assert!(!constant_time_eq(b"", b"x"));
+    }
+
+    #[test]
+    fn api_auth_rejects_prefix_and_suffix_near_misses() {
+        // Tokens that share a long prefix/suffix with the key must still fail:
+        // the comparison has no data-dependent early exit to exploit.
+        let auth = ApiAuth::new(Some("s3cret".into()));
+        assert!(!auth.is_authorized(Some("Bearer s3cre")));
+        assert!(!auth.is_authorized(Some("Bearer 3cret")));
+        assert!(!auth.is_authorized(Some("Bearer s3creu")));
     }
 }

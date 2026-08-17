@@ -24,10 +24,22 @@ ENV/
 /ResearchPapers/
 
 # --- Benchmark Results ---
+# NOTE: no blanket `*.json` rule — it silently swallowed legitimate config
+# and made the eval data look "checked in" when nothing was. Generated
+# outputs and downloaded datasets are ignored by directory instead.
 /results/
-*.json
+/bench_results/
 *.csv
 *.parquet
+# Downloaded eval datasets are large (LoCoMo alone is ~240MB). Fetch them
+# with `make download-eval-data`; never commit them.
+benchmarks/cognitive_eval/data/
+# Generated benchmark outputs (result JSON, predicted answers, scratch DBs).
+benchmarks/**/results/
+benchmarks/memory_benchmarks/datasets/
+mem0_eval_db/
+# Machine-local client settings.
+.claude/settings.local.json
 
 # --- Cloud/Temp ---
 *.log
@@ -37,6 +49,7 @@ ENV/
 # --- IDEs / Editors ---
 .vscode/
 .idea/
+.zcode/
 *.swp
 *.swo
 
@@ -56,6 +69,8 @@ vespa
 faiss
 ResearchPapers
 bench_results
+.env
+.env.*
 openai_key.txt
 .openai_key
 kimi_key.txt

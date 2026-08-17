@@ -126,12 +126,13 @@ class Memory:
     texts are known in this process. Persist your own mapping if you need
     cross-process verified consolidation.
 
-    Scope guard: the engine's exact-scan path treats an EMPTY scope bitmap
-    (a scope with no records yet) as "unfiltered" and would leak other
-    scopes' memories. ``recall`` therefore also drops hits whose scope is
-    known in this process and does not match ``user_id``. Scope knowledge is
-    in-memory only, like the text map, so the guard is exact for memories
-    added by this process and defers to the engine for pre-existing ones.
+    Scope guard: `recall` drops hits whose scope is known in this process
+    and does not match `user_id`. This is belt-and-suspenders — the engine
+    itself fixed the historical empty-scope-bitmap leak (an empty scope
+    bitmap used to be treated as "unfiltered"; it now matches nothing, with
+    a regression test in the storage crate). Scope knowledge is in-memory
+    only, like the text map, so the guard is exact for memories added by
+    this process and defers to the engine for pre-existing ones.
     """
 
     def __init__(

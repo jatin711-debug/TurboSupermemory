@@ -314,8 +314,9 @@ class TSMAdapter:
         logger.info("TSM engine initialized (cognitive=%s, belief_revision=%s)",
                     cognitive_features, belief_revision)
         
-        # Counter for unique IDs
+        # Counter for unique IDs and global cumulative turn tracking
         self._insert_counter = 0
+        self._global_turn_offset = 0
     
     def _extract_concepts(self, text: str) -> List[str]:
         """Extract meaningful concepts from text for graph building.
@@ -381,7 +382,7 @@ class TSMAdapter:
         import time
         total_start = time.perf_counter()
         
-        # Normalize messages to dicts
+        # Normalize messages to dicts with global cumulative turn indexing
         msg_dicts = []
         for msg_idx, msg in enumerate(messages):
             if hasattr(msg, 'content'):
@@ -389,13 +390,14 @@ class TSMAdapter:
                     'content': msg.content,
                     'role': getattr(msg, 'role', 'user'),
                     'timestamp': getattr(msg, 'timestamp', ''),
-                    'turn_index': getattr(msg, 'turn_index', msg_idx),
+                    'turn_index': getattr(msg, 'turn_index', self._global_turn_offset + msg_idx),
                 })
             else:
                 d = dict(msg)
                 if 'turn_index' not in d:
-                    d['turn_index'] = msg_idx
+                    d['turn_index'] = self._global_turn_offset + msg_idx
                 msg_dicts.append(d)
+        self._global_turn_offset += len(msg_dicts)
         
         # Extract all facts first
         extract_start = time.perf_counter()
@@ -582,7 +584,7 @@ class TSMAdapter:
 
             if self.supersession_mode == "tag" and mid in superseded:
                 text = "[OUTDATED] " + text
-            out.append({"id": mid, "score": float(r[1]), "text": text})
+            out.append({"id": mid, "score": float(r[1]), "text": text, "turn_index": turn_idx, "timestamp": ts})
             if len(out) >= top_k:
                 break
         return out

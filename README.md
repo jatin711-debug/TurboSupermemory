@@ -3,7 +3,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-75%20passing-brightgreen.svg)](#validation)
+[![Tests](https://img.shields.io/badge/tests-245%20passing-brightgreen.svg)](#validation)
 
 **A memory engine for AI agents — written in Rust, embeddable from Python.**
 
@@ -204,7 +204,7 @@ make build-api       # builds the gRPC + REST server binary
 |---|---|
 | `cargo fmt --all --check` | clean |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean (both cuda and non-cuda) |
-| `cargo test --workspace --exclude turbomemory_python` | **75 passed / 0 failed** |
+| `cargo test --workspace --exclude turbomemory_python` | **245 passed / 0 failed** |
 | `python benchmarks/verify.py` (E2E) | all pass (7/7 steps) |
 | `python benchmarks/test_batch_search.py` | 0 mismatches batch vs single-query |
 | `python benchmarks/cognitive_benchmark.py` | **3/4 cognitive scenarios won** (abstraction-at-scale: known open limitation) |
@@ -241,7 +241,7 @@ python benchmarks/cognitive_eval/head_to_head_eval.py --limit 50 --systems tsm,m
 
 See [benchmarks/cognitive_eval/README.md](benchmarks/cognitive_eval/README.md) for detailed methodology, cost analysis, and evaluation rubrics.
 
-Test breakdown: core 29 · graph 65 · storage 68 · crash-recovery 3.
+Test breakdown: core 29 · graph 85 · storage 101 · crash-recovery 4 · api 26.
 
 ---
 

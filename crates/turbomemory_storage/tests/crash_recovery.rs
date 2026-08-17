@@ -166,3 +166,52 @@ fn reopen_tolerates_truncated_wal_record() {
     // The last, partially-written record should be skipped.
     assert_eq!(engine.record_count(), n - 1);
 }
+
+#[test]
+fn flush_concurrent_with_inserts_loses_no_records() {
+    // Regression: flush() used to snapshot metadata and truncate the WAL
+    // without excluding in-flight inserts. An insert whose WAL entry was
+    // appended just before `wal.clear()` but whose metadata landed after the
+    // snapshot would lose both — silent record loss on reopen. The flush
+    // barrier now serializes the two.
+    let tmp = tempfile::tempdir().unwrap();
+    let dim = 32;
+    let writers = 4;
+    let per_writer = 150;
+
+    {
+        let engine = StorageEngine::open(tmp.path(), test_config(dim, 10_000, 100_000)).unwrap();
+        let mut handles = Vec::new();
+        for w in 0..writers {
+            let engine = engine.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..per_writer {
+                    let v = random_vec(dim, w * per_writer + i);
+                    engine
+                        .insert(&format!("w{w}_mem_{i}"), &format!("text {i}"), &v, 1.0, &[])
+                        .unwrap();
+                }
+            }));
+        }
+        // Hammer flush while the writers are active; each flush snapshots
+        // metadata and truncates the WAL.
+        for _ in 0..50 {
+            engine.flush().unwrap();
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        engine.flush().unwrap();
+    }
+
+    let engine = StorageEngine::open(tmp.path(), test_config(dim, 10_000, 100_000)).unwrap();
+    assert_eq!(engine.record_count(), writers * per_writer);
+    for w in 0..writers {
+        for i in 0..per_writer {
+            assert!(
+                engine.contains_id(&format!("w{w}_mem_{i}")),
+                "lost record w{w}_mem_{i}"
+            );
+        }
+    }
+}

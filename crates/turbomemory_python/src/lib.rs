@@ -20,6 +20,14 @@ fn storage_err(e: turbomemory_storage::StorageError) -> PyErr {
         E::DuplicateId(_) | E::DimensionMismatch | E::InvalidArgument(_) => {
             PyValueError::new_err(e.to_string())
         }
+        // Caller errors that arrive wrapped in the core error type get the
+        // same ValueError treatment as their storage-level equivalents — the
+        // API crate already classifies these as 400 / InvalidArgument.
+        E::Core(
+            turbomemory_core::TurboError::DimensionMismatch { .. }
+            | turbomemory_core::TurboError::InvalidArgument(_)
+            | turbomemory_core::TurboError::ZeroNorm,
+        ) => PyValueError::new_err(e.to_string()),
         E::NotFound(_) => PyKeyError::new_err(e.to_string()),
         _ => PyRuntimeError::new_err(e.to_string()),
     }
@@ -259,7 +267,8 @@ impl PyMemoryEngine {
         gist_chunk_facts=None,
         seed_hops_from=None,
         expansion_max_candidates=None,
-        concept_expansion=None
+        concept_expansion=None,
+        temporal_recency_weight=None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -323,6 +332,7 @@ impl PyMemoryEngine {
         seed_hops_from: Option<usize>,
         expansion_max_candidates: Option<usize>,
         concept_expansion: Option<bool>,
+        temporal_recency_weight: Option<f32>,
     ) -> PyResult<Self> {
         let mut config = StoreConfig::default_for_dimension(dimension);
         if let Some(me) = max_edges {
@@ -594,6 +604,9 @@ impl PyMemoryEngine {
         }
         if let Some(n) = gist_chunk_facts {
             config.tier.gist_chunk_facts = n;
+        }
+        if let Some(trw) = temporal_recency_weight {
+            config.tier.temporal_recency_weight = trw.clamp(0.0, 2.0);
         }
 
         let inner = StorageEngine::open(db_path, config).map_err(storage_err)?;

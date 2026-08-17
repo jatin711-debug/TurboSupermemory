@@ -92,6 +92,14 @@ def _gate_summary(text):
     return None
 
 
+def _eval_data_present():
+    """The eval datasets are downloaded, not checked in (see .gitignore)."""
+    data = COG / "data"
+    return any(data.glob("longmemeval/*.parquet")) or (
+        data / "test_longmemeval.json"
+    ).exists() or (data / "locomo" / "locomo_mc10.json").exists()
+
+
 def check_synthetic_belief():
     for mode in ("refinement", "contradiction"):
         t = time.time()
@@ -159,6 +167,14 @@ def main():
     print("=" * 78)
     print("TurboSuperMemory regression gate (W2)")
     print("=" * 78)
+
+    if not args.no_evals and not _eval_data_present():
+        # The datasets are not checked in (LoCoMo alone is ~240MB); fail fast
+        # with the download command instead of a confusing downstream error.
+        _record("eval data present", False,
+                "LongMemEval/LoCoMo data not found — run `make download-eval-data` "
+                "first (or `--no-evals` for the Rust checks only)")
+        return
 
     if not args.no_rust:
         check_cmd("cargo fmt --check", ["cargo", "fmt", "--all", "--", "--check"])

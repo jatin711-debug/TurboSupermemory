@@ -114,7 +114,10 @@ pub enum ConceptKind {
 }
 
 fn importance_factor(importance: f32) -> f32 {
-    if importance <= 0.0 {
+    // Non-finite importance (NaN/±inf) would poison edge weights and, via
+    // partial_cmp in sort comparators, make edge ordering non-total — which
+    // sort_by may panic on. Clamp it to the low-importance floor instead.
+    if !importance.is_finite() || importance <= 0.0 {
         0.1
     } else {
         importance.sqrt()
@@ -501,6 +504,45 @@ impl MemoryGraph {
         }
     }
 
+    /// Add concept Association edges to an existing memory — and nothing else.
+    ///
+    /// Belief revision uses this to merge an older memory's concepts into a
+    /// newer one *after both were inserted*. Calling `add_memory_scoped` for
+    /// that re-adds duplicate edges for already-linked concepts, double-counts
+    /// co-occurrence, and re-points the temporal chain head at an old memory.
+    /// Existing edges keep their weights (`ensure_int_edge` merges by max).
+    /// Returns false if the memory node does not exist.
+    pub fn add_concepts_to_memory(
+        &mut self,
+        id: &str,
+        concepts: &[String],
+        importance: f32,
+    ) -> bool {
+        let mem_key = NodeId::memory(id).as_str();
+        let Some(mem_id) = self.get_node_id(&mem_key) else {
+            return false;
+        };
+        let imp = importance_factor(importance);
+        let mut seen: HashSet<String> = HashSet::new();
+        for concept in concepts {
+            let norm = self.vocab.resolve(concept);
+            if norm.is_empty() || !seen.insert(norm.clone()) {
+                continue;
+            }
+            let concept_key = NodeId::concept(&norm).as_str();
+            let concept_id = self.intern_node(
+                concept_key,
+                NodeKind::Concept,
+                norm.clone(),
+                norm.clone(),
+                0.0,
+            );
+            self.ensure_int_edge(mem_id, concept_id, EdgeKind::Association, imp, 0);
+            self.ensure_int_edge(concept_id, mem_id, EdgeKind::Association, imp, 0);
+        }
+        true
+    }
+
     pub fn remove_memory(&mut self, id: &str) {
         let mem_key = NodeId::memory(id).as_str();
         let Some(mem_id) = self.get_node_id(&mem_key) else {
@@ -643,6 +685,10 @@ impl MemoryGraph {
         let Some(mem_id) = self.get_node_id(&mem_key) else {
             return;
         };
+        // 0 is the "never reinforced" sentinel; a real t=0 timestamp would
+        // leave edges permanently decay-exempt and forever eligible for the
+        // first-touch boost.
+        let now = now.max(1);
 
         // Strengthen outgoing edges where memory is source.
         if let Some(out_idxs) = self.int_adjacency.get(mem_id) {
@@ -685,7 +731,9 @@ impl MemoryGraph {
             let age = now.saturating_sub(edge.last_reinforced_at) as f64;
             let factor = 0.5f64.powf(age / hl) as f32;
             let decayed = edge.weight * factor;
-            edge.weight = decayed.max(1.0);
+            // Floor at 1.0, but never *raise* a weight: an edge created below
+            // the floor (low-importance baseline) must not decay upward.
+            edge.weight = decayed.max(edge.weight.min(1.0));
         }
     }
 
@@ -1042,13 +1090,16 @@ impl MemoryGraph {
         let canon_id = if let Some(&id) = self.interner.key_to_id.get(&canon_key) {
             id
         } else {
-            // Canonical does not exist; rename alias in place.
+            // Canonical does not exist; rename alias in place. The interner's
+            // reverse map must move with the key, or the node fails iter()'s
+            // key_to_id filter and is silently dropped by snapshots.
             if let Some(node) = self.interner.get_mut(alias_id) {
                 node.external_id = canonical.to_string();
                 node.text = canonical.to_string();
             }
             self.interner.key_to_id.remove(&alias_key);
             self.interner.key_to_id.insert(canon_key.clone(), alias_id);
+            self.interner.id_to_key[alias_id as usize] = canon_key.clone();
             self.vocab.add_alias(alias, canonical);
             self.suppressed_concepts.remove(alias);
             return true;
@@ -1085,8 +1136,12 @@ impl MemoryGraph {
                     } else {
                         continue;
                     };
+                    // Migrate alias -> mem to canon -> mem. Sourcing the new
+                    // edge at the alias was dead work: the retain below deletes
+                    // every edge that still touches the alias, which used to
+                    // take the concept -> memory direction with it.
                     self.ensure_int_edge(
-                        alias_id,
+                        canon_id,
                         target_id,
                         EdgeKind::Association,
                         edge.weight,
@@ -1107,7 +1162,7 @@ impl MemoryGraph {
                         continue;
                     };
                     self.ensure_int_edge(
-                        alias_id,
+                        canon_id,
                         target_id,
                         EdgeKind::Abstraction,
                         edge.weight,
@@ -1531,7 +1586,10 @@ impl MemoryGraph {
     /// written in u32-id order, edges are sorted with the
     /// [`compact`](Self::compact) comparator, and vocabulary aliases are
     /// sorted (`HashMap` iteration order is not stable).
-    pub fn to_snapshot_bytes(&self) -> Vec<u8> {
+    ///
+    /// Returns the serialization error rather than a header-only byte blob:
+    /// silently saving an empty payload would destroy the graph on next load.
+    pub fn to_snapshot_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
         // Live nodes in id order; ids are reassigned densely on load.
         let mut remap: HashMap<u32, u32> = HashMap::with_capacity(self.interner.id_to_key.len());
         let mut nodes: Vec<(String, InternalNode)> = Vec::new();
@@ -1588,12 +1646,12 @@ impl MemoryGraph {
             vocab_aliases,
             suppressed_concepts: self.suppressed_concepts.clone(),
         };
-        let payload = bincode::serialize(&snapshot).unwrap_or_default();
+        let payload = bincode::serialize(&snapshot)?;
         let mut out = Vec::with_capacity(8 + payload.len());
         out.extend_from_slice(&SNAPSHOT_MAGIC);
         out.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
         out.extend_from_slice(&payload);
-        out
+        Ok(out)
     }
 
     /// Returns true when `bytes` carries the binary snapshot magic. Anything
@@ -1934,7 +1992,7 @@ mod tests {
         g.remove_memory("m3"); // leave an interner tombstone to compact over
         g.compact();
 
-        let bytes = g.to_snapshot_bytes();
+        let bytes = g.to_snapshot_bytes().expect("binary save");
         assert!(MemoryGraph::is_snapshot_bytes(&bytes));
         let restored = MemoryGraph::from_snapshot_bytes(&bytes).expect("binary roundtrip");
 
@@ -1967,7 +2025,7 @@ mod tests {
             serde_json::to_string(&restored.edges()).unwrap()
         );
         // Determinism: re-saving the restored graph yields identical bytes.
-        assert_eq!(restored.to_snapshot_bytes(), bytes);
+        assert_eq!(restored.to_snapshot_bytes().unwrap(), bytes);
     }
 
     #[test]
@@ -1985,7 +2043,7 @@ mod tests {
 
         // Saving going forward produces a binary snapshot that reloads to the
         // same state.
-        let bytes = from_json.to_snapshot_bytes();
+        let bytes = from_json.to_snapshot_bytes().expect("binary save");
         let restored = MemoryGraph::from_snapshot_bytes(&bytes).expect("binary reload");
         assert_eq!(restored.node_count(), from_json.node_count());
         assert_eq!(restored.edge_count(), from_json.edge_count());
@@ -1996,7 +2054,7 @@ mod tests {
             serde_json::to_string(&restored.edges()).unwrap()
         );
         // The binary form is stable across further save/load cycles.
-        assert_eq!(restored.to_snapshot_bytes(), bytes);
+        assert_eq!(restored.to_snapshot_bytes().unwrap(), bytes);
     }
 
     #[test]
@@ -2015,7 +2073,7 @@ mod tests {
             );
         }
         let json_len = g.to_json().len();
-        let bin_len = g.to_snapshot_bytes().len();
+        let bin_len = g.to_snapshot_bytes().unwrap().len();
         let json_per_record = json_len as f64 / 1000.0;
         let bin_per_record = bin_len as f64 / 1000.0;
         assert!(
@@ -2440,6 +2498,170 @@ mod tests {
         assert!(g.nodes().contains_key(&NodeId::concept("rust").as_str()));
         assert!(!g.nodes().contains_key(&NodeId::concept(loser).as_str()));
         assert_eq!(g.vocab().resolve(loser), survivor);
+    }
+
+    #[test]
+    fn merge_concept_node_migrates_both_edge_directions() {
+        // Regression: the outgoing-edge arm re-created concept -> memory edges
+        // sourced at the *alias*, which the cleanup retain then deleted — the
+        // canonical concept ended up with memory -> concept edges but no
+        // concept -> memory edges (asymmetric adjacency, undercounted degree,
+        // unreachable sibling hop in spreading activation).
+        let mut g = MemoryGraph::new();
+        g.add_memory("m1", "rust coding", &["coding".into()]);
+        g.add_memory("m2", "programming", &["programming".into()]);
+
+        assert!(g.merge_concept_node("programming", "coding"));
+
+        // Incoming migration: m2's association now targets the canonical concept.
+        let m2_out = g.neighbors(&NodeId::memory("m2").as_str());
+        assert!(
+            m2_out
+                .iter()
+                .any(|e| e.kind == EdgeKind::Association && e.target == NodeId::concept("coding")),
+            "m2 -> coding edge missing after merge"
+        );
+
+        // Outgoing migration: the canonical concept reaches BOTH memories.
+        assert_eq!(g.concept_degree("coding"), 2);
+        let coding_out = g.neighbors(&NodeId::concept("coding").as_str());
+        assert!(
+            coding_out
+                .iter()
+                .any(|e| e.kind == EdgeKind::Association && e.target == NodeId::memory("m2")),
+            "coding -> m2 edge missing after merge"
+        );
+
+        // No edges reference the alias anymore.
+        assert!(g
+            .neighbors(&NodeId::concept("programming").as_str())
+            .is_empty());
+        assert!(!g
+            .nodes()
+            .contains_key(&NodeId::concept("programming").as_str()));
+        assert!(g
+            .edges()
+            .iter()
+            .all(|e| e.source != NodeId::concept("programming")
+                && e.target != NodeId::concept("programming")));
+    }
+
+    #[test]
+    fn merge_concept_node_rename_survives_snapshot() {
+        // Regression: the rename-in-place path (canonical node absent) updated
+        // key_to_id but left id_to_key pointing at the alias, so iter()
+        // filtered the renamed node out and snapshots silently dropped it.
+        let mut g = MemoryGraph::new();
+        g.add_memory("m1", "rust coding", &["coding".into()]);
+        let before = g.node_count();
+
+        assert!(g.merge_concept_node("coding", "programming"));
+
+        // Renamed in place: same node count, new key visible, edges intact.
+        assert_eq!(g.node_count(), before);
+        assert!(g
+            .nodes()
+            .contains_key(&NodeId::concept("programming").as_str()));
+        assert!(!g.nodes().contains_key(&NodeId::concept("coding").as_str()));
+        assert_eq!(g.concept_degree("programming"), 1);
+
+        // The renamed node and its edges survive a snapshot round-trip.
+        let bytes = g.to_snapshot_bytes().unwrap();
+        let restored = MemoryGraph::from_snapshot_bytes(&bytes).unwrap();
+        assert_eq!(restored.node_count(), before);
+        assert!(restored
+            .nodes()
+            .contains_key(&NodeId::concept("programming").as_str()));
+        assert_eq!(restored.concept_degree("programming"), 1);
+        assert!(restored
+            .neighbors(&NodeId::concept("programming").as_str())
+            .iter()
+            .any(|e| e.kind == EdgeKind::Association && e.target == NodeId::memory("m1")));
+    }
+
+    #[test]
+    fn add_concepts_to_memory_is_side_effect_free_beyond_new_edges() {
+        // Belief revision merges an older memory's concepts into a newer one
+        // after both were inserted. The full insert path used for that
+        // duplicated existing edges, double-counted co-occurrence, and
+        // re-pointed the temporal chain head at an old memory.
+        let mut g = MemoryGraph::new();
+        g.add_memory("m1", "alpha beta", &["alpha".into(), "beta".into()]);
+        g.add_memory("m2", "gamma", &["gamma".into()]);
+        let edges_before = g.edge_count();
+        let pair_key = "concept:alpha\0concept:beta".to_string();
+        let co_before = g.co_occurrence.get(&pair_key).copied();
+
+        // "beta" already linked (dedup), "delta" is new.
+        assert!(g.add_concepts_to_memory("m1", &["beta".into(), "delta".into()], 1.0));
+
+        // Exactly the two new edges (m1 -> delta, delta -> m1).
+        assert_eq!(g.edge_count(), edges_before + 2);
+        assert!(g
+            .neighbors(&NodeId::memory("m1").as_str())
+            .iter()
+            .any(|e| e.kind == EdgeKind::Association && e.target == NodeId::concept("delta")));
+
+        // Co-occurrence not recounted, temporal chain head not moved.
+        assert_eq!(g.co_occurrence.get(&pair_key).copied(), co_before);
+        assert_eq!(g.last_memory_id.as_deref(), Some("m2"));
+
+        // A second identical call adds nothing.
+        assert!(g.add_concepts_to_memory("m1", &["delta".into()], 1.0));
+        assert_eq!(g.edge_count(), edges_before + 2);
+
+        assert!(!g.add_concepts_to_memory("nope", &["x".into()], 1.0));
+    }
+
+    #[test]
+    fn non_finite_importance_does_not_poison_edge_weights() {
+        let mut g = MemoryGraph::new();
+        g.add_memory_with_importance("m1", "nan", &["c".into()], f32::NAN);
+        g.add_memory_with_importance("m2", "inf", &["c".into()], f32::INFINITY);
+        for e in g.edges() {
+            assert!(e.weight.is_finite(), "non-finite edge weight: {e:?}");
+        }
+    }
+
+    #[test]
+    fn decay_never_raises_low_baseline_edge_weight() {
+        // importance 0.04 -> factor 0.2: association edges start below the
+        // 1.0 decay floor. Decay must not push them back up toward it.
+        let mut g = MemoryGraph::new();
+        g.add_memory_with_importance("m1", "low importance", &["low".into()], 0.04);
+        g.reinforce("m1", 1);
+        let assoc = |g: &MemoryGraph| {
+            g.neighbors(&NodeId::memory("m1").as_str())
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Association)
+                .map(|e| e.weight)
+                .fold(0.0, f32::max)
+        };
+        let before = assoc(&g);
+        assert!(before < 1.0, "setup: edge should start below the floor");
+
+        g.decay_edges(1_000, 10);
+        let after = assoc(&g);
+        assert!(
+            after <= before,
+            "decay raised a low-baseline edge: {before} -> {after}"
+        );
+    }
+
+    #[test]
+    fn reinforce_at_time_zero_does_not_collide_with_never_reinforced() {
+        let mut g = MemoryGraph::new();
+        g.add_memory("m1", "text", &["c".into()]);
+        g.reinforce("m1", 0);
+        // t=0 is the "never reinforced" sentinel; the call must record a
+        // non-zero timestamp so the edge is not permanently decay-exempt.
+        let ts = g
+            .neighbors(&NodeId::memory("m1").as_str())
+            .iter()
+            .map(|e| e.last_reinforced_at)
+            .max()
+            .unwrap();
+        assert!(ts > 0, "t=0 reinforce must be remapped above the sentinel");
     }
 
     #[test]
