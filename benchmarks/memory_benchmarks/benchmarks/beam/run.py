@@ -958,6 +958,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rpm", type=int, default=200, help="Requests per minute for LLM")
     parser.add_argument("--backend", default="tsm", choices=["tsm", "oss", "cloud"],
                         help="Backend: 'tsm' for TurboSuperMemory (default), 'oss' for self-hosted Mem0, 'cloud' for api.mem0.ai")
+    parser.add_argument("--reranker", default=None, choices=[None, "colbert"],
+                        help="Optional Stage-2 reranker (e.g. 'colbert' for LFM2.5-ColBERT late interaction)")
     parser.add_argument("--mem0-host", default=None,
                         help="Mem0 server URL")
     parser.add_argument("--mem0-api-key", default=None,
@@ -1023,7 +1025,7 @@ async def async_main() -> None:
     # Init clients
     backend = os.getenv("MEM0_BACKEND", args.backend)
     if backend == "tsm":
-        mem0 = TSMClient()
+        mem0 = TSMClient(reranker=args.reranker)
     else:
         mem0 = Mem0Client(
             mode=backend,

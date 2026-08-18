@@ -42,6 +42,7 @@ class TSMClient:
         pool_k: int = 20,
         cognitive_features: bool = True,
         belief_revision: bool = True,
+        reranker: str | None = None,
     ):
         self.base_dir = db_dir or os.path.join(REPO_ROOT, "benchmarks", "memory_benchmarks", "results", "beam_tsm_db")
         os.makedirs(self.base_dir, exist_ok=True)
@@ -53,18 +54,21 @@ class TSMClient:
         self.pool_k = pool_k
         self.cognitive_features = cognitive_features
         self.belief_revision = belief_revision
+        self.reranker = reranker
 
         self._adapters: dict[str, Any] = {}
         self._shared_model = None
         self._shared_verifier = None
         self._shared_extractor = None
+        self._shared_reranker = None
 
         logger.info(
-            "TSMClient initialized at %s (embedder=%s, extractor=%s, cognitive=%s)",
+            "TSMClient initialized at %s (embedder=%s, extractor=%s, cognitive=%s, reranker=%s)",
             self.base_dir,
             self.embedder_type,
             self.extractor_type,
             self.cognitive_features,
+            self.reranker,
         )
 
     def _get_or_create_adapter(self, user_id: str):
@@ -222,7 +226,26 @@ class TSMClient:
                     item["score"] = item["score"] * (1.0 + 0.15 * recency_ratio)
                 items.sort(key=lambda x: x["score"], reverse=True)
                 final_items = items[:top_k]
-            
+
+            # 5. Stage-2 MultiVector ColBERT Late-Interaction MaxSim Reranking
+            if self.reranker == "colbert" and len(final_items) > 1:
+                try:
+                    if self._shared_reranker is None:
+                        from tsm.rerankers import ColBertReranker
+                        self._shared_reranker = ColBertReranker()
+                    
+                    candidate_texts = [x["memory"] for x in final_items]
+                    colbert_scores = self._shared_reranker.rerank(query, candidate_texts)
+                    if len(colbert_scores) == len(final_items):
+                        import numpy as np
+                        exp_scores = np.exp(colbert_scores - np.max(colbert_scores))
+                        norm_sim = exp_scores / np.sum(exp_scores)
+                        for idx, item in enumerate(final_items):
+                            item["score"] = item["score"] * (1.0 + float(norm_sim[idx]) * len(final_items))
+                        final_items.sort(key=lambda x: x["score"], reverse=True)
+                except Exception as e:
+                    logger.warning("ColBERT reranking skipped due to error: %s", e)
+
             return [{"memory": x["memory"], "score": float(x["score"]), "id": ""} for x in final_items]
 
         return await loop.run_in_executor(None, _do_search)
