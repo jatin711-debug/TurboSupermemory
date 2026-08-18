@@ -11,7 +11,8 @@ pub mod turbo_quant;
 
 pub use metrics::{
     cosine_distance, cosine_similarity, cosine_similarity_batch, dot_and_norms, dot_product,
-    l2_distance_sq, CosineMetric, DotProductMetric, EuclideanMetric, Metric,
+    l2_distance_sq, maxsim_score, maxsim_score_batch, CosineMetric, DotProductMetric,
+    EuclideanMetric, Metric,
 };
 pub use quantization::{LloydMaxTable, Quantizer, ScalarQuantizer, SignQuantizer, VectorQuantizer};
 pub use quantized_search::{AnyEncodedQuery, EncodedQuery, QuantizedStore};

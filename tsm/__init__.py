@@ -4,8 +4,10 @@ A one-flag preset over the compiled turbomemory engine: scoped, self-correcting
 conversational memory with verified belief revision and budget-aware recall.
 """
 
-from .interfaces import Embedder, Extractor, Verifier
+from .embedders import OpenAIEmbedder, SentenceTransformerEmbedder
+from .interfaces import Embedder, Extractor, Reranker, Verifier
 from .memory import CONVERSATIONAL_PROFILE, Memory
+from .rerankers import ColBertReranker
 
 __version__ = "0.1.0"
 
@@ -18,5 +20,9 @@ __all__ = [
     "Embedder",
     "Extractor",
     "Verifier",
+    "Reranker",
+    "OpenAIEmbedder",
+    "SentenceTransformerEmbedder",
+    "ColBertReranker",
     "__version__",
 ]

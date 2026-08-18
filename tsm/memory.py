@@ -144,6 +144,7 @@ class Memory:
         extractor: Optional[Extractor] = None,
         verifier: Optional[Verifier] = None,
         gist_summarizer: Optional[Callable[[List[str]], str]] = None,
+        reranker: Optional[object] = None,
         **engine_kwargs,
     ):
         """
@@ -161,11 +162,10 @@ class Memory:
                 propose -> verify -> commit. ``NLIVerifier`` (local
                 cross-encoder) is available in ``tsm.verification``.
             gist_summarizer: optional callable mapping a list of evicted fact
-                texts to a single gist string (typically an LLM call). When
-                provided, the engine's B4 gist-before-evict is enabled:
-                eviction victims are compressed into searchable gist records
-                (same scope, chronological chunks) instead of being dropped.
-                The gist embedding comes from this Memory's ``embedder``.
+                texts to a single gist string (typically an LLM call).
+            reranker: optional ``Reranker`` implementation or ``"colbert"``
+                to enable Stage-2 MultiVector late-interaction MaxSim precision
+                reranking (e.g. ``LFM2.5-ColBERT-350M``).
             **engine_kwargs: forwarded to ``turbomemory.MemoryEngine``.
         """
         cache_dir = None
@@ -181,9 +181,14 @@ class Memory:
             from .extractors import OpenAIExtractor
 
             extractor = OpenAIExtractor(cache_dir=cache_dir)
+        if reranker == "colbert":
+            from .rerankers import ColBertReranker
+
+            reranker = ColBertReranker()
         self.embedder = embedder
         self.extractor = extractor
         self.verifier = verifier
+        self.reranker = reranker
 
         self.dim = int(dimension or getattr(embedder, "dimension", None) or 1536)
 
@@ -233,6 +238,11 @@ class Memory:
             batch are skipped (write gate); cross-batch near-duplicates are
             the engine's job (dedup config / belief revision).
         """
+        if isinstance(messages, str):
+            messages = [{"role": "user", "content": messages}]
+        elif isinstance(messages, dict):
+            messages = [messages]
+
         facts: List[str] = []
         metas: List[Dict] = []
         seen_in_batch = set()
@@ -321,6 +331,8 @@ class Memory:
         pool_k: int = 20,
         lam: float = 0.7,
         resolve_beliefs: bool = True,
+        rerank: bool = False,
+        reranker: Optional[object] = None,
     ) -> List[Dict]:
         """Search memories under ``user_id``'s scope.
 
@@ -332,19 +344,20 @@ class Memory:
         belief lineage: any returned memory that has been superseded by a
         newer belief which is NOT itself in the result set gains
         ``"superseded_by"`` (the current belief's id) and ``"chain"`` (the
-        full supersession chain, oldest first, head last). Nothing is dropped
-        or re-ranked — an agent can present "current belief + history". Older
-        engines without ``resolve_beliefs`` degrade to unannotated results.
+        full supersession chain, oldest first, head last).
 
-        With ``token_budget`` set, a candidate pool of ``pool_k`` is retrieved
-        and greedy Maximal-Marginal-Relevance selection (relevance weight
-        ``lam=0.7`` vs. redundancy, ~4 chars per token) picks the best SET of
-        memories whose estimated total tokens fit the budget, returned in
-        selection order.
+        With ``rerank=True`` or an active ``reranker`` (e.g. ``ColBertReranker``),
+        retrieved candidate shortlists from TSM's cognitive graph are reranked
+        using token-level MaxSim late interaction.
         """
         query_embedding = np.asarray(self.embedder.encode(query), dtype=np.float32)
 
-        fetch_k = pool_k if token_budget is not None else top_k
+        active_reranker = reranker or (self.reranker if rerank else None)
+        if rerank and active_reranker is None:
+            from .rerankers import ColBertReranker
+            active_reranker = ColBertReranker()
+
+        fetch_k = pool_k if token_budget is not None else (top_k * 3 if active_reranker else top_k)
         results = self.engine.search(
             query_text=query,
             query_embedding=query_embedding,
@@ -356,7 +369,7 @@ class Memory:
 
         pool = []
         for mid, score in results:
-            # Scope guard (see class docstring): drop known-foreign hits that
+            # Scope guard: drop known-foreign hits that
             # the engine's empty-bitmap quirk can leak into scoped searches.
             if user_id is not None:
                 known_scope = self._id_to_scope.get(mid)
@@ -366,6 +379,19 @@ class Memory:
                          "score": float(score)})
         if not pool:
             return []
+
+        # Stage-2 MultiVector / ColBERT Late-Interaction Precision Reranking
+        if active_reranker is not None and len(pool) > 1:
+            candidate_texts = [p["text"] or "" for p in pool]
+            rerank_scores = np.asarray(active_reranker.rerank(query, candidate_texts), dtype=np.float32)
+            if len(rerank_scores) == len(pool):
+                exp_scores = np.exp(rerank_scores - np.max(rerank_scores))
+                norm_sim = exp_scores / np.sum(exp_scores)
+                for idx, p in enumerate(pool):
+                    p["maxsim_score"] = float(rerank_scores[idx])
+                    p["score"] = float(p["score"]) * (1.0 + float(norm_sim[idx]) * len(pool))
+                pool.sort(key=lambda x: x["score"], reverse=True)
+
         if token_budget is None:
             final = pool[:top_k]
         else:

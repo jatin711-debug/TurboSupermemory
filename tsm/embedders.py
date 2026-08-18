@@ -14,6 +14,7 @@ import logging
 import os
 import pickle
 import time
+from typing import List, Optional
 
 import numpy as np
 
@@ -118,3 +119,31 @@ class OpenAIEmbedder:
             self._dirty = 0
         except Exception as e:  # noqa: BLE001
             logger.warning("embed cache flush failed: %s", e)
+
+
+class SentenceTransformerEmbedder:
+    """Local open-source embedding backend using ``sentence-transformers`` models."""
+
+    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2", device: Optional[str] = None):
+        import torch
+        from sentence_transformers import SentenceTransformer
+
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = device
+        self.model_name = model_name
+        self.model = SentenceTransformer(model_name, device=device)
+        get_dim = getattr(self.model, "get_embedding_dimension", getattr(self.model, "get_sentence_embedding_dimension", None))
+        self._dim = get_dim() if get_dim else 384
+
+    @property
+    def dimension(self) -> int:
+        return self._dim
+
+    def encode(self, texts):
+        single = isinstance(texts, str)
+        if single:
+            texts = [texts]
+        embs = self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+        embs = np.asarray(embs, dtype=np.float32)
+        return embs[0] if single else embs

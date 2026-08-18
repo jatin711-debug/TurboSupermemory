@@ -66,3 +66,13 @@ class Verifier(Protocol):
         proposal is returned as an ``(old_id, new_id, kind)`` triple.
         """
         ...
+
+
+@runtime_checkable
+class Reranker(Protocol):
+    """Reranks candidate retrieved texts against a query using multi-vector or cross-encoder scoring."""
+
+    def rerank(self, query: str, texts: Sequence[str]) -> Sequence[float]:
+        """Compute relevance scores for candidate texts against query."""
+        ...
+

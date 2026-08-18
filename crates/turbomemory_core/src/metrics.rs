@@ -188,6 +188,49 @@ pub fn cosine_similarity_batch(query: &[f32], vectors: &[&[f32]]) -> Vec<f32> {
     out
 }
 
+/// Compute ColBERT-style MaxSim late-interaction score between multi-vector tokens.
+///
+/// `query_tokens` is a flat slice of `l_q × dim` f32 values.
+/// `doc_tokens` is a flat slice of `l_d × dim` f32 values.
+///
+/// MaxSim score is defined as:
+/// $$\text{MaxSim}(Q, D) = \sum_{i=1}^{L_q} \max_{j=1}^{L_d} (Q_i \cdot D_j)$$
+#[inline]
+pub fn maxsim_score(query_tokens: &[f32], doc_tokens: &[f32], dim: usize) -> f32 {
+    if dim == 0 || query_tokens.is_empty() || doc_tokens.is_empty() {
+        return 0.0;
+    }
+    let l_q = query_tokens.len() / dim;
+    let l_d = doc_tokens.len() / dim;
+    if l_q == 0 || l_d == 0 {
+        return 0.0;
+    }
+
+    let mut total_score = 0.0f32;
+    for q_idx in 0..l_q {
+        let q_vec = &query_tokens[q_idx * dim..(q_idx + 1) * dim];
+        let mut max_sim = f32::NEG_INFINITY;
+        for d_idx in 0..l_d {
+            let d_vec = &doc_tokens[d_idx * dim..(d_idx + 1) * dim];
+            let sim = dot_product(q_vec, d_vec);
+            if sim > max_sim {
+                max_sim = sim;
+            }
+        }
+        if max_sim.is_finite() {
+            total_score += max_sim;
+        }
+    }
+    total_score
+}
+
+/// Compute ColBERT-style MaxSim late-interaction scores between one multi-vector query and multiple multi-vector documents.
+pub fn maxsim_score_batch(query_tokens: &[f32], docs: &[&[f32]], dim: usize) -> Vec<f32> {
+    docs.iter()
+        .map(|doc| maxsim_score(query_tokens, doc, dim))
+        .collect()
+}
+
 /// Combine a dot product and the two squared norms into a clamped cosine score.
 #[inline]
 fn finalize_cosine(dot: f32, norm_sq_a: f32, norm_sq_b: f32) -> f32 {
@@ -830,5 +873,42 @@ mod tests {
         let refs: Vec<&[f32]> = vec![&zero];
         let got = cosine_similarity_batch(&query, &refs);
         assert_eq!(got, vec![0.0]);
+    }
+
+    #[test]
+    fn test_maxsim_score_and_batch() {
+        let dim = 4;
+        // 2 query tokens
+        let q = vec![
+            1.0, 0.0, 0.0, 0.0, // token 1
+            0.0, 1.0, 0.0, 0.0, // token 2
+        ];
+        // 3 doc tokens: doc 1 has exact match for token 1, partial for token 2
+        let d1 = vec![
+            1.0, 0.0, 0.0, 0.0, // dot with q1 = 1.0, dot with q2 = 0.0
+            0.0, 0.8, 0.0, 0.0, // dot with q1 = 0.0, dot with q2 = 0.8
+            0.0, 0.0, 1.0, 0.0, // dot with q1 = 0.0, dot with q2 = 0.0
+        ];
+        // MaxSim for q against d1 = max(1.0, 0.0, 0.0) + max(0.0, 0.8, 0.0) = 1.0 + 0.8 = 1.8
+        let score1 = maxsim_score(&q, &d1, dim);
+        assert!(
+            (score1 - 1.8).abs() < 1e-5,
+            "score1 expected 1.8, got {score1}"
+        );
+
+        // doc 2 has orthogonal tokens
+        let d2 = vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let score2 = maxsim_score(&q, &d2, dim);
+        assert!(
+            (score2 - 0.0).abs() < 1e-5,
+            "score2 expected 0.0, got {score2}"
+        );
+
+        // Test batch
+        let docs = vec![d1.as_slice(), d2.as_slice()];
+        let batch_scores = maxsim_score_batch(&q, &docs, dim);
+        assert_eq!(batch_scores.len(), 2);
+        assert!((batch_scores[0] - 1.8).abs() < 1e-5);
+        assert!((batch_scores[1] - 0.0).abs() < 1e-5);
     }
 }
