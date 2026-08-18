@@ -99,13 +99,26 @@ sequenceDiagram
     Note over Core: Record is now durable and searchable in Hot segment
 ```
 
-### 3.2 Read Path (Cognitive Retrieval)
+### 3.2 Read Path (Cognitive Retrieval & 2-Stage Late Interaction)
 
-Retrieval is an **ANN-floor + bounded augmenter** model: the dense ANN top-k is a non-negotiable recall floor, and the cognitive graph performs a single bounded 1-hop expansion that can only *add* candidates and apply a small additive, non-negative re-rank boost. The augmenter returns a **pure graph delta** (cosine is never folded in); the engine fuses cosine with the normalized delta. There is no per-query Feeling-of-Knowing gate on the hot path — `search()` returns `None` only when there are no ANN seeds at all. (See [Cognitive Memory Graph](file:///d:/personal-projects/TurboSuperMemory/docs/cognitive_graph.md) §2–3.)
+Retrieval in TurboSuperMemory follows a **2-Stage Hybrid Retrieval Pipeline**:
+
+1. **Stage 1 (TSM Core Fast Candidate Scan & Graph Expansion)**:
+   - Evaluates parallel segment candidate pools across Hot (RAM), Warm (TurboQuant-Prod), and Cold (TurboQuant-MSE) tiers in $<1\text{ms}$.
+   - Reranks candidates against the full float32 vector store (`vectors.bin`).
+   - Fuses semantic cosine similarity with 1-hop spreading activation across concept nodes and ACT-R power-law recency decay:
+     $$\text{Score}_{\text{TSM}}(M) = \Big[ \text{Cosine}(Q, M) + (1 - \alpha) \cdot \sigma(\Delta_{\text{graph}}(M)) \Big] \cdot \Big(1 + \lambda_{\text{recency}} \cdot \frac{\text{seq}(M)}{\text{seq}_{\max}}\Big) \cdot D(M)$$
+
+2. **Stage 2 (Optional ColBERT Multi-Vector Late Interaction)**:
+   - For multi-constraint and rare-entity queries, Stage 1 passes an expanded shortlist ($K_1 = 3 \times \text{top\_k}$) to the token-level multi-vector encoder (`LiquidAI/LFM2.5-ColBERT-350M` on CUDA).
+   - Computes token-level MaxSim dot products:
+     $$\text{MaxSim}(Q, D) = \sum_{i=1}^{L_q} \max_{j=1}^{L_d} (Q_i \cdot D_j)$$
+   - Fuses the scores to rank the most relevant memories at the top:
+     $$\text{Score}_{\text{fused}}(M) = \text{Score}_{\text{TSM}}(M) \cdot \Big(1 + \text{Softmax}(\text{MaxSim}(Q, M)) \cdot N\Big)$$
 
 ```mermaid
 flowchart TD
-    Q["Query Input"] --> ANN["Parallel Segment Search: Hot/SealedHot/Warm/Cold"]
+    Q["Query Input"] --> ANN["Stage 1: Parallel Segment Search: Hot/SealedHot/Warm/Cold"]
     ANN --> Rerank["Full f32 Vector Rerank via VectorStore"]
     Rerank --> Floor["ANN candidate floor: graph delta = 0"]
     Q --> BM25["BM25 Lexical Score Trigger"]
@@ -116,8 +129,11 @@ flowchart TD
     Lexical --> Expand["1-hop expand from top-M seeds"]
     Expand --> Pools["Strong x1.0 / Temporal x0.5 / Normal x0.3"]
     Pools --> Delta["Return PURE graph delta per candidate"]
-    Delta --> Fusion["Fuse: cosine + (1 - alpha) * normalized_delta"]
-    Fusion --> Sort["Sort & Return Top K Results"]
+    Delta --> Fusion["Fuse: cosine + (1 - alpha) * normalized_delta * recency * demotion"]
+    Fusion --> Stage2{"ColBERT Reranker Enabled?"}
+    Stage2 -- "No" --> TopK["Return Top K Results"]
+    Stage2 -- "Yes" --> ColBERT["Stage 2: LFM2.5-ColBERT MaxSim Late Interaction"]
+    ColBERT --> FinalSort["Fuse MaxSim & Return Top K Results"]
 ```
 
 ### 3.3 Full System Component Diagram
