@@ -5,6 +5,7 @@ conversational memory with verified belief revision and budget-aware recall.
 """
 
 from .embedders import OpenAIEmbedder, SentenceTransformerEmbedder
+from .extractors import GlinerExtractor, OpenAIExtractor
 from .interfaces import Embedder, Extractor, Reranker, Verifier
 from .memory import CONVERSATIONAL_PROFILE, Memory
 from .rerankers import ColBertReranker
@@ -23,6 +24,8 @@ __all__ = [
     "Reranker",
     "OpenAIEmbedder",
     "SentenceTransformerEmbedder",
+    "OpenAIExtractor",
+    "GlinerExtractor",
     "ColBertReranker",
     "__version__",
 ]

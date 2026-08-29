@@ -189,6 +189,7 @@ pub enum AnyEncodedQuery {
     Sign(SignEncodedQuery),
     TurboQuantMse(TurboQuantMseEncodedQuery),
     TurboQuantProd(TurboQuantProdEncodedQuery),
+    RaBitQ(crate::rabitq::RaBitQEncodedQuery),
 }
 
 impl EncodedQuery for AnyEncodedQuery {
@@ -198,6 +199,7 @@ impl EncodedQuery for AnyEncodedQuery {
             Self::Sign(q) => q.score(encoded),
             Self::TurboQuantMse(q) => q.score(encoded),
             Self::TurboQuantProd(q) => q.score(encoded),
+            Self::RaBitQ(q) => q.score(encoded),
         }
     }
 
@@ -207,6 +209,7 @@ impl EncodedQuery for AnyEncodedQuery {
             Self::Sign(q) => q.score_batch(encoded),
             Self::TurboQuantMse(q) => EncodedQuery::score_batch(q, encoded),
             Self::TurboQuantProd(q) => q.score_batch(encoded),
+            Self::RaBitQ(q) => q.score_batch(encoded),
         }
     }
 
@@ -216,6 +219,7 @@ impl EncodedQuery for AnyEncodedQuery {
             Self::Sign(q) => q.encoded_bytes_per_vector(),
             Self::TurboQuantMse(q) => q.encoded_bytes_per_vector(),
             Self::TurboQuantProd(q) => q.encoded_bytes_per_vector(),
+            Self::RaBitQ(q) => q.encoded_bytes_per_vector(),
         }
     }
 }
@@ -229,6 +233,7 @@ impl QuantizedStore for VectorQuantizer {
             Self::Sign(q) => Ok(AnyEncodedQuery::Sign(SignEncodedQuery::new(query, q)?)),
             Self::TurboQuantMse(q) => Ok(AnyEncodedQuery::TurboQuantMse(q.encode_query(query)?)),
             Self::TurboQuantProd(q) => Ok(AnyEncodedQuery::TurboQuantProd(q.encode_query(query)?)),
+            Self::RaBitQ(q) => Ok(AnyEncodedQuery::RaBitQ(q.encode_query(query)?)),
         }
     }
 }

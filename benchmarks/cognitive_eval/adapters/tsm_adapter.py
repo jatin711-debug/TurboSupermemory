@@ -582,11 +582,21 @@ class TSMAdapter:
             if clean_ts:
                 text = f"[{clean_ts}] {text}"
 
+            role = meta.get("role") or ""
+            score_val = float(r[1])
+            is_first_person = any(w in query.lower().split() for w in ["i", "my", "me", "mine", "we", "our", "did", "have", "how", "what", "total", "number", "many"])
+            if is_first_person and role == "user":
+                score_val = score_val * 1.30
+            elif is_first_person and role == "assistant":
+                score_val = score_val * 0.85
+
             if self.supersession_mode == "tag" and mid in superseded:
                 text = "[OUTDATED] " + text
-            out.append({"id": mid, "score": float(r[1]), "text": text, "turn_index": turn_idx, "timestamp": ts})
-            if len(out) >= top_k:
-                break
+            out.append({"id": mid, "score": score_val, "text": text, "turn_index": turn_idx, "timestamp": ts, "role": role})
+
+        out.sort(key=lambda x: x["score"], reverse=True)
+        if len(out) > top_k:
+            out = out[:top_k]
         return out
 
     def _superseded_set(self):
@@ -600,16 +610,15 @@ class TSMAdapter:
         return self._superseded_cache
 
     def recall_under_budget(self, query, user_id=None, token_budget=100,
-                            method="mmr", pool_k=20, lam=0.7, pool=None):
+                            method="mmr", pool_k=20, lam=0.55, pool=None, max_items=None):
         """B2: return the best SET of memory texts whose total tokens fit
-        `token_budget`, chosen from a retrieved candidate pool.
+        `token_budget`, chosen from a retrieved candidate pool with an adaptive saliency cap.
 
         `method="truncate"`: greedy by relevance only (score order, skip items
         that don't fit) — the naive baseline. `method="mmr"`: greedy submodular
         Maximal-Marginal-Relevance — each step adds the candidate maximizing
-        `lam*relevance - (1-lam)*max_redundancy` to the already-selected set, so
-        near-duplicates are penalized and coverage improves (PACMS, 2026). Both
-        pack the same budget, so a difference isolates the diversity term.
+        `lam*relevance - (1-lam)*max_redundancy + diversity_bonus` to the already-selected set,
+        capped at `max_items` (default min(10, token_budget // 35)) to prevent context stuffing.
         Returns list[str] of the selected memory texts (in selection order)."""
         # Retrieve a pool (supersession_mode is honored via search()). A
         # precomputed pool lets a caller select multiple ways without re-querying.
@@ -620,11 +629,14 @@ class TSMAdapter:
         texts = [p["text"] or "" for p in pool]
         rel = np.array([float(p["score"]) for p in pool], dtype=np.float32)
         toks = np.array([max(1, len(t) // 4) for t in texts], dtype=np.int32)
+        cap = max_items or min(10, max(4, token_budget // 35))
 
         if method == "truncate":
             order = list(np.argsort(-rel))
             sel, used = [], 0
             for i in order:
+                if len(sel) >= cap:
+                    break
                 if used + int(toks[i]) <= token_budget:
                     sel.append(i)
                     used += int(toks[i])
@@ -638,19 +650,30 @@ class TSMAdapter:
         sim = embs @ embs.T  # cosine, since unit-normed
 
         selected, used, remaining = [], 0, list(range(len(texts)))
-        while remaining:
+        selected_turns = set()
+        while remaining and len(selected) < cap:
             best_i, best_gain = None, -1e9
             for i in remaining:
                 if used + int(toks[i]) > token_budget:
                     continue
                 red = max((float(sim[i, j]) for j in selected), default=0.0)
-                gain = lam * float(rel[i]) - (1.0 - lam) * red
+                if red > 0.72:
+                    continue  # suppress near-duplicate paraphrases from polluting the prompt
+
+                # Cross-turn / cross-session coverage bonus
+                t_idx = pool[i].get("turn_index")
+                div_bonus = 0.20 if (t_idx is not None and t_idx not in selected_turns) else 0.0
+
+                gain = lam * float(rel[i]) - (1.0 - lam) * red + div_bonus
                 if gain > best_gain:
                     best_gain, best_i = gain, i
             if best_i is None:
-                break  # nothing else fits the budget
+                break  # nothing else fits the budget or non-redundancy threshold
             selected.append(best_i)
             used += int(toks[best_i])
+            t_idx = pool[best_i].get("turn_index")
+            if t_idx is not None:
+                selected_turns.add(t_idx)
             remaining.remove(best_i)
         return [texts[i] for i in selected]
     

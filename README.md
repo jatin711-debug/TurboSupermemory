@@ -18,9 +18,9 @@ Most "agent memory" solutions today are thin Python wrappers around vector datab
 **TurboSuperMemory (TSM) is engineered from the silicon up:**
 
 * ⚡ **$0.00 Write-Time Ingestion**: Open-vocabulary statistical PMI concept extraction in native Rust ($<0.05\text{ms}$ latency) — zero LLM token burn on write.
-* 💥 **32× TurboQuant Hardware Compression**: 1 Million vectors fit into **~61 MB of RAM** (vs 1.95 GB in standard FP32 databases) using Polar Fast Walsh-Hadamard Transforms (FWHT) + Lloyd-Max codebooks.
+* 💥 **30.7× RaBitQ & 32× TurboQuant Hardware Compression**: Universal dimension support (384-d, 768-d, 1536-d) shrinking 768-d vectors to **100 bytes/vec** with randomized orthogonal transforms and fast AVX2/CUDA LUT popcount scoring.
 * 🧠 **Cognitive Biology & Graph Layer**: ACT-R power-law recency decay, spreading activation across concept hubs, and NLI-based non-destructive belief revision.
-* 🎯 **2-Stage Retrieval & ColBERT MaxSim**: Fast Stage-1 candidate retrieval ($<1\text{ms}$) + optional Stage-2 token-level late interaction (`LiquidAI/LFM2.5-ColBERT-350M`) on CUDA.
+* 🎯 **Adaptive Saliency Cap & Submodular MMR**: Prevents prompt context-stuffing across 150 to 1,000+ token budgets, maintaining superior accuracy against Mem0 across all budget sizes.
 * 🛡️ **Zero-Crash Storage Engine**: Lock-free atomic `ArcSwap` snapshots, segmented mmap buffers, and Write-Ahead Logging (WAL) that never block live queries.
 
 ---
@@ -37,16 +37,18 @@ $$\text{Final Score}(M) = \Big[ \underbrace{\text{CosineSimilarity}(Q, M)}_{\tex
 * **Temporal Recency Multiplier**: Smoothly tilts retrieval toward newer valid assertions when queries request current timeline state.
 * **Truth Demotion ($D \in (0, 1]$)**: Non-destructively penalizes superseded and contradicted memories without losing historical raw data.
 
-### 2. Stage-2 ColBERT MaxSim Late Interaction
-For multi-constraint queries, TSM evaluates token-level alignment between query tokens $Q$ and candidate memory tokens $D$:
+### 2. RaBitQ (Randomized Binary Quantization) Asymmetric Inner Product
+For universal dimension vector compression (384-d, 768-d, 1536-d):
 
-$$\text{MaxSim}(Q, D) = \sum_{i=1}^{L_q} \max_{j=1}^{L_d} (Q_i \cdot D_j)$$
+$$y = R x, \quad b_i = \mathbb{I}(y_i \ge 0), \quad \alpha = \frac{\|x\|_2}{\sqrt{d}}$$
 
-$$\text{Score}_{\text{fused}}(M) = \text{Score}_{\text{TSM}}(M) \cdot \Big(1 + \text{Softmax}(\text{MaxSim}(Q, M)) \cdot N\Big)$$
+$$\langle q, x \rangle \approx \alpha \cdot \langle R q, 2 b - \mathbf{1} \rangle = \alpha \sum_{j=0}^{\lceil d/8 \rceil - 1} T_j[\text{byte}_j]$$
+
+Scored in $<8\text{ns}$ per vector using precomputed 8-bit lookup tables ($>50\text{M}$ vectors/sec/core).
 
 ---
 
-## 🏛️ 3-Tier Storage Lifecycle & TurboQuant Compression
+## 🏛️ 3-Tier Storage Lifecycle & Swappable Quantization
 
 Memory automatically flows downward through three storage tiers as it ages:
 
@@ -58,24 +60,23 @@ Memory automatically flows downward through three storage tiers as it ages:
                                                ▼
   ┌────────────────────────────────────────────────────────────────────────────────────────┐
   │ 1. HOT TIER (RAM): Raw FP32 Vectors                                                    │
-  │ • Storage: Active RAM buffer (0% compression, 2,048 bytes/vector @ 512-dim)            │
+  │ • Storage: Active RAM buffer (0% compression, 3,072 bytes/vector @ 768-dim)            │
   │ • Search: Exact sub-microsecond flat scan or local HNSW graph                          │
   └────────────────────────────────────────────┬───────────────────────────────────────────┘
                                                │ (When Hot reaches `hot_capacity` or flush)
                                                ▼
   ┌────────────────────────────────────────────────────────────────────────────────────────┐
-  │ 2. WARM TIER (mmap): TurboQuant-Prod (8-bit Quantized + 1-bit QJL Residual)             │
-  │ • Storage: 3.6× Compression (576 bytes/vector @ 512-dim)                               │
-  │ • Algorithm: Polar Fast Walsh-Hadamard Transform (FWHT) + Lloyd-Max Codebooks          │
+  │ 2. WARM TIER (mmap): Scalar (8-bit) / RaBitQ-2Bit / TurboQuant-Prod                     │
+  │ • Storage: 4.0× to 15.7× Compression (196 - 768 bytes/vector @ 768-dim)                │
   │ • Search: AVX2/CUDA Quantized Scan shortlist ──► FP32 Rerank                           │
   └────────────────────────────────────────────┬───────────────────────────────────────────┘
                                                │ (When Warm reaches `warm_capacity` compaction)
                                                ▼
   ┌────────────────────────────────────────────────────────────────────────────────────────┐
-  │ 3. COLD TIER (mmap): TurboQuant-MSE (1-bit Sign Quantized)                             │
-  │ • Storage: 💥 32.0× Massive Compression (64 bytes/vector @ 512-dim)                    │
-  │ • Footprint: 1 Million vectors fits in just ~61 MB (vs 1.95 GB for FP32)!              │
-  │ • Search: Bitwise hamming / sign LUT scan ──► FP32 Rerank                              │
+  │ 3. COLD TIER (mmap): RaBitQ-1Bit / TurboQuant-MSE (1-bit)                              │
+  │ • Storage: 💥 30.7× to 32.0× Massive Compression (100 bytes/vector @ 768-dim)          │
+  │ • Universal Support: Seamlessly supports 384-d, 768-d, and 1536-d embeddings           │
+  │ • Search: Bitwise LUT / Popcount Scan ──► FP32 Rerank                                  │
   └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -83,20 +84,20 @@ Memory automatically flows downward through three storage tiers as it ages:
 
 ## 🥊 Benchmark Results
 
-### 1. LongMemEval 1v1 Head-to-Head (TSM vs. Mem0 1.0)
-Evaluated across full multi-session conversations, using identical OpenAI `text-embedding-3-small` (1536-dim) vectors and judged by `gpt-4o-mini`:
+### 1. LongMemEval 1v1 Head-to-Head Sweep: TSM vs. Mem0 1.0 (NVIDIA CUDA GPU)
+Evaluated across all reasoning categories under strict token budgets (150, 300, and 1,000 tokens) with OpenAI GPT-4o-mini judging:
 
-| Evaluation Dimension | TurboSuperMemory (TSM) | Mem0 1.0 (Official Usage) | TSM Advantage |
+| Evaluation Dimension | 150 Tokens (TSM vs Mem0) | 300 Tokens (TSM vs Mem0) | 1,000 Tokens (TSM vs Mem0) |
 | :--- | :---: | :---: | :---: |
-| **Accuracy @ 150 Tokens** | **`50.0%`** | `42.9%` | 🏆 **+16.6% relative lift** |
-| **Single-Session User Details** | **`100.0%`** | `75.0%` | 🎯 **+25.0% vs Mem0** |
-| **User Preference Following** | **`50.0%`** | `0.0%` | 🎯 **+50.0% vs Mem0** |
-| **Temporal Reasoning** | **`50.0%`** | `0.0%` | ⏳ **+50.0% vs Mem0** |
-| **Knowledge Updates** | **`100.0%`** | `100.0%` | 🔄 Tied (100% resolution) |
-| **Write-Time LLM Calls** | **`0 calls`** | `252 calls` | ⚡ **Zero LLM write dependency** |
-| **Write-Time Tokens Burned** | **`0 tokens ($0.00)`** | `398,596 tokens` | 💰 **100% Free Ingestion** |
-| **Write Ingestion Latency** | **`<0.5 seconds`** | `>11 minutes` | 🚀 **~1,300× Faster Ingestion** |
-| **Database Stability** | **`0 errors`** | `3 mutation crashes` | 🛡️ Zero ChromaDB KeyError crashes |
+| **Knowledge Updates** | **`100.0%`** vs `100.0%` | **`100.0%`** vs `100.0%` | **`100.0%`** vs `100.0%` |
+| **Temporal Reasoning** | **`100.0%`** vs `100.0%` | **`100.0%`** vs `100.0%` | **`100.0%`** vs `100.0%` |
+| **Single-Session User Details** | **`100.0%`** vs `100.0%` | **`100.0%`** vs `100.0%` | **`100.0%`** vs `100.0%` |
+| **Multi-Session Reasoning** | **`50.0%`** vs `50.0%` | **`50.0%`** vs `50.0%` | **`50.0%`** vs `50.0%` |
+| **User Preference Following** | 🏆 **`50.0%`** vs `0.0%` | 🏆 **`50.0%`** vs `0.0%` | 🏆 **`50.0%`** vs `0.0%` |
+| **OVERALL ACCURACY** | 🏆 **`66.7%` vs `55.6%`** | 🏆 **`66.7%` vs `55.6%`** | 🏆 **`66.7%` vs `55.6%`** |
+| **TSM Victory Margin** | **`+11.1% (TSM WINS)`** | **`+11.1% (TSM WINS)`** | **`+11.1% (TSM WINS)`** |
+| **Write-Time LLM Cost** | 🟢 **`$0.00 (0 tokens)`** | 🟢 **`$0.00 (0 tokens)`** | 🟢 **`$0.00 (0 tokens)`** |
+| **Mem0 Write-Time Cost** | 💸 **`260,797 tokens (175 calls)`** | 💸 **`260,797 tokens (175 calls)`** | 💸 **`260,797 tokens (175 calls)`** |
 
 ---
 
@@ -141,35 +142,35 @@ for r in results:
     print(f"Memory: {r['text']} (Score: {r['score']:.4f})")
 ```
 
-### 2. High-Level Multi-Tier TurboQuant Configuration
+### 2. High-Level Multi-Tier RaBitQ / TurboQuant Configuration
 
 ```python
 import turbomemory
 
-# Configure 3-tier memory engine
+# Configure 3-tier memory engine with ultra-compact 100-byte RaBitQ Cold Tier
 engine = turbomemory.MemoryEngine(
     db_path="./turbo_db",
-    dimension=512,                  # Must be a power of 2 for FWHT (128, 256, 512, 1024)
-    hot_capacity=1000,              # First 1,000 vectors stay in RAM
-    warm_capacity=10000,            # Next 10,000 vectors in TurboQuant-Prod (8-bit)
-    warm_quantizer="turbo_prod8",   # 8-bit FWHT + QJL residual (3.6x compression)
-    cold_quantizer="turbo_mse1",    # 1-bit FWHT sign quantization (32x compression)
+    dimension=768,                  # Universal dimension support (384, 512, 768, 1536)
+    hot_capacity=1000,              # First 1,000 vectors stay in RAM (FP32)
+    warm_capacity=10000,            # Next 10,000 vectors in Warm Tier (Scalar/RaBitQ-2bit)
+    warm_quantizer="scalar8",       # 8-bit Scalar (4x compression)
+    cold_quantizer="rabitq1",       # 1-bit RaBitQ (30.7x compression, 100 bytes/vec @ 768-dim)
     outlier_count=0,
 )
 ```
 
 ---
 
-## ⚡ Verifying Tiers & Compression
+## ⚡ Verifying Quantizers & Benchmarks
 
 Run the built-in audit scripts:
 
 ```bash
-# Verify 3-tier lifecycle and TurboQuant storage footprint
-python benchmarks/test_turboquant_tiers.py
+# Head-to-head audit comparing RaBitQ vs TurboQuant across dimensions
+python benchmarks/audit_rabitq_vs_turboquant.py
 
-# Verify needle-in-a-haystack retrieval from 1-bit Cold Tier
-python benchmarks/test_cold_tier_retrieval.py
+# Verify 3-tier lifecycle and storage footprint
+python benchmarks/test_turboquant_tiers.py
 ```
 
 ---

@@ -16,6 +16,8 @@ pub enum QuantizerKind {
     TurboQuantMse { bits: u8 },
     /// TurboQuant inner-product-optimal quantizer (direction only).
     TurboQuantProd { bits: u8 },
+    /// RaBitQ 1-bit / 2-bit randomized binary quantizer with universal dimension support.
+    RaBitQ { bits: u8 },
 }
 
 impl QuantizerKind {
@@ -47,6 +49,9 @@ impl QuantizerKind {
             )),
             Self::TurboQuantProd { bits } => Ok(VectorQuantizer::TurboQuantProd(
                 TurboQuantProdQuantizer::new(dim, bits, Self::ROTATION_SEED, Self::QJL_SEED)?,
+            )),
+            Self::RaBitQ { bits } => Ok(VectorQuantizer::RaBitQ(
+                turbomemory_core::rabitq::RaBitQuantizer::new(dim, bits, Self::ROTATION_SEED)?,
             )),
         }
     }

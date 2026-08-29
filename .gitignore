@@ -79,4 +79,5 @@ minimax_key.txt
 .minimax_key
 benchmarks/cognitive_eval/extraction/_cache/
 benchmarks/cognitive_eval/embedding/_cache/
+.cache/
 test_db_*

@@ -172,6 +172,14 @@ fn parse_quantizer_kind(spec: Option<String>, default: QuantizerKind) -> PyResul
         })
     } else if spec == "sign" {
         Ok(QuantizerKind::Sign)
+    } else if spec == "rabitq" || spec == "rabitq1" {
+        Ok(QuantizerKind::RaBitQ { bits: 1 })
+    } else if spec == "rabitq2" {
+        Ok(QuantizerKind::RaBitQ { bits: 2 })
+    } else if spec.starts_with("rabitq") {
+        Ok(QuantizerKind::RaBitQ {
+            bits: extract_bits("rabitq", &spec)?,
+        })
     } else if spec.starts_with("turbo_prod") {
         Ok(QuantizerKind::TurboQuantProd {
             bits: extract_bits("turbo_prod", &spec)?,
@@ -182,7 +190,7 @@ fn parse_quantizer_kind(spec: Option<String>, default: QuantizerKind) -> PyResul
         })
     } else {
         Err(PyValueError::new_err(format!(
-            "unknown quantizer '{spec}'; expected scalar<N>, sign, turbo_mse<N>, or turbo_prod<N>"
+            "unknown quantizer '{spec}'; expected scalar<N>, sign, rabitq<N>, turbo_mse<N>, or turbo_prod<N>"
         )))
     }
 }

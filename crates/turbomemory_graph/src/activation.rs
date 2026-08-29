@@ -270,6 +270,39 @@ impl SpreadingActivation {
             let max_candidates = self.config.expansion_max_candidates.clamp(10, 200);
             let decay = self.config.decay;
 
+            // Direct query concept seeding: bridge abstract queries directly to concept hubs
+            let q_tokens: Vec<&str> = query_text
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .filter(|w| w.len() >= 3)
+                .collect();
+            for &token in &q_tokens {
+                let token_lower = token.to_lowercase();
+                let ckey = format!("concept:{token_lower}");
+                if let Some(cnid) = self.graph.get_node_id(&ckey) {
+                    if !self.graph.is_concept_suppressed(&token_lower) {
+                        if let Some(cedges) = self.graph.neighbor_indices(cnid) {
+                            for &cidx in cedges {
+                                if let Some(cedge) = self.graph.get_edge(cidx) {
+                                    if cedge.kind == EdgeKind::Association
+                                        && matches!(
+                                            self.graph.node_kind(cedge.target),
+                                            Some(NodeKind::Memory)
+                                        )
+                                    {
+                                        if let Some(mid) = self.graph.node_external_id(cedge.target)
+                                        {
+                                            let key = format!("mem:{mid}");
+                                            *normal.entry(key).or_insert(0.0) +=
+                                                0.75 * cedge.weight;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             'seeds: for (seed_key, seed_score) in seed_list {
                 let seed_id = seed_key.strip_prefix("mem:").unwrap_or(&seed_key);
                 let Some(seed_nid) = self.graph.memory_node_id(seed_id) else {
@@ -334,14 +367,8 @@ impl SpreadingActivation {
                                     // concept -> sibling memory (2 hops).
                                     if let Some(mid) = self.graph.node_external_id(cedge.target) {
                                         let key = format!("mem:{mid}");
-                                        if !ann_candidates.contains(&key) {
-                                            let signal = seed_score
-                                                * concept_w
-                                                * cedge.weight
-                                                * decay
-                                                * decay;
-                                            *normal.entry(key).or_insert(0.0) += signal;
-                                        }
+                                        let signal = seed_score * concept_w * cedge.weight * decay;
+                                        *normal.entry(key).or_insert(0.0) += signal;
                                     }
                                 } else if cedge.kind == EdgeKind::Abstraction
                                     && matches!(ckind, Some(NodeKind::Concept))
@@ -392,26 +419,13 @@ impl SpreadingActivation {
                                                 self.graph.node_external_id(sedge.target)
                                             {
                                                 let key = format!("mem:{mid}");
-                                                if !ann_candidates.contains(&key) {
-                                                    // The abstraction parent is a
-                                                    // DELIBERATE learned bridge
-                                                    // between related concepts, not
-                                                    // incidental multi-hop noise, so
-                                                    // it pays a single `decay` (not
-                                                    // decay^3) — otherwise a 4-hop
-                                                    // bridge can never carry enough
-                                                    // activation to surface a
-                                                    // sibling-concept memory the
-                                                    // query cannot reach by cosine.
-                                                    let signal = seed_score
-                                                        * concept_w
-                                                        * cedge.weight
-                                                        * pedge.weight
-                                                        * sedge.weight
-                                                        * decay;
-                                                    *abstraction.entry(key).or_insert(0.0) +=
-                                                        signal;
-                                                }
+                                                let signal = seed_score
+                                                    * concept_w
+                                                    * cedge.weight
+                                                    * pedge.weight
+                                                    * sedge.weight
+                                                    * decay;
+                                                *abstraction.entry(key).or_insert(0.0) += signal;
                                             }
                                         }
                                     }
@@ -435,8 +449,8 @@ impl SpreadingActivation {
 
             // Merge the pools into the graph delta with edge-kind-aware boost
             // factors. Strong (Refines/Contradicts) full strength; Temporal 0.5;
-            // Association-mediated 2-hop concept spread 0.3; Abstraction (4-hop,
-            // through the parent) 0.6 so a sibling-concept memory the query cannot
+            // Association-mediated 2-hop concept spread 0.75; Abstraction (4-hop,
+            // through the parent) 0.75 so a sibling-concept memory the query cannot
             // reach by cosine can still surface.
             for (key, signal) in strong {
                 if signal > 0.01 {
@@ -450,13 +464,13 @@ impl SpreadingActivation {
                 }
             }
             for (key, signal) in normal {
-                let boosted = signal * 0.3;
+                let boosted = signal * 0.75;
                 if boosted > 0.01 {
                     *delta.entry(key).or_insert(0.0) += boosted;
                 }
             }
             for (key, signal) in abstraction {
-                let boosted = signal * 0.6;
+                let boosted = signal * 0.75;
                 if boosted > 0.01 {
                     *delta.entry(key).or_insert(0.0) += boosted;
                 }

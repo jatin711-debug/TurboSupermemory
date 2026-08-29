@@ -78,6 +78,14 @@ impl WarmSegment {
                 )
                 .map_err(StorageError::Core)?,
             ),
+            QuantizerKind::RaBitQ { bits } => VectorQuantizer::RaBitQ(
+                turbomemory_core::rabitq::RaBitQuantizer::new(
+                    dim,
+                    bits,
+                    QuantizerKind::ROTATION_SEED,
+                )
+                .map_err(StorageError::Core)?,
+            ),
         };
 
         let bytes_per_vec = quantizer.encoded_bytes_per_vector();

@@ -75,6 +75,14 @@ impl ColdSegment {
                 )
                 .map_err(StorageError::Core)?,
             ),
+            QuantizerKind::RaBitQ { bits } => VectorQuantizer::RaBitQ(
+                turbomemory_core::rabitq::RaBitQuantizer::new(
+                    dim,
+                    bits,
+                    QuantizerKind::ROTATION_SEED,
+                )
+                .map_err(StorageError::Core)?,
+            ),
         };
         let path = path.as_ref().to_path_buf();
         fs::create_dir_all(&path)?;

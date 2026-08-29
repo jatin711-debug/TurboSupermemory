@@ -125,8 +125,8 @@ stateDiagram-v2
 |---|---|---|---|---|---|
 | **Hot** | Read-Write | FP32 (No compression) | In-memory `Vec<PointOffset>` + brute-force exact scan | Volatile RAM + mmap `vectors.bin` | Reaches capacity (e.g. `hot_capacity` = 10,000) |
 | **SealedHot** | Read-Only | FP32 (No compression) | `usearch` HNSW index graph walk (falls back to exact scan on filter selectivity < 1%) | Persisted disk file (`segments/sealed_hot/`) | Promoted to Warm/Cold or merged during background consolidations |
-| **Warm** | Read-Only | 8-bit Scalar or TurboQuant Product Quantizer (4x smaller) | SIMD-accelerated quantized Lookup Table (LUT) dot-product scan + top-k full FP32 reranking | Mmap array index file (`segments/warm/`) | Accumulated Warm records exceed `warm_capacity` |
-| **Cold** | Read-Only | 1-bit Sign or TurboQuant MSE Quantizer (32x smaller) | XOR + Popcount byte-level LUT index scan + top-k full FP32 reranking | Mmap array index file (`segments/cold/`) | Long-term archival; evicted if importance decays below floor |
+| **Warm** | Read-Only | 8-bit Scalar, 2-bit RaBitQ, or TurboQuant Product Quantizer (4x to 15.7x smaller) | SIMD-accelerated quantized Lookup Table (LUT) dot-product scan + top-k full FP32 reranking | Mmap array index file (`segments/warm/`) | Accumulated Warm records exceed `warm_capacity` |
+| **Cold** | Read-Only | 1-bit **RaBitQ** (Randomized Binary Quantization), Sign, or TurboQuant MSE Quantizer (30.7x to 32x smaller) | XOR + Popcount byte-level LUT index scan + top-k full FP32 reranking | Mmap array index file (`segments/cold/`) | Long-term archival; evicted if importance decays below floor |
 
 ### 5.1 Hot Segment
 * New insertions land here.
@@ -140,12 +140,13 @@ stateDiagram-v2
   - **`CudaAnnIndex` HNSW** (GPU path, `cuda` feature): Custom CUDA HNSW implementation. For small N (≤4096), uses GPU brute-force all-pairs; for large N, uses random-projection bucketing + local search + probabilistic hierarchical layer construction. Transparently falls back to `usearch` on CUDA error.
 
 ### 5.3 Warm Segment
-* Compresses embeddings to 8-bit integers using `ScalarQuantizer` or `TurboQuantProdQuantizer`.
+* Compresses embeddings to 8-bit integers using `ScalarQuantizer`, `TurboQuantProdQuantizer`, or 2-bit `RaBitQuantizer`.
 * Computes similarity using LUTs and AVX2-accelerated math directly on quantized bytes, then reranks the top candidates with full floats.
 * **GPU Rerank**: When `cuda` feature is enabled, quantized tier candidate reranking can use GPU batched exact scan via `exact_search_over_offsets_gpu()`.
 
 ### 5.4 Cold Segment
-* Compresses embeddings to 1-bit representations using `SignQuantizer` or `TurboQuantMseQuantizer`.
+* Compresses embeddings to 1-bit representations using `RaBitQuantizer` (universal dimension support), `SignQuantizer`, or `TurboQuantMseQuantizer`.
+* In 1-bit RaBitQ mode, stores $100\text{ bytes/vector}$ @ 768-dim (**$30.7\times$ compression**) and scores in $<8\text{ns}$ using precomputed 8-bit query lookup tables.
 * Computes similarity using bitwise XOR and popcount lookups (extremely compact).
 * **GPU Rerank**: Same GPU rerank path as Warm tier when `cuda` feature is enabled.
 

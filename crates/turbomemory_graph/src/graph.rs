@@ -397,7 +397,7 @@ impl MemoryGraph {
         self.interner.intern(key, node)
     }
 
-    fn get_node_id(&self, key: &str) -> Option<u32> {
+    pub(crate) fn get_node_id(&self, key: &str) -> Option<u32> {
         self.interner.resolve(key)
     }
 

@@ -177,10 +177,18 @@ class Memory:
             from .embedders import OpenAIEmbedder
 
             embedder = OpenAIEmbedder(cache_dir=cache_dir)
-        if extractor is None:
+        if extractor is None or extractor == "openai":
             from .extractors import OpenAIExtractor
 
             extractor = OpenAIExtractor(cache_dir=cache_dir)
+        elif extractor == "gliner":
+            from .extractors import GlinerExtractor
+
+            extractor = GlinerExtractor(cache_dir=cache_dir)
+        elif extractor == "passthrough" or extractor is False:
+            from .extractors import PassthroughExtractor
+
+            extractor = PassthroughExtractor()
         if reranker == "colbert":
             from .rerankers import ColBertReranker
 
@@ -219,6 +227,8 @@ class Memory:
 
         # In-memory id -> fact text (see class docstring for the limitation).
         self._id_to_text: Dict[str, str] = {}
+        # In-memory id -> metadata (role, timestamp, etc.)
+        self._id_to_meta: Dict[str, Dict] = {}
         # In-memory id -> scope, used by the recall scope guard.
         self._id_to_scope: Dict[str, Optional[str]] = {}
         self._insert_counter = 0
@@ -273,6 +283,7 @@ class Memory:
             self._insert_counter += 1
             memory_id = f"{user_id}_{self._insert_counter}" if user_id else f"mem_{self._insert_counter}"
             self._id_to_text[memory_id] = fact
+            self._id_to_meta[memory_id] = meta
             self._id_to_scope[memory_id] = user_id
             self.engine.insert(
                 id=memory_id,
@@ -357,7 +368,7 @@ class Memory:
             from .rerankers import ColBertReranker
             active_reranker = ColBertReranker()
 
-        fetch_k = pool_k if token_budget is not None else (top_k * 3 if active_reranker else top_k)
+        fetch_k = max(pool_k, 30) if token_budget is not None else (top_k * 3 if active_reranker else top_k)
         results = self.engine.search(
             query_text=query,
             query_embedding=query_embedding,
@@ -379,6 +390,18 @@ class Memory:
                          "score": float(score)})
         if not pool:
             return []
+
+        is_user_query = any(w in query.lower().split() for w in ["i", "my", "me", "mine", "we", "our", "did", "have", "how", "what", "total", "number", "many"])
+        for p in pool:
+            mid = p["id"]
+            meta = self._id_to_meta.get(mid) or {}
+            role = meta.get("role") or ""
+            if is_user_query and role == "user":
+                p["score"] = float(p["score"]) * 1.30
+            elif is_user_query and role == "assistant":
+                p["score"] = float(p["score"]) * 0.85
+            p["role"] = role
+            p["turn_index"] = meta.get("turn_index")
 
         # Stage-2 MultiVector / ColBERT Late-Interaction Precision Reranking
         if active_reranker is not None and len(pool) > 1:
@@ -419,16 +442,17 @@ class Memory:
                 by_id[res["id"]]["superseded_by"] = current
                 by_id[res["id"]]["chain"] = list(res["chain"])
 
-    def _mmr_under_budget(self, pool: List[Dict], token_budget: int, lam: float) -> List[Dict]:
-        """Greedy submodular MMR best-set selection (proven recall_under_budget).
+    def _mmr_under_budget(self, pool: List[Dict], token_budget: int, lam: float = 0.55, max_items: Optional[int] = None) -> List[Dict]:
+        """Greedy submodular MMR best-set selection with adaptive saliency cap.
 
         Each step adds the candidate maximizing
-        ``lam * relevance - (1 - lam) * max_redundancy`` against the selected
-        set, skipping candidates that would overflow the token budget.
+        ``lam * relevance - (1 - lam) * max_redundancy + diversity_bonus`` against the selected
+        set, capped at ``max_items`` (default min(10, token_budget // 35)) to prevent context stuffing.
         """
         texts = [p["text"] or "" for p in pool]
         rel = np.array([p["score"] for p in pool], dtype=np.float32)
         toks = np.array([max(1, len(t) // 4) for t in texts], dtype=np.int64)
+        cap = max_items or min(10, max(4, token_budget // 35))
 
         # Pairwise redundancy from pool embeddings (unit-normed -> cosine).
         embs = np.asarray(self.embedder.encode(texts), dtype=np.float32)
@@ -436,19 +460,27 @@ class Memory:
         sim = (embs / norms) @ (embs / norms).T
 
         selected, used, remaining = [], 0, list(range(len(pool)))
-        while remaining:
+        selected_turns = set()
+        while remaining and len(selected) < cap:
             best_i, best_gain = None, -1e9
             for i in remaining:
                 if used + int(toks[i]) > token_budget:
                     continue
                 red = max((float(sim[i, j]) for j in selected), default=0.0)
-                gain = lam * float(rel[i]) - (1.0 - lam) * red
+                if red > 0.72:
+                    continue
+                t_idx = pool[i].get("turn_index")
+                div_bonus = 0.20 if (t_idx is not None and t_idx not in selected_turns) else 0.0
+                gain = lam * float(rel[i]) - (1.0 - lam) * red + div_bonus
                 if gain > best_gain:
                     best_gain, best_i = gain, i
             if best_i is None:
-                break  # nothing else fits the budget
+                break  # nothing else fits the budget or threshold
             selected.append(best_i)
             used += int(toks[best_i])
+            t_idx = pool[best_i].get("turn_index")
+            if t_idx is not None:
+                selected_turns.add(t_idx)
             remaining.remove(best_i)
         return [pool[i] for i in selected]
 

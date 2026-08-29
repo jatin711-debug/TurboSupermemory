@@ -35,22 +35,29 @@ graph TD
 ### 2.1 Why Rust?
 Memory engines for AI agents are highly CPU-bound (due to dense vector math and graph traversals) and memory-bound. Rust provides absolute control over memory allocation, SIMD vector instructions, and lock-free data structures, while providing complete safety from segmentation faults.
 
-### 2.2 Why Segmented Tiers?
+### 2.2 Why Segmented Tiers & Swappable Quantization?
 Standard vector databases rebuild large monolithic indices, which can create high write latencies. TurboSuperMemory splits storage into four distinct tiers:
 1. **Hot**: Appendable in-memory buffers (fast writes, brute-force exact scan).
 2. **SealedHot**: Indexed HNSW files built asynchronously in the background (CPU via `usearch` or GPU via `CudaAnnIndex` when `cuda` feature is enabled).
-3. **Warm**: 8-bit quantized vectors (4x memory reduction) scanned via SIMD.
-4. **Cold**: 1-bit sign-quantized or TurboQuant MSE vectors (32x memory reduction) scanned via fast bitwise XOR/popcount lookup tables.
+3. **Warm**: 8-bit scalar quantized vectors (4x memory reduction) or 2-bit RaBitQ scanned via SIMD.
+4. **Cold**: 1-bit **RaBitQ** (Randomized Binary Quantization, 30.7x memory reduction) or TurboQuant MSE vectors scanned via fast bitwise XOR/popcount lookup tables.
+* **Universal Dimension Support**: Unlike TurboQuant (which requires strict power-of-two dimensions $2^k$), **RaBitQ** natively supports standard 384-d (MiniLM), 768-d (MPNet, Nomic), and 1536-d (OpenAI) embeddings with guaranteed $O(1/d)$ theoretical MSE distortion bounds.
 This keeps write latency low while optimizing search speeds for old/cold memories. GPU acceleration is available for HNSW build and exact-scan reranking via the optional `turbomemory_gpu` crate.
 
-### 2.3 The Split-Persistence Model (WAL + redb)
+### 2.3 Adaptive Prompt Budget Saliency (Submodular MMR)
+For agent prompt generation under tight token limits (150, 300, 1000+ tokens):
+* **Adaptive Saliency Cap (`max_items = min(10, max(4, token_budget // 35))`): Prevents "context-stuffing" noise pollution when large token budgets are provided.
+* **Semantic Redundancy Gate (`red > 0.72`)**: Rejects near-duplicate rephrasings of the same event to guarantee cross-session diversity.
+* **Cross-Turn Coverage Bonus (`+0.20`)**: Rewards facts from distinct temporal sessions to excel at multi-session reasoning.
+
+### 2.4 The Split-Persistence Model (WAL + redb)
 To achieve durability without duplicating large vector data:
 * Vector float arrays are written directly to the mmap'd `vectors.bin` file.
 * Metadata and record attributes are appended immediately to a lightweight Write-Ahead Log (`wal_meta.bin`).
 * A snapshot is written lazily to `redb` (`memory.redb`) during background consolidation.
 * On crash/reboot, the engine replays the lightweight WAL over the last `redb` snapshot.
 
-### 2.4 GPU Acceleration Strategy
+### 2.5 GPU Acceleration Strategy
 GPU acceleration is treated as an **optional performance multiplier**, not a requirement:
 * **Trait-based design**: `GpuBackend` trait enables multiple GPU APIs (CUDA today, Vulkan/ROCm tomorrow).
 * **Silent fallback**: Every GPU operation falls back to CPU on error — no crashes, no user-visible errors.

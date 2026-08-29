@@ -124,3 +124,124 @@ class OpenAIExtractor:
     def flush_cache(self):
         """Write any unpersisted cache entries to disk."""
         self._persist(force=True)
+
+
+class GlinerExtractor:
+    """Extracts structured atomic facts & entities using local GLiNER models.
+
+    Supports Fastino's GLiNER 2.5 / GLiNER multi-task architecture running
+    100% locally on CPU or CUDA without any external LLM API dependencies ($0.00 cost).
+    """
+
+    def __init__(
+        self,
+        model_name: str = "fastino/gliner2.5-multi-v1",
+        schema: Optional[List[str]] = None,
+        device: Optional[str] = None,
+        cache_dir: Optional[str] = None,
+    ):
+        self.model_name = model_name
+        self.schema = schema or [
+            "user preference",
+            "key fact",
+            "technical specification",
+            "person",
+            "organization",
+            "date and time",
+            "location",
+            "action",
+            "constraint",
+        ]
+        self._device = device
+        self._model = None
+        cdir = cache_dir or os.path.join(os.path.expanduser("~"), ".cache", "tsm")
+        os.makedirs(cdir, exist_ok=True)
+        self._cache_path = os.path.join(
+            cdir, f"extract_gliner_{model_name.replace('/', '_').replace(':', '_')}.json"
+        )
+        self._cache: dict = {}
+        if os.path.exists(self._cache_path):
+            try:
+                with open(self._cache_path, encoding="utf-8") as f:
+                    self._cache = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                self._cache = {}
+        self._dirty = 0
+
+    def _load(self):
+        if self._model is not None:
+            return
+        import torch
+
+        device = self._device or ("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info("Loading GLiNER model %s on %s", self.model_name, device)
+        try:
+            from gliner2 import GLiNER2
+            self._model = GLiNER2.from_pretrained(self.model_name)
+            if device == "cuda" and hasattr(self._model, "to"):
+                self._model = self._model.to("cuda")
+        except Exception:
+            try:
+                from gliner import GLiNER
+                self._model = GLiNER.from_pretrained(self.model_name)
+                if device == "cuda" and hasattr(self._model, "to"):
+                    self._model = self._model.to("cuda")
+            except Exception as e:
+                logger.warning("Could not load GLiNER model %s: %s; falling back to urchade/gliner_multi-v2.1", self.model_name, e)
+                from gliner import GLiNER
+                self._model = GLiNER.from_pretrained("urchade/gliner_multi-v2.1")
+                if device == "cuda" and hasattr(self._model, "to"):
+                    self._model = self._model.to("cuda")
+
+    def extract_facts(self, message: str, context: Optional[List[str]] = None) -> List[str]:
+        if not message or not message.strip():
+            return []
+        key = _cache_key(message, context)
+        if key in self._cache:
+            return self._cache[key]
+        self._load()
+
+        facts: List[str] = []
+        try:
+            if hasattr(self._model, "predict_entities"):
+                extracted = self._model.predict_entities(message, self.schema)
+            else:
+                extracted = self._model.predict_entities(message, self.schema, threshold=0.3)
+            
+            if extracted:
+                entity_summary = ", ".join(f"{e.get('label')}: {e.get('text')}" for e in extracted if 'label' in e and 'text' in e)
+                facts.append(f"{message.strip()} [{entity_summary}]")
+            else:
+                facts.append(message.strip())
+        except Exception as e:
+            logger.warning("GLiNER extraction failed: %s", e)
+            facts = [message.strip()]
+
+        self._cache[key] = facts
+        self._dirty += 1
+        if self._dirty >= 100:
+            self._persist()
+        return facts
+
+    def _persist(self, force=False):
+        try:
+            with open(self._cache_path, "w", encoding="utf-8") as f:
+                json.dump(self._cache, f)
+            self._dirty = 0
+        except OSError as e:
+            logger.warning("GLiNER extract cache write failed: %s", e)
+
+    def flush_cache(self):
+        self._persist(force=True)
+
+
+class PassthroughExtractor:
+    """Zero-overhead extractor that treats the raw message as an atomic fact."""
+
+    def extract_facts(self, message: str, context: Optional[List[str]] = None) -> List[str]:
+        return [message.strip()] if message and message.strip() else []
+
+    def flush_cache(self):
+        pass
+
+

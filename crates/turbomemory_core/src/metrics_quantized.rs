@@ -273,15 +273,10 @@ pub fn sign_quantized_score_batch(
     // happens when all |query_i| are equal, e.g. after L2 normalization and
     // certain symmetric queries), we can reduce the inner loop to a popcount.
     // Detect this by comparing table pointers/contents for the first byte.
-    let uniform_weight = weights.first().and_then(|first| {
-        if weights
+    let uniform_weight = weights.first().filter(|&first| {
+        weights
             .iter()
             .all(|w| std::ptr::eq(w.as_ptr(), first.as_ptr()) || w == first)
-        {
-            Some(first)
-        } else {
-            None
-        }
     });
 
     if let Some(uniform) = uniform_weight {

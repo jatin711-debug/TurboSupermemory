@@ -164,6 +164,7 @@ pub enum VectorQuantizer {
     Sign(SignQuantizer),
     TurboQuantMse(TurboQuantMseQuantizer),
     TurboQuantProd(TurboQuantProdQuantizer),
+    RaBitQ(crate::rabitq::RaBitQuantizer),
 }
 
 impl Quantizer for VectorQuantizer {
@@ -173,6 +174,7 @@ impl Quantizer for VectorQuantizer {
             Self::Sign(q) => q.dim(),
             Self::TurboQuantMse(q) => q.dim(),
             Self::TurboQuantProd(q) => q.dim(),
+            Self::RaBitQ(q) => q.dim(),
         }
     }
 
@@ -182,6 +184,7 @@ impl Quantizer for VectorQuantizer {
             Self::Sign(q) => q.encoded_bytes_per_vector(),
             Self::TurboQuantMse(q) => q.encoded_bytes_per_vector(),
             Self::TurboQuantProd(q) => q.encoded_bytes_per_vector(),
+            Self::RaBitQ(q) => q.encoded_bytes_per_vector(),
         }
     }
 
@@ -191,6 +194,7 @@ impl Quantizer for VectorQuantizer {
             Self::Sign(q) => q.encode(v),
             Self::TurboQuantMse(q) => q.encode(v),
             Self::TurboQuantProd(q) => q.encode(v),
+            Self::RaBitQ(q) => q.encode(v),
         }
     }
 
@@ -200,6 +204,7 @@ impl Quantizer for VectorQuantizer {
             Self::Sign(q) => q.decode(encoded),
             Self::TurboQuantMse(q) => q.decode(encoded),
             Self::TurboQuantProd(q) => q.decode(encoded),
+            Self::RaBitQ(q) => q.decode(encoded),
         }
     }
 }

@@ -7,6 +7,7 @@ pub mod metrics;
 pub mod metrics_quantized;
 pub mod quantization;
 pub mod quantized_search;
+pub mod rabitq;
 pub mod turbo_quant;
 
 pub use metrics::{
@@ -16,6 +17,7 @@ pub use metrics::{
 };
 pub use quantization::{LloydMaxTable, Quantizer, ScalarQuantizer, SignQuantizer, VectorQuantizer};
 pub use quantized_search::{AnyEncodedQuery, EncodedQuery, QuantizedStore};
+pub use rabitq::{RaBitQEncodedQuery, RaBitQuantizer};
 pub use turbo_quant::{TurboQuantMseQuantizer, TurboQuantProdQuantizer};
 
 use serde::{Deserialize, Serialize};

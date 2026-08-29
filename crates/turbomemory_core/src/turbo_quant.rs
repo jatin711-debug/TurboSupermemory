@@ -32,7 +32,7 @@ pub fn packed_bytes(dim: usize, bits: u8) -> usize {
 ///
 /// Codes are stored little-endian within the bit stream: the lowest bit of
 /// coordinate `i` is at bit position `i * bits`.
-fn pack_codes(codes: &[u8], bits: u8, out: &mut [u8]) {
+pub fn pack_codes(codes: &[u8], bits: u8, out: &mut [u8]) {
     assert_eq!(out.len(), packed_bytes(codes.len(), bits));
     out.fill(0);
     let bits = bits as usize;
