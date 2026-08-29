@@ -20,8 +20,9 @@ Most "agent memory" solutions today are thin Python wrappers around vector datab
 * ⚡ **$0.00 Write-Time Ingestion**: Open-vocabulary statistical PMI concept extraction in native Rust ($<0.05\text{ms}$ latency) — zero LLM token burn on write.
 * 💥 **30.7× RaBitQ & 32× TurboQuant Hardware Compression**: Universal dimension support (384-d, 768-d, 1536-d) shrinking 768-d vectors to **100 bytes/vec** with randomized orthogonal transforms and fast AVX2/CUDA LUT popcount scoring.
 * 🧠 **Cognitive Biology & Graph Layer**: ACT-R power-law recency decay, spreading activation across concept hubs, and NLI-based non-destructive belief revision.
-* 🎯 **Adaptive Saliency Cap & Submodular MMR**: Prevents prompt context-stuffing across 150 to 1,000+ token budgets, maintaining superior accuracy against Mem0 across all budget sizes.
-* 🛡️ **Zero-Crash Storage Engine**: Lock-free atomic `ArcSwap` snapshots, segmented mmap buffers, and Write-Ahead Logging (WAL) that never block live queries.
+* 🎯 **2-Stage Retrieval & ColBERT MaxSim**: Fast Stage-1 candidate retrieval ($<1\text{ms}$) + optional Stage-2 token-level late interaction (`LiquidAI/LFM2.5-ColBERT-350M`) on CUDA.
+* 🛡️ **Adaptive Saliency Cap & Submodular MMR**: Prevents prompt context-stuffing across 150 to 1,000+ token budgets, maintaining superior accuracy against Mem0 across all budget sizes.
+* 🔒 **Zero-Crash Storage Engine**: Lock-free atomic `ArcSwap` snapshots, segmented mmap buffers, and Write-Ahead Logging (WAL) that never block live queries.
 
 ---
 
@@ -45,6 +46,13 @@ $$y = R x, \quad b_i = \mathbb{I}(y_i \ge 0), \quad \alpha = \frac{\|x\|_2}{\sqr
 $$\langle q, x \rangle \approx \alpha \cdot \langle R q, 2 b - \mathbf{1} \rangle = \alpha \sum_{j=0}^{\lceil d/8 \rceil - 1} T_j[\text{byte}_j]$$
 
 Scored in $<8\text{ns}$ per vector using precomputed 8-bit lookup tables ($>50\text{M}$ vectors/sec/core).
+
+### 3. Stage-2 ColBERT MaxSim Late Interaction
+For multi-constraint and entity-dense queries, TSM evaluates token-level alignment between query tokens $Q$ and candidate memory tokens $D$:
+
+$$\text{MaxSim}(Q, D) = \sum_{i=1}^{L_q} \max_{j=1}^{L_d} (Q_i \cdot D_j)$$
+
+$$\text{Score}_{\text{fused}}(M) = \text{Score}_{\text{TSM}}(M) \cdot \Big(1 + \text{Softmax}(\text{MaxSim}(Q, M)) \cdot N\Big)$$
 
 ---
 
