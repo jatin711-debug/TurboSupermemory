@@ -209,7 +209,19 @@ fn parse_payload(payload: Option<String>) -> PyResult<Option<String>> {
 
 #[pyclass(name = "MemoryEngine")]
 pub struct PyMemoryEngine {
-    inner: Arc<StorageEngine>,
+    /// `None` once `close()` has run. Dropping the `Arc` is what releases the
+    /// database lock, mmaps, and worker threads, so `close()` takes it out
+    /// rather than leaving release to Python's garbage collector.
+    inner: Option<Arc<StorageEngine>>,
+}
+
+impl PyMemoryEngine {
+    /// The live engine, or `RuntimeError` after `close()`.
+    fn engine(&self) -> PyResult<&Arc<StorageEngine>> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("engine is closed"))
+    }
 }
 
 #[pymethods]
@@ -618,7 +630,7 @@ impl PyMemoryEngine {
         }
 
         let inner = StorageEngine::open(db_path, config).map_err(storage_err)?;
-        Ok(Self { inner })
+        Ok(Self { inner: Some(inner) })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -645,11 +657,12 @@ impl PyMemoryEngine {
         scope: Option<String>,
         source_role: Option<String>,
     ) -> PyResult<bool> {
+        let engine = self.engine()?;
         let emb_input = extract_f32_input(embedding)?;
         let emb = emb_input.as_slice();
         let payload = parse_payload(payload)?;
         py.allow_threads(|| {
-            self.inner
+            engine
                 .insert_with_payload_role(
                     id,
                     text,
@@ -687,6 +700,7 @@ impl PyMemoryEngine {
         scopes: Option<Vec<String>>,
         source_roles: Option<Vec<String>>,
     ) -> PyResult<usize> {
+        let engine = self.engine()?;
         let matrix = extract_f32_matrix(embeddings)?;
         let rows = matrix.rows();
         let payloads: Vec<Option<String>> = match payloads {
@@ -705,7 +719,7 @@ impl PyMemoryEngine {
             None => Vec::new(),
         };
         py.allow_threads(|| {
-            self.inner
+            engine
                 .insert_batch_with_payload_role(
                     &ids,
                     &texts,
@@ -729,11 +743,12 @@ impl PyMemoryEngine {
         search_list_size: Option<usize>,
         scope: Option<String>,
     ) -> PyResult<Vec<(String, f32)>> {
+        let engine = self.engine()?;
         let q_input = extract_f32_input(query_embedding)?;
         let q = q_input.as_slice();
         let scope_ref = scope.as_deref();
         py.allow_threads(|| {
-            self.inner
+            engine
                 .search_ann_scoped(q, top_k, search_list_size, scope_ref)
                 .map_err(storage_err)
         })
@@ -756,11 +771,12 @@ impl PyMemoryEngine {
         search_list_size: Option<usize>,
         scope: Option<String>,
     ) -> PyResult<Vec<Vec<(String, f32)>>> {
+        let engine = self.engine()?;
         let matrix = extract_f32_matrix(queries)?;
         let rows = matrix.rows();
         let scope_ref = scope.as_deref();
         py.allow_threads(|| {
-            self.inner
+            engine
                 .search_ann_batch(&rows, top_k, search_list_size, None, scope_ref)
                 .map_err(storage_err)
         })
@@ -775,11 +791,12 @@ impl PyMemoryEngine {
         search_list_size: Option<usize>,
         scope: Option<String>,
     ) -> PyResult<Vec<(String, f32)>> {
+        let engine = self.engine()?;
         let q_input = extract_f32_input(query_embedding)?;
         let q = q_input.as_slice();
         let scope_ref = scope.as_deref();
         py.allow_threads(|| {
-            self.inner
+            engine
                 .search_ann_scoped(q, top_k, search_list_size, scope_ref)
                 .map_err(storage_err)
         })
@@ -795,11 +812,12 @@ impl PyMemoryEngine {
         search_list_size: Option<usize>,
         scope: Option<String>,
     ) -> PyResult<Option<Vec<(String, f32)>>> {
+        let engine = self.engine()?;
         let q_input = extract_f32_input(query_embedding)?;
         let q = q_input.as_slice();
         let scope_ref = scope.as_deref();
         py.allow_threads(|| {
-            self.inner
+            engine
                 .search_scoped_with_ef(query_text, q, top_k, search_list_size, scope_ref)
                 .map_err(storage_err)
         })
@@ -811,8 +829,9 @@ impl PyMemoryEngine {
         user_input: &str,
         assistant_response: &str,
     ) -> PyResult<String> {
+        let engine = self.engine()?;
         py.allow_threads(|| {
-            self.inner
+            engine
                 .step_session(user_input, assistant_response)
                 .map_err(storage_err)
         })
@@ -840,10 +859,11 @@ impl PyMemoryEngine {
     /// engine.set_llm_compressor(my_compressor)
     /// ```
     fn set_llm_compressor(&self, callable: Py<PyAny>) -> PyResult<()> {
+        let engine = self.engine()?;
         let compressor = Arc::new(PythonCompressor {
             callable: Mutex::new(callable),
         });
-        self.inner.set_compressor(compressor);
+        engine.set_compressor(compressor);
         Ok(())
     }
 
@@ -866,29 +886,33 @@ impl PyMemoryEngine {
     /// engine.set_gist_compressor(my_gister)
     /// ```
     fn set_gist_compressor(&self, callable: Py<PyAny>) -> PyResult<()> {
+        let engine = self.engine()?;
         let compressor = Arc::new(PythonGistCompressor {
             callable: Mutex::new(callable),
         });
-        self.inner.set_gist_compressor(Some(compressor));
+        engine.set_gist_compressor(Some(compressor));
         Ok(())
     }
 
     fn trigger_consolidation(&self, py: Python<'_>) -> PyResult<(usize, usize, usize)> {
-        py.allow_threads(|| self.inner.trigger_consolidation().map_err(storage_err))
+        let engine = self.engine()?;
+        py.allow_threads(|| engine.trigger_consolidation().map_err(storage_err))
     }
 
     /// Run bounded-storage eviction directly, returning the number of records
     /// dropped. No-op (returns 0) unless `max_records` or `evict_score_floor`
     /// was configured.
     fn evict(&self, py: Python<'_>) -> PyResult<usize> {
-        py.allow_threads(|| self.inner.evict().map_err(storage_err))
+        let engine = self.engine()?;
+        py.allow_threads(|| engine.evict().map_err(storage_err))
     }
 
     /// Run semantic near-duplicate consolidation directly, returning the number
     /// of duplicate records merged away. No-op (returns 0) unless
     /// `dedup_cosine_threshold` was configured.
     fn deduplicate(&self, py: Python<'_>) -> PyResult<usize> {
-        py.allow_threads(|| self.inner.deduplicate().map_err(storage_err))
+        let engine = self.engine()?;
+        py.allow_threads(|| engine.deduplicate().map_err(storage_err))
     }
 
     /// Run automatic importance scoring directly, returning the number of
@@ -897,48 +921,103 @@ impl PyMemoryEngine {
     /// `trigger_consolidation` when enabled; this method lets callers run it
     /// independently.
     fn recompute_importance(&self, py: Python<'_>) -> PyResult<usize> {
-        py.allow_threads(|| self.inner.recompute_importance().map_err(storage_err))
+        let engine = self.engine()?;
+        py.allow_threads(|| engine.recompute_importance().map_err(storage_err))
     }
 
     /// Run one pass of online concept vocabulary evolution, returning
     /// `(merged, newly_suppressed, examined_pairs)`. No-op `(0, 0, 0)` unless
     /// `concept_evolution_enabled` is true.
     fn evolve_concept_vocabulary(&self, py: Python<'_>) -> PyResult<(usize, usize, usize)> {
-        py.allow_threads(|| self.inner.evolve_concept_vocabulary().map_err(storage_err))
+        let engine = self.engine()?;
+        py.allow_threads(|| engine.evolve_concept_vocabulary().map_err(storage_err))
     }
 
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
-        py.allow_threads(|| self.inner.flush().map_err(storage_err))
+        let engine = self.engine()?;
+        py.allow_threads(|| engine.flush().map_err(storage_err))
     }
 
     fn delete(&self, py: Python<'_>, id: &str) -> PyResult<bool> {
-        py.allow_threads(|| self.inner.delete_by_id(id).map_err(storage_err))
+        let engine = self.engine()?;
+        py.allow_threads(|| engine.delete_by_id(id).map_err(storage_err))
     }
 
     /// Number of live (non-tombstoned) records. Lets callers assert that
     /// bounded-storage eviction is keeping the collection under `max_records`.
     fn record_count(&self, py: Python<'_>) -> PyResult<usize> {
-        Ok(py.allow_threads(|| self.inner.record_count()))
+        let engine = self.engine()?;
+        Ok(py.allow_threads(|| engine.record_count()))
     }
 
     /// True if a record with this id is still live (not evicted/deleted). Used
     /// by the retention eval (W5) to measure gold-fact survival after eviction.
     fn contains_id(&self, py: Python<'_>, id: String) -> PyResult<bool> {
-        Ok(py.allow_threads(|| self.inner.contains_id(&id)))
+        let engine = self.engine()?;
+        Ok(py.allow_threads(|| engine.contains_id(&id)))
     }
 
     /// Return the stored text for `id`, or None when the id is unknown. Lets
     /// callers render engine-generated records (e.g. gist-before-evict gist
     /// records) whose ids they did not mint themselves.
     fn get_text(&self, py: Python<'_>, id: String) -> PyResult<Option<String>> {
-        Ok(py.allow_threads(|| self.inner.find_record_by_id(&id).map(|r| r.text)))
+        let engine = self.engine()?;
+        Ok(py.allow_threads(|| engine.find_meta_by_id(&id).map(|r| r.text)))
+    }
+
+    /// Stored metadata for each id, parallel to `ids`: a dict with keys
+    /// `id` / `text` / `payload` / `scope` / `source_role` / `importance` /
+    /// `created_at` / `insert_seq`, or `None` for an id that is not live.
+    /// `payload` is the raw JSON string given at insert time (or `None`).
+    /// Lets callers hydrate search hits from the engine instead of mirroring
+    /// record metadata in process memory, where it is lost on restart.
+    fn get_records(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<Vec<Option<Py<PyDict>>>> {
+        let engine = self.engine()?;
+        let metas = py.allow_threads(|| {
+            ids.iter()
+                .map(|id| engine.find_meta_by_id(id))
+                .collect::<Vec<_>>()
+        });
+        metas
+            .into_iter()
+            .map(|meta| {
+                meta.map(|m| {
+                    let d = PyDict::new(py);
+                    d.set_item("id", m.id)?;
+                    d.set_item("text", m.text)?;
+                    d.set_item("payload", m.payload)?;
+                    d.set_item("scope", m.scope)?;
+                    d.set_item("source_role", m.source_role)?;
+                    d.set_item("importance", m.importance)?;
+                    d.set_item("created_at", m.created_at)?;
+                    d.set_item("insert_seq", m.insert_seq)?;
+                    Ok(d.unbind())
+                })
+                .transpose()
+            })
+            .collect()
+    }
+
+    /// The `insert_seq` the next inserted record will receive. Durable and
+    /// monotonically increasing — never reused across restarts, deletes, or
+    /// eviction — so callers can derive collision-free ids from it.
+    fn next_insert_seq(&self, py: Python<'_>) -> PyResult<u64> {
+        let engine = self.engine()?;
+        Ok(py.allow_threads(|| engine.next_insert_seq()))
     }
 
     /// Returns True if the engine is using GPU acceleration for distance
     /// computation. This is determined at runtime based on CUDA availability.
     #[getter]
-    fn gpu_accelerated(&self) -> bool {
-        self.inner.is_gpu_accelerated()
+    fn gpu_accelerated(&self) -> PyResult<bool> {
+        Ok(self.engine()?.is_gpu_accelerated())
+    }
+
+    /// True once `close()` has run; every other method then raises
+    /// `RuntimeError("engine is closed")`.
+    #[getter]
+    fn closed(&self) -> bool {
+        self.inner.is_none()
     }
 
     // ---- Graph introspection API (C7) -------------------------------------
@@ -955,8 +1034,9 @@ impl PyMemoryEngine {
         &self,
         py: Python<'_>,
     ) -> PyResult<(usize, usize, usize, usize, usize, usize, usize)> {
+        let engine = self.engine()?;
         Ok(py.allow_threads(|| {
-            let guard = self.inner.read_graph();
+            let guard = engine.read_graph();
             let s = guard.graph().stats();
             (
                 s.node_count,
@@ -974,8 +1054,9 @@ impl PyMemoryEngine {
     /// attached). Returns list[(concept, degree)] sorted by degree desc.
     /// Abstraction parent nodes (containing '+') are excluded.
     fn get_concepts(&self, py: Python<'_>) -> PyResult<Vec<(String, usize)>> {
+        let engine = self.engine()?;
         Ok(py.allow_threads(|| {
-            let guard = self.inner.read_graph();
+            let guard = engine.read_graph();
             let graph = guard.graph();
             let mut concepts: Vec<(String, usize)> = graph
                 .nodes()
@@ -996,8 +1077,9 @@ impl PyMemoryEngine {
     /// Concepts attached to memory `id`. Returns list[concept]. Empty if the
     /// memory is unknown.
     fn get_memory_concepts(&self, py: Python<'_>, id: String) -> PyResult<Vec<String>> {
+        let engine = self.engine()?;
         Ok(py.allow_threads(|| {
-            let guard = self.inner.read_graph();
+            let guard = engine.read_graph();
             guard.graph().memory_concepts(&id)
         }))
     }
@@ -1005,8 +1087,9 @@ impl PyMemoryEngine {
     /// Memories that `id` refines (the older memories `id` supersedes).
     /// Returns list[id]. Empty if `id` has no Refines edges or is unknown.
     fn get_refinements(&self, py: Python<'_>, id: String) -> PyResult<Vec<String>> {
+        let engine = self.engine()?;
         Ok(py.allow_threads(|| {
-            let guard = self.inner.read_graph();
+            let guard = engine.read_graph();
             guard.graph().refined_by(&id)
         }))
     }
@@ -1014,8 +1097,9 @@ impl PyMemoryEngine {
     /// Memories that contradict `id` (the newer memories that correct it).
     /// Returns list[id]. Empty if `id` has no Contradicts edges or is unknown.
     fn get_contradictions(&self, py: Python<'_>, id: String) -> PyResult<Vec<String>> {
+        let engine = self.engine()?;
         Ok(py.allow_threads(|| {
-            let guard = self.inner.read_graph();
+            let guard = engine.read_graph();
             guard.graph().contradicted_by(&id)
         }))
     }
@@ -1024,8 +1108,9 @@ impl PyMemoryEngine {
     /// edge to a live newer memory (B1). Exclude these from the answer context
     /// (or tag them outdated) instead of merely rank-demoting them.
     fn superseded_ids(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let engine = self.engine()?;
         Ok(py.allow_threads(|| {
-            let guard = self.inner.read_graph();
+            let guard = engine.read_graph();
             guard.graph().superseded_ids()
         }))
     }
@@ -1037,7 +1122,8 @@ impl PyMemoryEngine {
     /// without any cognitive config flags: with no supersession edges every id
     /// resolves to itself (`superseded=False`, `chain=[id]`).
     fn resolve_beliefs(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<Vec<Py<PyDict>>> {
-        let resolutions = py.allow_threads(|| self.inner.resolve_beliefs(&ids));
+        let engine = self.engine()?;
+        let resolutions = py.allow_threads(|| engine.resolve_beliefs(&ids));
         resolutions
             .into_iter()
             .map(|r| {
@@ -1065,11 +1151,12 @@ impl PyMemoryEngine {
         scope: Option<String>,
         source_role: Option<String>,
     ) -> PyResult<bool> {
+        let engine = self.engine()?;
         let emb_input = extract_f32_input(embedding)?;
         let emb = emb_input.as_slice();
         let payload = parse_payload(payload)?;
         py.allow_threads(|| {
-            self.inner
+            engine
                 .update_with_payload_role(
                     id,
                     text,
@@ -1094,7 +1181,8 @@ impl PyMemoryEngine {
         &self,
         py: Python<'_>,
     ) -> PyResult<Vec<(String, String, String, f32)>> {
-        let props = py.allow_threads(|| self.inner.propose_supersessions().map_err(storage_err))?;
+        let engine = self.engine()?;
+        let props = py.allow_threads(|| engine.propose_supersessions().map_err(storage_err))?;
         Ok(props
             .into_iter()
             .map(|p| (p.old_id, p.new_id, p.kind.as_str().to_string(), p.cosine))
@@ -1112,21 +1200,38 @@ impl PyMemoryEngine {
         py: Python<'_>,
         pairs: Vec<(String, String, String)>,
     ) -> PyResult<usize> {
+        let engine = self.engine()?;
         let parsed: Vec<(String, String, SupersessionKind)> = pairs
             .into_iter()
             .filter_map(|(o, n, k)| SupersessionKind::from_label(&k).map(|kind| (o, n, kind)))
             .collect();
         py.allow_threads(|| {
-            self.inner
+            engine
                 .commit_supersessions_by_id(&parsed)
                 .map_err(storage_err)
         })
     }
 
-    /// Flush all durable state. The engine's built-in background optimizer is
-    /// stopped automatically when the engine is dropped.
+    /// Flush all durable state and release the engine: the background workers
+    /// are stopped and the database lock, mmaps, and index files are let go, so
+    /// the same `db_path` can be reopened immediately. Idempotent. The engine
+    /// is released even when the final flush fails; that error is still raised.
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
-        py.allow_threads(|| self.inner.shutdown().map_err(storage_err))
+        let Some(engine) = self.inner.take() else {
+            return Ok(());
+        };
+        // Drop the Python callbacks while the GIL is held. A gist/LLM callback
+        // is usually a bound method of the object that owns this engine, a
+        // reference cycle Python's collector cannot see through the Rust side.
+        engine.set_compressor(Arc::new(DeterministicCompressor));
+        engine.set_gist_compressor(None);
+        // Shutdown joins the worker threads, which may be waiting for the GIL
+        // inside a callback, so it must run with the GIL released.
+        py.allow_threads(move || {
+            let result = engine.shutdown().map_err(storage_err);
+            drop(engine);
+            result
+        })
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {

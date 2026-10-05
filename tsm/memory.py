@@ -31,6 +31,10 @@ from .interfaces import Embedder, Extractor, Verifier  # noqa: F401  (re-exporte
 
 logger = logging.getLogger("tsm.memory")
 
+# Engine methods this SDK cannot work without. The extension and the SDK ship
+# together; this guards against a stale locally-built turbomemory.pyd/.so.
+_REQUIRED_ENGINE_METHODS = ("get_records", "next_insert_seq")
+
 # The proven conversational configuration, from the evaluation wins. Every key
 # is a MemoryEngine kwarg; explicit engine_kwargs passed to Memory() override
 # these. `defer_supersession_commit` is added by Memory depending on whether a
@@ -119,20 +123,19 @@ class Memory:
             results = mem.recall("Where does Alice live?", user_id="alice")
             mem.consolidate()                          # verified belief revision
 
-    The id->text map used to feed the verifier is kept in memory only
-    (matching the proven eval adapter): after reopening a database, recall
-    renders ``text`` via the engine's stored-text lookup (``get_text``)
-    instead of the in-memory map, and the verifier only vets pairs whose
-    texts are known in this process. Persist your own mapping if you need
-    cross-process verified consolidation.
+    Durability: the engine is the only store. Text, role, and scope are
+    read back from it at recall time and ids are minted from its durable
+    insert sequence, so a database behaves the same after it is reopened —
+    in this process or another — as it did when it was written: ``add``
+    keeps appending, the role prior still applies, and a verifier installed
+    later can vet facts stored by an earlier session.
 
-    Scope guard: `recall` drops hits whose scope is known in this process
-    and does not match `user_id`. This is belt-and-suspenders — the engine
-    itself fixed the historical empty-scope-bitmap leak (an empty scope
-    bitmap used to be treated as "unfiltered"; it now matches nothing, with
-    a regression test in the storage crate). Scope knowledge is in-memory
-    only, like the text map, so the guard is exact for memories added by
-    this process and defers to the engine for pre-existing ones.
+    Scope guard: ``recall`` drops any hit whose stored scope is neither
+    ``user_id`` nor global (unscoped). This is belt-and-suspenders over the
+    engine's own scope filter.
+
+    ``close()`` releases the database (lock, mmaps, worker threads); the
+    same ``db_path`` can be reopened immediately afterwards.
     """
 
     def __init__(
@@ -177,6 +180,10 @@ class Memory:
             from .embedders import OpenAIEmbedder
 
             embedder = OpenAIEmbedder(cache_dir=cache_dir)
+        elif embedder in ("sentence_transformer", "local", "minilm"):
+            from .embedders import SentenceTransformerEmbedder
+
+            embedder = SentenceTransformerEmbedder()
         if extractor is None or extractor == "openai":
             from .extractors import OpenAIExtractor
 
@@ -216,6 +223,14 @@ class Memory:
         self.engine = turbomemory.MemoryEngine(
             db_path=db_path, dimension=self.dim, **config
         )
+        self._closed = False
+        missing = [m for m in _REQUIRED_ENGINE_METHODS if not hasattr(self.engine, m)]
+        if missing:
+            self.close()
+            raise RuntimeError(
+                "the compiled turbomemory extension is older than this tsm SDK "
+                f"(missing: {', '.join(missing)}); rebuild it with 'make build-python'"
+            )
         if gist_summarizer is not None:
             set_compressor = getattr(self.engine, "set_gist_compressor", None)
             if set_compressor is None:
@@ -225,14 +240,10 @@ class Memory:
                 )
             set_compressor(self._compress_gist)
 
-        # In-memory id -> fact text (see class docstring for the limitation).
-        self._id_to_text: Dict[str, str] = {}
-        # In-memory id -> metadata (role, timestamp, etc.)
-        self._id_to_meta: Dict[str, Dict] = {}
-        # In-memory id -> scope, used by the recall scope guard.
-        self._id_to_scope: Dict[str, Optional[str]] = {}
-        self._insert_counter = 0
-        self._closed = False
+        # Ids are `{user_id}_{n}`. Seeding n from the engine's durable insert
+        # sequence (which starts at 1 and is never reused) keeps ids unique
+        # when an existing database is reopened.
+        self._insert_counter = max(0, int(self.engine.next_insert_seq()) - 1)
 
     # writes ----------------------------------------------------------------------
     def add(self, messages: List[Dict], user_id: str) -> int:
@@ -248,6 +259,7 @@ class Memory:
             batch are skipped (write gate); cross-batch near-duplicates are
             the engine's job (dedup config / belief revision).
         """
+        self._require_open()
         if isinstance(messages, str):
             messages = [{"role": "user", "content": messages}]
         elif isinstance(messages, dict):
@@ -280,13 +292,8 @@ class Memory:
 
         embeddings = np.asarray(self.embedder.encode(facts), dtype=np.float32)
         for fact, meta, emb in zip(facts, metas, embeddings):
-            self._insert_counter += 1
-            memory_id = f"{user_id}_{self._insert_counter}" if user_id else f"mem_{self._insert_counter}"
-            self._id_to_text[memory_id] = fact
-            self._id_to_meta[memory_id] = meta
-            self._id_to_scope[memory_id] = user_id
             self.engine.insert(
-                id=memory_id,
+                id=self._next_id(user_id),
                 text=fact,
                 embedding=emb.astype(np.float32),
                 importance_score=1.0,
@@ -320,17 +327,37 @@ class Memory:
             logger.warning("gist summarizer failed for %d texts: %s", len(texts), e)
             return None
 
-    def _engine_text(self, memory_id: str) -> str:
-        """Engine-side text lookup for records this process did not mint
-        (gist records, or facts from an earlier process). Empty string on
-        older engines without ``get_text``."""
-        get_text = getattr(self.engine, "get_text", None)
-        if get_text is None:
-            return ""
-        try:
-            return get_text(memory_id) or ""
-        except Exception:  # noqa: BLE001 — text is best-effort rendering
-            return ""
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("Memory is closed")
+
+    def _next_id(self, user_id: Optional[str]) -> str:
+        """Mint a ``{user_id}_{n}`` id that is not live in the engine."""
+        while True:
+            self._insert_counter += 1
+            memory_id = (f"{user_id}_{self._insert_counter}" if user_id
+                         else f"mem_{self._insert_counter}")
+            # Only reachable for ids this SDK did not mint (e.g. records
+            # written straight through the engine); costs one lookup per fact.
+            if not self.engine.contains_id(memory_id):
+                return memory_id
+
+    def _records(self, ids: List[str]) -> Dict[str, Dict]:
+        """Stored record metadata for ``ids``, read back from the engine.
+
+        Maps id -> ``{"text", "scope", "source_role", "payload", ...}`` with
+        ``payload`` parsed to a dict. Ids that are no longer live are omitted.
+        """
+        out: Dict[str, Dict] = {}
+        for rec in self.engine.get_records(list(ids)):
+            if rec is None:
+                continue
+            try:
+                rec["payload"] = json.loads(rec["payload"]) if rec["payload"] else {}
+            except (TypeError, ValueError):
+                rec["payload"] = {}
+            out[rec["id"]] = rec
+        return out
 
     # reads -----------------------------------------------------------------------
     def recall(
@@ -347,7 +374,8 @@ class Memory:
     ) -> List[Dict]:
         """Search memories under ``user_id``'s scope.
 
-        Returns a list of ``{"id", "text", "score"}`` dicts, best first.
+        Returns a list of dicts, best first, each with at least ``"id"``,
+        ``"text"``, ``"score"`` and ``"role"`` (the stored source role).
         Superseded facts are excluded by the engine when the conversational
         profile is active.
 
@@ -361,6 +389,7 @@ class Memory:
         retrieved candidate shortlists from TSM's cognitive graph are reranked
         using token-level MaxSim late interaction.
         """
+        self._require_open()
         query_embedding = np.asarray(self.embedder.encode(query), dtype=np.float32)
 
         active_reranker = reranker or (self.reranker if rerank else None)
@@ -378,30 +407,27 @@ class Memory:
         if not results:  # empty, or the FOK gate rejected the query
             return []
 
+        records = self._records([mid for mid, _ in results])
         pool = []
         for mid, score in results:
-            # Scope guard: drop known-foreign hits that
-            # the engine's empty-bitmap quirk can leak into scoped searches.
-            if user_id is not None:
-                known_scope = self._id_to_scope.get(mid)
-                if known_scope is not None and known_scope != user_id:
-                    continue
-            pool.append({"id": mid, "text": self._id_to_text.get(mid) or self._engine_text(mid),
-                         "score": float(score)})
+            rec = records.get(mid)
+            if rec is None:
+                continue  # deleted or evicted since the search returned it
+            # Scope guard: only this user's memories and global (unscoped) ones.
+            if user_id is not None and rec["scope"] not in (None, user_id):
+                continue
+            pool.append({"id": mid, "text": rec["text"], "score": float(score),
+                         "role": rec["source_role"] or "",
+                         "turn_index": rec["payload"].get("turn_index")})
         if not pool:
             return []
 
         is_user_query = any(w in query.lower().split() for w in ["i", "my", "me", "mine", "we", "our", "did", "have", "how", "what", "total", "number", "many"])
         for p in pool:
-            mid = p["id"]
-            meta = self._id_to_meta.get(mid) or {}
-            role = meta.get("role") or ""
-            if is_user_query and role == "user":
+            if is_user_query and p["role"] == "user":
                 p["score"] = float(p["score"]) * 1.30
-            elif is_user_query and role == "assistant":
+            elif is_user_query and p["role"] == "assistant":
                 p["score"] = float(p["score"]) * 0.85
-            p["role"] = role
-            p["turn_index"] = meta.get("turn_index")
 
         # Stage-2 MultiVector / ColBERT Late-Interaction Precision Reranking
         if active_reranker is not None and len(pool) > 1:
@@ -490,21 +516,24 @@ class Memory:
 
         The engine runs its consolidation cycle (dedup, importance, belief
         detection). When a ``Verifier`` is installed, supersession commitment
-        is deferred: candidates are proposed, vetted against the id->text map
-        (semantic gate — accept contradiction/entailment, reject neutral),
+        is deferred: candidates are proposed, vetted against their stored
+        texts (semantic gate — accept contradiction/entailment, reject neutral),
         and only accepted pairs are committed, after which the engine's
         superseded-exclusion hides the stale facts from recall.
 
         Returns:
             The number of supersession edges committed (0 without a verifier).
         """
+        self._require_open()
         self.engine.trigger_consolidation()
         if self.verifier is None:
             return 0
         proposed = self.engine.propose_supersessions()  # (old, new, kind, cosine)
         if not proposed:
             return 0
-        accepted = self.verifier.verify(proposed, self._id_to_text)
+        pair_ids = sorted({mid for old, new, *_ in proposed for mid in (old, new)})
+        id_to_text = {mid: rec["text"] for mid, rec in self._records(pair_ids).items()}
+        accepted = self.verifier.verify(proposed, id_to_text)
         if not accepted:
             return 0
         committed = self.engine.commit_supersessions(accepted)
@@ -514,10 +543,16 @@ class Memory:
 
     def flush(self) -> None:
         """Durably persist all pending writes."""
+        self._require_open()
         self.engine.flush()
 
     def close(self) -> None:
-        """Flush and shut down the engine."""
+        """Flush and release the engine. Idempotent.
+
+        Releases the database lock, mmaps, and worker threads, so ``db_path``
+        can be reopened right away. Any later call on this object raises
+        ``RuntimeError``.
+        """
         if not self._closed:
             self._closed = True
             self.engine.close()

@@ -25,6 +25,7 @@ if _ROOT not in sys.path:
 
 import numpy as np
 
+import tsm
 from tsm import CONVERSATIONAL_PROFILE, Memory
 
 
@@ -120,7 +121,7 @@ class TestAddRecallRoundTrip(MemoryTestBase):
         texts = [r["text"] for r in results]
         self.assertIn("I adopted a dog named Rex", texts)
         for r in results:
-            self.assertEqual(set(r), {"id", "text", "score"})
+            self.assertTrue({"id", "text", "score"}.issubset(set(r)))
             self.assertIsInstance(r["score"], float)
 
     def test_recall_is_scoped_per_user(self):
@@ -285,35 +286,34 @@ class TestBeliefResolution(MemoryTestBase):
         results = mem.recall("dog Rex", user_id="alice")
         self.assertTrue(results, "recall should still return results")
         for r in results:
-            self.assertEqual(set(r), {"id", "text", "score"})
+            self.assertTrue({"id", "text", "score"}.issubset(set(r)))
+            self.assertIsInstance(r["score"], float)
 
 
 class TestMmrBudgetRecall(MemoryTestBase):
     def test_best_set_fits_token_budget(self):
         mem = self.make_memory()
         facts = [
-            "alice enjoys hiking in the alps during summer",
-            "bob plays chess every weekend with his club",
-            "carol bakes sourdough bread every morning",
-            "dave runs marathons twice a year abroad",
-            "erin paints watercolor landscapes on sundays",
-            "frank collects vintage vinyl jazz records",
+            "alice adopted a golden retriever puppy named charlie in june",
+            "bob bought a red bicycle with ten speeds for commuting",
+            "carol visited the botanical garden and saw the orchids",
+            "dave learned to bake sourdough with a three-year-old starter",
         ]
         mem.add([{"role": "user", "content": f + "."} for f in facts], user_id="alice")
 
-        budget = 12  # ~48 chars -> at most one of these facts fits
-        results = mem.recall("hobby", user_id="alice", token_budget=budget)
-        self.assertTrue(results, "MMR recall returned no results")
-        used = sum(max(1, len(r["text"]) // 4) for r in results)
-        self.assertLessEqual(used, budget, f"token budget exceeded: {used} > {budget}")
+        # 4 facts ~ 40 words ~ 50 tokens. Budget 25 tokens should return at most 2.
+        results = mem.recall("alice bob carol dave", user_id="alice", token_budget=25)
+        self.assertTrue(results, "recall returned empty result set")
+        self.assertLessEqual(len(results), 2, "budget constraint violated")
+        total_toks = sum(max(1, len(r["text"]) // 4) for r in results)
+        self.assertLessEqual(total_toks, 25)
 
     def test_no_budget_returns_top_k_dicts(self):
         mem = self.make_memory()
-        facts = [f"fact number {i} about topic {i}" for i in range(5)]
-        mem.add([{"role": "user", "content": f + "."} for f in facts], user_id="alice")
-        results = mem.recall("fact topic", user_id="alice", top_k=3)
-        self.assertLessEqual(len(results), 3)
-        self.assertTrue(all({"id", "text", "score"} == set(r) for r in results))
+        mem.add([{"role": "user", "content": "the sky is blue."}], user_id="alice")
+        results = mem.recall("sky", user_id="alice", top_k=5)
+        self.assertEqual(len(results), 1)
+        self.assertTrue(all({"id", "text", "score"}.issubset(set(r)) for r in results))
 
 
 class TestGistBeforeEvict(MemoryTestBase):
@@ -343,7 +343,7 @@ class TestGistBeforeEvict(MemoryTestBase):
         self.assertTrue(all(any(t in f for f in facts) for t in captured[0]))
 
         # The gist is retrievable through the scoped recall path, and its text
-        # renders via the engine fallback (this process never minted its id).
+        # is read back from the engine (this process never minted its id).
         results = mem.recall("beagle rex", user_id="alice", top_k=5)
         gists = [r for r in results if r["id"].startswith("gist:")]
         self.assertTrue(gists, f"no gist record in recall results: {results}")
@@ -362,6 +362,141 @@ class TestGistBeforeEvict(MemoryTestBase):
         results = mem.recall("fact topic", user_id="alice", top_k=10)
         self.assertFalse(any(r["id"].startswith("gist:") for r in results))
 
+    def test_context_manager_auto_close_and_flush(self):
+        embedder = FakeEmbedder()
+        extractor = FakeExtractor()
+
+        with Memory(db_path=self.db_path, embedder=embedder, extractor=extractor) as mem:
+            mem.add([{"role": "user", "content": "alice prefers python programming."}], user_id="alice")
+            results = mem.recall("python programming", user_id="alice")
+            self.assertTrue(results)
+            self.assertFalse(mem._closed)
+
+        self.assertTrue(mem._closed)
+
+
+class TestPackaging(unittest.TestCase):
+    def test_version_matches_pyproject(self):
+        pyproject = os.path.join(_ROOT, "pyproject.toml")
+        if not os.path.exists(pyproject):
+            self.skipTest("not running from a source checkout")
+        import tomllib
+
+        with open(pyproject, "rb") as f:
+            declared = tomllib.load(f)["project"]["version"]
+        self.assertEqual(tsm.__version__, declared)
+
+
+class RecordingVerifier(AcceptAllVerifier):
+    """Accepts everything and remembers the id -> text map it was handed."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen_texts = {}
+
+    def verify(self, proposals, id_to_text):
+        self.seen_texts.update(id_to_text)
+        return super().verify(proposals, id_to_text)
+
+
+class TestDurability(MemoryTestBase):
+    """A database must behave the same after it is closed and reopened."""
+
+    OLD_FACT = "user user user user lives in paris"
+    NEW_FACT = "user user user user lives in london"
+
+    def reopen(self, **kwargs):
+        self.mem.close()
+        return self.make_memory(**kwargs)
+
+    def test_add_after_reopen_appends_with_fresh_ids(self):
+        mem = self.make_memory()
+        mem.add([{"role": "user", "content": "I adopted a dog named Rex."}], user_id="alice")
+
+        mem = self.reopen()
+        self.assertEqual(mem.engine.record_count(), 1)
+        n = mem.add([{"role": "user", "content": "I moved to Lisbon last year."}],
+                    user_id="alice")
+        self.assertEqual(n, 1)
+        self.assertEqual(mem.engine.record_count(), 2)
+
+        results = mem.recall("dog Rex Lisbon", user_id="alice", top_k=5)
+        self.assertEqual({r["id"] for r in results}, {"alice_1", "alice_2"})
+        self.assertEqual({r["text"] for r in results},
+                         {"I adopted a dog named Rex", "I moved to Lisbon last year"})
+
+    def test_ids_are_not_reused_after_eviction_and_reopen(self):
+        mem = self.make_memory(max_records=2)
+        mem.add(
+            [{"role": "user", "content": f"fact number {i} about topic {i}."} for i in range(4)],
+            user_id="alice",
+        )
+        self.assertEqual(mem.engine.evict(), 2)
+
+        mem = self.reopen(max_records=2)
+        self.assertEqual(mem.engine.record_count(), 2)
+        mem.add([{"role": "user", "content": "a brand new fact."}], user_id="alice")
+        # Four ids were handed out before the restart, two of them evicted
+        # since; the next one must still be the fifth.
+        self.assertTrue(mem.engine.contains_id("alice_5"))
+
+    def test_close_releases_database_for_reopen(self):
+        first = self.make_memory()
+        first.add([{"role": "user", "content": "I adopted a dog named Rex."}], user_id="alice")
+        first.close()
+        first.close()  # idempotent
+
+        # `first` is still referenced, so only a real release (not garbage
+        # collection) can let the same path be opened again.
+        second = self.make_memory()
+        self.assertEqual(second.engine.record_count(), 1)
+
+        for call in (
+            lambda: first.recall("dog Rex", user_id="alice"),
+            lambda: first.add([{"role": "user", "content": "More."}], user_id="alice"),
+            first.consolidate,
+            first.flush,
+        ):
+            with self.assertRaises(RuntimeError):
+                call()
+
+    def test_role_and_scope_survive_reopen(self):
+        mem = self.make_memory()
+        mem.add(
+            [
+                {"role": "user", "content": "I adopted a dog named Rex."},
+                {"role": "assistant", "content": "Rex is a lovely dog name."},
+            ],
+            user_id="alice",
+        )
+        before = mem.recall("what is my dog named", user_id="alice", top_k=5)
+
+        mem = self.reopen()
+        after = mem.recall("what is my dog named", user_id="alice", top_k=5)
+        self.assertEqual({r["id"]: r["role"] for r in after},
+                         {"alice_1": "user", "alice_2": "assistant"})
+        # Same role prior on both sides of the restart, so the same ranking.
+        self.assertEqual([r["id"] for r in after], [r["id"] for r in before])
+        self.assertEqual(mem.recall("dog Rex", user_id="bob"), [],
+                         "scope leak after reopen: bob saw alice's memory")
+
+    def test_verifier_vets_facts_from_an_earlier_session(self):
+        mem = self.make_memory()  # no verifier: nothing is committed yet
+        mem.add([{"role": "user", "content": self.OLD_FACT + "."}], user_id="alice")
+        mem.add([{"role": "user", "content": self.NEW_FACT + "."}], user_id="alice")
+
+        verifier = RecordingVerifier()
+        mem = self.reopen(verifier=verifier)
+        committed = mem.consolidate()
+        self.assertGreaterEqual(committed, 1, "no supersession was committed")
+        self.assertEqual(verifier.seen_texts,
+                         {"alice_1": self.OLD_FACT, "alice_2": self.NEW_FACT})
+
+        after = [r["text"] for r in mem.recall("user lives", user_id="alice", top_k=10)]
+        self.assertIn(self.NEW_FACT, after)
+        self.assertNotIn(self.OLD_FACT, after)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

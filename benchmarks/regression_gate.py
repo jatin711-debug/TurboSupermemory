@@ -12,10 +12,12 @@ Checks (each PASS/FAIL; the gate exits nonzero if any FAIL):
   1. cargo fmt --check                     — formatting is clean
   2. cargo clippy -D warnings (workspace)  — no lint regressions
   3. cargo test (workspace, ex-python)     — Rust unit/integration suite green
-  4. synthetic belief (refinement+contra)  — clean-data lift held, no false demotion
-  5. LongMemEval smoke (role-filtered)     — KU lift non-negative, NO edge explosion,
+  4. tsm SDK unit tests                    — add/recall/consolidate/close contract,
+                                             incl. behavior across a database reopen
+  5. synthetic belief (refinement+contra)  — clean-data lift held, no false demotion
+  6. LongMemEval smoke (role-filtered)     — KU lift non-negative, NO edge explosion,
                                              NO single-session collateral (Stage-A guard)
-  6. recall audit                          — ANN recall floor intact
+  7. recall audit                          — ANN recall floor intact
 
 The two eval scripts print a machine-readable `GATE_SUMMARY: {json}` line that
 this gate parses, so it never depends on the human-readable tables.
@@ -184,6 +186,7 @@ def main():
                   ["cargo", "test", "--workspace", "--exclude", "turbomemory_python"])
 
     if not args.no_evals:
+        check_cmd("tsm SDK unit tests", [PY, "-m", "unittest", "tsm.tests.test_memory"])
         check_synthetic_belief()
         check_longmemeval_smoke(limit=20 if args.quick else 40)
         check_recall_audit()

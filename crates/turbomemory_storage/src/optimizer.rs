@@ -108,7 +108,9 @@ impl ResourceBudget {
 /// Background optimizer that drives sealing, compaction, and flush.
 pub struct BackgroundOptimizer {
     tx: Sender<OptimizerMsg>,
-    handle: Option<JoinHandle<()>>,
+    /// Behind a mutex so `stop` works through the engine's shared
+    /// `Arc<BackgroundOptimizer>` (explicit shutdown), not only from `Drop`.
+    handle: Mutex<Option<JoinHandle<()>>>,
     running: Arc<AtomicBool>,
     /// Set while the foreground `drain` is running so the background loop
     /// yields and does not race for the same segments.
@@ -205,7 +207,7 @@ impl BackgroundOptimizer {
         });
         Self {
             tx,
-            handle,
+            handle: Mutex::new(handle),
             running,
             draining,
             budget,
@@ -453,12 +455,21 @@ impl BackgroundOptimizer {
         let _ = self.tx.send(OptimizerMsg::Consolidate);
     }
 
-    /// Stop the optimizer thread and wait for it to finish.
-    pub fn stop(&mut self) {
+    /// Stop the optimizer thread and wait for it to finish. Idempotent.
+    ///
+    /// The worker holds a strong engine reference for the duration of a cycle,
+    /// so the engine's last reference can be released on the worker thread
+    /// itself; `Drop` then lands here on that thread. Joining our own handle
+    /// would deadlock, so in that case the thread is left to exit on its own
+    /// (`running` is already cleared and it is on its way out of the loop).
+    pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
         let _ = self.tx.send(OptimizerMsg::Shutdown);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+        let handle = self.handle.lock().take();
+        if let Some(handle) = handle {
+            if handle.thread().id() != std::thread::current().id() {
+                let _ = handle.join();
+            }
         }
         Self::try_cleanup_pending(&self.pending_deletion);
     }

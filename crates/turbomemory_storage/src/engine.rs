@@ -752,6 +752,13 @@ impl StorageEngine {
         self.update_with_payload(id, text, embedding, importance, concepts, None, None)
     }
 
+    /// The `insert_seq` the next inserted record will receive. Durable and
+    /// monotonically increasing: it is never reused across restarts, deletes,
+    /// or eviction, so callers can derive collision-free ids from it.
+    pub fn next_insert_seq(&self) -> u64 {
+        self.meta.next_seq()
+    }
+
     /// Whether a record with this id is currently live (present in the id
     /// index, i.e. not evicted/deleted).
     pub fn contains_id(&self, id: &str) -> bool {
@@ -1546,10 +1553,14 @@ impl StorageEngine {
 
     /// Gracefully shut down the engine.
     ///
-    /// Flushes the WAL, vector store, metadata snapshot, and segment files.
-    /// The background optimizer is stopped automatically when the engine is
-    /// dropped.
+    /// Stops the background optimizer (waiting for an in-flight cycle), then
+    /// flushes the WAL, vector store, metadata snapshot, and segment files.
+    /// Stopping first means no worker can still hold a strong engine reference
+    /// afterwards, so dropping the caller's last `Arc` releases the database
+    /// lock, mmaps, and index files immediately. The engine stays usable for
+    /// foreground calls; only automatic consolidation is off from here on.
     pub fn shutdown(&self) -> crate::Result<()> {
+        self.optimizer.stop();
         self.flush()
     }
 
@@ -4936,6 +4947,61 @@ mod tests {
         assert_eq!(engine.record_count(), 3);
         let results = engine.search_ann(&q, 1).unwrap();
         assert_ne!(results[0].0, "mem_2");
+    }
+
+    #[test]
+    fn shutdown_stops_optimizer_so_reopen_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        // Background optimizer ON, cycling fast, so it is live at shutdown.
+        config.auto_consolidation_interval = Some(std::time::Duration::from_millis(10));
+        let engine = StorageEngine::open(tmp.path(), config.clone()).unwrap();
+        engine
+            .insert("mem_0", "text 0", &make_vec(8, 0), 1.0, &[])
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        engine.shutdown().unwrap();
+        // Idempotent, and foreground calls keep working afterwards.
+        engine.shutdown().unwrap();
+        assert_eq!(engine.record_count(), 1);
+        drop(engine);
+
+        // redb takes an exclusive lock on the database file, so this only
+        // succeeds if the previous engine was really released.
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        assert_eq!(engine.record_count(), 1);
+    }
+
+    #[test]
+    fn next_insert_seq_is_never_reused_after_delete_and_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+        // Sequences start at 1; 0 is the "nothing applied yet" WAL sentinel.
+        assert_eq!(engine.next_insert_seq(), 1);
+        for i in 0..3usize {
+            let v = make_vec(8, i);
+            engine
+                .insert(&format!("mem_{i}"), &format!("text {i}"), &v, 1.0, &[])
+                .unwrap();
+        }
+        assert_eq!(engine.next_insert_seq(), 4);
+        // Deleting the newest record must not hand its sequence out again.
+        assert!(engine.delete_by_id("mem_2").unwrap());
+
+        // Restart via WAL replay (no metadata flush).
+        engine.flush_vectors().unwrap();
+        engine.flush_wal().unwrap();
+        drop(engine);
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+        assert_eq!(engine.record_count(), 2);
+        assert_eq!(engine.next_insert_seq(), 4);
+
+        // Restart via a clean shutdown (redb snapshot).
+        engine.shutdown().unwrap();
+        drop(engine);
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+        assert_eq!(engine.next_insert_seq(), 4);
     }
 
     #[test]
