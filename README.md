@@ -1,13 +1,13 @@
 # TurboSuperMemory (TSM)
 
-[![Rust](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](https://www.rust-lang.org/)
-[![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
+[![Rust](https://img.shields.io/badge/rust-1.99%20(pinned)-orange.svg)](./rust-toolchain.toml)
+[![Python](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#license)
-[![Status: Production Ready](https://img.shields.io/badge/status-production%20ready-brightgreen.svg)](#validation)
+[![Status: Beta](https://img.shields.io/badge/status-beta-yellow.svg)](#verification)
 [![CUDA](https://img.shields.io/badge/CUDA-12.6%20accelerated-76B900.svg?logo=nvidia)](#gpu-acceleration-opt-in-via-cuda-feature)
-[![Tests](https://img.shields.io/badge/tests-108%20passing-brightgreen.svg)](#validation)
+[![Tests](https://img.shields.io/badge/tests-252%20Rust%20%2B%2044%20SDK-brightgreen.svg)](#verification)
 
-> **🚀 Production Release:** TurboSuperMemory is a high-performance, bare-metal cognitive memory engine for AI agents — written in native Rust, accelerated by CUDA, and equipped with 3-tier TurboQuant hardware compression and Stage-2 ColBERT late interaction.
+> **TurboSuperMemory** is a high-performance, bare-metal cognitive memory engine for AI agents — written in native Rust, accelerated by CUDA, and equipped with 3-tier TurboQuant hardware compression and Stage-2 ColBERT late interaction.
 
 ---
 
@@ -133,22 +133,31 @@ Evaluated across 20 multi-turn probing questions spanning all 10 memory reasonin
 from tsm import Memory
 
 # Initialize turnkey memory engine with Stage-2 ColBERT late interaction
-memory = Memory(
+with Memory(
     db_path="./agent_memory_db",
     embedder="sentence_transformer",  # 100% local, free embeddings (MiniLM)
+    extractor="passthrough",          # store each message as-is: zero LLM calls on write
     reranker="colbert",               # LiquidAI/LFM2.5-ColBERT-350M on CUDA
-)
+) as memory:
+    # Ingest memories (no LLM API calls with the passthrough extractor)
+    memory.add("User's primary database port is 9443 on host telemetry.prod.internal", user_id="alice")
+    memory.add("User upgraded database port to 9444 last Tuesday", user_id="alice")
 
-# Ingest memories (runs in <0.05ms with zero LLM API calls)
-memory.add("User's primary database port is 9443 on host telemetry.prod.internal", user_id="alice")
-memory.add("User upgraded database port to 9444 last Tuesday", user_id="alice")
+    # Recall with cognitive graph search + ColBERT MaxSim reranking
+    results = memory.recall("What is the current database port?", user_id="alice", top_k=3)
 
-# Recall with cognitive graph search + ColBERT MaxSim reranking
-results = memory.recall("What is the current database port?", user_id="alice", top_k=3)
+    for r in results:
+        print(f"Memory: {r['text']} (Score: {r['score']:.4f})")
 
-for r in results:
-    print(f"Memory: {r['text']} (Score: {r['score']:.4f})")
+    # Or: the best set of memories that fits a prompt budget
+    context = memory.recall("database port", user_id="alice", token_budget=150)
 ```
+
+Notes on defaults:
+
+* With no `embedder` / `extractor` arguments, `Memory` uses OpenAI for both (`pip install "tsm[openai]"`, `OPENAI_API_KEY`), which means one LLM extraction call per added message. `extractor="passthrough"` (above) and `extractor="gliner"` keep writes local.
+* The database is durable: reopen the same `db_path` and `add` / `recall` continue where they left off. Leaving the `with` block (or calling `close()`) flushes and releases it.
+* The cognitive features are a preset (`profile="conversational"`); `profile=None` gives a plain scoped vector store. On the raw `turbomemory.MemoryEngine`, belief revision, eviction, dedup and auto-importance are all opt-in.
 
 ### 2. High-Level Multi-Tier RaBitQ / TurboQuant Configuration
 
@@ -211,8 +220,11 @@ TURBO_DB_PATH=./server_db TURBO_DIMENSION=768 make api-server
 | `turbomemory_gpu` | `crates/turbomemory_gpu` | CUDA acceleration kernels (NVRTC + cuBLAS) with transparent CPU fallback. |
 | `turbomemory_python` | `crates/turbomemory_python` | PyO3 C-extension facade with zero-copy NumPy bindings. |
 | `turbomemory_api` | `crates/turbomemory_api` | High-throughput gRPC (Tonic) and REST (Axum) server. |
+| `tsm` (Python) | `tsm/` | The SDK: `Memory` facade, budget recall, gist summarizers, pluggable embedder / extractor / verifier / reranker. |
 
 ---
+
+<a id="verification"></a>
 
 ## 🛠️ Verification & Build Commands
 
@@ -221,13 +233,23 @@ TURBO_DB_PATH=./server_db TURBO_DIMENSION=768 make api-server
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 
-# Rust Suite (108 tests)
-cargo test --workspace --exclude turbomemory_python --features cuda
+# Rust suite
+cargo test --workspace --exclude turbomemory_python
 
-# Python Extension & Verification
+# Python extension, engine verification, SDK unit suite
 make build-python
 make verify
+make test-python
+
+# Everything above plus the regression evals (the merge gate; there is no CI)
+make gate
+
+# Install the SDK + extension into the active environment / build a wheel
+make dev
+make wheel
 ```
+
+The toolchain is pinned in `rust-toolchain.toml`; Python 3.12 or newer is required (the extension is an `abi3-py312` wheel). `make gate` needs the LongMemEval data (`make download-eval-data`) and a cached `all-MiniLM-L6-v2` model.
 
 ---
 

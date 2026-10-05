@@ -108,7 +108,7 @@ flowchart TD
 
 ## 3. Retrieval Score Fusion
 
-The augmenter returns only the pure graph delta; the storage engine ([`StorageEngine::hydrate_and_fuse`](file:///d:/personal-projects/TurboSuperMemory/crates/turbomemory_storage/src/engine.rs)) re-hydrates each candidate's exact FP32 embedding, computes the authoritative cosine, normalizes the delta to `[0, 1]`, and produces the final ranking:
+The augmenter returns only the pure graph delta; the storage engine ([`StorageEngine::hydrate_and_fuse`](file:///d:/personal-projects/TurboSuperMemory/crates/turbomemory_storage/src/engine/search.rs)) re-hydrates each candidate's exact FP32 embedding, computes the authoritative cosine, normalizes the delta to `[0, 1]`, and produces the final ranking:
 \[
 \text{Final Score}(M) = \text{CosineSimilarity}(Q, M) + (1 - \alpha_{\text{cognitive}}) \cdot \frac{\Delta_{\text{graph}}(M)}{\max_j \Delta_{\text{graph}}(j)}
 \]

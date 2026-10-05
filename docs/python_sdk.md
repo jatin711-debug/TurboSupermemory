@@ -19,6 +19,7 @@ from tsm import Memory
 memory = Memory(
     db_path="./agent_memory_db",
     embedder="sentence_transformer",  # Uses local 'all-MiniLM-L6-v2' on CPU/GPU ($0.00 cost)
+    extractor="passthrough",          # Store each message as-is (no LLM call on write)
     reranker="colbert",               # Uses 'LiquidAI/LFM2.5-ColBERT-350M' on CUDA
 )
 
@@ -31,7 +32,37 @@ results = memory.recall("What is the telemetry port?", user_id="alice", top_k=3)
 
 for r in results:
     print(f"Memory: {r['text']} (Score: {r['score']:.4f})")
+
+# 4. Flush and release the database (or use `with Memory(...) as memory:`)
+memory.close()
 ```
+
+With no `embedder` / `extractor` arguments, `Memory` uses OpenAI for both
+(`pip install "tsm[openai]"`, `OPENAI_API_KEY`): one extraction call per added
+message. `extractor="passthrough"` and `extractor="gliner"` keep writes local.
+
+### Results, budgets, and lifecycle
+
+- `recall()` returns dicts with `id`, `text`, `score`, `role` (the stored
+  source role) and `turn_index`; superseded facts whose current belief is not
+  in the result set also carry `superseded_by` and `chain`.
+- `recall(..., token_budget=N)` returns the best *set* that fits `N` tokens
+  instead of the top-k: greedy MMR over a candidate pool with a redundancy
+  cutoff, a cross-turn coverage bonus and an adaptive item cap
+  (`tsm.budget.select_under_budget`).
+- `consolidate()` runs the engine's consolidation cycle; with a `verifier`
+  installed (`tsm.verification.NLIVerifier`) supersessions are proposed,
+  vetted, and only then committed.
+- Compress instead of delete: `Memory(db, max_records=500,
+  gist_summarizer=OpenAIGistSummarizer())` (or the model-free
+  `ExtractiveGistSummarizer()`, both in `tsm.gist`) folds eviction victims
+  into searchable gist records.
+- The engine is the only store. Reopening a `db_path` — in the same process
+  or a later one — continues exactly where it left off: `add` keeps
+  appending with fresh ids, and role, scope and text are read back from the
+  database. `close()` flushes and releases the database lock, mmaps and
+  worker threads; the path can be reopened immediately, and further calls on
+  the closed object raise `RuntimeError`.
 
 ### Supported Embedders & Rerankers
 
@@ -96,5 +127,17 @@ print(f"GPU Accelerated: {engine.gpu_accelerated}")
 print(f"Graph Stats: {engine.graph_stats()}")
 
 engine.flush()
-engine.close()
+engine.close()   # releases the database; later calls raise RuntimeError
+```
+
+### Reading records back
+
+```python
+engine.get_records(["mem_001", "missing"])
+# [{'id': 'mem_001', 'text': 'Deployment configuration notes', 'payload': None,
+#   'scope': 'team_alpha', 'source_role': None, 'importance': 1.0,
+#   'created_at': 1790000000, 'insert_seq': 1}, None]
+
+engine.next_insert_seq()   # durable, monotonically increasing; never reused
+engine.closed              # False until close()
 ```

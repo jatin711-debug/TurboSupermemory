@@ -13,8 +13,9 @@
 - `turbomemory_core`: vector math, SIMD/FWHT, quantizers, and quantized scoring. Keep I/O and persistence out.
 - `turbomemory_graph`: BM25, concept extraction, graph/reinforcement/belief semantics, spreading activation, FOK, and CCS/compressors.
 - `turbomemory_gpu`: the `GpuBackend` abstraction, CPU fallback, and optional CUDA implementation.
-- `turbomemory_storage`: the central `StorageEngine`, persistence, indexes, tier lifecycle, filtering, and background workers. Start at `engine.rs`; tier decisions live in `config.rs`, `segment_holder.rs`, and `optimizer.rs`.
+- `turbomemory_storage`: the central `StorageEngine`, persistence, indexes, tier lifecycle, filtering, and background workers. Start at `engine/mod.rs` (the struct, `open`, the consolidation cycle, `flush`/`shutdown`); its methods are grouped by concern in `engine/{write,search,retention,belief}.rs` and its unit tests live in `engine/tests.rs`. Tier decisions live in `config.rs`, `segment_holder.rs`, and `optimizer.rs`.
 - `turbomemory_python`: the `MemoryEngine` PyO3 facade. Keep it thin and preserve `py.allow_threads(...)` around heavy engine calls and zero-copy contiguous `float32` NumPy paths.
+- `tsm/` (Python): the shipped SDK. `memory.py` is the `Memory` facade; the engine-free logic in `budget.py`, `gist.py`, `concepts.py`, and `ranking.py` is imported by the eval harness (`benchmarks/cognitive_eval`) too, so evaluations measure shipped code. Packaged with the extension by maturin (`pyproject.toml`).
 - `turbomemory_api`: shared behavior belongs in `service.rs`; transport conversion belongs in `grpc.rs`/`rest.rs`. Edit the proto source, never generated files under `target/`.
 
 ## Focused Commands
@@ -35,6 +36,7 @@ cargo test --workspace --exclude turbomemory_python
 # Python extension and E2E
 make build-python
 make verify
+make test-python        # tsm SDK unit suite (fake embedder, real engine, no keys)
 
 # API
 make build-api
@@ -49,14 +51,16 @@ make api-server
 ## Required Verification
 
 - For local iteration, run the narrow crate/test first, then format check, clippy, and the Rust suite.
-- For storage-engine or cognitive-layer changes, finish with `make gate`; use `make gate GATE_ARGS=--quick` only for a faster, noisier pass. The gate rebuilds the extension and runs formatting, clippy, Rust tests, synthetic belief checks, a role-filtered LongMemEval smoke test, and an ANN recall floor.
-- `make gate` must run under Python 3.12 and expects the LongMemEval data (download it with `make download-eval-data` — the datasets are too large to check in, so a fresh clone has none until downloaded) plus a locally cached embedding model to be usable offline (`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`).
+- For storage-engine or cognitive-layer changes, finish with `make gate`; use `make gate GATE_ARGS=--quick` only for a faster, noisier pass. The gate rebuilds the extension and runs formatting, clippy, Rust tests, the `tsm` SDK unit suite, synthetic belief checks, a role-filtered LongMemEval smoke test, and an ANN recall floor.
+- `make gate` must run under Python 3.12 and expects the LongMemEval data (download it with `make download-eval-data` — the datasets are too large to check in, so a fresh clone has none until downloaded) plus a locally cached embedding model (`sentence-transformers/all-MiniLM-L6-v2` in the Hugging Face cache) to be usable offline (`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`).
 - Full cognitive evaluations and performance benchmarks are expensive and are not substitutes for the regression gate. Their runners and prerequisites are documented in `benchmarks/cognitive_eval/README.md` and `setup.sh`.
 - There is no CI workflow in this repository; local verification is the merge gate.
 
 ## Engine Invariants
 
 - `StorageEngine::open` returns `Arc<StorageEngine>` and the engine owns its synchronization. Do not add an external mutex around it; clones share internal `Arc`s.
+- `shutdown()` stops the background optimizer, then flushes; the database lock, mmaps, and index files are released when the last `Arc` drops. Python `MemoryEngine.close()` does both (it takes the engine out and drops it), so the same path can be reopened immediately and any later call raises `RuntimeError`. Do not go back to a flush-only `close()`.
+- The engine is the only store for the SDK: `tsm.Memory` reads text/role/scope back with `get_records` and mints ids from `next_insert_seq` (durable, never reused). Do not reintroduce per-process id/text/role maps; a reopened database must behave like the one that was written.
 - Durability order is vector mmap write, metadata-only WAL append, then lazy `redb` snapshot. `flush()` drains pending seals/access counters, syncs vectors/text/metadata/segments/graph/CCS, and only then clears the WAL. Preserve this order and cover persistence changes with restart/crash tests.
 - Full embeddings live in `vectors.bin`; `MetaRecord`/WAL/redb metadata must not duplicate them. Derived id, scope, payload, text, graph, and segment indexes are rebuilt or reloaded on open. Graph snapshots are stored binary (`meta_bin` table, `TMGR` magic) with legacy JSON snapshots still readable on open; the next flush rewrites them as binary.
 - Search uses an exact scan at 4,096 records or fewer. Above that, immutable segment snapshots search Hot/SealedHot/Warm/Cold candidates and rerank against full-f32 vectors.
@@ -69,8 +73,9 @@ make api-server
 ## Change Routing
 
 - Distance/SIMD/FWHT/quantization: `crates/turbomemory_core/src/{metrics,quantization,turbo_quant,metrics_quantized}.rs`.
-- Retrieval, durability, filtering, or concurrency: `crates/turbomemory_storage/src/engine.rs` plus the relevant index/store module.
+- Retrieval, durability, filtering, or concurrency: `crates/turbomemory_storage/src/engine/{mod,write,search}.rs` plus the relevant index/store module.
 - Tier lifecycle/HNSW: `crates/turbomemory_storage/src/{segment_holder,optimizer}.rs` and `src/segments/`.
-- Cognitive behavior: `crates/turbomemory_graph/src/{activation,graph,extract,ccs}.rs`; belief orchestration also exists in storage consolidation.
+- Cognitive behavior: `crates/turbomemory_graph/src/{activation,graph,extract,ccs}.rs`; belief orchestration lives in `crates/turbomemory_storage/src/engine/belief.rs`, and eviction, gist-before-evict, dedup, and importance scoring in `engine/retention.rs`.
 - Public Python behavior: `crates/turbomemory_python/src/lib.rs`; preserve storage-to-Python exception mapping (`ValueError` for invalid/duplicate/dimension, `KeyError` for missing ids, `RuntimeError` otherwise).
+- SDK behavior: `tsm/memory.py` plus the shared modules above. `select_under_budget`, the role prior, concept extraction, and the gist summarizers feed the published eval numbers; a behavior change there needs a gate run and a note in `benchmarks/PHASE_PROGRESS.md`.
 - Public server behavior: `crates/turbomemory_api/proto/turbomemory.proto` plus `src/{service,grpc,rest}.rs`. The server starts gRPC and REST together with graceful shutdown (Ctrl-C or one server's failure stops both); defaults come from `TURBO_DB_PATH`, `TURBO_DIMENSION`, `TURBO_GRPC_ADDR`, and `TURBO_REST_ADDR` in `main.rs`. Setting `TURBO_API_KEY` enables bearer-token auth on both transports; unset means open access (a wildcard bind logs a warning). REST errors are JSON (`{"error":{code,message}}`), the JSON filter DSL caps nesting at `MAX_FILTER_DEPTH = 32`, and batch inserts validate parallel-array lengths.

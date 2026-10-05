@@ -1540,3 +1540,65 @@ clean, SDK 18/18.
 - **Knowledge Updates / Belief Revision**: TSM **66.7%** vs Naive-RAG **50.0%** (**+16.7% lift** from belief supersession).
 - **Temporal Reasoning**: TSM **42.9%** vs Mem0 **28.6%** vs Naive **35.7%** (**+14.3% lift** from scoped temporal graph edges).
 - **Ingestion Cost & Latency**: Mem0 burned **1,130,633 tokens (~$1.13)** across 708 blocking LLM calls taking **~40 minutes**; TSM ingested all 50 conversations in **~8 seconds locally on GPU with 0 LLM calls ($0.00)**.
+
+
+# Hardening pass — SDK durability, real close(), shared eval/SDK logic, engine split (2026-10-05)
+
+No new evaluation numbers; this pass fixes product-surface defects and removes
+duplicated logic. Commits `881b5b0`, `09ebe22`, `08a31d2`, `aaaf98c`, plus the
+engine-split commit that carries this note.
+
+**1. Gate was red on a new toolchain.** rustc 1.99 added
+`clippy::chunks_exact_to_as_chunks`, which failed `-D warnings` in
+`turbomemory_core`. Fixed, and the toolchain is now pinned
+(`rust-toolchain.toml`, 1.99.0) so the lint set only changes on a deliberate bump.
+
+**2. `tsm.Memory` was not usable across a restart** (reproduced before fixing):
+- `add()` on a reopened database raised `ValueError: id already exists: alice_1`
+  — ids came from an in-process counter. They are now seeded from the engine's
+  durable insert sequence (`MemoryEngine.next_insert_seq()`).
+- Role, text and scope lived in per-process dicts, so after a reopen the role
+  prior stopped applying and a verifier could not vet earlier facts. They are
+  now read back from the engine (`MemoryEngine.get_records()`).
+- `close()` only flushed. This refines the 2026-08-06 leak verdict above: the
+  engine did not leak, but release waited for Python's garbage collector
+  (`leak_repro.py` does `del engine; gc.collect()`), so reopening a path
+  in-process failed with `redb error: Database already open`. `close()` now
+  stops the optimizer, drops the engine and its Python callbacks.
+  Probe: 30 engines closed but kept referenced, background consolidation on —
+  RSS 33.9 -> 37.9 MB plateau, threads flat at 19, every database directory
+  deletable immediately on Windows.
+- Also fixed: `BackgroundOptimizer::stop` could join its own thread when the
+  engine's last reference was dropped on the worker (latent deadlock).
+
+**3. Packaging metadata** matched to the wheel that is actually built:
+`requires-python >=3.12` (the extension is abi3-py312; the old `>=3.10` could
+not load), version 0.2.0 in both places, an `openai` extra for the defaults.
+
+**4. The harness now runs shipped code.** `TSMAdapter`, `budgeting.py` and
+`gist.py` import `tsm.budget` / `tsm.gist` / `tsm.concepts` / `tsm.ranking`
+instead of carrying their own copies. Verified behavior-identical against the
+previous implementations on 4,272 real sentences and several thousand random
+pools and packings (concepts, role prior, MMR and truncate selection, every
+packing helper, extractive gist, bounded-store construction). One SDK
+behavior change: `tsm.Memory` now records a turn index per message, so the
+cross-turn bonus in budget recall is live there as it already was in the
+evaluated adapter (it was dead code in the SDK copy).
+
+**5. `engine.rs` (5,590 lines) split by concern** into
+`engine/{mod,write,search,retention,belief,tests}.rs`. Pure move: the same 152
+functions and 61 tests, no token removed.
+
+**Gate after each engine-touching step:** fmt, clippy, 252 Rust tests, the
+`tsm` SDK suite (now part of the gate; 44 tests), synthetic belief +1.00 /
+false-demotion 0.00 (both modes), LongMemEval smoke KU +0.00, worst
+single-session +0.00, recall 100%. The final full `make gate` (rebuilt
+extension, split engine) passed 8/8. Over six smoke runs the edge count came
+out between 248 and 251 (five of them on byte-identical code: 249, 250 x3,
+251) — a small run-to-run variation worth pinning down before any gate
+threshold is tightened.
+
+**Left open** (see `TODO.md`): the role prior's broad cue set, per-call
+re-embedding in budget recall, vacuum, the remaining O(N) consolidation
+passes, CI.
+
