@@ -2,7 +2,7 @@
 
 ## Toolchain And Shell
 
-- This is a Rust 2021 workspace with six crates. There is no pinned `rust-toolchain`; the README targets stable Rust 1.96+ and the PyO3 extension uses `abi3-py312`.
+- This is a Rust 2021 workspace with six crates. The toolchain is pinned in `rust-toolchain.toml` (stable 1.99.0 with `rustfmt` and `clippy`) so the `-D warnings` clippy gate sees the same lint set everywhere; bump it deliberately and fix new lints in the same change. The PyO3 extension uses `abi3-py312`.
 - Python extension and evaluation work must use Python 3.12. Set both `PYO3_PYTHON` and `PYTHON` when overriding the interpreter; the Windows Makefile default is the machine-specific `C:\Users\User\AppData\Local\Programs\Python\Python312\python.exe`.
 - Make recipes use POSIX `export`, `cp`, and `rm` even on Windows. Run them under GNU Make with a POSIX shell (for example Git Bash/MSYS), not `nmake` or a PowerShell-only shell.
 - Building `turbomemory_api` runs `tonic-build` over `crates/turbomemory_api/proto/turbomemory.proto`; `protoc` must be installed and on `PATH`.

@@ -173,14 +173,14 @@ pub fn cosine_similarity_batch(query: &[f32], vectors: &[&[f32]]) -> Vec<f32> {
     // ||query||^2 computed once instead of once per vector.
     let na = dot_product(query, query);
 
-    let mut chunks = vectors.chunks_exact(4);
-    for chunk in &mut chunks {
+    let (chunks, remainder) = vectors.as_chunks::<4>();
+    for chunk in chunks {
         let dn = dot_and_nb_x4(query, chunk[0], chunk[1], chunk[2], chunk[3]);
         for (dot, nb) in dn {
             out.push(finalize_cosine(dot, na, nb));
         }
     }
-    for v in chunks.remainder() {
+    for v in remainder {
         let dot = dot_product(query, v);
         let nb = dot_product(v, v);
         out.push(finalize_cosine(dot, na, nb));

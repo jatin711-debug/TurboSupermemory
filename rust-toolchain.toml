@@ -1,0 +1,7 @@
+# Pinned so `cargo clippy -- -D warnings` (part of `make gate`) sees the same
+# lint set on every machine. Bump deliberately: update the channel, run
+# `make gate`, and fix any new lints in the same change.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
