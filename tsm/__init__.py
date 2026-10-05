@@ -10,7 +10,8 @@ from .interfaces import Embedder, Extractor, Reranker, Verifier
 from .memory import CONVERSATIONAL_PROFILE, Memory
 from .rerankers import ColBertReranker
 
-__version__ = "0.1.0"
+# Keep in step with `version` in pyproject.toml (checked by the unit tests).
+__version__ = "0.2.0"
 
 # Convenience alias matching the requested public surface: the preset mapping.
 MemoryConfig = CONVERSATIONAL_PROFILE

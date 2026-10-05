@@ -1,0 +1,84 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "tsm"
+version = "0.2.0"
+description = "TurboSuperMemory: Bare-metal cognitive episodic memory engine for AI agents"
+readme = "README.md"
+# The extension is built as abi3-py312 (see the pyo3 features in Cargo.toml),
+# so one wheel serves 3.12 and every later CPython; nothing older can load it.
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [
+    { name = "TurboSuperMemory Contributors" }
+]
+keywords = [
+    "memory",
+    "vector-search",
+    "agents",
+    "quantization",
+    "cognitive-architecture",
+    "episodic-memory",
+    "turbomemory",
+    "rabitq",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+# The default Embedder/Extractor are OpenAI-backed (OPENAI_API_KEY).
+openai = [
+    "openai>=1.0.0",
+]
+cpu = [
+    "sentence-transformers>=2.2.0",
+    "torch>=2.0.0",
+]
+cuda = [
+    "sentence-transformers>=2.2.0",
+    "torch>=2.0.0",
+]
+eval = [
+    "openai>=1.0.0",
+    "scikit-learn>=1.3.0",
+    "tqdm>=4.65.0",
+    "pytest>=7.0.0",
+]
+all = [
+    "sentence-transformers>=2.2.0",
+    "torch>=2.0.0",
+    "openai>=1.0.0",
+    "scikit-learn>=1.3.0",
+    "tqdm>=4.65.0",
+    "pytest>=7.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/jatin711-debug/TurboSupermemory"
+Repository = "https://github.com/jatin711-debug/TurboSupermemory.git"
+Documentation = "https://github.com/jatin711-debug/TurboSupermemory/blob/development/README.md"
+
+[tool.maturin]
+manifest-path = "crates/turbomemory_python/Cargo.toml"
+python-packages = ["tsm"]
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+# The SDK unit suite: fake embedder/extractor, real engine, no keys or model
+# downloads. The `test_*.py` files under benchmarks/ and tests/ are live
+# evaluation scripts that need models and API keys; run those explicitly.
+testpaths = ["tsm/tests"]

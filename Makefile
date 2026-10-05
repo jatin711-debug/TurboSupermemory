@@ -1,7 +1,7 @@
 # TurboSuperMemory — build orchestration
 #
 # Requires:
-#   - Rust 1.75+ (tested on 1.96)
+#   - Rust toolchain pinned in rust-toolchain.toml (rustup installs it automatically)
 #   - Python 3.12 with development libraries (adjust PYO3_PYTHON if needed)
 #   - Optional: CUDA toolkit for GPU acceleration (set FEATURES=cuda)
 
@@ -34,7 +34,7 @@ FEATURES    ?=
 # Build flags: add --features cuda if FEATURES=cuda
 CARGO_FEATURES := $(if $(FEATURES),--features $(FEATURES),)
 
-.PHONY: build build-python build-api test verify audit benchmark benchmark-gpu cognitive-benchmark batch-test clippy fmt clean api-server download-eval-data longmemeval locomoco compare report gate
+.PHONY: build build-python build-api test test-python verify audit benchmark benchmark-gpu cognitive-benchmark batch-test clippy fmt clean api-server download-eval-data longmemeval locomoco compare report gate dev wheel
 
 build:
 	export PYO3_PYTHON="$(PYO3_PYTHON)" && cargo build --workspace $(CARGO_FEATURES)
@@ -42,11 +42,23 @@ build:
 build-python:
 	export PYO3_PYTHON="$(PYO3_PYTHON)" && cargo build --release --package turbomemory_python $(CARGO_FEATURES)
 
+dev:
+	uv pip install -e .
+
+wheel:
+	maturin build --release $(if $(FEATURES),--features $(FEATURES),)
+
 build-api:
 	export PYO3_PYTHON="$(PYO3_PYTHON)" && cargo build --release --package turbomemory_api --bin turbomemory-server $(CARGO_FEATURES)
 
 test:
 	export PYO3_PYTHON="$(PYO3_PYTHON)" && cargo test --workspace $(CARGO_FEATURES)
+
+# SDK unit suite: fake embedder/extractor against the real engine (no API
+# keys, no model downloads). Also part of `make gate`.
+test-python: build-python
+	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
+	"$(PYTHON)" -m unittest tsm.tests.test_memory
 
 verify: build-python
 	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true

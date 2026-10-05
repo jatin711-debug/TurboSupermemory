@@ -5,9 +5,18 @@ scoped fact storage, belief revision, verified supersession, budget recall.
 
 ## Install / requirements
 
-Build the extension first (`make build-python` → repo-root `turbomemory.pyd`),
-keep the `tsm/` package next to it, `pip install numpy`. Defaults need
-`pip install openai` and `OPENAI_API_KEY` set.
+Python 3.12 or newer (the extension is an `abi3-py312` wheel).
+
+- Installed: `make dev` (`uv pip install -e .`) builds the extension with
+  maturin and installs `tsm` plus `turbomemory` into the active environment;
+  `make wheel` produces a redistributable wheel under `target/wheels/`.
+- In-tree: `make build-python` then copy the artifact to the repo root as
+  `turbomemory.pyd` / `.so` (what `make verify` / `make gate` do); `tsm` finds
+  it there without installation.
+
+The default embedder and extractor are OpenAI-backed: install the `openai`
+extra (`pip install "tsm[openai]"`) and set `OPENAI_API_KEY`. Local models
+(`embedder="local"`, `reranker="colbert"`, `NLIVerifier`) need the `cpu` extra.
 
 ## Usage
 
@@ -29,11 +38,16 @@ with Memory("./my_db") as mem:                       # conversational profile
   needs `torch` + `transformers`) — consolidation then proposes, NLI-vets
   (accept contradiction/entailment, reject neutral), and commits only the
   survivors; stale facts are excluded from recall.
-- The id→text map is in-memory only (per-process); engine data persists,
-  result `text` fields don't across restarts. See `Memory` docstring.
+- The engine is the only store: text, role, and scope are read back from it,
+  and ids come from its durable insert sequence, so a reopened database keeps
+  appending and recalls the same way it did before the restart.
+- `close()` (or leaving the `with` block) flushes and releases the database;
+  the same path can be reopened immediately. A closed `Memory` raises
+  `RuntimeError` on further calls.
 
 ## Tests
 
 ```
 python -m unittest tsm.tests.test_memory -v   # from the repo root, no API key
+make test-python                              # same, after rebuilding the extension
 ```
