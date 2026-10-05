@@ -186,7 +186,8 @@ def main():
                   ["cargo", "test", "--workspace", "--exclude", "turbomemory_python"])
 
     if not args.no_evals:
-        check_cmd("tsm SDK unit tests", [PY, "-m", "unittest", "tsm.tests.test_memory"])
+        check_cmd("tsm SDK unit tests",
+                  [PY, "-m", "unittest", "discover", "-s", "tsm/tests", "-t", "."])
         check_synthetic_belief()
         check_longmemeval_smoke(limit=20 if args.quick else 40)
         check_recall_audit()

@@ -21,13 +21,15 @@ OpenAI-backed and read the key from ``OPENAI_API_KEY``.
 
 import json
 import logging
-import re
 from typing import Callable, Dict, List, Optional
 
 import numpy as np
 
 from ._loader import load_turbomemory
+from .budget import select_under_budget
+from .concepts import extract_concepts
 from .interfaces import Embedder, Extractor, Verifier  # noqa: F401  (re-exported types)
+from .ranking import is_first_person_query, role_prior
 
 logger = logging.getLogger("tsm.memory")
 
@@ -51,66 +53,6 @@ CONVERSATIONAL_PROFILE = {
     "access_aware_eviction": True,
     "auto_consolidation_secs": 0,        # manual consolidation (deterministic)
 }
-
-# Common single-word sentence starters that are capitalized for syntactic
-# reasons rather than because they are proper nouns.
-_SENTENCE_START_WORDS = {
-    "the", "a", "an", "i", "it", "he", "she", "they", "we", "you",
-    "this", "that", "these", "those", "there", "here", "what", "which",
-    "when", "where", "why", "how", "if", "but", "and", "or", "so",
-    "because", "although", "however", "therefore", "moreover", "furthermore",
-    "actually", "basically", "honestly", "hopefully", "unfortunately",
-    "fortunately", "interestingly", "surprisingly", "obviously", "clearly",
-    "sure", "yes", "no", "maybe", "ok", "okay", "right", "wrong",
-}
-
-# Stop words used to filter content-word extraction.
-_STOP_WORDS = frozenset({
-    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "could",
-    "should", "may", "might", "must", "shall", "can", "need", "dare",
-    "ought", "used", "to", "of", "in", "for", "on", "with", "at", "by",
-    "from", "as", "into", "through", "during", "before", "after", "above",
-    "below", "between", "under", "again", "further", "then", "once",
-    "here", "there", "when", "where", "why", "how", "all", "each", "few",
-    "more", "most", "other", "some", "such", "only", "own", "same", "than",
-    "too", "very", "just", "and", "but", "if", "or", "because", "until",
-    "while", "this", "that", "these", "those", "me", "my", "myself", "our",
-    "ours", "ourselves", "you", "your", "yours", "yourself", "yourselves",
-    "him", "his", "himself", "her", "hers", "herself", "its", "itself",
-    "them", "their", "theirs", "themselves", "what", "which", "who", "whom",
-    "whose", "whoever", "whomever", "whatever", "whichever", "also",
-    "about", "any", "both", "either", "neither", "nor", "not", "out",
-    "over", "off", "down", "up", "now", "still", "even", "well", "back",
-    "away", "around", "along", "since", "though", "unless", "whether",
-})
-
-
-def extract_concepts(text: str) -> List[str]:
-    """Extract salient concepts from a fact for the memory graph.
-
-    Multi-strategy: capitalized phrases (proper nouns), hyphenated compounds,
-    then content words (4+ chars, not stop words). Returns at most 15
-    deduplicated lowercase concepts, most salient first.
-    """
-    concepts: List[str] = []
-    for m in re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", text):
-        if len(m.split()) > 1 or m.lower() not in _SENTENCE_START_WORDS:
-            concepts.append(m.lower())
-    concepts.extend(re.findall(r"\b[a-z]+(?:-[a-z]+)+\b", text.lower()))
-    for w in re.findall(r"\b[a-zA-Z]{4,}\b", text.lower()):
-        if w not in _STOP_WORDS:
-            concepts.append(w)
-
-    seen = set()
-    unique: List[str] = []
-    for c in concepts:
-        c = c.strip()
-        if c and c not in seen and len(c) > 2:
-            seen.add(c)
-            unique.append(c)
-    return unique[:15]
-
 
 class Memory:
     """Scoped, self-correcting conversational memory.
@@ -251,7 +193,10 @@ class Memory:
 
         Args:
             messages: list of ``{"role": ..., "content": ...}`` dicts
-                (an optional ``"timestamp"`` is carried into the payload).
+                (optional ``"timestamp"`` and ``"turn_index"`` are carried
+                into the payload). Facts extracted from one message share a
+                turn index, which budget recall uses to spread its selection
+                across turns; when the caller gives none, one is assigned.
             user_id: scope the facts are stored under (recall is scoped too).
 
         Returns:
@@ -269,7 +214,7 @@ class Memory:
         metas: List[Dict] = []
         seen_in_batch = set()
         context: List[str] = []
-        for msg in messages:
+        for turn, msg in enumerate(messages):
             content = (msg.get("content") or "").strip()
             if not content:
                 continue
@@ -284,6 +229,8 @@ class Memory:
                     "role": role,
                     "timestamp": msg.get("timestamp", ""),
                     "content": content,
+                    "turn": turn,
+                    "turn_index": msg.get("turn_index"),
                 })
             context.append(content)
 
@@ -291,9 +238,17 @@ class Memory:
             return 0
 
         embeddings = np.asarray(self.embedder.encode(facts), dtype=np.float32)
+        assigned_turns: Dict[int, int] = {}
         for fact, meta, emb in zip(facts, metas, embeddings):
+            memory_id = self._next_id(user_id)
+            # A caller-supplied turn index wins. Otherwise the turn is keyed by
+            # the sequence number of its first stored fact: unique per message
+            # and durable across restarts, like the ids themselves.
+            turn_index = meta["turn_index"]
+            if turn_index is None:
+                turn_index = assigned_turns.setdefault(meta["turn"], self._insert_counter)
             self.engine.insert(
-                id=self._next_id(user_id),
+                id=memory_id,
                 text=fact,
                 embedding=emb.astype(np.float32),
                 importance_score=1.0,
@@ -303,6 +258,7 @@ class Memory:
                     "role": meta["role"],
                     "user_id": user_id,
                     "original_message": meta["content"],
+                    "turn_index": turn_index,
                 }),
                 scope=user_id,
                 source_role=meta["role"],
@@ -375,7 +331,10 @@ class Memory:
         """Search memories under ``user_id``'s scope.
 
         Returns a list of dicts, best first, each with at least ``"id"``,
-        ``"text"``, ``"score"`` and ``"role"`` (the stored source role).
+        ``"text"``, ``"score"``, ``"role"`` (the stored source role) and
+        ``"turn_index"``. With ``token_budget`` set, the result is instead the
+        best *set* that fits the budget (``tsm.budget.select_under_budget``:
+        greedy MMR over a pool of ``pool_k`` candidates), in selection order.
         Superseded facts are excluded by the engine when the conversational
         profile is active.
 
@@ -422,12 +381,9 @@ class Memory:
         if not pool:
             return []
 
-        is_user_query = any(w in query.lower().split() for w in ["i", "my", "me", "mine", "we", "our", "did", "have", "how", "what", "total", "number", "many"])
+        first_person = is_first_person_query(query)
         for p in pool:
-            if is_user_query and p["role"] == "user":
-                p["score"] = float(p["score"]) * 1.30
-            elif is_user_query and p["role"] == "assistant":
-                p["score"] = float(p["score"]) * 0.85
+            p["score"] = p["score"] * role_prior(first_person, p["role"])
 
         # Stage-2 MultiVector / ColBERT Late-Interaction Precision Reranking
         if active_reranker is not None and len(pool) > 1:
@@ -444,7 +400,8 @@ class Memory:
         if token_budget is None:
             final = pool[:top_k]
         else:
-            final = self._mmr_under_budget(pool, token_budget, lam)
+            final = select_under_budget(pool, token_budget,
+                                        embed=self.embedder.encode, lam=lam)
         if resolve_beliefs:
             self._annotate_beliefs(final)
         return final
@@ -467,48 +424,6 @@ class Memory:
             if current != res["id"] and current not in present:
                 by_id[res["id"]]["superseded_by"] = current
                 by_id[res["id"]]["chain"] = list(res["chain"])
-
-    def _mmr_under_budget(self, pool: List[Dict], token_budget: int, lam: float = 0.55, max_items: Optional[int] = None) -> List[Dict]:
-        """Greedy submodular MMR best-set selection with adaptive saliency cap.
-
-        Each step adds the candidate maximizing
-        ``lam * relevance - (1 - lam) * max_redundancy + diversity_bonus`` against the selected
-        set, capped at ``max_items`` (default min(10, token_budget // 35)) to prevent context stuffing.
-        """
-        texts = [p["text"] or "" for p in pool]
-        rel = np.array([p["score"] for p in pool], dtype=np.float32)
-        toks = np.array([max(1, len(t) // 4) for t in texts], dtype=np.int64)
-        cap = max_items or min(10, max(4, token_budget // 35))
-
-        # Pairwise redundancy from pool embeddings (unit-normed -> cosine).
-        embs = np.asarray(self.embedder.encode(texts), dtype=np.float32)
-        norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-9
-        sim = (embs / norms) @ (embs / norms).T
-
-        selected, used, remaining = [], 0, list(range(len(pool)))
-        selected_turns = set()
-        while remaining and len(selected) < cap:
-            best_i, best_gain = None, -1e9
-            for i in remaining:
-                if used + int(toks[i]) > token_budget:
-                    continue
-                red = max((float(sim[i, j]) for j in selected), default=0.0)
-                if red > 0.72:
-                    continue
-                t_idx = pool[i].get("turn_index")
-                div_bonus = 0.20 if (t_idx is not None and t_idx not in selected_turns) else 0.0
-                gain = lam * float(rel[i]) - (1.0 - lam) * red + div_bonus
-                if gain > best_gain:
-                    best_gain, best_i = gain, i
-            if best_i is None:
-                break  # nothing else fits the budget or threshold
-            selected.append(best_i)
-            used += int(toks[best_i])
-            t_idx = pool[best_i].get("turn_index")
-            if t_idx is not None:
-                selected_turns.add(t_idx)
-            remaining.remove(best_i)
-        return [pool[i] for i in selected]
 
     # maintenance -----------------------------------------------------------------
     def consolidate(self) -> int:

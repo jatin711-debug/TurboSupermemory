@@ -58,7 +58,7 @@ test:
 # keys, no model downloads). Also part of `make gate`.
 test-python: build-python
 	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
-	"$(PYTHON)" -m unittest tsm.tests.test_memory
+	"$(PYTHON)" -m unittest discover -s tsm/tests -t .
 
 verify: build-python
 	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true

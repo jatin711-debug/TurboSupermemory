@@ -34,6 +34,12 @@ with Memory("./my_db") as mem:                       # conversational profile
 - Extra engine kwargs override the profile: `Memory(db, cognitive_alpha=0.7)`.
 - Plug in local backends via the `Embedder` / `Extractor` / `Verifier`
   protocols (`tsm.interfaces`); pass instances to `Memory(...)`.
+- Budget recall: `recall(..., token_budget=N)` returns the best set that fits
+  (`tsm.budget.select_under_budget`, greedy MMR with a cross-turn bonus).
+- Compress instead of delete: with `max_records` set, pass
+  `gist_summarizer=OpenAIGistSummarizer()` (or the model-free
+  `ExtractiveGistSummarizer()`, both in `tsm.gist`) and eviction victims are
+  folded into searchable gist records instead of being dropped.
 - Verified supersession: pass `verifier=NLIVerifier()` (`tsm.verification`,
   needs `torch` + `transformers`) — consolidation then proposes, NLI-vets
   (accept contradiction/entailment, reject neutral), and commits only the
@@ -48,6 +54,6 @@ with Memory("./my_db") as mem:                       # conversational profile
 ## Tests
 
 ```
-python -m unittest tsm.tests.test_memory -v   # from the repo root, no API key
-make test-python                              # same, after rebuilding the extension
+python -m unittest discover -s tsm/tests -t .   # from the repo root, no API key
+make test-python                                # same, after rebuilding the extension
 ```

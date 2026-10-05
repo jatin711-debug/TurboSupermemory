@@ -17,43 +17,14 @@ from typing import Dict, List, Optional, Union
 
 import numpy as np
 
+# Shipped logic, shared with tsm.Memory (the cognitive_eval package puts the
+# repo root on sys.path): the evals exercise the same concept extraction,
+# role prior and budget selection that the SDK runs.
+from tsm.budget import select_under_budget
+from tsm.concepts import STOP_WORDS, extract_concepts
+from tsm.ranking import is_first_person_query, role_prior
+
 logger = logging.getLogger("cognitive_eval.adapters.tsm")
-
-
-# Common single-word sentence starters that are capitalized for syntactic
-# reasons rather than because they are proper nouns. Multi-word capitalized
-# spans are always kept (they are almost always named entities).
-_SENTENCE_START_WORDS = {
-    "the", "a", "an", "i", "it", "he", "she", "they", "we", "you",
-    "this", "that", "these", "those", "there", "here", "what", "which",
-    "when", "where", "why", "how", "if", "but", "and", "or", "so",
-    "because", "although", "however", "therefore", "moreover", "furthermore",
-    "actually", "basically", "honestly", "hopefully", "unfortunately",
-    "fortunately", "interestingly", "surprisingly", "obviously", "clearly",
-    "sure", "yes", "no", "maybe", "ok", "okay", "right", "wrong",
-}
-
-# Stop words used to filter content-word extraction. Kept as a frozenset for
-# O(1) membership tests in the hot path.
-_STOP_WORDS = frozenset({
-    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "could",
-    "should", "may", "might", "must", "shall", "can", "need", "dare",
-    "ought", "used", "to", "of", "in", "for", "on", "with", "at", "by",
-    "from", "as", "into", "through", "during", "before", "after", "above",
-    "below", "between", "under", "again", "further", "then", "once",
-    "here", "there", "when", "where", "why", "how", "all", "each", "few",
-    "more", "most", "other", "some", "such", "only", "own", "same", "than",
-    "too", "very", "just", "and", "but", "if", "or", "because", "until",
-    "while", "this", "that", "these", "those", "me", "my", "myself", "our",
-    "ours", "ourselves", "you", "your", "yours", "yourself", "yourselves",
-    "him", "his", "himself", "her", "hers", "herself", "its", "itself",
-    "them", "their", "theirs", "themselves", "what", "which", "who", "whom",
-    "whose", "whoever", "whomever", "whatever", "whichever", "also",
-    "about", "any", "both", "either", "neither", "nor", "not", "out",
-    "over", "off", "down", "up", "now", "still", "even", "well", "back",
-    "away", "around", "along", "since", "though", "unless", "whether",
-})
 
 
 def _setup_turbomemory():
@@ -182,8 +153,8 @@ class TSMAdapter:
         # B1: supersession handling at recall.
         self.supersession_mode = supersession_mode
         self._superseded_cache = None  # set[str], invalidated on add/consolidate
-        # Stop-word set used by _extract_concepts.
-        self._stop_words = _STOP_WORDS
+        # Stop-word set used by the keyword candidate augmentation in search().
+        self._stop_words = STOP_WORDS
 
         # Store mapping of id -> text and id -> metadata for retrieval
         self._id_to_text = {}
@@ -319,52 +290,9 @@ class TSMAdapter:
         self._global_turn_offset = 0
     
     def _extract_concepts(self, text: str) -> List[str]:
-        """Extract meaningful concepts from text for graph building.
+        """Concepts for graph building (the shipped ``tsm.concepts`` extractor)."""
+        return extract_concepts(text)
 
-        Uses a multi-strategy approach:
-        1. Named entities (capitalized phrases) - high-value proper nouns
-        2. Compound words with hyphens (high semantic value)
-        3. Nouns and content words (>3 chars, not stop words)
-
-        Prioritizes semantically meaningful concepts that help build the
-        memory graph. Returns at most 15 deduplicated lowercase concepts.
-        """
-        import re
-
-        concepts: List[str] = []
-
-        # Strategy 1: Capitalized phrases (proper nouns, names, places, orgs).
-        # These carry the highest discriminative value for retrieval.
-        for m in re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", text):
-            # Skip common sentence-start words unless multi-word.
-            m_lower = m.lower()
-            if len(m.split()) > 1 or m_lower not in _SENTENCE_START_WORDS:
-                concepts.append(m_lower)
-
-        # Strategy 2: Compound words with hyphens (e.g. "state-of-the-art").
-        concepts.extend(re.findall(r"\b[a-z]+(?:-[a-z]+)+\b", text.lower()))
-
-        # Strategy 3: Content words (nouns and important terms).
-        # A 4-char minimum plus stop-word filter removes most function words
-        # while keeping nouns, verbs, and domain terms.
-        for w in re.findall(r"\b[a-zA-Z]{4,}\b", text.lower()):
-            if w not in self._stop_words:
-                concepts.append(w)
-
-        # Deduplicate while preserving order of first occurrence.
-        seen = set()
-        unique: List[str] = []
-        for c in concepts:
-            c_clean = c.strip()
-            if c_clean and c_clean not in seen and len(c_clean) > 2:
-                seen.add(c_clean)
-                unique.append(c_clean)
-
-        # Cap the number of concepts to bound graph density. The engine's
-        # max_concepts setting also caps this, but pre-filtering here keeps
-        # the most salient (earliest) concepts.
-        return unique[:15]
-    
     def add(self, messages: List[Dict], user_id: Optional[str] = None, batch: bool = True) -> Dict:
         """Add conversation messages to memory (Mem0-compatible API).
         
@@ -546,6 +474,7 @@ class TSMAdapter:
             return []
 
         superseded = self._superseded_set() if self.supersession_mode in ("exclude", "tag") else set()
+        is_first_person = is_first_person_query(query)
         out = []
         for r in results:
             mid = r[0]
@@ -583,12 +512,7 @@ class TSMAdapter:
                 text = f"[{clean_ts}] {text}"
 
             role = meta.get("role") or ""
-            score_val = float(r[1])
-            is_first_person = any(w in query.lower().split() for w in ["i", "my", "me", "mine", "we", "our", "did", "have", "how", "what", "total", "number", "many"])
-            if is_first_person and role == "user":
-                score_val = score_val * 1.30
-            elif is_first_person and role == "assistant":
-                score_val = score_val * 0.85
+            score_val = float(r[1]) * role_prior(is_first_person, role)
 
             if self.supersession_mode == "tag" and mid in superseded:
                 text = "[OUTDATED] " + text
@@ -626,57 +550,10 @@ class TSMAdapter:
             pool = self.search(query, user_id=user_id, top_k=pool_k, use_cognitive=True)
         if not pool:
             return []
-        texts = [p["text"] or "" for p in pool]
-        rel = np.array([float(p["score"]) for p in pool], dtype=np.float32)
-        toks = np.array([max(1, len(t) // 4) for t in texts], dtype=np.int32)
-        cap = max_items or min(10, max(4, token_budget // 35))
+        selected = select_under_budget(pool, token_budget, embed=self.model.encode,
+                                       method=method, lam=lam, max_items=max_items)
+        return [p["text"] or "" for p in selected]
 
-        if method == "truncate":
-            order = list(np.argsort(-rel))
-            sel, used = [], 0
-            for i in order:
-                if len(sel) >= cap:
-                    break
-                if used + int(toks[i]) <= token_budget:
-                    sel.append(i)
-                    used += int(toks[i])
-            return [texts[i] for i in sel]
-
-        # MMR: needs pairwise similarity → embed the pool once (unit vectors).
-        embs = self.model.encode(texts)
-        embs = np.asarray(embs, dtype=np.float32)
-        norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-9
-        embs = embs / norms
-        sim = embs @ embs.T  # cosine, since unit-normed
-
-        selected, used, remaining = [], 0, list(range(len(texts)))
-        selected_turns = set()
-        while remaining and len(selected) < cap:
-            best_i, best_gain = None, -1e9
-            for i in remaining:
-                if used + int(toks[i]) > token_budget:
-                    continue
-                red = max((float(sim[i, j]) for j in selected), default=0.0)
-                if red > 0.72:
-                    continue  # suppress near-duplicate paraphrases from polluting the prompt
-
-                # Cross-turn / cross-session coverage bonus
-                t_idx = pool[i].get("turn_index")
-                div_bonus = 0.20 if (t_idx is not None and t_idx not in selected_turns) else 0.0
-
-                gain = lam * float(rel[i]) - (1.0 - lam) * red + div_bonus
-                if gain > best_gain:
-                    best_gain, best_i = gain, i
-            if best_i is None:
-                break  # nothing else fits the budget or non-redundancy threshold
-            selected.append(best_i)
-            used += int(toks[best_i])
-            t_idx = pool[best_i].get("turn_index")
-            if t_idx is not None:
-                selected_turns.add(t_idx)
-            remaining.remove(best_i)
-        return [texts[i] for i in selected]
-    
     def search_ann(self, query: str, user_id: Optional[str] = None, top_k: int = 3) -> List[Dict]:
         """Pure ANN search without cognitive layer (for comparison).
         

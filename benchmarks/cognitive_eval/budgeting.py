@@ -1,135 +1,24 @@
-"""Shared approximate-token budgeting for cognitive evaluations."""
+"""Equal-budget comparison stores for the bounded-storage evaluations.
 
-import re
+The token estimate and packing primitives are the shipped ones in
+``tsm.budget`` (re-exported here for the eval scripts); only the eval-specific
+construction of matched naive / gist-compressed stores lives in this module.
+"""
+
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
+from tsm.budget import (  # noqa: F401  (re-exported for the eval scripts)
+    estimate_tokens,
+    fit_complete_facts_to_budget,
+    fit_text_to_budget,
+    pack_recent,
+    pack_role_priority_recent,
+    partition_by_token_weight,
+    total_tokens,
+    truncate_to_budget,
+)
 
-def estimate_tokens(text: str) -> int:
-    """Match the benchmark suite's established four-characters-per-token estimate."""
-    return max(1, len(text) // 4) if text and text.strip() else 0
-
-
-def total_tokens(texts: Sequence[str]) -> int:
-    return sum(estimate_tokens(text) for text in texts)
-
-
-def truncate_to_budget(texts: Sequence[str], token_budget: int) -> list[str]:
-    """Greedily pack texts in input order, skipping entries that do not fit."""
-    selected = []
-    used = 0
-    for text in texts:
-        tokens = estimate_tokens(text)
-        if tokens and used + tokens <= token_budget:
-            selected.append(text)
-            used += tokens
-    return selected
-
-
-def pack_recent(texts: Sequence[str], token_budget: int) -> tuple[list[str], list[str]]:
-    """Keep the most-recent entries that fit and return `(kept, overflow)` in input order."""
-    selected_indexes = _pack_indexes(texts, token_budget, range(len(texts) - 1, -1, -1))
-    kept = [text for index, text in enumerate(texts) if index in selected_indexes]
-    overflow = [text for index, text in enumerate(texts) if index not in selected_indexes]
-    return kept, overflow
-
-
-def _pack_indexes(texts, token_budget, candidate_indexes):
-    selected_indexes = set()
-    used = 0
-    for index in candidate_indexes:
-        tokens = estimate_tokens(texts[index])
-        if tokens and used + tokens <= token_budget:
-            selected_indexes.add(index)
-            used += tokens
-    return selected_indexes
-
-
-def pack_role_priority_recent(texts, roles, token_budget):
-    """Pack recent user facts first, then system/assistant facts, under one cap."""
-    if len(texts) != len(roles):
-        raise ValueError("texts and roles must have the same length")
-    role_order = ("user", "system", "assistant")
-    candidates = []
-    for role in role_order:
-        candidates.extend(
-            index for index in range(len(texts) - 1, -1, -1) if roles[index] == role
-        )
-    candidates.extend(
-        index
-        for index in range(len(texts) - 1, -1, -1)
-        if roles[index] not in role_order
-    )
-    selected_indexes = _pack_indexes(texts, token_budget, candidates)
-    kept = [text for index, text in enumerate(texts) if index in selected_indexes]
-    overflow = [text for index, text in enumerate(texts) if index not in selected_indexes]
-    return kept, overflow
-
-
-def fit_text_to_budget(text: str, token_budget: int) -> str:
-    """Bound one generated text using the same approximation as storage accounting."""
-    if not text or token_budget <= 0:
-        return ""
-    if estimate_tokens(text) <= token_budget:
-        return text.strip()
-    clipped = text[: token_budget * 4].strip()
-    if " " in clipped:
-        clipped = clipped.rsplit(" ", 1)[0].rstrip(" ,;:")
-    return clipped
-
-
-def fit_complete_facts_to_budget(text: str, token_budget: int) -> str:
-    """Keep complete generated fact units; never hard-cut a fact mid-sentence."""
-    if not text or token_budget <= 0:
-        return ""
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if len(lines) <= 1:
-        lines = [part.strip() for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
-
-    selected = []
-    for line in lines:
-        fact = re.sub(r"^(?:[-*]\s*|\d+[.)]\s*)", "", line).strip()
-        if not fact:
-            continue
-        candidate = "\n".join([*selected, f"- {fact}"])
-        if estimate_tokens(candidate) <= token_budget:
-            selected.append(f"- {fact}")
-    return "\n".join(selected)
-
-
-def partition_by_token_weight(texts: Sequence[str], chunk_count: int) -> list[list[str]]:
-    """Split ordered texts into contiguous chunks with roughly equal token weight."""
-    if chunk_count < 1:
-        raise ValueError("chunk_count must be at least 1")
-    if not texts:
-        return []
-    chunk_count = min(chunk_count, len(texts))
-    total = sum(max(1, estimate_tokens(text)) for text in texts)
-    chunks = []
-    start = 0
-    remaining_tokens = total
-    for chunk_index in range(chunk_count):
-        remaining_chunks = chunk_count - chunk_index
-        if remaining_chunks == 1:
-            chunks.append(list(texts[start:]))
-            break
-        target = max(1, round(remaining_tokens / remaining_chunks))
-        end = start
-        used = 0
-        max_end = len(texts) - (remaining_chunks - 1)
-        while end < max_end:
-            tokens = max(1, estimate_tokens(texts[end]))
-            if end > start and used + tokens > target:
-                break
-            used += tokens
-            end += 1
-        if end == start:
-            end += 1
-            used = max(1, estimate_tokens(texts[start]))
-        chunks.append(list(texts[start:end]))
-        start = end
-        remaining_tokens -= used
-    return chunks
 
 
 @dataclass(frozen=True)

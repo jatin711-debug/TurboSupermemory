@@ -480,6 +480,33 @@ class TestDurability(MemoryTestBase):
         self.assertEqual(mem.recall("dog Rex", user_id="bob"), [],
                          "scope leak after reopen: bob saw alice's memory")
 
+    def test_turn_index_groups_facts_by_message_across_reopen(self):
+        mem = self.make_memory()
+        mem.add(
+            [
+                {"role": "user", "content": "I adopted a dog. His name is Rex."},
+                {"role": "user", "content": "I moved to Lisbon."},
+            ],
+            user_id="alice",
+        )
+        mem = self.reopen()
+        mem.add([{"role": "user", "content": "I started a pottery class."}], user_id="alice")
+
+        results = mem.recall("dog Rex Lisbon pottery", user_id="alice", top_k=10)
+        turn = {r["text"]: r["turn_index"] for r in results}
+        self.assertEqual(len(turn), 4)
+        # Two facts from one message share a turn; every message is its own turn,
+        # including the one added after the restart.
+        self.assertEqual(turn["I adopted a dog"], turn["His name is Rex"])
+        self.assertEqual(len(set(turn.values())), 3)
+
+    def test_caller_supplied_turn_index_is_kept(self):
+        mem = self.make_memory()
+        mem.add([{"role": "user", "content": "I adopted a dog named Rex.", "turn_index": 41}],
+                user_id="alice")
+        results = mem.recall("dog Rex", user_id="alice")
+        self.assertEqual(results[0]["turn_index"], 41)
+
     def test_verifier_vets_facts_from_an_earlier_session(self):
         mem = self.make_memory()  # no verifier: nothing is committed yet
         mem.add([{"role": "user", "content": self.OLD_FACT + "."}], user_id="alice")
