@@ -54,6 +54,10 @@ with Memory("./my_db") as mem:                       # conversational profile
   verifier, `recall()` also marks it in the result's `context`
   (`[earlier, since changed] ...`) and serves the fact that replaced it with
   it. `exclude_superseded=True` drops replaced facts instead.
+- A token budget per user: `Memory(db, max_user_tokens=256,
+  gist_summarizer=...)` keeps the newest facts as they are and folds
+  everything older into a few short gists at `consolidate()`, again and
+  again as the history grows (`tsm.compaction`).
 - The engine is the only store: text, role, and scope are read back from it,
   and ids come from its durable insert sequence, so a reopened database keeps
   appending and recalls the same way it did before the restart.

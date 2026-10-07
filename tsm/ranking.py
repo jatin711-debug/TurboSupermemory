@@ -17,6 +17,13 @@ FIRST_PERSON_CUES = frozenset({
 USER_ROLE_BOOST = 1.30
 ASSISTANT_ROLE_DAMP = 0.85
 
+# A gist counts as its source: one written from what the user said is ranked
+# like a user fact, the other kind like an assistant fact (the role names are
+# `tsm.compaction.GIST_ROLE` / `GIST_OTHER_ROLE`). Without this a store that
+# has been compacted ranks every raw fact above the history behind it.
+USER_ROLES = frozenset({"user", "summary"})
+ASSISTANT_ROLES = frozenset({"assistant", "summary-assistant"})
+
 
 def is_first_person_query(query: str) -> bool:
     """True when ``query`` contains any first-person / question cue token."""
@@ -25,8 +32,8 @@ def is_first_person_query(query: str) -> bool:
 
 def role_prior(first_person: bool, role: str) -> float:
     """Score multiplier for a memory with source ``role``."""
-    if first_person and role == "user":
+    if first_person and role in USER_ROLES:
         return USER_ROLE_BOOST
-    if first_person and role == "assistant":
+    if first_person and role in ASSISTANT_ROLES:
         return ASSISTANT_ROLE_DAMP
     return 1.0

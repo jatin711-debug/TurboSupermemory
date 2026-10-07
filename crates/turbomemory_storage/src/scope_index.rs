@@ -76,6 +76,20 @@ impl ScopeIndex {
         }
     }
 
+    /// The offsets stored under exactly this scope. Unlike `query`, global
+    /// records are not included: this is what the scope owns, not what a
+    /// search in it may see.
+    pub fn exact(&self, scope: &str) -> RoaringBitmap {
+        self.by_scope.get(scope).cloned().unwrap_or_default()
+    }
+
+    /// Every scope that holds at least one record, sorted.
+    pub fn scopes(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.by_scope.keys().cloned().collect();
+        names.sort_unstable();
+        names
+    }
+
     /// All offsets currently indexed (global + every named scope).
     pub fn all_offsets(&self) -> RoaringBitmap {
         let mut result = self.global.clone();

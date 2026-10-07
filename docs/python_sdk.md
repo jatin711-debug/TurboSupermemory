@@ -110,13 +110,33 @@ message. `extractor="passthrough"` and `extractor="gliner"` keep writes local.
   ("I attended PyCon in 2022", "I attended PyCon in 2024"). The small local
   model also confuses two things of one kind ("I play the guitar", "I play
   the piano").
-- Compress instead of delete: `Memory(db, max_records=500,
-  gist_summarizer=OpenAIGistSummarizer())` (or the model-free
-  `ExtractiveGistSummarizer()`, both in `tsm.gist`) folds eviction victims
-  into searchable gist records. A memory is only deleted once its gist is
-  stored: if the summarizer raises, that chunk's memories stay and are tried
-  again on the next eviction. A summarizer that returns an empty string is
-  saying there is nothing worth keeping, and the chunk is dropped.
+- A token budget per user: `Memory(db, max_user_tokens=256,
+  gist_summarizer=OpenAIGistSummarizer())` keeps each user's memory under
+  that many tokens. `consolidate()` compacts the users written to since the
+  last pass (`compact(user_id)` does one on request, `compact()` all of
+  them): the newest facts stay as they are, what the user said before what
+  the assistant said, and everything older is rewritten as a few short
+  gists stored like any other memory (`role` `"summary"`). The next pass
+  folds those gists again together with what has aged out since, so the
+  store stays within its budget however long the history grows. Facts a
+  newer one replaced are folded first. Gists are written before anything is
+  removed, and a summarizer that fails removes nothing. Without a
+  summarizer the older facts are simply dropped. This is the policy the
+  bounded-storage evaluation measures (`tsm.compaction.plan_compaction`).
+  On 112 judged LongMemEval questions a 256-token store answered 0.464
+  when compacted once and 0.411 when compacted four times as the
+  conversation arrived, against 0.348 for Mem0 at the same allowance, 0.098
+  for keeping only the newest facts, and 0.59 for the unbounded store
+  (`benchmarks/PHASE_PROGRESS.md`, 2026-10-07).
+- The engine's own cap is a different thing: `Memory(db, max_records=500,
+  gist_summarizer=...)` is one count for the whole store. It keeps whatever
+  was used or written most recently, whoever said it, and folds eviction
+  victims into gists of 24 facts (or the model-free
+  `ExtractiveGistSummarizer()`, also in `tsm.gist`). A memory is only
+  deleted once its gist is stored: if the summarizer raises, that chunk's
+  memories stay and are tried again on the next eviction. A summarizer that
+  returns an empty string is saying there is nothing worth keeping, and the
+  chunk is dropped. Prefer `max_user_tokens` for conversational memory.
 - `add()` stores the facts of one call as a single validated batch: it either
   stores all of them or raises having stored none, and it can be called from
   several threads.

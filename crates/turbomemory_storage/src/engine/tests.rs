@@ -799,6 +799,51 @@ fn supersession_candidates_ignore_memories_replaced_by_others() {
     assert_eq!(offered, [("porto".to_string(), "madrid".to_string())]);
 }
 
+/// `scope_ids` is one scope's own records, oldest first: no other scope's,
+/// no global ones, nothing deleted, and an updated record keeps its id but
+/// moves to the end (it is a new version).
+#[test]
+fn scope_ids_lists_one_scope_in_insertion_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+    let put = |id: &str, axis: usize, scope: Option<&str>| {
+        let mut v = [0.0f32; 8];
+        v[axis] = 1.0;
+        engine
+            .insert_with_payload(id, id, &v, 1.0, &[], None, scope.map(str::to_string))
+            .unwrap();
+    };
+    put("a1", 0, Some("alice"));
+    put("b1", 1, Some("bob"));
+    put("g1", 2, None);
+    put("a2", 3, Some("alice"));
+    put("a3", 4, Some("alice"));
+    assert_eq!(engine.scope_ids("alice"), ["a1", "a2", "a3"]);
+    assert_eq!(engine.scope_ids("bob"), ["b1"]);
+    assert!(engine.scope_ids("carol").is_empty());
+    assert_eq!(engine.scopes(), ["alice", "bob"]);
+
+    assert!(engine.delete_by_id("a2").unwrap());
+    let mut v = [0.0f32; 8];
+    v[5] = 1.0;
+    // An update replaces the whole record, scope included.
+    assert!(engine
+        .update_with_payload(
+            "a1",
+            "a1 again",
+            &v,
+            1.0,
+            &[],
+            None,
+            Some("alice".to_string())
+        )
+        .unwrap());
+    assert_eq!(engine.scope_ids("alice"), ["a3", "a1"]);
+
+    assert!(engine.delete_by_id("b1").unwrap());
+    assert_eq!(engine.scopes(), ["alice"]);
+}
+
 /// Belief-state resolution: after committing the A <- B <- C supersession
 /// chain, `resolve_beliefs` maps every chain element to the CURRENT head
 /// with the full lineage — with `exclude_superseded` off (resolution is an

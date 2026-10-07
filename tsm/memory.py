@@ -14,7 +14,10 @@ preset (``profile="conversational"``):
     replaced it in beside it,
   - access-aware eviction and importance auto-scoring,
   - concept extraction (bigram ngrams) for the memory graph,
-  - MMR best-set recall under a token budget.
+  - MMR best-set recall under a token budget,
+  - optionally, each user's memory kept under a token budget
+    (``max_user_tokens``): the newest facts stay as they are and everything
+    older is folded into a few short gists.
 
 Pluggable backends: pass any ``Embedder`` / ``Extractor`` / ``Verifier``
 (see ``tsm.interfaces``) to use local models or other APIs. Defaults are
@@ -29,7 +32,8 @@ from typing import Callable, Dict, List, Optional
 import numpy as np
 
 from ._loader import load_turbomemory
-from .budget import select_under_budget
+from .budget import select_under_budget, total_tokens
+from .compaction import plan_compaction
 from .concepts import extract_concepts
 from .interfaces import Embedder, Extractor, Verifier  # noqa: F401  (re-exported types)
 from .ranking import is_first_person_query, role_prior
@@ -98,6 +102,7 @@ class Memory:
         verifier: Optional[Verifier] = None,
         gist_summarizer: Optional[Callable[[List[str]], str]] = None,
         reranker: Optional[object] = None,
+        max_user_tokens: Optional[int] = None,
         **engine_kwargs,
     ):
         """
@@ -122,7 +127,19 @@ class Memory:
                 Pass ``exclude_superseded=True`` to remove superseded facts
                 from recall instead.
             gist_summarizer: optional callable mapping a list of evicted fact
-                texts to a single gist string (typically an LLM call).
+                texts to a single gist string (typically an LLM call); the
+                ones in ``tsm.gist`` are also told how long the gist may be.
+            max_user_tokens: keep each user's memory under this many tokens.
+                ``consolidate()`` then compacts the users written to since
+                the last pass: the newest facts stay as they are (what the
+                user said before what the assistant said) and everything
+                older is folded into a few short gists by
+                ``gist_summarizer``, earlier gists included, so the store
+                stays within the budget however long the history grows.
+                Without a summarizer the older facts are simply removed.
+                This is per user and by tokens; the engine's ``max_records``
+                is one count for the whole store and keeps whatever is
+                newest.
             reranker: optional ``Reranker`` implementation or ``"colbert"``
                 to enable Stage-2 MultiVector late-interaction MaxSim precision
                 reranking (e.g. ``LFM2.5-ColBERT-350M``).
@@ -206,6 +223,12 @@ class Memory:
         config.update(engine_kwargs)  # explicit kwargs win over the profile
         self.profile = profile
         self._gist_summarizer = gist_summarizer
+        if max_user_tokens is not None and int(max_user_tokens) < 16:
+            raise ValueError("max_user_tokens must be at least 16")
+        self.max_user_tokens = None if max_user_tokens is None else int(max_user_tokens)
+        # Users written to since their last compaction (this process only;
+        # compact() with no argument covers every user in the store).
+        self._touched: set = set()
 
         turbomemory = load_turbomemory()
         self.engine = turbomemory.MemoryEngine(
@@ -215,7 +238,9 @@ class Memory:
         # One writer at a time: id minting and the insert it feeds must not
         # interleave between threads sharing this Memory.
         self._write_lock = threading.Lock()
-        missing = [m for m in _REQUIRED_ENGINE_METHODS if not hasattr(self.engine, m)]
+        required = _REQUIRED_ENGINE_METHODS + (
+            ("scope_ids", "scopes") if self.max_user_tokens is not None else ())
+        missing = [m for m in required if not hasattr(self.engine, m)]
         if missing:
             self.close()
             raise RuntimeError(
@@ -326,6 +351,8 @@ class Memory:
                 [user_id] * len(facts) if user_id is not None else None,
                 [str(meta["role"]) for meta in metas],
             )
+            if self.max_user_tokens is not None and user_id is not None:
+                self._touched.add(user_id)
         return len(facts)
 
     def _compress_gist(self, texts: List[str]):
@@ -404,12 +431,13 @@ class Memory:
         Returns a list of dicts, best first, each with at least ``"id"``,
         ``"text"``, ``"context"`` (the text to put in a prompt: the same as
         ``"text"`` unless marked, see below), ``"score"``, ``"role"`` (the
-        stored source role) and ``"turn_index"``. With ``token_budget`` set, the result is instead the
-        best *set* that fits the budget (``tsm.budget.select_under_budget``:
-        greedy MMR over a candidate pool), in selection order. The pool is
-        ``pool_k`` candidates or more: it grows with the budget so a large
-        budget can be filled. ``max_items`` limits the number of results as
-        well; by default only the token budget does.
+        stored source role) and ``"turn_index"``. With ``token_budget`` set,
+        the result is instead the best *set* that fits the budget
+        (``tsm.budget.select_under_budget``: greedy MMR over a candidate
+        pool), in selection order. The pool is ``pool_k`` candidates or more:
+        it grows with the budget so a large budget can be filled.
+        ``max_items`` limits the number of results as well; by default only
+        the token budget does.
 
         With ``resolve_beliefs`` (default True), a memory that has been
         superseded stays in the results, ranked lower, with
@@ -555,11 +583,28 @@ class Memory:
         verifier (``NLIVerifier``) only sees the pairs that already passed the
         engine's own lexical gates.
 
+        With ``max_user_tokens``, the users written to since the last pass
+        are then brought back under their budget (see ``compact``). A
+        summarizer failure there leaves that user's memories as they are, to
+        be tried again on the next pass.
+
         Returns:
             The number of supersession edges committed (0 without a verifier).
         """
         self._require_open()
         self.engine.trigger_consolidation()
+        committed = self._verify_supersessions()
+        if self.max_user_tokens is not None:
+            for user in sorted(self._touched):
+                try:
+                    self._compact_user(user)
+                except Exception as e:  # noqa: BLE001 — nothing was removed; retried later
+                    logger.warning("memory of %r not compacted (kept as it is, will retry): %s",
+                                   user, type(e).__name__)
+        return committed
+
+    def _verify_supersessions(self) -> int:
+        """Propose, vet and commit supersessions; 0 without a verifier."""
         if self.verifier is None:
             return 0
         min_cosine = getattr(self.verifier, "candidate_min_cosine", None)
@@ -581,6 +626,90 @@ class Memory:
         logger.info("verified supersession: proposed=%d accepted=%d committed=%d",
                     len(proposed), len(accepted), committed)
         return committed
+
+    def compact(self, user_id: Optional[str] = None) -> int:
+        """Bring one user's memory (or, with no argument, every user's) back
+        under ``max_user_tokens``.
+
+        The newest facts are kept as they are, user facts first. What does
+        not fit, together with any earlier gist, is rewritten by
+        ``gist_summarizer`` as a few short gists stored under the same user
+        (``source_role`` ``"summary"``); facts a newer one has replaced are
+        folded first. The gists are written before anything is removed, so an
+        interruption can leave extra memories behind but never lose one, and
+        a summarizer that fails removes nothing: the error is raised.
+
+        Returns:
+            The number of memories folded away.
+        """
+        self._require_open()
+        if self.max_user_tokens is None:
+            raise ValueError("compact() needs Memory(max_user_tokens=...)")
+        users = [user_id] if user_id is not None else list(self.engine.scopes())
+        return sum(self._compact_user(user) for user in users)
+
+    def _summarize_chunk(self, texts, max_tokens: int) -> str:
+        summarize = getattr(self._gist_summarizer, "summarize", None)
+        if callable(summarize):
+            return summarize(list(texts), max_tokens=max_tokens) or ""
+        return self._gist_summarizer(list(texts)) or ""
+
+    def _compact_user(self, user: str) -> int:
+        records = [r for r in self.engine.get_records(self.engine.scope_ids(user)) if r]
+        texts = [r["text"] or "" for r in records]
+        if total_tokens(texts) <= self.max_user_tokens:
+            self._touched.discard(user)
+            return 0
+        superseded = set(self.engine.superseded_ids())
+        plan = plan_compaction(
+            texts,
+            [r["source_role"] or "user" for r in records],
+            self.max_user_tokens,
+            self._summarize_chunk if self._gist_summarizer is not None else None,
+            fold_first=[i for i, r in enumerate(records) if r["id"] in superseded],
+        )
+        if plan is None:
+            self._touched.discard(user)
+            return 0
+        embeddings = None
+        if plan.gists:
+            embeddings = np.ascontiguousarray(self.embedder.encode(plan.gists), dtype=np.float32)
+            if embeddings.shape != (len(plan.gists), self.dim):
+                raise ValueError(
+                    f"embedder returned shape {embeddings.shape} for {len(plan.gists)} gists; "
+                    f"expected ({len(plan.gists)}, {self.dim})")
+        folded = [records[i]["id"] for i in plan.fold]
+        with self._write_lock:
+            # The plan was made without the lock (it may have called a model).
+            # If a memory it folds is gone, something else changed the store:
+            # leave it for the next pass.
+            if not all(self.engine.contains_id(mid) for mid in folded):
+                return 0
+            if plan.gists:
+                gist_ids, payloads = [], []
+                for _ in plan.gists:
+                    gist_ids.append(self._next_id(user))
+                    # Each gist is a turn of its own, so budget recall spreads
+                    # its selection over gists as it does over turns.
+                    payloads.append(json.dumps({"kind": "gist", "user_id": user,
+                                                "folded": len(folded),
+                                                "turn_index": self._insert_counter}))
+                self.engine.insert_batch(
+                    gist_ids,
+                    plan.gists,
+                    embeddings,
+                    [1.0] * len(plan.gists),
+                    [extract_concepts(gist) for gist in plan.gists],
+                    payloads,
+                    [user] * len(plan.gists),
+                    list(plan.gist_roles),
+                )
+            for mid in folded:
+                self.engine.delete(mid)
+            self._touched.discard(user)
+        logger.info("compacted %r: %d memories folded into %d gists", user, len(folded),
+                    len(plan.gists))
+        return len(folded)
 
     def flush(self) -> None:
         """Durably persist all pending writes."""

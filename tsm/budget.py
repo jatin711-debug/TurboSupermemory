@@ -155,8 +155,8 @@ def _pack_indexes(texts, token_budget, candidate_indexes):
     return selected_indexes
 
 
-def pack_role_priority_recent(texts, roles, token_budget):
-    """Pack recent user facts first, then system/assistant facts, under one cap."""
+def pack_role_priority_recent_indexes(texts, roles, token_budget):
+    """Indexes of the texts ``pack_role_priority_recent`` keeps."""
     if len(texts) != len(roles):
         raise ValueError("texts and roles must have the same length")
     role_order = ("user", "system", "assistant")
@@ -170,7 +170,12 @@ def pack_role_priority_recent(texts, roles, token_budget):
         for index in range(len(texts) - 1, -1, -1)
         if roles[index] not in role_order
     )
-    selected_indexes = _pack_indexes(texts, token_budget, candidates)
+    return _pack_indexes(texts, token_budget, candidates)
+
+
+def pack_role_priority_recent(texts, roles, token_budget):
+    """Pack recent user facts first, then system/assistant facts, under one cap."""
+    selected_indexes = pack_role_priority_recent_indexes(texts, roles, token_budget)
     kept = [text for index, text in enumerate(texts) if index in selected_indexes]
     overflow = [text for index, text in enumerate(texts) if index not in selected_indexes]
     return kept, overflow

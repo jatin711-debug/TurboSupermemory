@@ -630,6 +630,25 @@ impl StorageEngine {
         self.id_index.read().contains_key(id)
     }
 
+    /// Ids of the live records stored under exactly `scope`, oldest first.
+    /// Global (unscoped) records are not part of any scope's list. For
+    /// maintenance that works on one scope's whole store (compaction).
+    pub fn scope_ids(&self, scope: &str) -> Vec<String> {
+        let offsets = self.scope_index.read().exact(scope);
+        let mut rows: Vec<(u64, String)> = offsets
+            .iter()
+            .filter_map(|offset| self.meta.get(offset as PointOffset).ok().flatten())
+            .map(|rec| (rec.insert_seq, rec.id))
+            .collect();
+        rows.sort_unstable();
+        rows.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// The scopes that hold at least one record, sorted.
+    pub fn scopes(&self) -> Vec<String> {
+        self.scope_index.read().scopes()
+    }
+
     /// Return the JSON payload attached to a record, if any.
     pub fn get_payload(&self, id: &str) -> crate::Result<Option<String>> {
         let idx = self.id_index.read();

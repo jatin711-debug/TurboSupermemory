@@ -1040,6 +1040,21 @@ impl PyMemoryEngine {
             .collect()
     }
 
+    /// Ids of the live records stored under exactly `scope`, oldest first
+    /// (unscoped records belong to no scope's list). With `get_records` this
+    /// gives a caller one scope's whole store, for maintenance such as
+    /// compaction.
+    fn scope_ids(&self, py: Python<'_>, scope: String) -> PyResult<Vec<String>> {
+        let engine = self.engine()?;
+        Ok(py.allow_threads(|| engine.scope_ids(&scope)))
+    }
+
+    /// The scopes that hold at least one record, sorted.
+    fn scopes(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let engine = self.engine()?;
+        Ok(py.allow_threads(|| engine.scopes()))
+    }
+
     /// The `insert_seq` the next inserted record will receive. Durable and
     /// monotonically increasing — never reused across restarts, deletes, or
     /// eviction — so callers can derive collision-free ids from it.

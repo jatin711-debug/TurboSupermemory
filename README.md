@@ -159,6 +159,7 @@ Notes on defaults:
 * The database is durable: reopen the same `db_path` and `add` / `recall` continue where they left off. Leaving the `with` block (or calling `close()`) flushes and releases it.
 * The cognitive features are a preset (`profile="conversational"`); `profile=None` gives a plain scoped vector store. On the raw `turbomemory.MemoryEngine`, belief revision, eviction, dedup and auto-importance are all opt-in.
 * Belief revision runs in `memory.consolidate()`. A fact that a newer one replaces is never removed from recall: it is ranked lower and returned with `superseded_by`. With `verifier="llm"` (a chat model judges each candidate pair) or `verifier="nli"` (a small local model), `recall()` also marks it for the reader (`[earlier, since changed] ...` in the result's `context`) and serves the fact that replaced it alongside. What each setup catches and gets wrong is measured in [`benchmarks/PHASE_PROGRESS.md`](./benchmarks/PHASE_PROGRESS.md).
+* `Memory(db, max_user_tokens=256, gist_summarizer=...)` keeps each user's memory under a token budget: the newest facts stay as they are and everything older is folded into a few short gists, again and again as the history grows.
 
 ### 2. High-Level Multi-Tier RaBitQ / TurboQuant Configuration
 

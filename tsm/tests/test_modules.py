@@ -22,9 +22,11 @@ from tsm.budget import (
     pack_recent,
     select_under_budget,
 )
+from tsm.compaction import GIST_OTHER_ROLE, GIST_ROLE, plan_compaction
 from tsm.concepts import extract_concepts
 from tsm.gist import ExtractiveGistSummarizer, OpenAIGistSummarizer, single_fact, strip_role
-from tsm.ranking import is_first_person_query, role_prior
+from tsm.ranking import (ASSISTANT_ROLE_DAMP, USER_ROLE_BOOST, is_first_person_query,
+                         role_prior)
 
 
 def _item(text, score, vec, turn_index=None):
@@ -216,6 +218,89 @@ class TestConceptsAndRanking(unittest.TestCase):
         self.assertEqual(role_prior(True, "assistant"), 0.85)
         self.assertEqual(role_prior(True, "gist"), 1.0)
         self.assertEqual(role_prior(False, "user"), 1.0)
+
+
+class TestGistRanking(unittest.TestCase):
+    def test_a_gist_is_ranked_like_the_facts_it_was_written_from(self):
+        self.assertEqual(role_prior(True, GIST_ROLE), USER_ROLE_BOOST)
+        self.assertEqual(role_prior(True, GIST_ROLE), role_prior(True, "user"))
+        self.assertEqual(role_prior(True, GIST_OTHER_ROLE), ASSISTANT_ROLE_DAMP)
+        self.assertEqual(role_prior(False, GIST_ROLE), 1.0)
+
+
+class TestCompactionPlan(unittest.TestCase):
+    """plan_compaction: what stays, what is folded, what the gists are written from."""
+
+    @staticmethod
+    def _capture():
+        seen = []
+
+        def summarize(texts, max_tokens):
+            seen.append((list(texts), max_tokens))
+            return "\n".join("- " + t.split("] ", 1)[1] for t in texts)
+        return seen, summarize
+
+    def test_nothing_to_do_when_everything_fits(self):
+        self.assertIsNone(plan_compaction(["a" * 40, "b" * 40], ["user", "user"], 20, None))
+
+    def test_newest_user_facts_survive_and_the_rest_is_summarized(self):
+        texts = [f"{'u' if i % 2 == 0 else 'a'}{i} " + "x" * 36 for i in range(10)]  # 10 tokens each
+        roles = ["user" if i % 2 == 0 else "assistant" for i in range(10)]
+        seen, summarize = self._capture()
+        plan = plan_compaction(texts, roles, 60, summarize)
+        # 30 tokens for facts: the three newest user facts, though assistant
+        # facts are newer still.
+        self.assertEqual(plan.keep, [4, 6, 8])
+        self.assertEqual(plan.fold, [0, 1, 2, 3, 5, 7, 9])
+        self.assertEqual(sorted(plan.keep + plan.fold), list(range(10)))
+        # 30 tokens of gist is one chunk, and a single chunk is the user's.
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][0], [f"[user] {texts[0]}", f"[user] {texts[2]}"])
+        self.assertEqual(seen[0][1], 30)
+        self.assertEqual(plan.gist_roles, [GIST_ROLE])
+        kept_tokens = sum(estimate_tokens(texts[i]) for i in plan.keep)
+        self.assertLessEqual(kept_tokens + sum(estimate_tokens(g) for g in plan.gists), 60)
+
+    def test_an_earlier_gist_is_folded_again_and_leads_the_new_one(self):
+        texts = ["- old fact one\n- old fact two", "u1 " + "x" * 36, "u2 " + "x" * 36,
+                 "u3 " + "x" * 36, "u4 " + "x" * 36]
+        roles = [GIST_ROLE, "user", "user", "user", "user"]
+        seen, summarize = self._capture()
+        plan = plan_compaction(texts, roles, 40, summarize)
+        self.assertEqual(plan.keep, [3, 4])
+        self.assertIn(0, plan.fold, "a gist never survives as it is")
+        self.assertEqual(seen[0][0][:2], ["[user] old fact one", "[user] old fact two"])
+        self.assertEqual(seen[0][0][2:], [f"[user] {texts[1]}", f"[user] {texts[2]}"])
+
+    def test_assistant_history_gets_a_chunk_once_there_are_four(self):
+        texts = [f"{role[0]}{i} " + "x" * 36 for i, role in
+                 enumerate(["user", "assistant"] * 20)]
+        roles = ["user", "assistant"] * 20
+        seen, summarize = self._capture()
+        plan = plan_compaction(texts, roles, 256, summarize)
+        self.assertEqual(len(seen), 4)
+        self.assertTrue(all(t.startswith("[user] ") for chunk, _ in seen[:3] for t in chunk))
+        self.assertTrue(all(t.startswith("[assistant] ") for t in seen[3][0]))
+        self.assertEqual(plan.gist_roles, [GIST_ROLE] * 3 + [GIST_OTHER_ROLE])
+
+    def test_fold_first_keeps_a_memory_from_surviving(self):
+        texts = ["u0 " + "x" * 36, "u1 " + "x" * 36, "u2 " + "x" * 36]
+        plan = plan_compaction(texts, ["user"] * 3, 20, None, fold_first=[2])
+        self.assertEqual(plan.keep, [0, 1])
+        self.assertEqual(plan.fold, [2])
+
+    def test_without_a_summarizer_the_whole_budget_holds_facts(self):
+        texts = ["u%d " % i + "x" * 36 for i in range(6)]
+        plan = plan_compaction(texts, ["user"] * 6, 40, None)
+        self.assertEqual(plan.keep, [2, 3, 4, 5])
+        self.assertEqual(plan.gists, [])
+
+    def test_a_failing_summarizer_plans_nothing(self):
+        def broken(texts, max_tokens):
+            raise RuntimeError("down")
+
+        with self.assertRaises(RuntimeError):
+            plan_compaction(["u " + "x" * 80] * 3, ["user"] * 3, 30, broken)
 
 
 if __name__ == "__main__":

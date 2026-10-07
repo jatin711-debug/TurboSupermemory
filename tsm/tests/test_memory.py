@@ -11,6 +11,7 @@ supersession-exclusion path exercised here is the engine's, not a mock's.
 """
 
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -31,6 +32,7 @@ import numpy as np
 
 import tsm
 from tsm import CONVERSATIONAL_PROFILE, Memory
+from tsm.gist import ExtractiveGistSummarizer
 from tsm.memory import STALE_MARK
 from tsm.verification import LLMVerifier
 
@@ -902,6 +904,133 @@ class TestLLMVerifiedRevision(MemoryTestBase):
         finally:
             if saved is not None:
                 os.environ["OPENAI_API_KEY"] = saved
+
+
+class TestUserBudget(MemoryTestBase):
+    """Memory(max_user_tokens=...): a user's memory is kept under a token
+    budget by keeping the newest facts and folding the rest into gists."""
+
+    BUDGET = 60
+
+    @staticmethod
+    def _tokens(mem, user):
+        records = [r for r in mem.engine.get_records(mem.engine.scope_ids(user)) if r]
+        return sum(max(1, len(r["text"]) // 4) for r in records), records
+
+    def _fill(self, mem, user, first, count, role="user"):
+        # Each stored fact is 7 tokens by the four-characters estimate.
+        for i in range(first, first + count):
+            mem.add([{"role": role, "content": f"{role} fact number {i:03d} is here."}], user_id=user)
+
+    def test_store_is_brought_under_the_budget_newest_user_facts_first(self):
+        mem = self.make_memory(max_user_tokens=self.BUDGET,
+                               gist_summarizer=ExtractiveGistSummarizer())
+        self._fill(mem, "alice", 0, 12)
+        self._fill(mem, "alice", 0, 6, role="assistant")
+        self._fill(mem, "bob", 0, 3)
+        before, _ = self._tokens(mem, "alice")
+        self.assertGreater(before, self.BUDGET)
+
+        mem.consolidate()
+        after, records = self._tokens(mem, "alice")
+        self.assertLessEqual(after, self.BUDGET)
+        kept = [r["text"] for r in records if r["source_role"] == "user"]
+        # Half the budget holds the newest facts as they were, the user's
+        # before the assistant's (which were written later).
+        self.assertEqual(kept, [f"user fact number {i:03d} is here" for i in (8, 9, 10, 11)])
+        self.assertFalse([r for r in records if r["source_role"] == "assistant"])
+        gists = [r for r in records if r["source_role"] == "summary"]
+        self.assertEqual(len(gists), 1)
+        self.assertIn("user fact number", gists[0]["text"])
+        self.assertEqual(gists[0]["scope"], "alice")
+        # A gist is a turn of its own, unlike any fact's.
+        payload = json.loads(gists[0]["payload"])
+        self.assertEqual(payload["kind"], "gist")
+        fact_turns = {json.loads(r["payload"])["turn_index"] for r in records
+                      if r["source_role"] == "user"}
+        self.assertNotIn(payload["turn_index"], fact_turns)
+        # Another user's memory is not touched.
+        self.assertEqual(self._tokens(mem, "bob")[0], 21)
+
+        # The gist is an ordinary memory: recall finds it.
+        found = mem.recall(gists[0]["text"].splitlines()[0], user_id="alice", top_k=5)
+        self.assertIn(gists[0]["id"], [r["id"] for r in found])
+
+    def test_later_passes_fold_the_earlier_gist_again(self):
+        mem = self.make_memory(max_user_tokens=self.BUDGET,
+                               gist_summarizer=ExtractiveGistSummarizer())
+        self._fill(mem, "alice", 0, 12)
+        mem.consolidate()
+        first_gist = [r["id"] for r in self._tokens(mem, "alice")[1]
+                      if r["source_role"] == "summary"]
+        self.assertEqual(len(first_gist), 1)
+        for start in (12, 24, 36):
+            self._fill(mem, "alice", start, 12)
+            mem.consolidate()
+            tokens, records = self._tokens(mem, "alice")
+            self.assertLessEqual(tokens, self.BUDGET)
+            gists = [r for r in records if r["source_role"] == "summary"]
+            self.assertEqual(len(gists), 1, "gists must be folded, not piled up")
+        self.assertFalse(mem.engine.contains_id(first_gist[0]))
+        # Nothing to do when the store already fits.
+        self.assertEqual(mem.compact("alice"), 0)
+
+    def test_a_failing_summarizer_removes_nothing(self):
+        def broken(texts):
+            raise RuntimeError("summarizer is down")
+
+        mem = self.make_memory(max_user_tokens=self.BUDGET, gist_summarizer=broken)
+        self._fill(mem, "alice", 0, 12)
+        with self.assertLogs("tsm.memory", level="WARNING"):
+            mem.consolidate()  # maintenance carries on
+        self.assertEqual(len(mem.engine.scope_ids("alice")), 12)
+        with self.assertRaises(RuntimeError):
+            mem.compact("alice")  # asked for directly, the failure is reported
+        self.assertEqual(len(mem.engine.scope_ids("alice")), 12)
+
+    def test_without_a_summarizer_the_older_facts_are_dropped(self):
+        mem = self.make_memory(max_user_tokens=self.BUDGET)
+        self._fill(mem, "alice", 0, 12)
+        self.assertEqual(mem.compact("alice"), 4)
+        tokens, records = self._tokens(mem, "alice")
+        self.assertLessEqual(tokens, self.BUDGET)
+        # The whole budget goes to the newest facts: eight of seven tokens.
+        self.assertEqual([r["text"] for r in records],
+                         [f"user fact number {i:03d} is here" for i in range(4, 12)])
+
+    def test_a_replaced_fact_is_folded_before_a_current_one(self):
+        old_fact = "user user user user lives in paris"
+        new_fact = "user user user user lives in london"
+        mem = self.make_memory(verifier=AcceptAllVerifier(), max_user_tokens=self.BUDGET)
+        self._fill(mem, "alice", 0, 8)
+        # The pair is written last, so by age both would survive.
+        mem.add([{"role": "user", "content": old_fact + "."}], user_id="alice")
+        mem.add([{"role": "user", "content": new_fact + "."}], user_id="alice")
+        self.assertEqual(mem.consolidate(), 1)
+        texts = [r["text"] for r in self._tokens(mem, "alice")[1]]
+        self.assertIn(new_fact, texts)
+        self.assertNotIn(old_fact, texts)
+        # Its place went to one more of the facts that are still true.
+        self.assertEqual(len(texts), 8)
+
+    def test_compact_with_no_user_covers_every_user(self):
+        mem = self.make_memory(max_user_tokens=self.BUDGET)
+        self._fill(mem, "alice", 0, 12)
+        self._fill(mem, "bob", 0, 12)
+        mem.close()  # a new process: nothing is marked as written to
+        mem = self.make_memory(max_user_tokens=self.BUDGET)
+        self.assertEqual(mem.consolidate(), 0)
+        self.assertEqual(len(mem.engine.scope_ids("alice")), 12)
+        self.assertEqual(mem.compact(), 8)
+        for user in ("alice", "bob"):
+            self.assertLessEqual(self._tokens(mem, user)[0], self.BUDGET)
+
+    def test_budget_is_validated(self):
+        with self.assertRaises(ValueError):
+            self.make_memory(max_user_tokens=8)
+        mem = self.make_memory()
+        with self.assertRaises(ValueError):
+            mem.compact("alice")
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ from tsm.budget import (  # noqa: F401  (re-exported for the eval scripts)
     total_tokens,
     truncate_to_budget,
 )
-
+from tsm.compaction import plan_compaction
 
 
 @dataclass(frozen=True)
@@ -58,45 +58,17 @@ def build_token_bounded_stores(
     if role_aware:
         if roles is None or len(roles) != len(facts):
             raise ValueError("role-aware compression requires one role per fact")
-        survivors, tail = pack_role_priority_recent(facts, roles, token_budget - gist_limit)
-        survivor_counts = {}
-        for survivor in survivors:
-            survivor_counts[survivor] = survivor_counts.get(survivor, 0) + 1
-        tail_entries = []
-        for fact, role in zip(facts, roles):
-            remaining = survivor_counts.get(fact, 0)
-            if remaining:
-                survivor_counts[fact] = remaining - 1
-            else:
-                tail_entries.append((fact, role))
-        labeled_tail = [f"[{role}] {fact}" for fact, role in tail_entries]
-        user_tail = [fact for fact in labeled_tail if fact.lower().startswith("[user] ")]
-        other_tail = [fact for fact in labeled_tail if not fact.lower().startswith("[user] ")]
-        chunk_count = min(max_gist_chunks, max(1, gist_limit // gist_chunk_tokens))
-        # Tight budgets are reserved for user history. At four or more chunks,
-        # keep one chunk for assistant/system information so that answerable
-        # assistant facts are not erased entirely.
-        other_chunks = 1 if other_tail and chunk_count >= 4 else 0
-        user_chunks = chunk_count - other_chunks if user_tail else 0
-        if not user_chunks and other_tail:
-            other_chunks = chunk_count
-        summary_chunks = partition_by_token_weight(user_tail, user_chunks) if user_chunks else []
-        if other_chunks:
-            summary_chunks.extend(partition_by_token_weight(other_tail, other_chunks))
+        # The shipped policy: what Memory(max_user_tokens=...) does to a store.
+        plan = plan_compaction(facts, roles, token_budget, summarize, gist_share=gist_share,
+                               gist_chunk_tokens=gist_chunk_tokens,
+                               max_gist_chunks=max_gist_chunks)
+        survivors = [facts[index] for index in plan.keep]
+        tail = [facts[index] for index in plan.fold]
+        gists = list(plan.gists)
     else:
         survivors, tail = pack_recent(facts, token_budget - gist_limit)
-        summary_chunks = [list(tail)]
-
-    chunk_limits = []
-    if summary_chunks:
-        base_limit, remainder = divmod(gist_limit, len(summary_chunks))
-        chunk_limits = [base_limit + (1 if index < remainder else 0)
-                        for index in range(len(summary_chunks))]
-    gists = []
-    for summary_input, chunk_limit in zip(summary_chunks, chunk_limits):
-        gist = fit_complete_facts_to_budget(summarize(summary_input, chunk_limit), chunk_limit)
-        if gist:
-            gists.append(gist)
+        gist = fit_complete_facts_to_budget(summarize(list(tail), gist_limit), gist_limit)
+        gists = [gist] if gist else []
     compressed = survivors + gists
     if total_tokens(compressed) > token_budget:
         raise AssertionError("compressed store exceeded its active-memory token budget")
