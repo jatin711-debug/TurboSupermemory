@@ -184,6 +184,20 @@ impl StorageEngine {
         self.ann_top_k_excluding(query, top_k, ef, allowed, exclusion.as_ref())
     }
 
+    /// The nearest records of a scope whatever their belief state: superseded
+    /// ones are returned even with `exclude_superseded` on. For maintenance
+    /// that has to see what a memory has already replaced.
+    pub(super) fn search_ann_any_belief_state(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        scope: Option<&str>,
+    ) -> crate::Result<Vec<(String, f32)>> {
+        validate_query(query, self.config.dimension)?;
+        let allowed = self.allowed_offsets(None, scope)?;
+        self.ann_top_k_excluding(query, top_k, None, allowed.as_ref(), None)
+    }
+
     /// `ann_top_k` with the ids to leave out supplied by the caller (`None`:
     /// leave nothing out).
     fn ann_top_k_excluding(

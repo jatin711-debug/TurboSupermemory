@@ -16,7 +16,7 @@ Python 3.12 or newer (the extension is an `abi3-py312` wheel).
 
 The default embedder and extractor are OpenAI-backed: install the `openai`
 extra (`pip install "tsm[openai]"`) and set `OPENAI_API_KEY`. Local models
-(`embedder="local"`, `reranker="colbert"`, `NLIVerifier`) need the `cpu` extra.
+(`embedder="local"`, `reranker="colbert"`, `verifier="nli"`) need the `cpu` extra.
 
 ## Usage
 
@@ -42,10 +42,16 @@ with Memory("./my_db") as mem:                       # conversational profile
   folded into searchable gist records instead of being dropped. If the
   summarizer raises, the affected memories are kept and retried on the next
   eviction; only an empty summary drops them.
-- Verified supersession: pass `verifier=NLIVerifier()` (`tsm.verification`,
-  needs `torch` + `transformers`) — consolidation then proposes, NLI-vets
-  (accept contradiction/entailment, reject neutral), and commits only the
-  survivors; stale facts are excluded from recall.
+- Belief revision (`consolidate()`): pass `verifier="llm"` and a chat model
+  decides, for each new fact and its closest older facts, whether the newer
+  one replaces the older one (`tsm.verification.LLMVerifier`; any
+  OpenAI-compatible endpoint, verdicts cached on disk). `verifier="nli"`
+  uses a small local cross-encoder instead (`NLIVerifier`, needs `torch` +
+  `transformers`): free, but it only vets the pairs the engine's lexical
+  detection proposes and misses most reworded updates. Either way only
+  accepted pairs are committed, and those stale facts are removed from
+  recall. Without a verifier nothing is removed: facts the engine marks as
+  superseded are ranked lower and returned with `superseded_by`.
 - The engine is the only store: text, role, and scope are read back from it,
   and ids come from its durable insert sequence, so a reopened database keeps
   appending and recalls the same way it did before the restart.

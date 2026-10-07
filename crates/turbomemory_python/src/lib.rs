@@ -1283,6 +1283,34 @@ impl PyMemoryEngine {
             .collect())
     }
 
+    /// Wide candidates for a verifier that can judge meaning (a language
+    /// model): each memory with its nearest older memories of the same scope
+    /// (at most `per_record`, cosine >= `min_cosine`, and no more than
+    /// `margin` below the closest of them; `margin=None` drops that last
+    /// rule), without the lexical gates `propose_supersessions` applies. Same
+    /// tuples as `propose_supersessions`. Most candidates are NOT
+    /// supersessions: vet every one before `commit_supersessions`.
+    #[pyo3(signature = (min_cosine=0.45, per_record=2, margin=Some(0.1)))]
+    fn propose_supersession_candidates(
+        &self,
+        py: Python<'_>,
+        min_cosine: f32,
+        per_record: usize,
+        margin: Option<f32>,
+    ) -> PyResult<Vec<(String, String, String, f32)>> {
+        let engine = self.engine()?;
+        let margin = margin.unwrap_or(f32::INFINITY);
+        let props = py.allow_threads(|| {
+            engine
+                .propose_supersession_candidates(min_cosine, per_record, margin)
+                .map_err(storage_err)
+        })?;
+        Ok(props
+            .into_iter()
+            .map(|p| (p.old_id, p.new_id, p.kind.as_str().to_string(), p.cosine))
+            .collect())
+    }
+
     /// Commit verified supersessions (W3). `pairs` is a list of
     /// `(old_id, new_id, kind)` with `kind` in `{"refinement","contradiction"}`.
     /// Creates the Refines/Contradicts edge and applies bounded demotion for

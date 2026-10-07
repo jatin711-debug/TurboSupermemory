@@ -668,6 +668,137 @@ fn propose_supersessions_is_pure_commit_mutates() {
     );
 }
 
+/// Wide candidates: a memory is offered its closest older memory and those
+/// about as close, not every older memory on the topic, and that still holds
+/// in the cycle after the closest one was replaced (with superseded records
+/// hidden from ordinary searches).
+#[test]
+fn supersession_candidates_keep_to_the_closest_older_memories() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = small_config(8);
+    config.tier.refinement_max_pairs_per_cycle = 100;
+    config.tier.exclude_superseded = true;
+    let engine = StorageEngine::open(tmp.path(), config).unwrap();
+    // Cosine to "new": target 0.98, reworded 0.97, other 0.59.
+    for (id, text, vector) in [
+        (
+            "target",
+            "the recital starts at five",
+            [1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ),
+        (
+            "reworded",
+            "five is when the recital begins",
+            [0.99f32, 0.14, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ),
+        (
+            "other",
+            "my monday class starts at nine",
+            [0.6f32, 0.0, 0.0, 0.8, 0.0, 0.0, 0.0, 0.0],
+        ),
+        (
+            "new",
+            "actually the recital starts at six",
+            [0.98f32, 0.0, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ),
+    ] {
+        engine.insert(id, text, &vector, 1.0, &[]).unwrap();
+    }
+    let offered_to_new = |margin: f32| -> Vec<String> {
+        engine
+            .propose_supersession_candidates(0.45, 3, margin)
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.new_id == "new")
+            .map(|p| p.old_id)
+            .collect()
+    };
+    assert_eq!(
+        offered_to_new(f32::INFINITY),
+        ["target", "reworded", "other"]
+    );
+    assert_eq!(offered_to_new(0.1), ["target", "reworded"]);
+
+    // The verifier accepted both wordings of the old time.
+    let committed = engine
+        .commit_supersessions_by_id(&[
+            (
+                "target".to_string(),
+                "new".to_string(),
+                SupersessionKind::Contradiction,
+            ),
+            (
+                "reworded".to_string(),
+                "new".to_string(),
+                SupersessionKind::Contradiction,
+            ),
+        ])
+        .unwrap();
+    assert_eq!(committed, 2);
+
+    // Next cycle: what "new" replaced still marks its closest neighbour, so
+    // the unrelated fact is not offered in its place.
+    assert!(offered_to_new(0.1).is_empty());
+    assert_eq!(offered_to_new(f32::INFINITY), ["other"]);
+    // A replaced memory replaces nothing itself any more.
+    let all = engine
+        .propose_supersession_candidates(0.45, 3, f32::INFINITY)
+        .unwrap();
+    assert!(all
+        .iter()
+        .all(|p| p.new_id != "reworded" && p.old_id != "target" && p.old_id != "reworded"));
+}
+
+/// A memory that some OTHER statement replaced is not the reference: the
+/// current belief is offered even when it is worded far from the original.
+#[test]
+fn supersession_candidates_ignore_memories_replaced_by_others() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = small_config(8);
+    config.tier.refinement_max_pairs_per_cycle = 100;
+    config.tier.exclude_superseded = true;
+    let engine = StorageEngine::open(tmp.path(), config).unwrap();
+    // Cosine to "madrid": lisbon 0.98, porto 0.49.
+    for (id, text, vector) in [
+        (
+            "lisbon",
+            "i live in lisbon",
+            [1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ),
+        (
+            "porto",
+            "we relocated to porto last spring",
+            [0.5f32, 0.866, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ),
+    ] {
+        engine.insert(id, text, &vector, 1.0, &[]).unwrap();
+    }
+    engine
+        .commit_supersessions_by_id(&[(
+            "lisbon".to_string(),
+            "porto".to_string(),
+            SupersessionKind::Contradiction,
+        )])
+        .unwrap();
+    engine
+        .insert(
+            "madrid",
+            "i live in madrid",
+            &[0.98f32, 0.0, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0],
+            1.0,
+            &[],
+        )
+        .unwrap();
+
+    let offered: Vec<(String, String)> = engine
+        .propose_supersession_candidates(0.45, 2, 0.1)
+        .unwrap()
+        .into_iter()
+        .map(|p| (p.old_id, p.new_id))
+        .collect();
+    assert_eq!(offered, [("porto".to_string(), "madrid".to_string())]);
+}
+
 /// Belief-state resolution: after committing the A <- B <- C supersession
 /// chain, `resolve_beliefs` maps every chain element to the CURRENT head
 /// with the full lineage — with `exclude_superseded` off (resolution is an

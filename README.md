@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#license)
 [![Status: Beta](https://img.shields.io/badge/status-beta-yellow.svg)](#verification)
 [![CUDA](https://img.shields.io/badge/CUDA-12.6%20optional-76B900.svg?logo=nvidia)](#gpu-acceleration)
-[![Tests](https://img.shields.io/badge/tests-286%20Rust%20%2B%2068%20SDK-brightgreen.svg)](#verification)
+[![Tests](https://img.shields.io/badge/tests-294%20Rust%20%2B%2083%20SDK-brightgreen.svg)](#verification)
 
 > **TurboSuperMemory** is a high-performance, bare-metal cognitive memory engine for AI agents — written in native Rust, with optional CUDA acceleration, and equipped with 3-tier TurboQuant hardware compression and Stage-2 ColBERT late interaction.
 
@@ -158,6 +158,7 @@ Notes on defaults:
 * With no `embedder` / `extractor` arguments, `Memory` uses OpenAI for both (`pip install "tsm[openai]"`, `OPENAI_API_KEY`), which means one LLM extraction call per added message. `extractor="passthrough"` (above) and `extractor="gliner"` keep writes local.
 * The database is durable: reopen the same `db_path` and `add` / `recall` continue where they left off. Leaving the `with` block (or calling `close()`) flushes and releases it.
 * The cognitive features are a preset (`profile="conversational"`); `profile=None` gives a plain scoped vector store. On the raw `turbomemory.MemoryEngine`, belief revision, eviction, dedup and auto-importance are all opt-in.
+* Belief revision runs in `memory.consolidate()`. With `verifier="llm"` (a chat model judges each candidate pair) or `verifier="nli"` (a small local model), a fact that a newer one replaces is removed from recall. Without a verifier nothing is removed: a fact the engine's own detection marks as superseded is ranked lower and returned with `superseded_by`. What each setup catches and gets wrong is measured in [`benchmarks/PHASE_PROGRESS.md`](./benchmarks/PHASE_PROGRESS.md).
 
 ### 2. High-Level Multi-Tier RaBitQ / TurboQuant Configuration
 

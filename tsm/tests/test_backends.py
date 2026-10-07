@@ -1,5 +1,5 @@
-"""Unit tests for the OpenAI-backed backends (extractor, embedder, summarizer)
-and the retry policy they share.
+"""Unit tests for the OpenAI-backed backends (extractor, embedder, summarizer,
+supersession verifier) and the retry policy they share.
 
 No network and no API key: each backend is given a fake client. The tests pin
 behaviour under failure, which is where these backends used to lose data or
@@ -27,6 +27,7 @@ from tsm._retry import call_with_retries, is_permanent
 from tsm.embedders import OpenAIEmbedder
 from tsm.extractors import OpenAIExtractor
 from tsm.gist import OpenAIGistSummarizer
+from tsm.verification import LLMVerifier
 
 logging.getLogger("tsm").setLevel(logging.CRITICAL)  # expected warnings stay quiet
 
@@ -259,6 +260,102 @@ class TestSummarizerRetries(unittest.TestCase):
             summarizer(["[user] fact one", "[user] fact two"])
         self.assertIn("HTTP 401", str(ctx.exception))
         self.assertEqual(len(client.requests), 1)
+
+
+class TestLLMVerifier(TempDirTest):
+    """The chat-model supersession verifier: how replies are read, what is
+    cached, and that a failure never commits (hides) anything."""
+
+    TEXTS = {
+        "o1": "I live in Lisbon.", "n1": "I live in Porto.",
+        "o2": "I'm allergic to cats.", "n2": "Cats trigger my allergies.",
+        "o3": "My sister lives in Vancouver.", "n3": "My brother lives in Vancouver.",
+    }
+    PAIRS = [("o1", "n1", "contradiction", 0.9), ("o2", "n2", "refinement", 0.8),
+             ("o3", "n3", "contradiction", 0.7)]
+
+    def verifier(self, *script, **kwargs):
+        self.client = ScriptedChat(*script)
+        kwargs.setdefault("max_retries", 1)
+        return LLMVerifier(client=self.client, **kwargs)
+
+    def test_reads_verdicts_however_the_model_formats_them(self):
+        reply = ("<think>pair 1: KEEPS? no, they moved.</think>\n"
+                 "1: REPLACES\n2. **same**\n3) Keeps")
+        verifier = self.verifier(chat_reply(reply), accept=("replaces", "same"))
+        self.assertEqual(verifier.verify(self.PAIRS, self.TEXTS),
+                         [("o1", "n1", "contradiction"), ("o2", "n2", "refinement")])
+        request = self.client.requests[0]
+        self.assertEqual(request["temperature"], 0.0)
+        asked = request["messages"][-1]["content"]
+        self.assertIn("OLDER: I live in Lisbon.\nNEWER: I live in Porto.", asked)
+        # By default a reworded repeat ("same") retires nothing.
+        default = self.verifier(chat_reply(reply))
+        self.assertEqual(default.verify(self.PAIRS, self.TEXTS), [("o1", "n1", "contradiction")])
+        # The verdict is the last one on a line that starts with a pair
+        # number; reasoning before it may mention the other words.
+        wordy = self.verifier(chat_reply(
+            "Pair 1: not the SAME city, they moved. REPLACES\n"
+            "2 - both sentences describe one allergy: same\n"
+            "Note: KEEPS is the safe answer.\n"
+            "3: different people, both true. KEEPS"), accept=("replaces", "same"))
+        self.assertEqual(wordy.verify(self.PAIRS, self.TEXTS),
+                         [("o1", "n1", "contradiction"), ("o2", "n2", "refinement")])
+
+    def test_unanswered_pairs_are_not_committed_and_are_asked_again(self):
+        verifier = self.verifier(chat_reply("1: REPLACES\nI am not sure about the others."),
+                                 chat_reply("1: KEEPS\n2: KEEPS"))
+        self.assertEqual(verifier.verify(self.PAIRS, self.TEXTS), [("o1", "n1", "contradiction")])
+        # Second round: the answered pair comes from the cache, only the two
+        # the model skipped are sent.
+        self.assertEqual(verifier.verify(self.PAIRS, self.TEXTS), [("o1", "n1", "contradiction")])
+        second = self.client.requests[1]["messages"][-1]["content"]
+        self.assertNotIn("Lisbon", second)
+        self.assertEqual(second.count("OLDER:"), 2)
+
+    def test_requests_are_batched_and_verdicts_cached_on_disk(self):
+        verifier = self.verifier(chat_reply("1: REPLACES\n2: SAME"), chat_reply("1: KEEPS"),
+                                 batch_size=2, cache_dir=self.dir, accept=("replaces", "same"))
+        first = verifier.verify(self.PAIRS, self.TEXTS)
+        self.assertEqual(verifier.calls, 2)
+        self.assertEqual(len(first), 2)
+        # A later process: nothing is asked (or paid for) twice.
+        again = self.verifier(cache_dir=self.dir,  # empty script: any request would fail
+                              accept=("replaces", "same"))
+        self.assertEqual(again.verify(self.PAIRS, self.TEXTS), first)
+        self.assertEqual(again.calls, 0)
+
+    def test_an_outage_commits_nothing_and_caches_nothing(self):
+        for failure in (ApiError(503), ApiError(401), TimeoutError()):
+            verifier = self.verifier(failure, chat_reply("1: REPLACES\n2: SAME\n3: KEEPS"),
+                                     cache_dir=self.dir)
+            self.assertEqual(verifier.verify(self.PAIRS, self.TEXTS), [],
+                             "a failed check must not retire a fact")
+            # Nothing was remembered as a verdict: the next attempt asks again.
+            self.assertEqual(verifier.verify(self.PAIRS, self.TEXTS),
+                             [("o1", "n1", "contradiction")])
+            os.remove(os.path.join(self.dir, "verdicts_gpt-4o-mini.json"))
+
+    def test_an_older_fact_is_superseded_by_one_newer_fact_only(self):
+        texts = dict(self.TEXTS, n9="I live in Madrid.")
+        pairs = [("o1", "n1", "contradiction", 0.6), ("o1", "n9", "contradiction", 0.9)]
+        verifier = self.verifier(chat_reply("1: REPLACES\n2: REPLACES"))
+        self.assertEqual(verifier.verify(pairs, texts), [("o1", "n9", "contradiction")])
+
+    def test_pairs_without_stored_text_are_skipped(self):
+        verifier = self.verifier(chat_reply("1: REPLACES"))
+        pairs = [("gone", "n1", "contradiction", 0.9), ("o1", "n1", "contradiction", 0.8)]
+        self.assertEqual(verifier.verify(pairs, self.TEXTS), [("o1", "n1", "contradiction")])
+
+    def test_needs_a_key_or_an_endpoint(self):
+        saved = os.environ.pop("OPENAI_API_KEY", None)
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                LLMVerifier()
+            self.assertIn("OPENAI_API_KEY", str(ctx.exception))
+        finally:
+            if saved is not None:
+                os.environ["OPENAI_API_KEY"] = saved
 
 
 if __name__ == "__main__":

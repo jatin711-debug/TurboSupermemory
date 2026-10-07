@@ -18,6 +18,15 @@ Tests temporal reasoning — retrieving current vs past facts correctly from mul
 
 **Metrics**: recall@K, temporal accuracy, recency bias
 
+### Belief pairs (in the repository, no download)
+Tests belief revision directly: does a newer statement retire the older one when it replaces it, and only then?
+
+**Dataset**: `belief_pairs.jsonl`, 260 labeled pairs of first-person statements written for this repository (110 updates, 120 pairs where both stay true, 30 rewordings), split in half into `dev` and `test`. They are not sampled from real conversations.
+
+**Metrics**: updates caught (recall), still-true facts wrongly retired, precision
+
+**Run**: `python benchmarks/cognitive_eval/belief_pairs_eval.py --verifier none|nli|llm --split dev|test` through the shipped `tsm.Memory`. Needs only the cached MiniLM model; `--verifier llm` also needs an OpenAI-compatible chat endpoint (`--llm-base-url` for a local one). Tune on `dev`, quote `test`.
+
 ## Quick Start (Optimized for Local Hardware)
 
 ### Hardware Requirements

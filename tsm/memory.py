@@ -6,10 +6,12 @@ preset (``profile="conversational"``):
 
   - role-tagged, scope-filtered fact storage (user-scoped memories),
   - belief revision with refinement/contradiction thresholds 0.85 / 0.75,
-  - cognitive search (``cognitive_alpha = 0.5``) with superseded facts
-    EXCLUDED from results (the B1 ghost-memory fix),
-  - NLI-verified supersession: consolidation proposes, a ``Verifier`` vets,
-    only accepted pairs are committed,
+  - cognitive search (``cognitive_alpha = 0.5``),
+  - verified supersession: consolidation proposes, a ``Verifier`` vets, only
+    accepted pairs are committed, and the superseded facts are then EXCLUDED
+    from results (the B1 ghost-memory fix). Without a verifier the engine's
+    own detection is not trusted to hide anything: superseded facts are
+    ranked lower and flagged instead,
   - access-aware eviction and importance auto-scoring,
   - concept extraction (bigram ngrams) for the memory graph,
   - MMR best-set recall under a token budget.
@@ -41,9 +43,9 @@ _REQUIRED_ENGINE_METHODS = ("get_records", "next_insert_seq", "recovery_report")
 # The proven conversational configuration, from the evaluation wins. Every key
 # is a MemoryEngine kwarg; explicit engine_kwargs passed to Memory() override
 # these. `defer_supersession_commit` is added by Memory depending on whether a
-# verifier is installed.
+# verifier is installed, and `exclude_superseded` only applies with one.
 CONVERSATIONAL_PROFILE = {
-    "exclude_superseded": True,          # B1: drop superseded facts from results
+    "exclude_superseded": True,          # B1: drop VERIFIED superseded facts from results
     "refinement_cosine_threshold": 0.85,
     "contradiction_cosine_threshold": 0.75,
     "cognitive_alpha": 0.5,
@@ -103,10 +105,15 @@ class Memory:
                 Explicit ``engine_kwargs`` override the profile.
             embedder: ``Embedder`` implementation. Default: ``OpenAIEmbedder``.
             extractor: ``Extractor`` implementation. Default: ``OpenAIExtractor``.
-            verifier: ``Verifier`` implementation. When installed, the profile
-                defers supersession commitment so ``consolidate()`` runs
-                propose -> verify -> commit. ``NLIVerifier`` (local
-                cross-encoder) is available in ``tsm.verification``.
+            verifier: ``Verifier`` implementation, or ``"nli"`` /``"llm"``
+                for the two in ``tsm.verification`` (``NLIVerifier``: a small
+                local cross-encoder; ``LLMVerifier``: a chat model, far more
+                accurate, one short request per few candidate pairs). When
+                installed, ``consolidate()`` runs propose -> verify -> commit
+                and superseded facts are excluded from recall. Without one,
+                superseded facts stay in results, ranked lower and flagged
+                (``superseded_by``): unverified detection hides true facts
+                too often to be allowed to remove them.
             gist_summarizer: optional callable mapping a list of evicted fact
                 texts to a single gist string (typically an LLM call).
             reranker: optional ``Reranker`` implementation or ``"colbert"``
@@ -120,6 +127,7 @@ class Memory:
             ("embedder", embedder, ("openai", "sentence_transformer", "local", "minilm")),
             ("extractor", extractor, ("openai", "gliner", "passthrough")),
             ("reranker", reranker, ("colbert",)),
+            ("verifier", verifier, ("nli", "llm")),
         ):
             if isinstance(value, str) and value not in known:
                 raise ValueError(
@@ -156,6 +164,16 @@ class Memory:
             from .rerankers import ColBertReranker
 
             reranker = ColBertReranker()
+        if verifier == "nli":
+            from .verification import NLIVerifier
+
+            verifier = NLIVerifier()
+        elif verifier == "llm":
+            import os
+
+            from .verification import LLMVerifier
+
+            verifier = LLMVerifier(cache_dir=os.path.join(db_path, "tsm_cache"))
         self.embedder = embedder
         self.extractor = extractor
         self.verifier = verifier
@@ -171,6 +189,12 @@ class Memory:
         # A verifier only gets to vet supersessions if the engine does not
         # commit them first, whatever the profile.
         config["defer_supersession_commit"] = verifier is not None
+        # Hiding a fact is only safe once something has checked the pair: on
+        # its own the detector also fires on facts that are both still true
+        # ("my sister lives in Vancouver" / "my brother lives in Vancouver").
+        # Unverified supersessions rank lower and are flagged in recall().
+        if verifier is None and "exclude_superseded" in config:
+            config["exclude_superseded"] = False
         if gist_summarizer is not None:
             config["gist_before_evict"] = True
         config.update(engine_kwargs)  # explicit kwargs win over the profile
@@ -379,10 +403,11 @@ class Memory:
         profile is active.
 
         With ``resolve_beliefs`` (default True), results are ANNOTATED with
-        belief lineage: any returned memory that has been superseded by a
-        newer belief which is NOT itself in the result set gains
+        belief lineage: any returned memory that has been superseded gains
         ``"superseded_by"`` (the current belief's id) and ``"chain"`` (the
-        full supersession chain, oldest first, head last).
+        full supersession chain, oldest first, head last), whether or not the
+        current belief is in the result set too. A result without
+        ``"superseded_by"`` is current.
 
         With ``rerank=True`` or an active ``reranker`` (e.g. ``ColBertReranker``),
         retrieved candidate shortlists from TSM's cognitive graph are reranked
@@ -449,19 +474,18 @@ class Memory:
     def _annotate_beliefs(self, results: List[Dict]) -> None:
         """Attach ``superseded_by``/``chain`` lineage to superseded results.
 
-        Only results whose current belief (chain head) is NOT itself in the
-        result set are annotated — when the head is already present the agent
-        sees the current belief directly. Older engines lacking
+        Every superseded result is annotated, also when its current belief is
+        in the result set: with both in front of it, a reader still has to be
+        told which of the two is the stale one. Older engines lacking
         ``resolve_beliefs`` silently leave results unannotated.
         """
         resolve = getattr(self.engine, "resolve_beliefs", None)
         if resolve is None or not results:
             return
-        present = {r["id"] for r in results}
         by_id = {r["id"]: r for r in results}
         for res in resolve([r["id"] for r in results]):
             current = res["current_id"]
-            if current != res["id"] and current not in present:
+            if current != res["id"]:
                 by_id[res["id"]]["superseded_by"] = current
                 by_id[res["id"]]["chain"] = list(res["chain"])
 
@@ -472,9 +496,15 @@ class Memory:
         The engine runs its consolidation cycle (dedup, importance, belief
         detection). When a ``Verifier`` is installed, supersession commitment
         is deferred: candidates are proposed, vetted against their stored
-        texts (semantic gate — accept contradiction/entailment, reject neutral),
-        and only accepted pairs are committed, after which the engine's
+        texts, and only accepted pairs are committed, after which the engine's
         superseded-exclusion hides the stale facts from recall.
+
+        Which candidates are proposed depends on the verifier. One that can
+        judge meaning says so with a ``candidate_min_cosine`` attribute
+        (``LLMVerifier``) and is given every new fact paired with its nearest
+        older facts (the closest one and any about as close). Any other
+        verifier (``NLIVerifier``) only sees the pairs that already passed the
+        engine's own lexical gates.
 
         Returns:
             The number of supersession edges committed (0 without a verifier).
@@ -483,7 +513,14 @@ class Memory:
         self.engine.trigger_consolidation()
         if self.verifier is None:
             return 0
-        proposed = self.engine.propose_supersessions()  # (old, new, kind, cosine)
+        min_cosine = getattr(self.verifier, "candidate_min_cosine", None)
+        wide = getattr(self.engine, "propose_supersession_candidates", None)
+        if min_cosine is not None and wide is not None:
+            proposed = wide(float(min_cosine),
+                            int(getattr(self.verifier, "candidates_per_record", 2)),
+                            getattr(self.verifier, "candidate_margin", 0.1))
+        else:
+            proposed = self.engine.propose_supersessions()  # (old, new, kind, cosine)
         if not proposed:
             return 0
         pair_ids = sorted({mid for old, new, *_ in proposed for mid in (old, new)})
@@ -519,7 +556,8 @@ class Memory:
                 # embeddings); they otherwise only reach disk every few
                 # hundred entries or at interpreter exit.
                 for backend, method in ((self.extractor, "flush_cache"),
-                                        (self.embedder, "flush")):
+                                        (self.embedder, "flush"),
+                                        (self.verifier, "flush_cache")):
                     flush = getattr(backend, method, None)
                     if callable(flush):
                         try:

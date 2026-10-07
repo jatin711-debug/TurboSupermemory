@@ -1770,3 +1770,212 @@ be cut off: the message itself instead of nothing.
 **Gate after the follow-up:** `make gate` 8/8 with 286 Rust tests and 68 SDK
 tests (17 added in this follow-up, 15 of them against fake API clients); LongMemEval smoke KU +0.00,
 edges 247 for the fourth consecutive run, recall 100%.
+
+---
+
+# GPU search, power-loss durability, CI, verified belief revision (2026-10-07)
+
+The four things the robustness pass left open. Parts 1 to 3 do not change what
+any query returns on a CPU build. Part 4 does: see "Behaviour changes" at the
+end.
+
+**1. Vector search on the GPU (CUDA build only).**
+Until now the one GPU path was the batched rerank, which measured no faster
+than the CPU. Now the store's vectors are mirrored once in device memory (row
+`i` is the vector at offset `i`) and kept current by uploading the tail written
+since the last search. A search is one cuBLAS product over every row (`gemv`
+for one query, `gemm` for a batch): exact, no index. Deleted, updated and
+filtered rows are masked on the host from the payload index's live set.
+Single queries that arrive together share one device call (up to 64). The
+mirror takes at most half of the free device memory by default
+(`gpu_memory_budget_mb`); a store that outgrows it, or any device error,
+switches it off for the life of the engine and searches go back to the
+segments, which are still built for that reason. It applies above 4,096
+records (`gpu_exact_min_records`); `gpu_exact_search=False` turns it off.
+`gpu_search_stats()` reports rows, memory, queries and device calls.
+
+Measured on an RTX 3050 Laptop (4 GB), CUDA 12.6, the same store files for
+both builds, runs alternated, hot segments of 4,000
+(`benchmarks/gpu_parity.py`):
+
+| store | build | one query (median) | per query, batch of 32 | 8 threads |
+|---|---|---|---|---|
+| 20,000 x 384 | CPU | 2.2–3.0 ms | 2.3 ms | 600–780 q/s |
+| | GPU | 0.40 ms | 0.27 ms | 4,034 q/s |
+| 100,000 x 384 | CPU | 5.9–7.5 ms | 6.0–9.2 ms | 128–174 q/s |
+| | GPU | 1.35–1.55 ms | 0.34–0.39 ms | 1,436–1,754 q/s |
+| 100,000 x 768 | CPU | 13.2–15.8 ms | 13.6–15.8 ms | 69–71 q/s |
+| | GPU | 2.29–2.40 ms | 0.34–0.39 ms | 1,088–1,190 q/s |
+
+Recall against a NumPy exact scan is 1.000 on the GPU and 0.999 on the CPU
+tiered path at 100,000. A CUDA build with `gpu_exact_search=False` measures
+like the CPU build. The mirror used 44 / 220 / 439 MiB of a 1,653 MiB budget.
+The first search pays for the CUDA context and the upload (0.35 to 5.4 s).
+Under 8 threads at 100,000 x 384, 4,096 queries took about 1,035 device calls.
+
+What these numbers do not show: a second card, or a store above 100,000
+vectors. The cost is linear in the bytes scanned (here about 1.1 ms per 150 MB
+plus 0.35 ms per query), so on a store several times larger an index wins
+again. NumPy's exact scan on the CPU takes 1.1–1.5 / 5.0–6.4 / 8.8–11.2 ms on
+the same three stores: with 4,000-record segments the CPU tiered path is not
+faster than a plain BLAS scan at these sizes.
+
+One earlier measurement in this run was thrown away: a CPU figure of 16.7 ms
+taken while another job was using the machine. Timings above are from a quiet
+machine; the 100,000 x 384 ranges include one run of the final build.
+
+Closing an engine did not give the mirror's memory back: cudarc frees into
+the device's memory pool, which keeps it reserved for the process until the
+stream is next synchronized. With a 220 MiB mirror the process still held
+289 MiB after `close()`, and an engine opened next computed its budget from
+the reduced figure (1,539 instead of 1,652 MiB). The mirror is now released
+through `GpuBackend::resident_release` (synchronize, then trim the pool):
+65 MiB after `close()`, which is the CUDA context, and the full budget for
+the next engine. A test fails without it ("free device memory went from 3069
+to 3069 MiB after releasing 195 MiB").
+
+Tests: four `resident_search_*` cases in `tests/robustness.rs` (exact while
+records are written, updated and deleted; scope and filter; fallback when the
+store outgrows the budget; searches alongside writers). They run on the host
+backend in a normal build and on the device with `--features cuda`.
+
+**2. Power-loss durability.** `TierConfig::sync_writes` (Python
+`sync_writes=True`, server `TURBO_SYNC_WRITES=1`): each write syncs the vector
+range it wrote and then its WAL record before it returns, in that order,
+because recovery drops a logged insert whose vector is not on disk. New files
+and atomically renamed manifests also fsync their directory on POSIX. Off by
+default. Cost on an NVMe SSD (Micron 2450): a single insert goes from 0.09 ms
+to 5.5 ms (about 11,400 to about 180 per second); a batch of 100 from
+2.0–2.7 ms to 7.6–8.6 ms. Not tested against a real power cut: the test
+checks that every write path syncs and that the store recovers.
+
+**3. Linux and CI.** `.github/workflows/ci.yml` runs fmt, clippy, the Rust
+suite and the SDK unit suite on push and pull request (Linux and Windows
+required, macOS non-blocking). The same four commands pass in a Linux
+container (`python:3.12-bookworm`, the pinned toolchain); before this the code
+had only ever run on Windows. The workflow file itself has not run: nothing
+has been pushed. AArch64 compiles different code in
+`turbomemory_core/src/metrics.rs` (NEON kernels) and did not pass clippy
+there; it does now, for `turbomemory_core` and `turbomemory_graph`, the two
+crates that cross-check without a C++ toolchain.
+
+**4. Belief revision.**
+The audit's 12-pair spot check said the default path missed real updates and
+retired unrelated facts. To measure that properly there is now a labeled set:
+`benchmarks/cognitive_eval/belief_pairs.jsonl`, 260 pairs of first-person
+statements written for this purpose (110 updates in five categories, 120 pairs
+where both statements stay true in six, 30 rewordings), split in half by
+position within each category. `belief_pairs_eval.py` stores them through the
+shipped `tsm.Memory` (MiniLM, no extraction), calls `consolidate()`, and
+reports which older statements ended up superseded. Everything was tuned on
+`dev`; `test` was run once, at the end.
+
+What it showed about the existing detection (`dev`, no verifier): 14 of 56
+updates caught, 5 of 62 still-true facts marked stale. The misses come from
+the lexical gates: an update worded differently from the fact it replaces
+("I'm a backend developer at Shopify", then "Monday was my first day at
+Stripe") shares no words and no negation with it, so it is never proposed.
+The NLI verifier does not change this. It only sees what the gates propose,
+and it calls a pair about two different people ("my sister lives in Toronto",
+"my brother lives in Toronto") a contradiction just as it does a real update.
+
+What changed:
+- *Without a verifier, nothing is hidden.* `tsm.Memory` used to take
+  `exclude_superseded` from the conversational profile whether or not a
+  verifier was installed, so unchecked detection removed facts from recall.
+  It now applies only with a verifier. Without one, a fact the engine marks
+  as superseded is ranked lower and returned with `superseded_by`; an
+  explicit `exclude_superseded=True` still hides it.
+- *`tsm.verification.LLMVerifier`* (`verifier="llm"`): a chat model is asked,
+  per pair, whether both statements can be true at the same time, and answers
+  REPLACES, SAME or KEEPS after a few words of reasoning. Only REPLACES
+  retires the older fact by default. Any OpenAI-compatible endpoint; verdicts
+  are cached on disk per model and prompt; a failed or unreadable reply
+  leaves the pair uncommitted and is asked again later.
+- *Wide candidates for it*: `propose_supersession_candidates` pairs each
+  memory with its nearest older memories of the same scope (cosine at least
+  0.45, at most 2) with no lexical gate, since the verifier makes the call.
+- *Only the closest older memories are offered*: a neighbour more than 0.10
+  below the closest one is not judged. Before this rule the shared-store run
+  on `dev` retired 10 of 62 still-true facts, 6 of them through a statement of
+  another pair, typically an explicit correction ("Actually, the recital
+  starts at 6") that the model also applied to its second-nearest neighbour
+  ("My Monday class starts at 9"). With it: 6 of 62, the same 53 of 56
+  updates, and 17% fewer requests (211 candidates instead of 254). Any margin
+  between 0.05 and 0.15 gives the same result on `dev`. The closest memory
+  stays the reference after it has been replaced, so repeated consolidation
+  does not work down the neighbour list: five rounds on `dev` settle after the
+  second (65 commits against 63), with no further still-true fact retired.
+
+Results (`updates caught` / `still-true facts retired` / precision; "own
+store" gives every pair its own user, "shared store" puts all pairs under one):
+
+| setup | layout | dev (56 updates, 62 still true) | test (54 updates, 58 still true) |
+|---|---|---|---|
+| no verifier: flagged, not hidden | either | 14 / 5 / 0.74 | 16 / 8 / 0.67 |
+| NLI verifier | either | 14 / 4 / 0.78 | 16 / 6 / 0.73 |
+| LLM verifier, local `qwen3.5:4b` | own store | 52 / 4 / 0.93 | 48 / 7 / 0.87 |
+| LLM verifier, local `qwen3.5:4b` | shared store | 53 / 6 / 0.88 | 49 / 9 / 0.83 |
+
+On the held-out half the LLM verifier catches 48 to 49 of 54 updates where
+the engine's own detection catches 16. It does not retire fewer still-true
+facts: 7 to 9 of 58, against 8 (flagged) without a verifier and 6 with NLI.
+Six of the 7 are one category, two things of one kind ("I play the guitar",
+"I play the piano"), where this model answered REPLACES for 6 of 12 pairs on
+`test` after 1 of 13 on `dev`. That is most of the drop in precision between
+the halves (0.93 to 0.87 with a store per pair). The 2 extra in the shared
+store are statements of different pairs that do conflict within one user
+(two universities, a two-bedroom and a one-bedroom flat). Of the 6 updates it
+missed, 5 had a MiniLM similarity below the 0.45 floor and were never shown to
+the model, and 1 was judged KEEPS: of the 49 updates it saw, it retired 48.
+
+How far these numbers go:
+- The model is a 4.7B-parameter one running locally (Ollama, thinking off,
+  one pair per request, about 3 s each on this laptop). The verifier's
+  default, `gpt-4o-mini`, was not measured: no paid API call was made for
+  this entry.
+- The pairs are short single sentences written for the test, and the prompt
+  was written after looking at the `dev` categories; `test` comes from the
+  same source, so it guards against fitting individual `dev` pairs, not
+  against a different style of text. No judged LongMemEval run was made with
+  the LLM verifier, so its effect on answer accuracy is not known.
+- In the shared store, statements of different pairs can truly contradict
+  each other (two phone numbers, two home cities). The labels do not cover
+  those; the eval counts them apart.
+- An update whose embedding is less than 0.45 similar to the old fact is never
+  shown to the verifier (4 of 56 on `dev` with MiniLM: "I am 29 years old",
+  then "I just celebrated my thirtieth birthday").
+- A pair the model gives no verdict for is asked again at every consolidation.
+- A supersession still cannot be retracted.
+
+**Behaviour changes that can move results**
+- `tsm.Memory` with the conversational profile and no verifier returns
+  superseded facts again, ranked lower and flagged, instead of dropping them.
+  The published harness is not affected: `adapters/tsm_adapter.py` configures
+  `MemoryEngine` directly. Two diagnostic scripts build a plain `Memory`
+  (`multi_session_drilldown.py`, `inspect_multi_session.py`); pass
+  `exclude_superseded=True` there to get the old behaviour.
+- Every superseded result carries `superseded_by` and `chain`. They used to be
+  added only when the current belief was missing from the result set.
+- `LLMVerifier`, `propose_supersession_candidates` and the eval are new;
+  nothing that existed calls them. `propose_supersessions` and the NLI path
+  are unchanged.
+- In a CUDA build, searches above 4,096 records are exact instead of
+  approximate (recall 1.000 against 0.999 at 100,000). Both exact paths order
+  equal scores by offset.
+
+**Verification on the final tree.** `make gate` 8/8: fmt, clippy, 294 Rust
+tests, 83 SDK tests, synthetic belief +1.00 / false-demotion 0.00 (both
+modes), LongMemEval smoke KU +0.00, edges 247 (the fifth consecutive run at
+that count), worst single-session +0.00, recall 100%. In a Linux container
+(`python:3.12-bookworm`, rustc 1.99.0): fmt, clippy, the same 294 Rust tests
+and 83 SDK tests pass. With `--features cuda` on the GPU: 6 GPU + 110 storage
+unit + 4 crash-recovery + 31 robustness tests pass, and clippy is clean for
+that feature too. Not run: the CI workflow itself, anything on macOS, and any
+test on AArch64 (lint only).
+
+**Not changed** (listed in `TODO.md`): the engine's own detection and its
+lexical gates; retraction of a supersession; maintenance reads counted as
+accesses (the new candidate search does it too); the first run of the CI
+workflow and anything on macOS; a real power-cut test; half-precision or
+partial device mirrors; and a measurement of `gpt-4o-mini` as the verifier.

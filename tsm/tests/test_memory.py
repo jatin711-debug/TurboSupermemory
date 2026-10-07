@@ -19,6 +19,7 @@ import tempfile
 import textwrap
 import threading
 import unittest
+from types import SimpleNamespace
 
 # Repo root = two levels up from this file (tsm/tests/ -> tsm/ -> root). Makes
 # `import tsm` and the repo-root `turbomemory.pyd` importable from anywhere.
@@ -30,6 +31,7 @@ import numpy as np
 
 import tsm
 from tsm import CONVERSATIONAL_PROFILE, Memory
+from tsm.verification import LLMVerifier
 
 
 class FakeEmbedder:
@@ -216,8 +218,8 @@ class _EngineWithoutResolve:
 
 
 class TestBeliefResolution(MemoryTestBase):
-    """The annotation contract: recall tags stale results whose CURRENT
-    belief is not itself in the result set with superseded_by + chain."""
+    """The annotation contract: recall tags every stale result with
+    superseded_by + chain, so a result without them is a current belief."""
 
     OLD_FACT = "user user user user lives in paris"
     NEW_FACT = "user user user user lives in london"
@@ -253,15 +255,16 @@ class TestBeliefResolution(MemoryTestBase):
         self.assertEqual(stale["chain"], [old_id, new_id],
                          "chain is the full lineage, oldest first, head last")
 
-    def test_head_in_result_set_means_no_annotation(self):
+    def test_stale_result_is_flagged_next_to_its_current_belief_too(self):
         mem = self._memory_with_correction()
-        # top_k=2: both the stale fact and its current belief are returned,
-        # so per the contract nothing is annotated.
-        results = mem.recall(self.OLD_FACT, user_id="alice", top_k=2)
-        self.assertEqual(len(results), 2)
-        for r in results:
-            self.assertNotIn("superseded_by", r)
-            self.assertNotIn("chain", r)
+        # top_k=2: both the stale fact and its current belief are returned.
+        # The reader has to be told which is which.
+        results = {r["id"]: r for r in mem.recall(self.OLD_FACT, user_id="alice", top_k=2)}
+        self.assertEqual(set(results), {"alice_1", "alice_2"})
+        self.assertEqual(results["alice_1"]["superseded_by"], "alice_2")
+        self.assertEqual(results["alice_1"]["chain"], ["alice_1", "alice_2"])
+        self.assertNotIn("superseded_by", results["alice_2"])
+        self.assertNotIn("chain", results["alice_2"])
 
     def test_mmr_budget_recall_annotates_stale_result(self):
         mem = self._memory_with_correction()
@@ -706,6 +709,156 @@ class TestRobustness(MemoryTestBase):
             mem.engine.search_ann(bad, 5)
         # An absurd top_k is clamped, not allocated.
         self.assertEqual(len(mem.engine.search_ann(mem.embedder.encode("dog Rex"), 2 ** 40)), 1)
+
+
+class FakeJudge:
+    """An OpenAI-compatible chat client that gives every pair one verdict."""
+
+    def __init__(self, verdict):
+        self.verdict = verdict
+        self.requests = []
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs):
+        self.requests.append(kwargs)
+        pairs = kwargs["messages"][-1]["content"].count("OLDER:")
+        text = "\n".join(f"{i + 1}: {self.verdict}" for i in range(pairs))
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))])
+
+
+class TestUnverifiedRevision(MemoryTestBase):
+    """Without a verifier the engine's own detection still runs, but it is
+    not allowed to remove a fact from recall: on real text it also fires on
+    facts that are both still true."""
+
+    OLD_FACT = "user user user user lives in paris"
+    NEW_FACT = "user user user user lives in london"
+
+    def _add_both(self, mem):
+        mem.add([{"role": "user", "content": self.OLD_FACT + "."}], user_id="alice")
+        mem.add([{"role": "user", "content": self.NEW_FACT + "."}], user_id="alice")
+
+    def test_superseded_fact_is_flagged_and_ranked_lower_not_hidden(self):
+        mem = self.make_memory()
+        self._add_both(mem)
+        self.assertEqual(mem.consolidate(), 0)
+        self.assertEqual(mem.engine.superseded_ids(), ["alice_1"], "detection did not run")
+
+        results = mem.recall("user lives", user_id="alice", top_k=10)
+        order = [r["text"] for r in results]
+        self.assertIn(self.OLD_FACT, order, "an unverified supersession hid a fact")
+        self.assertLess(order.index(self.NEW_FACT), order.index(self.OLD_FACT))
+        by_text = {r["text"]: r for r in results}
+        self.assertEqual(by_text[self.OLD_FACT]["superseded_by"], "alice_2")
+        self.assertNotIn("superseded_by", by_text[self.NEW_FACT])
+
+    def test_exclusion_can_still_be_asked_for_explicitly(self):
+        mem = self.make_memory(exclude_superseded=True)
+        self._add_both(mem)
+        mem.consolidate()
+        texts = [r["text"] for r in mem.recall("user lives", user_id="alice", top_k=10)]
+        self.assertIn(self.NEW_FACT, texts)
+        self.assertNotIn(self.OLD_FACT, texts)
+
+
+class TestLLMVerifiedRevision(MemoryTestBase):
+    """An update that shares almost no words with the fact it replaces. The
+    engine's lexical gates never propose it; a verifier that can judge
+    meaning is given every new fact with its nearest older ones instead."""
+
+    OLD_FACT = "user user user works at shopify as a backend developer"
+    NEW_FACT = "user user user started at stripe on monday"
+
+    def _add_both(self, mem):
+        emb = FakeEmbedder()
+        cosine = _cosine(emb.encode(self.OLD_FACT), emb.encode(self.NEW_FACT))
+        self.assertTrue(0.45 <= cosine < 0.75, f"cosine {cosine} is outside the tested band")
+        mem.add([{"role": "user", "content": self.OLD_FACT + "."}], user_id="alice")
+        mem.add([{"role": "user", "content": "the cello is fun to play."}], user_id="alice")
+        mem.add([{"role": "user", "content": self.NEW_FACT + "."}], user_id="alice")
+
+    def _recalled(self, mem):
+        return [r["text"] for r in mem.recall("user works", user_id="alice", top_k=10)]
+
+    def test_the_lexical_gates_never_propose_it(self):
+        verifier = AcceptAllVerifier()
+        mem = self.make_memory(verifier=verifier)
+        self._add_both(mem)
+        self.assertEqual(mem.consolidate(), 0)
+        self.assertEqual(verifier.calls, 0, "nothing was proposed, so nothing was vetted")
+        self.assertIn(self.OLD_FACT, self._recalled(mem))
+
+    def test_a_judging_verifier_sees_it_and_retires_the_old_fact(self):
+        judge = FakeJudge("REPLACES")
+        mem = self.make_memory(verifier=LLMVerifier(client=judge, candidates_per_record=1))
+        self._add_both(mem)
+        self.assertEqual(mem.consolidate(), 1)
+        self.assertEqual(mem.engine.superseded_ids(), ["alice_1"])
+        asked = judge.requests[0]["messages"][-1]["content"]
+        self.assertIn(f"OLDER: {self.OLD_FACT}\nNEWER: {self.NEW_FACT}", asked)
+        recalled = self._recalled(mem)
+        self.assertIn(self.NEW_FACT, recalled)
+        self.assertNotIn(self.OLD_FACT, recalled, "the verified stale fact is still served")
+        # A second pass has nothing left to ask: the pair is settled.
+        requests = len(judge.requests)
+        self.assertEqual(mem.consolidate(), 0)
+        self.assertEqual(len(judge.requests), requests)
+
+    def test_a_judge_that_says_keep_changes_nothing(self):
+        judge = FakeJudge("KEEPS")
+        mem = self.make_memory(verifier=LLMVerifier(client=judge))
+        self._add_both(mem)
+        self.assertEqual(mem.consolidate(), 0)
+        self.assertGreaterEqual(len(judge.requests), 1)
+        self.assertEqual(mem.engine.superseded_ids(), [])
+        results = mem.recall("user works", user_id="alice", top_k=10)
+        self.assertIn(self.OLD_FACT, [r["text"] for r in results])
+        for r in results:
+            self.assertNotIn("superseded_by", r)
+
+    # On the same topic as NEW_FACT, but clearly further from it than the
+    # fact it updates.
+    ON_TOPIC = "user user likes tea and long walks by the river on sunday mornings"
+
+    def _add_three(self, mem):
+        emb = FakeEmbedder()
+        new = emb.encode(self.NEW_FACT)
+        closest = _cosine(emb.encode(self.OLD_FACT), new)
+        further = _cosine(emb.encode(self.ON_TOPIC), new)
+        self.assertTrue(0.45 <= further < closest - 0.1, f"cosines {further} and {closest}")
+        for fact in (self.OLD_FACT, self.ON_TOPIC, self.NEW_FACT):
+            mem.add([{"role": "user", "content": fact + "."}], user_id="alice")
+
+    def test_only_the_closest_older_facts_are_judged(self):
+        # This judge would retire anything it is asked about.
+        judge = FakeJudge("REPLACES")
+        mem = self.make_memory(verifier=LLMVerifier(client=judge))
+        self._add_three(mem)
+        self.assertEqual(mem.consolidate(), 1)
+        self.assertEqual(mem.engine.superseded_ids(), ["alice_1"])
+        # Still so on the next pass, when the closest fact is already retired.
+        self.assertEqual(mem.consolidate(), 0)
+        self.assertEqual(mem.engine.superseded_ids(), ["alice_1"])
+        self.assertIn(self.ON_TOPIC, [r["text"] for r in mem.recall("user", user_id="alice", top_k=10)])
+
+    def test_the_margin_can_be_turned_off(self):
+        judge = FakeJudge("REPLACES")
+        mem = self.make_memory(verifier=LLMVerifier(client=judge, candidate_margin=None))
+        self._add_three(mem)
+        self.assertEqual(mem.consolidate(), 2)
+        self.assertEqual(sorted(mem.engine.superseded_ids()), ["alice_1", "alice_2"])
+
+    def test_verifier_names_are_resolved(self):
+        with self.assertRaises(ValueError):
+            self.make_memory(verifier="gpt")
+        saved = os.environ.pop("OPENAI_API_KEY", None)
+        try:
+            with self.assertRaises(RuntimeError) as ctx:  # "llm" is known: it needs a key
+                self.make_memory(verifier="llm")
+            self.assertIn("OPENAI_API_KEY", str(ctx.exception))
+        finally:
+            if saved is not None:
+                os.environ["OPENAI_API_KEY"] = saved
 
 
 if __name__ == "__main__":

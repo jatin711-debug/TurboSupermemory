@@ -15,6 +15,11 @@ This file is only the short list of open engineering work, grouped by area.
 > (see "Robustness pass" in `PHASE_PROGRESS.md`). What that audit found and
 > this pass did NOT change is listed below, mostly under "Cognitive
 > behaviour": those change what recall returns and need a judged re-run.
+>
+> **2026-10-07.** GPU search over device-resident vectors, `sync_writes`,
+> a CI workflow, and verified belief revision landed (entry of that date in
+> `PHASE_PROGRESS.md`). What each of them leaves open is listed under its
+> heading below.
 
 ## Durability and operations
 
@@ -112,16 +117,38 @@ are closed.
 Found by the audit, deliberately left as they are because fixing them changes
 recall results:
 
-- **Belief revision precision.** With the default profile (MiniLM, no
-  verifier) a 12-pair spot check retired 1 of 4 real updates and 2 of 8
-  unrelated facts ("My sister lives in Toronto" was hidden by "My brother
-  lives in Toronto"). The text gate ignores digits, short tokens and stop
-  words, so "visited Paris in 2019" and "in 2023" look identical to it.
-  The NLI-verified path was not measured. There is no way to retract a
-  supersession.
+- **Belief revision still retires facts that are true.** Measured on the
+  held-out half of `belief_pairs.jsonl` (54 updates, 58 pairs that both stay
+  true): the LLM verifier with a local 4.7B model catches 48 to 49 updates
+  (the engine's own detection: 16) but retires 7 to 9 of the 58 still-true
+  facts, no better than before (8 without a verifier, 6 with NLI). Six of
+  them are two things of one kind ("I play the guitar", "I play the piano").
+  Open, in order of expected value:
+  - measure `gpt-4o-mini` (the verifier's default) on the same pairs. It is
+    the model most users will run and it has not been measured; nothing here
+    made a paid call;
+  - a judged LongMemEval run with the LLM verifier, since pair-level numbers
+    say nothing about answer accuracy;
+  - the candidate floor: 5 of the 6 held-out misses had a MiniLM similarity
+    below 0.45 and were never shown to the model. Lowering
+    `candidate_min_cosine` costs more requests and more chances to be
+    wrong; tune it on `--split dev` only;
+  - pairs from real conversations. The 260 are single sentences written for
+    the test.
+- **No way to retract a supersession**, and a pair the verifier gives no
+  verdict for is asked again at every consolidation.
+- **The engine's own detection is unchanged** (without a verifier its
+  results are now flagged, not hidden): it misses updates worded differently
+  from the fact they replace, and its text gate ignores digits, short tokens
+  and stop words, so "visited Paris in 2019" and "in 2023" look identical to
+  it. The NLI verifier only sees what that detection proposes.
+- **`incremental_supersession_detection` is not switched on with the LLM
+  verifier**, so every consolidation looks at every record again. The
+  verdict cache keeps that from costing requests, but the neighbour searches
+  are repeated.
 - **Maintenance reads count as accesses.** Deduplication and supersession
-  detection search for neighbours through the normal path, which bumps access
-  counters. Access-aware eviction and importance scoring therefore measure
+  detection (including the candidate search for an LLM verifier) search for
+  neighbours through the normal path, which bumps access counters. Access-aware eviction and importance scoring therefore measure
   neighbourhood density and the consolidation schedule as well as real
   retrieval; with dedup on, everything sits inside the eviction grace window.
 - **Access-aware eviction removes never-queried records first**, including

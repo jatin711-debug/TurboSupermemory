@@ -585,6 +585,159 @@ impl StorageEngine {
         }
         Ok(proposed)
     }
+
+    /// Candidates for a verifier that can judge meaning (a language model):
+    /// every memory paired with its nearest OLDER memories of the same scope,
+    /// at most `per_record` of them, each at least `min_cosine` similar.
+    ///
+    /// `propose_supersessions` has to be precise on its own, so it only
+    /// reports pairs that pass its lexical gates (word overlap, a negation
+    /// word, mutual nearest neighbours). That misses most real updates: "I'm
+    /// a backend developer at Shopify" and "Monday was my first day at
+    /// Stripe" share no words and no negation. Here the gates are dropped and
+    /// the decision is left to the verifier, so the list is long and mostly
+    /// made of pairs that should NOT be committed. Never commit it unvetted.
+    ///
+    /// Of a memory's older neighbours only those about as close as the
+    /// closest one are offered: at most `margin` below its cosine. A
+    /// statement that changes a fact sits nearest to that fact. A neighbour
+    /// well below it is another fact on the same topic, and asking about it
+    /// only gives the verifier a chance to be wrong ("Actually, the recital
+    /// starts at 6" next to "My Monday class starts at 9"). The closest
+    /// neighbour stays the reference after this memory has replaced it, so a
+    /// later cycle does not move on to the next one down. `f32::INFINITY`
+    /// turns the rule off.
+    ///
+    /// Superseded memories take no part: they are not offered as the older
+    /// side again, and they no longer replace anything themselves. The role
+    /// gate, the incremental cursor, and the deferred commit work as in
+    /// `propose_supersessions`. Nothing is changed.
+    pub fn propose_supersession_candidates(
+        &self,
+        min_cosine: f32,
+        per_record: usize,
+        margin: f32,
+    ) -> crate::Result<Vec<ProposedSupersession>> {
+        let max_pairs = self.config.tier.refinement_max_pairs_per_cycle;
+        if per_record == 0 || max_pairs == 0 {
+            return Ok(Vec::new());
+        }
+        let text_floor = self.config.tier.refinement_text_threshold;
+        let allowed_roles = self.config.tier.belief_source_roles.as_deref();
+        let watermark = if self.config.tier.incremental_supersession_detection {
+            self.supersession_watermark.load(Ordering::Relaxed)
+        } else {
+            0
+        };
+        let examined_up_to = self.meta.next_seq();
+
+        struct Cand {
+            id: String,
+            offset: PointOffset,
+            insert_seq: u64,
+            text: String,
+            scope: Option<String>,
+        }
+        let mut cands: Vec<Cand> = Vec::new();
+        self.meta.for_each_record(|offset, rec| {
+            if rec.insert_seq >= watermark && role_allowed(&rec.source_role, allowed_roles) {
+                cands.push(Cand {
+                    offset,
+                    id: rec.id.clone(),
+                    insert_seq: rec.insert_seq,
+                    text: rec.text.clone(),
+                    scope: rec.scope.clone(),
+                });
+            }
+        })?;
+        cands.sort_by_key(|c| std::cmp::Reverse(c.insert_seq));
+        let superseded: std::collections::HashSet<String> = self
+            .graph
+            .read()
+            .graph()
+            .superseded_ids()
+            .into_iter()
+            .collect();
+
+        let mut proposed: Vec<ProposedSupersession> = Vec::new();
+        for cand in &cands {
+            if proposed.len() >= max_pairs {
+                break;
+            }
+            if superseded.contains(&cand.id) {
+                continue;
+            }
+            let embedding: Vec<f32> = {
+                let view = self.vectors.read_view();
+                match view.get(cand.offset) {
+                    Some(v) => v.to_vec(),
+                    None => continue,
+                }
+            };
+            // Newer memories, other roles and superseded memories share the
+            // neighbourhood, so look a little past `per_record`.
+            let pool = per_record.saturating_mul(4).max(10);
+            let neighbors =
+                self.search_ann_any_belief_state(&embedding, pool, cand.scope.as_deref())?;
+            let mut taken = 0usize;
+            // Cosine of the closest older memory: one still current, or one
+            // this memory has already replaced.
+            let mut closest: Option<f32> = None;
+            for (nid, cosine) in neighbors {
+                if taken == per_record || cosine < min_cosine {
+                    break; // best first: nothing further is similar enough
+                }
+                if closest.is_some_and(|best| cosine < best - margin) {
+                    break; // a different fact, not another wording of the closest
+                }
+                if nid == cand.id {
+                    continue;
+                }
+                if superseded.contains(&nid) {
+                    if closest.is_none() && self.graph.read().graph().belief_head(&nid) == cand.id {
+                        closest = Some(cosine);
+                    }
+                    continue;
+                }
+                let Some(old) = self.find_meta_by_id(&nid) else {
+                    continue;
+                };
+                if old.insert_seq >= cand.insert_seq
+                    || old.scope != cand.scope
+                    || !role_allowed(&old.source_role, allowed_roles)
+                {
+                    continue;
+                }
+                let Some(&old_offset) = self.id_index.read().get(nid.as_str()) else {
+                    continue;
+                };
+                // The label only chooses what a commit does besides hiding
+                // the older memory: a re-statement hands its concepts on.
+                let kind = if turbomemory_graph::text_jaccard_similarity(&cand.text, &old.text)
+                    >= text_floor
+                {
+                    SupersessionKind::Refinement
+                } else {
+                    SupersessionKind::Contradiction
+                };
+                closest.get_or_insert(cosine);
+                proposed.push(ProposedSupersession {
+                    old_id: nid,
+                    new_id: cand.id.clone(),
+                    old_offset,
+                    new_offset: cand.offset,
+                    kind,
+                    cosine,
+                });
+                taken += 1;
+            }
+        }
+        if self.config.tier.defer_supersession_commit {
+            self.supersession_watermark
+                .store(examined_up_to, Ordering::Relaxed);
+        }
+        Ok(proposed)
+    }
 }
 
 /// The kind of supersession relationship a proposed pair represents.
