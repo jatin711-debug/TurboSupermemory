@@ -1,9 +1,9 @@
 """Token budgeting: choosing and packing memories under a context budget.
 
 ``select_under_budget`` picks the best *set* of retrieved memories that fits a
-token budget (greedy submodular MMR with an adaptive item cap). The packing
-helpers bound stored or generated text with the same four-characters-per-token
-estimate, so storage accounting and recall accounting agree.
+token budget (greedy submodular MMR). The packing helpers bound stored or
+generated text with the same four-characters-per-token estimate, so storage
+accounting and recall accounting agree.
 """
 
 import re
@@ -28,12 +28,6 @@ def total_tokens(texts: Sequence[str]) -> int:
     return sum(estimate_tokens(text) for text in texts)
 
 
-def default_item_cap(token_budget: int) -> int:
-    """Adaptive saliency cap: at most ``min(10, max(4, budget // 35))`` items,
-    so a large budget is not stuffed with marginal memories."""
-    return min(10, max(4, token_budget // 35))
-
-
 def select_under_budget(
     pool: Sequence[Dict],
     token_budget: int,
@@ -54,14 +48,18 @@ def select_under_budget(
     redundancy. ``method="truncate"``: relevance order only, skipping items
     that do not fit (the naive baseline; ``embed`` unused).
 
-    Both are capped at ``max_items`` (default :func:`default_item_cap`).
+    The token budget is what bounds the set. ``max_items`` adds a limit on
+    the number of items for a caller that wants one; by default there is
+    none. (There used to be: ``min(10, max(4, budget // 35))``. With memories
+    of about 18 tokens it filled 72 of a 150-token budget and cost judged
+    answers, 0.487 against 0.565 without it.)
     """
     if not pool:
         return []
     texts = [p["text"] or "" for p in pool]
     rel = np.array([float(p["score"]) for p in pool], dtype=np.float32)
     toks = np.array([max(1, len(t) // 4) for t in texts], dtype=np.int64)
-    cap = max_items or default_item_cap(token_budget)
+    cap = max_items if max_items else len(pool)
 
     if method == "truncate":
         sel, used = [], 0

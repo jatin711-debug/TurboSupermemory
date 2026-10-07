@@ -536,13 +536,13 @@ class TSMAdapter:
     def recall_under_budget(self, query, user_id=None, token_budget=100,
                             method="mmr", pool_k=20, lam=0.55, pool=None, max_items=None):
         """B2: return the best SET of memory texts whose total tokens fit
-        `token_budget`, chosen from a retrieved candidate pool with an adaptive saliency cap.
+        `token_budget`, chosen from a retrieved candidate pool.
 
         `method="truncate"`: greedy by relevance only (score order, skip items
         that don't fit) — the naive baseline. `method="mmr"`: greedy submodular
         Maximal-Marginal-Relevance — each step adds the candidate maximizing
-        `lam*relevance - (1-lam)*max_redundancy + diversity_bonus` to the already-selected set,
-        capped at `max_items` (default min(10, token_budget // 35)) to prevent context stuffing.
+        `lam*relevance - (1-lam)*max_redundancy + diversity_bonus` to the already-selected set.
+        `max_items` limits the number of items as well; by default only the token budget does.
         Returns list[str] of the selected memory texts (in selection order)."""
         # Retrieve a pool (supersession_mode is honored via search()). A
         # precomputed pool lets a caller select multiple ways without re-querying.

@@ -391,6 +391,7 @@ class Memory:
         resolve_beliefs: bool = True,
         rerank: bool = False,
         reranker: Optional[object] = None,
+        max_items: Optional[int] = None,
     ) -> List[Dict]:
         """Search memories under ``user_id``'s scope.
 
@@ -398,7 +399,10 @@ class Memory:
         ``"text"``, ``"score"``, ``"role"`` (the stored source role) and
         ``"turn_index"``. With ``token_budget`` set, the result is instead the
         best *set* that fits the budget (``tsm.budget.select_under_budget``:
-        greedy MMR over a pool of ``pool_k`` candidates), in selection order.
+        greedy MMR over a candidate pool), in selection order. The pool is
+        ``pool_k`` candidates or more: it grows with the budget so a large
+        budget can be filled. ``max_items`` limits the number of results as
+        well; by default only the token budget does.
         Superseded facts are excluded by the engine when the conversational
         profile is active.
 
@@ -421,7 +425,11 @@ class Memory:
             from .rerankers import ColBertReranker
             active_reranker = ColBertReranker()
 
-        fetch_k = max(pool_k, 30) if token_budget is not None else (top_k * 3 if active_reranker else top_k)
+        if token_budget is not None:
+            # Enough candidates to fill the budget even with short memories.
+            fetch_k = max(pool_k, 30, token_budget // 8)
+        else:
+            fetch_k = top_k * 3 if active_reranker else top_k
         results = self.engine.search(
             query_text=query,
             query_embedding=query_embedding,
@@ -465,8 +473,8 @@ class Memory:
         if token_budget is None:
             final = pool[:top_k]
         else:
-            final = select_under_budget(pool, token_budget,
-                                        embed=self.embedder.encode, lam=lam)
+            final = select_under_budget(pool, token_budget, embed=self.embedder.encode,
+                                        lam=lam, max_items=max_items)
         if resolve_beliefs:
             self._annotate_beliefs(final)
         return final

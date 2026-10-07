@@ -17,7 +17,6 @@ if _ROOT not in sys.path:
 import numpy as np
 
 from tsm.budget import (
-    default_item_cap,
     estimate_tokens,
     fit_complete_facts_to_budget,
     pack_recent,
@@ -75,14 +74,18 @@ class TestSelectUnderBudget(unittest.TestCase):
         self.assertEqual([p["text"] for p in without],
                          ["turn1 top", "turn1 more", "turn2 only"])
 
-    def test_item_cap(self):
-        self.assertEqual(default_item_cap(50), 4)
-        self.assertEqual(default_item_cap(210), 6)
-        self.assertEqual(default_item_cap(5000), 10)
+    def test_the_token_budget_is_the_only_default_limit(self):
         vecs = np.eye(8, dtype=np.float32)
+        # "fact N" is one token by the four-characters estimate.
         pool = [_item(f"fact {i}", 1.0 - i * 0.01, vecs[i].tolist()) for i in range(8)]
-        self.assertEqual(len(select_under_budget(pool, 1000, embed=_embedder(pool), max_items=3)), 3)
-        self.assertEqual(len(select_under_budget(pool, 50, embed=_embedder(pool))), 4)
+        for method, kwargs in (("mmr", {"embed": _embedder(pool)}), ("truncate", {})):
+            # A roomy budget takes everything: nothing caps the item count.
+            self.assertEqual(len(select_under_budget(pool, 1000, method=method, **kwargs)), 8)
+            # A tight one is filled, not half used.
+            self.assertEqual(len(select_under_budget(pool, 6, method=method, **kwargs)), 6)
+            # A caller can still ask for fewer.
+            self.assertEqual(
+                len(select_under_budget(pool, 1000, method=method, max_items=3, **kwargs)), 3)
 
     def test_truncate_is_relevance_order_and_needs_no_embedder(self):
         pool = [_item("low", 0.1, _A), _item("high", 0.9, _A_DUP), _item("mid", 0.5, _B)]

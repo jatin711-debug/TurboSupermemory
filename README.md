@@ -21,7 +21,7 @@ Most "agent memory" solutions today are thin Python wrappers around vector datab
 * 💥 **30.7× RaBitQ & 32× TurboQuant Hardware Compression**: Universal dimension support (384-d, 768-d, 1536-d) shrinking 768-d vectors to **100 bytes/vec** with randomized orthogonal transforms and fast AVX2 LUT popcount scoring.
 * 🧠 **Cognitive Biology & Graph Layer**: ACT-R power-law recency decay, spreading activation across concept hubs, and NLI-based non-destructive belief revision.
 * 🎯 **2-Stage Retrieval & ColBERT MaxSim**: Fast Stage-1 candidate retrieval ($<1\text{ms}$) + optional Stage-2 token-level late interaction (`LiquidAI/LFM2.5-ColBERT-350M`) on CUDA.
-* 🛡️ **Adaptive Saliency Cap & Submodular MMR**: Prevents prompt context-stuffing across 150 to 1,000+ token budgets, maintaining superior accuracy against Mem0 across all budget sizes.
+* 🛡️ **Budget-Aware Recall (Submodular MMR)**: Packs the most relevant, least redundant memories into a token budget from 150 to 1,000+ tokens, maintaining superior accuracy against Mem0 across all budget sizes.
 * 🔒 **Crash-Safe Storage Engine**: Lock-free atomic `ArcSwap` snapshots, segmented mmap buffers, and a checksummed Write-Ahead Log. A process that is killed loses nothing it acknowledged, an update is atomic, damaged index segments are rebuilt on open, and a scope or filter bounds every stage of a search.
 
 ---

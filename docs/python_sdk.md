@@ -49,8 +49,9 @@ message. `extractor="passthrough"` and `extractor="gliner"` keep writes local.
   without `superseded_by` is current.
 - `recall(..., token_budget=N)` returns the best *set* that fits `N` tokens
   instead of the top-k: greedy MMR over a candidate pool with a redundancy
-  cutoff, a cross-turn coverage bonus and an adaptive item cap
-  (`tsm.budget.select_under_budget`).
+  cutoff and a cross-turn coverage bonus (`tsm.budget.select_under_budget`).
+  The budget is filled; pass `max_items=` to also limit the number of
+  results.
 - `consolidate()` runs the engine's consolidation cycle, including belief
   revision. What a superseded fact turns into depends on the verifier:
   - `verifier="llm"` (`tsm.verification.LLMVerifier`): every new fact is
