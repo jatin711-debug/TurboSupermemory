@@ -20,6 +20,12 @@ This file is only the short list of open engineering work, grouped by area.
 > a CI workflow, and verified belief revision landed (entry of that date in
 > `PHASE_PROGRESS.md`). What each of them leaves open is listed under its
 > heading below.
+>
+> **2026-10-07, later.** A judged end-to-end run of the shipped stack
+> ("Judged end-to-end check" in `PHASE_PROGRESS.md`) found that no
+> cognitive mechanism beats plain vector search with OpenAI embeddings, and
+> why the shipped stack trailed it. The four items it produced lead the
+> "SDK" and "Cognitive behaviour" lists below.
 
 ## Durability and operations
 
@@ -87,6 +93,30 @@ are closed.
 
 ## SDK (`tsm/`)
 
+- **Budget recall uses half its budget.** `select_under_budget` stops at
+  `default_item_cap(budget) = min(10, max(4, budget // 35))` items: 4 at 150
+  tokens. With facts of about 18 tokens that is 72 tokens of context where
+  plain truncation uses 144, and it costs judged accuracy (0.487 against
+  0.565 with the cap lifted, 10 questions gained and 1 lost, p=0.01; plain
+  search 0.539). Let the cap follow the token budget (or drop it and let
+  the budget bind), run `make gate`, and re-judge with
+  `shipped_stack_eval.py`. The evaluation adapter packs through the same
+  function, so the published adapter numbers carry the same handicap.
+- **`Memory(max_records=..., gist_summarizer=...)` does not implement the
+  compression policy that was measured.** The bounded head-to-head builds
+  its stores in the harness (`budgeting.build_token_bounded_stores`:
+  user facts kept first, the overflow turned into a few terse gists that are
+  embedded separately) and scores 0.482 at a 256-token store. The engine's
+  path keeps the newest records whatever their role and writes one long gist
+  per 24 evicted facts: 0.139 at 16 records plus gists (0.078 without the
+  gists). Move the measured policy into the engine's eviction, or build the
+  bounded store in `tsm` and have the engine store it.
+- **The judged head-to-head measures `TSMAdapter`, not `tsm.Memory`.** The
+  adapter has its own engine settings and two additions `recall()` lacks
+  (keyword candidates, date tags). Make the head-to-head drive `tsm.Memory`
+  (as `shipped_stack_eval.py` does), and decide whether the date tags, which
+  are the one thing the adapter does better on (temporal questions 0.29
+  against 0.18), belong in `recall()`.
 - **Extraction results cached before 2026-10-06 may be wrong.** The OpenAI
   extractor used to cache "no facts" for a reply that was cut off at 400
   tokens. It no longer does, but an existing `extract_<model>.json` cache can
@@ -116,6 +146,20 @@ are closed.
 Found by the audit, deliberately left as they are because fixing them changes
 recall results:
 
+- **No cognitive mechanism improved judged answers** on 115 LongMemEval
+  questions with OpenAI embeddings and a 150-token context (plain vector
+  search 0.539; with the item cap lifted, MMR packing 0.565, cognitive
+  search 0.574 truncated or 0.522 packed, LLM-verified belief revision
+  0.522; none of these differences is significant). None hurt either. Until
+  something shows a gain on a judged run, describe graph expansion, MMR and
+  belief revision as neutral for answer accuracy, and lead with bounded
+  compression, which did reproduce.
+- **Verified belief revision removes what a question about the past needs.**
+  Excluding superseded facts gained 3 knowledge-update questions and lost
+  questions whose answer was the older fact (in 5 of 9 losses the answer's
+  key term had left the context). Options to measure: keep superseded facts
+  retrievable but marked, or exclude them only when the question is not
+  about history.
 - **Belief revision still retires some facts that are true.** Measured on
   the held-out half of `belief_pairs.jsonl` (54 updates, 58 pairs that both
   stay true, every pair in its own store): the LLM verifier with
@@ -242,6 +286,15 @@ recall results:
 
 - Confirm the bounded-compression result on the full LongMemEval set (~500
   conversations) and on LoCoMo before publishing any number (PLAN Phase D).
+  On 120 conversations (2026-10-07) it reproduced against deletion at every
+  budget; against Mem0 it is level at 64 and 128 stored tokens and ahead at
+  256 (0.482 against 0.348), where Mem0's own store is smaller than the
+  allowance. State the store sizes next to any Mem0 comparison.
+- The 2026-10-07 judged run did not reproduce a lead of the stack over plain
+  vector search (adapter 0.504, plain 0.539, 120 conversations, gpt-4.1-mini
+  judge). The README's head-to-head table (50 conversations, gpt-4o-mini
+  judge) shows one; re-run that table's exact configuration before relying
+  on it, and say which system (adapter or SDK) each number measures.
 - Re-run the retrieval-side levers on OpenAI embeddings; their original lifts
   were measured on MiniLM only.
 - The README's benchmark tables are the owner's own runs. To let a reader

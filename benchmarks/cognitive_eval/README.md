@@ -125,6 +125,7 @@ benchmarks/cognitive_eval/
 │   ├── openai_judge.py      # LLM-as-a-Judge (GPT-4o / GPT-4o-mini)
 │   └── ollama_judge.py      # Local Ollama judge
 ├── head_to_head_eval.py     # Main A4 judged head-to-head harness
+├── shipped_stack_eval.py    # Judged check of tsm.Memory itself, one mechanism per arm
 ├── full_harness_audit.py    # Multi-budget audit (150, 300, 600 tokens)
 ├── budget_recall_eval.py    # Submodular MMR vs truncation evaluator
 └── retention_eval.py        # Ebbinghaus forgetting & reinforcement evaluator
@@ -135,6 +136,11 @@ benchmarks/cognitive_eval/
 ```bash
 # 1. Run the Multi-Budget Full Harness Audit (150, 300, 600 tokens)
 python benchmarks/cognitive_eval/full_harness_audit.py --limit 50 --budgets 150,300,600 --mem0-path ./mem0_eval_db
+
+# 1b. Judge the shipped SDK (tsm.Memory), one mechanism per arm, with per-question output
+python benchmarks/cognitive_eval/shipped_stack_eval.py --limit 120 --token-budget 150 --judge openai --judge-model gpt-4.1-mini --out shipped.json
+#     no network: cached texts, proxy judge (checks the plumbing only)
+python benchmarks/cognitive_eval/shipped_stack_eval.py --offline --limit 5
 
 # 2. Run the 50-Conversation Head-to-Head Evaluation
 python benchmarks/cognitive_eval/head_to_head_eval.py --limit 50 --systems tsm,mem0,naive --token-budget 150 --tsm-embedder openai --embed-model text-embedding-3-small --extractor mock --judge openai --judge-model gpt-4o-mini

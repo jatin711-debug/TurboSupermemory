@@ -2021,3 +2021,179 @@ partial device mirrors; and a measurement of `gpt-4o-mini` as the verifier.
   not a judgement problem. Still not measured: answer accuracy on LongMemEval.
   `belief_pairs_eval.py --verifier llm` now reads the OpenAI key the way the
   rest of the harness does (environment or the gitignored key file).
+
+---
+
+# Judged end-to-end check of the shipped stack — plain search is not beaten (2026-10-07)
+
+Question: with the engine now sound, does the cognitive layer make answers
+better? Measured on the code at `155aa4b`, with a new runner that tests
+`tsm.Memory` itself.
+
+**Two things about the earlier judged runs, found while preparing this one.**
+- *They measure an evaluation adapter, not the SDK.* The head-to-head "tsm"
+  arm is `adapters/tsm_adapter.py`: its own engine settings (belief thresholds
+  0.5 / 0.5 and `cognitive_alpha` 0.7, where the SDK's conversational profile
+  has 0.85 / 0.75 and 0.5; two-hop expansion, vocabulary evolution), plus two
+  things `Memory.recall()` does not do: it appends every stored fact that
+  shares a word with the query as an extra candidate, and it prefixes each
+  fact with its date.
+- *The bounded-storage runner never uses the engine's eviction.*
+  `bounded_head_to_head.py` builds the capped stores in Python
+  (`budgeting.build_token_bounded_stores`: role-aware survivors plus short
+  chronological gists) and searches them with plain vector search. The
+  engine's own `max_records` + `gist_before_evict` path had never been judged.
+
+**Setup.** The first 120 LongMemEval conversations, 115 answerable questions
+(28 temporal-reasoning, 31 multi-session, 18 knowledge-update, 18
+single-session-user, 11 single-session-assistant, 9 single-session-preference).
+One cached gpt-4.1-nano extraction pass supplies every arm (15,706 facts);
+`text-embedding-3-small` embeddings, cached; 150-token answer context; the
+answer and the grade both from gpt-4.1-mini; belief verifier gpt-4o-mini;
+gists gpt-4.1-nano; Mem0 1.0.0 with gpt-4.1-nano. New runner:
+`benchmarks/cognitive_eval/shipped_stack_eval.py` (one mechanism added per
+arm, per-question output, resumable). Differences are given with the number
+of questions only one side got right and a two-sided sign test.
+
+**1. Unbounded storage.**
+
+| arm | what it is | judged | context used |
+|---|---|---|---|
+| `naive` | head-to-head floor: plain vector top-20, truncated | 0.539 | 8.2 items / 144 tok |
+| `adapter` | head-to-head "tsm" arm (adapter stack, NLI-verified exclusion) | 0.504 | 3.9 / 87 |
+| `sdk_plain` | `Memory(profile=None)`: scoped vector top-20, truncated | 0.539 | 8.2 / 144 |
+| `sdk_pack` | the same pool packed as `recall()` packs it (role prior + MMR) | 0.487 | 3.9 / 72 |
+| `sdk_cognitive` | conversational profile, belief detection off | 0.496 | 4.0 / 72 |
+| `sdk_belief` | + belief detection, no verifier (flagged, ranked lower) | 0.478 | 4.0 / 73 |
+| `sdk_belief_llm` | + `LLMVerifier` (verified supersessions leave recall) | 0.470 | 4.0 / 72 |
+
+| comparison | difference | only first right / only second right | p |
+|---|---|---|---|
+| `sdk_plain` vs `naive` | +0.000 | 3 / 3 | 1.00 |
+| `sdk_pack` vs `sdk_plain` | -0.052 | 7 / 13 | 0.26 |
+| `sdk_cognitive` vs `sdk_pack` | +0.009 | 7 / 6 | 1.00 |
+| `sdk_belief` vs `sdk_cognitive` | -0.017 | 0 / 2 | 0.50 |
+| `sdk_belief_llm` vs `sdk_cognitive` | -0.026 | 6 / 9 | 0.61 |
+| `sdk_belief_llm` vs `sdk_plain` | -0.070 | 10 / 18 | 0.18 |
+| `adapter` vs `naive` | -0.035 | 9 / 13 | 0.52 |
+
+No arm beats plain vector search, and no single step is significant at 115
+questions. The adapter's deficit (-0.035) is the one this file already
+records for the same comparison on OpenAI embeddings ("A4 FOLLOW-UP": 0.591
+against 0.557).
+
+*Why the packed arms trail: the item cap.* `select_under_budget` stops at
+`default_item_cap(budget) = min(10, max(4, budget // 35))` items, 4 at a
+150-token budget. These facts average about 18 tokens, so the packed arms hand
+the reader 72 tokens of a 150-token budget where truncation hands it 144. The
+losses are questions that need several facts (7 of the 13 are multi-session).
+Four diagnostic arms repack the same stores:
+
+| arm | judged | context used |
+|---|---|---|
+| `sdk_pack_full`: MMR with the cap lifted to 12 (the token budget still binds) | 0.565 | 8.0 / 143 |
+| `sdk_cognitive_trunc`: cognitive search results, truncated like `sdk_plain` | 0.574 | 8.3 / 144 |
+| `sdk_cognitive_full`: cognitive search + MMR, cap lifted | 0.522 | 8.1 / 144 |
+| `sdk_belief_llm_full`: the same with LLM-verified belief revision | 0.522 | 8.0 / 143 |
+
+| comparison | difference | only first / only second | p |
+|---|---|---|---|
+| `sdk_pack_full` vs `sdk_pack` | +0.078 | 10 / 1 | 0.01 |
+| `sdk_pack_full` vs `sdk_plain` | +0.026 | 11 / 8 | 0.65 |
+| `sdk_cognitive_trunc` vs `sdk_plain` | +0.035 | 10 / 6 | 0.45 |
+| `sdk_cognitive_full` vs `sdk_pack_full` | -0.043 | 3 / 8 | 0.23 |
+| `sdk_belief_llm_full` vs `sdk_cognitive_full` | +0.000 | 5 / 5 | 1.00 |
+| `sdk_belief_llm_full` vs `sdk_plain` | -0.017 | 9 / 11 | 0.82 |
+
+Lifting the cap is the one significant effect in this section. With it lifted
+every arm lands between 0.52 and 0.57, which at this sample size is the same
+as plain search (0.539). So: the cap costs about 5 to 8 points wherever
+`recall(token_budget=...)` is used with short facts, and neither MMR, nor
+cognitive search (graph expansion and fusion), nor belief revision moves
+answer accuracy measurably in either direction here.
+
+*Belief revision in detail.* The LLM verifier retired 400 facts over the 115
+conversations (the unverified detector flags 172; the adapter's NLI path
+retires 414 at its looser thresholds). Knowledge-update questions: 9 of 18
+without it, 10 of 18 with it. It changes the context of 51 of the 115
+questions, and in 5 of the 9 questions it loses, the answer's key term is in
+the context without belief revision and gone with it: a question about what
+was true earlier needs the fact that was superseded. Excluding stale facts
+trades those against the knowledge-update gains; the net is zero.
+
+**2. Bounded storage, harness-built stores** (`bounded_head_to_head.py
+--storage-budgets 64,128,256`, the published design, now with Mem0 again):
+
+| active-store budget | delete | TSM compress | Mem0 | compress vs delete | compress vs Mem0 |
+|---|---|---|---|---|---|
+| 64 tokens (n=114) | 0.018 | 0.140 | 0.193 | +0.123, 15 / 1, p=0.001 | -0.053, 10 / 16, p=0.33 |
+| 128 tokens (n=112) | 0.036 | 0.250 | 0.268 | +0.214, 26 / 2, p<0.001 | -0.018, 17 / 19, p=0.87 |
+| 256 tokens (n=112) | 0.098 | 0.482 | 0.348 | +0.384, 46 / 3, p<0.001 | +0.134, 26 / 11, p=0.02 |
+
+Compress-instead-of-delete reproduces at every budget, and at 256 tokens the
+compressed store answers almost as well as the unbounded stores above (0.48
+against 0.47 to 0.57) from about a tenth of the text. Against Mem0 it is a tie
+at 64 and 128 tokens and a lead at 256. Read the 256-token row with the store
+sizes: Mem0's own memory averages 12.1 items / 170 tokens per conversation, so
+it is not constrained there (150 tokens stored) while the TSM store uses 218
+of the 256. At the two tighter budgets Mem0 is cut to its most recent
+memories. Mem0 logged 4 internal "Error processing memory action" lines
+(its model named a memory id that did not exist) and carried on.
+
+**3. Bounded storage through the engine** (`Memory(max_records=16)`,
+conversational profile, one `consolidate()` after ingestion):
+
+| arm | judged | store |
+|---|---|---|
+| `sdk_evict` | 0.078 | 15.7 records per conversation |
+| `sdk_evict_gist` (`gist_summarizer=OpenAIGistSummarizer`) | 0.139 | 15.7 records + 5.1 gists |
+| the same stack unbounded (`sdk_cognitive`) | 0.496 | 125 records |
+
+Gists win 7 questions and lose none (p=0.02), so compress-then-evict is
+better than evict here too. But the engine's version keeps far less than the
+harness's: 0.139 with 16 facts and five gists, against 0.482 from a
+256-token harness-built store. Three differences explain it. With nothing
+queried yet, eviction keeps exactly the newest records (16 of 16 in each of
+12 conversations checked, 20% of them user facts), where the harness keeps
+user facts first. The engine writes one gist of up to 120 tokens per 24
+evicted facts, where the harness writes four terse ones of about 32 tokens;
+a long multi-fact gist is rarely the nearest neighbour of a specific
+question (a gist reached the context of 35 of 115 questions, never more than
+one). And `recall()` then applies the 4-item cap.
+
+**What this says about the claims.**
+- Stands, and is the strongest result again: when storage is bounded,
+  compressing the overflow beats deleting it by a wide margin.
+- Stands in a narrower form: at an equal allowance TSM-compress is level with
+  Mem0 when the allowance is tight and ahead when it is large enough that
+  Mem0 does not use it all.
+- Does not stand on this evidence: that the cognitive retrieval stack answers
+  better than plain vector search with a good embedder. It does not answer
+  worse either once the item cap is out of the way.
+- Not delivered by the product yet: the compression result belongs to a
+  policy implemented in the harness. `Memory(max_records=...,
+  gist_summarizer=...)` does not implement it and scores far lower.
+
+**Limits.** One dataset, 115 questions, one run, a 150-token context and a
+small reader: differences under about 0.08 are not resolved, and the
+per-type cells (9 to 31 questions) are noisier still. All arms share one
+extraction pass, so extraction quality is not tested. Eviction was exercised
+in the harshest way (fill, consolidate once, then ask), which gives access-
+aware eviction nothing to work with. Mem0 unbounded was not run. The README's
+tables were not re-run as such: they use 50 conversations and a gpt-4o-mini
+judge.
+
+**Cost.** About 8,350 chat requests and roughly 5.6M input tokens (Mem0's
+own ingestion 2,100 requests and 3.1M of them; judging 3,980 requests;
+gists 1,790; verifier 490), against the 8,400 requests quoted. An
+interrupted first attempt accounts for about 950 of them (Mem0 ingestion
+resumed from its store, and verifier verdicts were reused from their cache,
+but gists were paid for twice); the runner now checkpoints every
+conversation.
+
+**Next, in order of expected value** (all in `TODO.md`): make the packer's
+item cap follow the token budget instead of a 35-token-per-item guess, then
+re-judge; move the harness's compression policy into the engine's
+eviction; decide what verified belief revision should do with a superseded
+fact when the question is about the past; make the head-to-head use
+`tsm.Memory` so published numbers describe what ships.
