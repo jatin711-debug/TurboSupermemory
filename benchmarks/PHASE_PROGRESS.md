@@ -2197,3 +2197,254 @@ re-judge; move the harness's compression policy into the engine's
 eviction; decide what verified belief revision should do with a superseded
 fact when the question is about the past; make the head-to-head use
 `tsm.Memory` so published numbers describe what ships.
+
+---
+
+# The three follow-ups, judged: item cap, superseded facts, a per-user budget; and time tags (2026-10-07)
+
+The previous entry ended with three things to do. All three are done, a
+fourth came out of the measurements, and everything was judged again on the
+same 115 questions.
+
+**What changed in the product.**
+1. *No item cap.* `select_under_budget` fills the token budget; `max_items`
+   is optional. `recall(token_budget=N)` fetches `max(pool_k, 30, N // 8)`
+   candidates so a large budget can be filled. The evaluation adapter packs
+   through the same function, so it changed too.
+2. *Superseded facts stay.* No profile sets `exclude_superseded` any more. A
+   replaced fact is flagged (`superseded_by`, `chain`) and ranked lower.
+   With a verifier, `recall()` also acts on it in what a model reads: the
+   old fact's `context` starts with `[earlier, since changed] `, the fact
+   that replaced it is ranked where the old one would have been without its
+   demotion (`resolve_beliefs` now reports the factor), and it is brought in
+   when the search missed it. The packer never drops one of such a pair as a
+   duplicate of the other.
+3. *A token budget per user.* `Memory(max_user_tokens=N, gist_summarizer=...)`
+   and `tsm/compaction.py::plan_compaction`: the newest facts stay (the
+   user's first), everything older and every earlier gist is folded into a
+   few short gists, superseded facts first. It is the policy the bounded
+   head-to-head measures; `budgeting.build_token_bounded_stores` now calls
+   the same function. Gists are written before anything is deleted and a
+   summarizer failure removes nothing. The engine gained `scope_ids` and
+   `scopes`.
+4. *Time tags (new).* A result's `context` starts with when the memory was
+   said: `[2024-03-02] ` when its message carried a timestamp, otherwise
+   `[turn 12] `. Gists carry none. Reason: on the 28 temporal questions the
+   adapter answered 11 and every SDK arm 5 or 6, and the difference between
+   their contexts was the adapter's `[Turn N]` prefix (one question was won
+   with 5 of 6 facts shared).
+
+**Setup.** As in the previous entry: the first 120 LongMemEval conversations,
+115 answerable questions, one cached gpt-4.1-nano extraction pass,
+`text-embedding-3-small`, 150-token answer context, gpt-4.1-mini answers and
+grades, gpt-4o-mini verifier, gpt-4.1-nano gists, sign tests on the
+questions only one side got right. Four runs of `shipped_stack_eval.py`:
+A (after changes 1 to 3, 15 arms), B (after change 4 and a fix to how gists
+are ranked, 12 arms, each `recall()` arm with an untagged twin), C and D
+(diagnostics, below). An identical context is judged once, so arms that did
+not change between runs carry their verdicts over.
+
+**1. The stack as it ships** (run B; `naive` and `adapter` from run A,
+`sdk_pack_tagged` from run C).
+
+| arm | what it is | judged | context used |
+|---|---|---|---|
+| `naive`, `sdk_plain` | plain vector top-20, truncated | 0.539 (62) | 8.2 items / 144 tok |
+| `adapter` | head-to-head "tsm" arm (adapter stack, NLI-verified exclusion) | 0.583 (67) | 6.6 / 140 |
+| `sdk_pack` | plain pool packed as `recall()` packs it, no tags | 0.565 (65) | 8.0 / 143 |
+| `sdk_pack_tagged` | the same with time tags | 0.617 (71) | 7.0 / 142 |
+| `sdk_cognitive` | conversational profile, belief detection off | 0.574 (66) | 7.1 / 144 |
+| `sdk_belief` | + belief detection, no verifier | 0.565 (65) | 7.1 / 143 |
+| `sdk_belief_llm` | + `LLMVerifier`: `tsm.Memory` with everything on | 0.591 (68) | 7.1 / 143 |
+
+| arm | knowledge-update (18) | multi-session (31) | ss-assistant (11) | ss-preference (9) | ss-user (18) | temporal (28) |
+|---|---|---|---|---|---|---|
+| `sdk_plain` | 10 | 18 | 6 | 7 | 16 | 5 |
+| `adapter` | 10 | 15 | 7 | 7 | 17 | 11 |
+| `sdk_pack` | 11 | 17 | 8 | 7 | 16 | 6 |
+| `sdk_pack_tagged` | 11 | 19 | 7 | 8 | 16 | 10 |
+| `sdk_cognitive` | 10 | 16 | 8 | 7 | 16 | 9 |
+| `sdk_belief_llm` | 10 | 18 | 8 | 7 | 15 | 10 |
+
+| comparison | difference | only first right / only second right | p |
+|---|---|---|---|
+| `sdk_belief_llm` vs `sdk_plain` | +0.052 | 13 / 7 | 0.26 |
+| `sdk_belief_llm` vs `adapter` | +0.009 | 10 / 9 | 1.00 |
+| `sdk_pack_tagged` vs `sdk_plain` | +0.078 | 15 / 6 | 0.08 |
+| `sdk_pack_tagged` vs `adapter` | +0.035 | 9 / 5 | 0.42 |
+| `adapter` vs `naive` | +0.043 | 15 / 10 | 0.42 |
+
+In the previous entry the shipped stack was 7 points behind plain search
+(0.470 against 0.539). It is now 5 ahead and level with the adapter. Neither
+lead is significant at 115 questions. What moved it is below, one change at
+a time.
+
+**2. The item cap** (run A). `sdk_pack` 0.565 against `sdk_pack_capped`
+0.487: 10 questions gained, 1 lost, p=0.01, with 8.0 items and 143 tokens of
+context in place of 3.9 and 72. That is the diagnostic of the previous entry
+made the default. The adapter, which packs through the same function, went
+from 0.504 to 0.583 and from 87 to 140 context tokens.
+
+**3. Time tags.** Every comparison goes the same way:
+
+| comparison | right | only tagged / only untagged | p |
+|---|---|---|---|
+| plain pool: `sdk_pack_tagged` vs `sdk_pack` | 71 vs 65 | 9 / 3 | 0.15 |
+| `sdk_cognitive` vs its untagged twin (same store, run B) | 66 vs 59 | 8 / 1 | 0.04 |
+| `sdk_cognitive` vs the untagged arm of run A | 66 vs 61 | 7 / 2 | 0.18 |
+| `sdk_belief_llm` vs its untagged twin | 68 vs 61 | 8 / 1 | 0.04 |
+| `sdk_belief_llm` vs the untagged arm of run A | 68 vs 60 | 8 / 0 | 0.01 |
+| bounded: `sdk_budget` vs its untagged twin | 52 vs 49 | 4 / 1 | 0.38 |
+
+The gain is on temporal questions: 5 to 7 of 28 without tags, 9 to 10 with
+them (4 / 0 on the plain pool, 4 / 0 and 4 / 1 on the two twins), which is
+where the adapter was (11). The cognitive arms also gain 2 or 3
+knowledge-update questions, where the reader can now tell which of two
+values is the newer one; the plain pool does not (1 / 1). A tag costs about 3
+tokens, one item of a 150-token context (7.1 items against 8.1). The twin
+comparisons need one caveat: the twin is served from the same store right
+after the tagged call, and `recall()` reinforces what it returns, so its
+contexts are not exactly a first call's (59 right against 61 in run A).
+That is why the table gives the comparison against run A as well, and the
+plain pool, which has no such state. LongMemEval messages carry no dates
+here, so only `[turn N]` was exercised; `[YYYY-MM-DD]` is covered by unit
+tests. `time_tags=True` is the default.
+
+**4. Superseded facts.**
+
+| comparison | judged | only first right / only second right | p |
+|---|---|---|---|
+| kept and marked vs excluded (run A, untagged) | 0.522 vs 0.504 | 2 / 0 | 0.50 |
+| `sdk_belief_llm` vs `sdk_cognitive` (run B) | 0.591 vs 0.574 | 4 / 2 | 0.69 |
+| the same in run A, untagged | 0.522 vs 0.530 | 4 / 5 | 1.00 |
+| `sdk_belief` (no verifier) vs `sdk_cognitive` | 0.565 vs 0.574 | 0 / 1 (0 / 2 in run A) | 1.00 |
+| run C: no demotion vs the default | 0.600 vs 0.591 | 4 / 3 | 1.00 |
+
+Keeping superseded facts did not cost anything, and verified belief
+revision as a whole is still neutral for answers here (the verifier retired
+400 facts over the 115 conversations). The mark itself is rarely seen: a
+superseded fact's score is multiplied by 0.4
+(`supersession_demotion_factor`), which puts it outside a 150-token context
+almost always, so a marked fact reached 2 of the 115 contexts. Run C
+(`sdk_belief_llm_nodemote`, factor 1.0: the old fact keeps its rank and is
+only marked, with the current one beside it) puts a marked fact in 62
+contexts and comes out level. It gains where the old fact holds a detail the
+question needs (how long the asylum decision took, which coffee ratio was
+used before) and gets 12 knowledge-update questions against 10; it loses
+where a marked fact takes the place of a useful one (2 preference
+questions) or the verifier's supersession was wrong and the mark told the
+reader to discount a fact that still held. The default is unchanged;
+`Memory(verifier=..., supersession_demotion_factor=1.0)` is the alternative.
+Unverified detection (flag and demote, no mark) has now lost 1 or 2
+questions and won none in every run.
+
+**5. A token budget per user.** Stores of 256 tokens, on the 112 questions
+this run shares with the harness run of the previous entry:
+
+| store | judged (n=112) | what it holds per conversation |
+|---|---|---|
+| harness, delete | 0.098 | |
+| Mem0 | 0.348 | 12.1 items / 170 tokens |
+| harness, compress (`budgeting.build_token_bounded_stores`) | 0.482 | 218 tokens |
+| `Memory(max_user_tokens=256)`, compacted once after ingestion (`sdk_budget`) | 0.464 | 10.9 records / 212 tokens |
+| the same, compacted 4 times as the conversation arrives (`sdk_budget_rolling`) | 0.411 | 10.9 / 216 |
+| the same without a summarizer | 0.330 | 14.0 / 249 |
+
+| comparison | only first right / only second right | p |
+|---|---|---|
+| `sdk_budget` vs harness compress | 6 / 8 | 0.79 |
+| `sdk_budget` vs Mem0 | 26 / 13 | 0.05 |
+| `sdk_budget` vs harness delete | 44 / 3 | <0.001 |
+| `sdk_budget_rolling` vs harness compress | 10 / 18 | 0.19 |
+| `sdk_budget_rolling` vs Mem0 | 23 / 16 | 0.34 |
+| `sdk_budget_rolling` vs `sdk_budget` (n=115) | 7 / 13 | 0.26 |
+| with vs without the summarizer (untagged twins, n=115) | 19 / 7 | 0.03 |
+| `sdk_budget` vs the engine's `max_records` + gists (0.148, n=115) | 38 / 3 | <0.001 |
+| `sdk_budget` vs `sdk_cognitive`, unbounded (n=115) | 7 / 21 | 0.01 |
+
+The product now delivers the compression result: one compaction of the SDK
+store answers as well as the harness-built store (0.464 against 0.482) from
+212 tokens, a twelfth of the unbounded store's 2,535, for 12 points of
+accuracy. Run A had this arm at 0.411 on the same questions: its gists were
+stored under a role the role prior did not know, and all gists of one pass
+shared a turn, so the packer's cross-turn bonus went to one of them only.
+With gists ranked like the facts they stand for, 3.0 gists reach a context
+(2.2 before), as in the harness, and the untagged twin scores 0.438; the
+time tags account for the rest. Two things to keep in view. Compacting as the conversation arrives,
+which is what a deployment does, scores lower than compacting once (0.411
+against 0.464; knowledge-update 7 against 10, multi-session 8 against 12,
+temporal 8 against 5): each pass summarizes the previous pass's gists again.
+It is not a significant difference and the harness never measured it. And
+on knowledge-update questions the bounded stores do as well as the
+unbounded ones (10 of 18), because the newest facts are the ones kept
+verbatim.
+
+**6. Cognitive search: three readings, all negative.** Not one of the three
+tasks, but the arms were there. With the same packing, the conversational
+profile's search against the plain vector pool:
+
+| comparison | right | only cognitive / only plain | p |
+|---|---|---|---|
+| untagged, run A (`sdk_cognitive` vs `sdk_pack`) | 61 vs 65 | 3 / 7 | 0.34 |
+| untagged twin, run B | 59 vs 65 | 2 / 8 | 0.11 |
+| tagged (`sdk_cognitive` vs `sdk_pack_tagged`) | 66 vs 71 | 3 / 8 | 0.23 |
+| run D: `cognitive_alpha=1.0` vs the profile's 0.5 | 70 vs 66 | 7 / 3 | 0.34 |
+
+Run D (`sdk_cognitive_alpha1`) keeps the profile and only sets
+`cognitive_alpha=1.0`, which leaves the graph proposing candidates and ranks
+by cosine. Its context is identical to the plain pool's in 114 of 115
+questions (0.609 against 0.617). So on these embeddings the graph expansion
+adds no candidate that makes the top 30, and the profile's re-rank (a graph
+boost of up to 0.5 added to a cosine) costs about 4 points. The direction is
+the same every time and no single comparison is significant; the four are
+not independent (same questions, overlapping contexts). The profile is
+unchanged: `cognitive_alpha=0.5` came from earlier runs, most of them on
+MiniLM embeddings, where the graph did help, and what the default should be
+for a strong embedder is a product decision, recorded in `TODO.md`.
+
+**What this says about the claims.**
+- The shipped SDK no longer trails plain search: 0.591 against 0.539, not
+  significant. What the lead is made of is packing to the budget and time
+  tags (the plain pool with both: 0.617, 15 / 6 against plain search,
+  p=0.08). Cognitive search and belief revision add nothing measurable to
+  answer accuracy on these embeddings.
+- Bounded compression is now a product feature with a judged number of its
+  own: 0.464 from a 256-token store (Mem0 0.348, delete 0.098), 0.411 when
+  compacted as the conversation arrives.
+- Time tags are worth 5 to 8 questions of 115, most of them temporal
+  questions, in every setting they were tried in.
+
+**Limits.** One dataset, 115 questions, one run per arm: differences under
+about 0.08 are not resolved and per-type cells less so. Verdicts are reused
+for identical contexts only; a different order of the same facts is judged
+again. The plain-pool arms are deterministic. The cognitive arms reproduced
+exactly when built the same way (runs B, C and D), but `recall()` changes
+the store it reads, so an arm served second from a store differs slightly
+from one served first. The published README tables (50 conversations,
+gpt-4o-mini judge, the adapter) were not re-run. `bounded_head_to_head.py`
+was not re-judged after its store builder moved to `plan_compaction`; its
+13 unit tests pass.
+
+**The runner.** `shipped_stack_eval.py` gained: `<arm>_untagged` twins and
+the diagnostics `sdk_pack_tagged`, `sdk_belief_llm_nodemote`,
+`sdk_cognitive_alpha1`; a disk cache for gists; resuming with fewer arms
+than the checkpoint was written with; verdicts saved while judging, so an
+interrupted run started again pays for nothing twice.
+
+**Checks.** `make gate` passed on this tree, 8 of 8: fmt, clippy, the Rust
+suite, the SDK suite (105 tests), both synthetic belief checks, the
+LongMemEval smoke test and the ANN recall floor.
+
+**Cost.** About 7,100 chat requests against the 4,500 quoted: 2,691 for
+answers and grades (0.69M input tokens) and about 4,400 gists, plus 1,772
+gist texts embedded. The overrun is the time-tag work, which was not in the
+plan (its twins and the three diagnostic arms), and run B being interrupted
+four times (the laptop went to standby; it was stopped once to spare the
+battery; the session that had launched it ended; the machine ran short of
+memory under other work). Its finished conversations and their gists were
+kept each time.
+
+**Next** (all in `TODO.md`): decide `cognitive_alpha` for the default
+embedder; make the head-to-head drive `tsm.Memory`; give gists a time span
+and look at why rolling compaction trails one pass; confirm on the full
+LongMemEval set and on LoCoMo before quoting any of this outside the repo.

@@ -141,6 +141,9 @@ python benchmarks/cognitive_eval/full_harness_audit.py --limit 50 --budgets 150,
 python benchmarks/cognitive_eval/shipped_stack_eval.py --limit 120 --token-budget 150 --judge openai --judge-model gpt-4.1-mini --out shipped.json
 #     no network: cached texts, proxy judge (checks the plumbing only)
 python benchmarks/cognitive_eval/shipped_stack_eval.py --offline --limit 5
+#     An interrupted run started again with the same --out continues after the last finished
+#     conversation and keeps the verdicts it already paid for. --reuse a.json,b.json takes
+#     verdicts for identical contexts from earlier runs; --arms picks arms (see the docstring).
 
 # 2. Run the 50-Conversation Head-to-Head Evaluation
 python benchmarks/cognitive_eval/head_to_head_eval.py --limit 50 --systems tsm,mem0,naive --token-budget 150 --tsm-embedder openai --embed-model text-embedding-3-small --extractor mock --judge openai --judge-model gpt-4o-mini

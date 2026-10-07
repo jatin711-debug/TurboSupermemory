@@ -93,30 +93,41 @@ are closed.
 
 ## SDK (`tsm/`)
 
-- **Budget recall uses half its budget.** `select_under_budget` stops at
-  `default_item_cap(budget) = min(10, max(4, budget // 35))` items: 4 at 150
-  tokens. With facts of about 18 tokens that is 72 tokens of context where
-  plain truncation uses 144, and it costs judged accuracy (0.487 against
-  0.565 with the cap lifted, 10 questions gained and 1 lost, p=0.01; plain
-  search 0.539). Let the cap follow the token budget (or drop it and let
-  the budget bind), run `make gate`, and re-judge with
-  `shipped_stack_eval.py`. The evaluation adapter packs through the same
-  function, so the published adapter numbers carry the same handicap.
-- **`Memory(max_records=..., gist_summarizer=...)` does not implement the
-  compression policy that was measured.** The bounded head-to-head builds
-  its stores in the harness (`budgeting.build_token_bounded_stores`:
-  user facts kept first, the overflow turned into a few terse gists that are
-  embedded separately) and scores 0.482 at a 256-token store. The engine's
-  path keeps the newest records whatever their role and writes one long gist
-  per 24 evicted facts: 0.139 at 16 records plus gists (0.078 without the
-  gists). Move the measured policy into the engine's eviction, or build the
-  bounded store in `tsm` and have the engine store it.
-- **The judged head-to-head measures `TSMAdapter`, not `tsm.Memory`.** The
-  adapter has its own engine settings and two additions `recall()` lacks
-  (keyword candidates, date tags). Make the head-to-head drive `tsm.Memory`
-  (as `shipped_stack_eval.py` does), and decide whether the date tags, which
-  are the one thing the adapter does better on (temporal questions 0.29
-  against 0.18), belong in `recall()`.
+- **Compacting as the conversation arrives scores lower than compacting
+  once.** `Memory(max_user_tokens=256)` answers 0.464 of 112 judged
+  questions when the store is compacted once after ingestion (the
+  harness-built store: 0.482) and 0.411 when it is compacted four times
+  along the way, which is what a deployment does (7 questions gained, 13
+  lost, p=0.26). Each pass summarizes the previous pass's gists again;
+  knowledge-update and multi-session questions are where it loses. To
+  measure: keep earlier gists as they are until the gist share is full and
+  only then merge the oldest; or compact only when a user is well over
+  budget instead of at every `consolidate()`.
+- **Gists carry no time cue.** `recall()` puts a date or a turn in front of
+  each fact and leaves gists bare, so in a compacted store most of the
+  history has no order. A gist could carry the span it covers
+  (`[turns 3-41]`); `plan_compaction` would have to report which memories
+  each gist was written from.
+- **`max_user_tokens` only compacts in `consolidate()`, and only the users
+  this process wrote to** (`compact()` covers every user). A store that is
+  only ever added to grows until one of them is called.
+- **The engine's `max_records` path is unchanged** and scores far lower on
+  the same questions (0.148 with gists, 0.070 without, against 0.452 for
+  `max_user_tokens`): one count for the whole store, the newest records
+  kept whatever their role, one long gist per 24 evicted facts. Give it the
+  same policy or keep steering conversational use to `max_user_tokens`, as
+  the docs now do.
+- **The judged head-to-head still measures `TSMAdapter`, not `tsm.Memory`.**
+  The adapter has its own engine settings and adds keyword candidates.
+  On the same questions the two are now level (adapter 0.583, `tsm.Memory`
+  with everything on 0.591), so the published head-to-head and bounded
+  tables can be re-run through `tsm.Memory` (`shipped_stack_eval.py` shows
+  how) and the adapter retired.
+- **`recall()` is not read-only.** A query reinforces what it returned, so
+  the same question asked twice of one store comes back in a different
+  order more often than not (13 of 19 questions checked, different members
+  in 3). An evaluation has to build one store per arm, and a caller cannot
+  rely on a repeated query. A read that does not reinforce is missing.
 - **Extraction results cached before 2026-10-06 may be wrong.** The OpenAI
   extractor used to cache "no facts" for a reply that was cut off at 400
   tokens. It no longer does, but an existing `extract_<model>.json` cache can
@@ -137,29 +148,42 @@ are closed.
 - **Budget recall re-embeds its candidate pool on every call** (a paid API
   call with the OpenAI embedder). Have the engine return the stored vectors
   for the pool, or cache them.
-- **Timestamp anchoring** (`[2024-01-15] fact`) exists only in the eval
-  adapter's `search()`. Decide whether it belongs in `recall()`; it has no
-  isolated measurement yet.
+- **Time tags were judged with turn numbers only.** LongMemEval messages
+  carry no dates in this loader, so `[turn N]` is what gained 5 to 8
+  questions of 115. `[YYYY-MM-DD]` is covered by unit tests, not by a judged
+  run (LoCoMo has dated sessions). A tag costs about 3 tokens, one item of a
+  150-token context; whether a shorter form does as well is not known.
 
 ## Cognitive behaviour (needs a judged re-run before changing)
 
 Found by the audit, deliberately left as they are because fixing them changes
 recall results:
 
-- **No cognitive mechanism improved judged answers** on 115 LongMemEval
-  questions with OpenAI embeddings and a 150-token context (plain vector
-  search 0.539; with the item cap lifted, MMR packing 0.565, cognitive
-  search 0.574 truncated or 0.522 packed, LLM-verified belief revision
-  0.522; none of these differences is significant). None hurt either. Until
-  something shows a gain on a judged run, describe graph expansion, MMR and
-  belief revision as neutral for answer accuracy, and lead with bounded
-  compression, which did reproduce.
-- **Verified belief revision removes what a question about the past needs.**
-  Excluding superseded facts gained 3 knowledge-update questions and lost
-  questions whose answer was the older fact (in 5 of 9 losses the answer's
-  key term had left the context). Options to measure: keep superseded facts
-  retrievable but marked, or exclude them only when the question is not
-  about history.
+- **Decide `cognitive_alpha` for a strong embedder (owner's call).** The
+  conversational profile ranks by cosine plus a graph boost of up to 0.5
+  (`cognitive_alpha=0.5`). On 115 judged LongMemEval questions with OpenAI
+  embeddings, the default embedder, that scores 0.574; the same profile with
+  `cognitive_alpha=1.0` (the graph still proposes candidates, ranking is by
+  cosine) scores 0.609 and returns the plain vector pool in 114 of 115
+  questions (7 gained, 3 lost, p=0.34; three other comparisons of cognitive
+  search against the plain pool went 3/7, 2/8 and 3/8). No single
+  comparison is significant; all point the same way. The 0.5 came from
+  earlier runs, most on MiniLM embeddings, where the graph helped. Options:
+  leave it; set 1.0 in the profile; choose by embedder. Whatever is chosen,
+  describe graph expansion and belief revision as neutral for answer
+  accuracy on strong embeddings, and lead with what was measured: packing
+  to the budget, time tags, bounded compression.
+- **Marking a superseded fact or demoting it.** Superseded facts are kept
+  now, and a verifier's are marked for the reader, but the 0.4 score
+  demotion keeps the marked fact out of a 150-token context almost always
+  (2 of 115). Without the demotion (`supersession_demotion_factor=1.0`) a
+  marked fact is in 62 contexts and the answers come out level (0.600
+  against 0.591; 4 gained, 3 lost): better where the old fact holds a
+  needed detail and on knowledge-update questions (12 against 10 of 18),
+  worse where a marked fact takes a useful one's place or the supersession
+  was wrong. Unverified detection (demoted, never marked) has lost 1 or 2
+  questions and won none in three runs; whether it should demote at all is
+  open.
 - **Belief revision still retires some facts that are true.** Measured on
   the held-out half of `belief_pairs.jsonl` (54 updates, 58 pairs that both
   stay true, every pair in its own store): the LLM verifier with
@@ -174,8 +198,6 @@ recall results:
     chances to be wrong. Tune it on `--split dev` only, and treat the
     held-out half as seen for this setting: its similarities have been
     looked at;
-  - a judged LongMemEval run with the LLM verifier, since pair-level numbers
-    say nothing about answer accuracy;
   - dated events in the prompt, and whether one pair per request is worth
     7 to 8 times the requests (on `dev`: 1 error instead of 2 and 52 updates
     instead of 51; not run on the held-out half);

@@ -14,20 +14,35 @@ neighbouring arms belongs to one mechanism:
     sdk_pack        the same pool, packed the way recall() packs it
                     (role prior + MMR under the budget)
     sdk_cognitive   conversational profile, belief detection off: cognitive
-                    search (graph expansion, fusion) + the same packing
+                    search (graph expansion, fusion) + the same packing, each
+                    fact shown with its turn or date (recall()'s default)
     sdk_belief      + belief detection, no verifier (flagged and ranked lower)
-    sdk_belief_llm  + LLMVerifier (verified supersessions leave recall)
+    sdk_belief_llm  + LLMVerifier (superseded facts marked as earlier, the
+                    fact that replaced each one served with it)
 
-  bounded storage through the engine itself (max_records)
-    sdk_evict       conversational profile with max_records: evict
-    sdk_evict_gist  the same with a gist summarizer: compress, then evict
+  bounded storage
+    sdk_evict       the engine's cap, max_records: the newest records stay
+    sdk_evict_gist  the same with a gist summarizer
+    sdk_budget      Memory(max_user_tokens=...): the newest facts stay, the
+                    rest is folded into short gists, once, after ingestion
+    sdk_budget_rolling  the same store compacted --rolling-passes times as
+                    the conversation arrives, each pass folding the last
+                    one's gists again: what a live deployment does
 
-  diagnostics (not run by default): the same stores as above, packed differently
-    sdk_cognitive_trunc   cognitive search results, truncated like sdk_plain
-                          (cognitive search alone, without the packer)
-    sdk_pack_full, sdk_cognitive_full, sdk_belief_llm_full
-                          the packer with its item cap lifted to --full-items,
-                          so it can use the whole token budget
+  diagnostics (not run by default)
+    <recall arm>_untagged   the same store, recall(time_tags=False): the
+                            facts without their turn or date
+    sdk_cognitive_trunc     cognitive search results, untagged and truncated
+                            like sdk_plain (cognitive search without the packer)
+    sdk_cognitive_alpha1    sdk_cognitive with cognitive_alpha=1.0: the graph
+                            still proposes candidates but ranking is by cosine
+    sdk_pack_capped         sdk_pack with the item cap recall() used to have
+    sdk_pack_tagged         sdk_pack with recall()'s time tags: what recall()
+                            would hand over without cognitive search
+    sdk_belief_llm_exclude  sdk_belief_llm with exclude_superseded=True
+    sdk_belief_llm_nodemote sdk_belief_llm with supersession_demotion_factor=1.0:
+                            a superseded fact keeps its rank and is only marked
+    sdk_budget_delete       sdk_budget without a summarizer
 
 Every arm gets the facts of one cached extraction pass and the same cached
 embeddings; only the memory system differs. Per-question results are written
@@ -73,29 +88,51 @@ logger = logging.getLogger("shipped_stack_eval")
 
 UNBOUNDED = ("naive", "adapter", "sdk_plain", "sdk_pack", "sdk_cognitive", "sdk_belief",
              "sdk_belief_llm")
-BOUNDED = ("sdk_evict", "sdk_evict_gist")
-DIAGNOSTIC = ("sdk_cognitive_trunc", "sdk_pack_full", "sdk_cognitive_full", "sdk_belief_llm_full")
+BOUNDED = ("sdk_evict", "sdk_evict_gist", "sdk_budget", "sdk_budget_rolling")
+# Arms served by recall() as it ships; each also has an _untagged twin.
+RECALL_ARMS = ("sdk_cognitive", "sdk_cognitive_alpha1", "sdk_belief", "sdk_belief_llm",
+               "sdk_belief_llm_exclude", "sdk_belief_llm_nodemote", "sdk_evict",
+               "sdk_evict_gist", "sdk_budget", "sdk_budget_rolling", "sdk_budget_delete")
+DIAGNOSTIC = (("sdk_cognitive_trunc", "sdk_cognitive_alpha1", "sdk_pack_capped", "sdk_pack_tagged",
+               "sdk_belief_llm_exclude", "sdk_belief_llm_nodemote", "sdk_budget_delete")
+              + tuple(a + "_untagged" for a in RECALL_ARMS))
 DEFAULT_ARMS = UNBOUNDED + BOUNDED
 ARMS = DEFAULT_ARMS + DIAGNOSTIC
 # (arm, baseline): each pair differs in one mechanism.
 PAIRS = (
     ("sdk_plain", "naive"),
     ("sdk_pack", "sdk_plain"),
-    ("sdk_cognitive", "sdk_pack"),
+    ("sdk_cognitive_untagged", "sdk_pack"),
+    ("sdk_cognitive", "sdk_cognitive_untagged"),
     ("sdk_belief", "sdk_cognitive"),
     ("sdk_belief_llm", "sdk_cognitive"),
+    ("sdk_belief_llm", "sdk_belief_llm_untagged"),
     ("sdk_belief_llm", "sdk_plain"),
     ("adapter", "naive"),
+    ("sdk_belief_llm", "adapter"),
     ("sdk_evict_gist", "sdk_evict"),
-    ("sdk_evict_gist", "sdk_cognitive"),
+    ("sdk_budget", "sdk_evict_gist"),
+    ("sdk_budget", "sdk_cognitive"),
+    ("sdk_budget", "sdk_budget_untagged"),
+    ("sdk_budget_rolling", "sdk_budget"),
+    ("sdk_budget", "sdk_budget_delete"),
+    ("sdk_budget_untagged", "sdk_budget_delete_untagged"),
     ("sdk_cognitive_trunc", "sdk_plain"),
-    ("sdk_pack_full", "sdk_plain"),
-    ("sdk_pack_full", "sdk_pack"),
-    ("sdk_cognitive_full", "sdk_pack_full"),
-    ("sdk_cognitive_full", "sdk_cognitive"),
-    ("sdk_belief_llm_full", "sdk_cognitive_full"),
-    ("sdk_belief_llm_full", "sdk_plain"),
+    ("sdk_pack", "sdk_pack_capped"),
+    ("sdk_pack_tagged", "sdk_pack"),
+    ("sdk_cognitive", "sdk_pack_tagged"),
+    ("sdk_cognitive_alpha1", "sdk_cognitive"),
+    ("sdk_cognitive_alpha1", "sdk_pack_tagged"),
+    ("sdk_belief_llm", "sdk_pack_tagged"),
+    ("sdk_belief_llm", "sdk_belief_llm_exclude"),
+    ("sdk_belief_llm_nodemote", "sdk_belief_llm"),
+    ("sdk_belief_llm_nodemote", "sdk_cognitive"),
 )
+
+
+def variants(name):
+    """A recall() arm and the diagnostics served from the same store."""
+    return (name, name + "_trunc", name + "_untagged")
 
 
 class Embeddings:
@@ -189,6 +226,46 @@ class CachedExtraction:
         return self._extractor
 
 
+class CachedGists:
+    """A gist summarizer whose answers are kept on disk: a rerun over the same
+    stores costs nothing, and two runs compare the same gists instead of two
+    samples of the model's wording."""
+
+    def __init__(self, inner, path):
+        self._inner = inner
+        self._path = path
+        self.model = getattr(inner, "model", "?")
+        self.calls = self.hits = 0
+        self._new = 0
+        self._cache = {}
+        if path and os.path.exists(path):
+            with open(path, encoding="utf-8") as fh:
+                self._cache = json.load(fh)
+
+    def summarize(self, texts, max_tokens=None):
+        texts = list(texts)
+        key = hashlib.sha256(json.dumps([self.model, max_tokens, texts]).encode("utf-8")).hexdigest()
+        if key in self._cache:
+            self.hits += 1
+            return self._cache[key]
+        self.calls += 1
+        gist = self._inner.summarize(texts, max_tokens=max_tokens) or ""
+        self._cache[key] = gist
+        self._new += 1
+        return gist
+
+    def __call__(self, texts):
+        return self.summarize(texts)
+
+    def flush(self):
+        if self._new and self._path:
+            tmp = self._path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self._cache, fh)
+            os.replace(tmp, self._path)
+            self._new = 0
+
+
 class ProxyJudge:
     """No-cost stand-in: counts a hit when the gold answer's most distinctive
     token is in the context. Only for checking the plumbing."""
@@ -248,7 +325,8 @@ def sdk_pool(mem, embedder, query, user_id, k):
             except ValueError:
                 payload = {}
         pool.append({"id": mid, "text": rec["text"], "score": float(score),
-                     "role": rec.get("source_role") or "", "turn_index": payload.get("turn_index")})
+                     "role": rec.get("source_role") or "", "turn_index": payload.get("turn_index"),
+                     "timestamp": payload.get("timestamp")})
     return pool
 
 
@@ -259,8 +337,11 @@ def main():
     ap.add_argument("--arms", default=",".join(DEFAULT_ARMS))
     ap.add_argument("--token-budget", type=int, default=150, help="answer-context token cap")
     ap.add_argument("--pool-k", type=int, default=20)
-    ap.add_argument("--full-items", type=int, default=12,
-                    help="item cap of the *_full diagnostic arms (the token budget still applies)")
+    ap.add_argument("--user-tokens", type=int, default=256,
+                    help="storage budget of the sdk_budget arms (tokens per conversation)")
+    ap.add_argument("--rolling-passes", type=int, default=4,
+                    help="how many times sdk_budget_rolling adds a part of the conversation "
+                         "and compacts")
     ap.add_argument("--max-records", type=int, default=16,
                     help="storage cap of the sdk_evict arms (records per conversation)")
     ap.add_argument("--embed-model", default="text-embedding-3-small")
@@ -273,6 +354,10 @@ def main():
     ap.add_argument("--work-dir", default=None,
                     help="where the verdict cache and the embedding overlay are kept")
     ap.add_argument("--out", default=None, help="write per-question results here (JSON)")
+    ap.add_argument("--reuse", default=None, metavar="PATHS",
+                    help="comma-separated --out files of earlier runs with the same judge: an "
+                         "answer already judged for the same question and context is not "
+                         "judged again")
     ap.add_argument("--rejudge", default=None, metavar="PATH",
                     help="skip ingestion: judge the contexts saved in PATH (the --out file of a "
                          "run whose judging did not finish)")
@@ -299,6 +384,7 @@ def main():
     from tsm import Memory
     from tsm.budget import select_under_budget
     from tsm.gist import ExtractiveGistSummarizer, OpenAIGistSummarizer
+    from tsm.memory import time_tag
     from tsm.ranking import is_first_person_query, role_prior
     from tsm.verification import LLMVerifier
 
@@ -310,15 +396,21 @@ def main():
         from cognitive_eval.judge import create_judge
 
         judge = create_judge("openai", openai_model=args.judge_model)
+    def asked(*names):
+        return any(a in arms for name in names for a in variants(name))
+
     verifier = None
-    if "sdk_belief_llm" in arms or "sdk_belief_llm_full" in arms:
+    if asked("sdk_belief_llm", "sdk_belief_llm_exclude", "sdk_belief_llm_nodemote"):
         verifier = LLMVerifier(model=args.verifier_model,
                                client=KeepsClient() if args.offline else None,
                                cache_dir=None if args.offline else os.path.join(work_dir, "verdicts"))
     summarizer = None
-    if "sdk_evict_gist" in arms:
-        summarizer = ExtractiveGistSummarizer() if args.offline else OpenAIGistSummarizer(
-            model=args.gist_model)
+    if asked("sdk_evict_gist", "sdk_budget", "sdk_budget_rolling"):
+        summarizer = CachedGists(
+            ExtractiveGistSummarizer() if args.offline else OpenAIGistSummarizer(
+                model=args.gist_model),
+            None if args.offline else os.path.join(
+                work_dir, f"gists_{args.gist_model.replace('/', '_')}.json"))
     nli = None
 
     convs = load_longmemeval(args.data_dir)[:args.limit]
@@ -344,10 +436,13 @@ def main():
         convs = []
 
     # One line per finished conversation, so an interrupted run picks up where
-    # it stopped instead of paying for the same verdicts and gists again.
+    # it stopped instead of paying for the same verdicts and gists again. It
+    # may be resumed with fewer arms; a conversation that was not run for
+    # every arm asked for now is run again.
     checkpoint = args.out + ".partial.jsonl" if args.out and not args.rejudge else None
     setup = {"arms": arms, "token_budget": args.token_budget, "pool_k": args.pool_k,
-             "max_records": args.max_records, "full_items": args.full_items, "embed_model": args.embed_model,
+             "max_records": args.max_records, "user_tokens": args.user_tokens,
+             "rolling_passes": args.rolling_passes, "embed_model": args.embed_model,
              "extractor_model": args.extractor_model, "gist_model": args.gist_model,
              "verifier_model": args.verifier_model, "offline": args.offline}
     done = set()
@@ -358,13 +453,18 @@ def main():
                     row = json.loads(line)
                 except ValueError:
                     continue  # a line cut off by the interruption
-                if row.get("setup") != setup:
+                was = dict(row.get("setup") or {})
+                had = set(was.pop("arms", ()))
+                if was != {k: v for k, v in setup.items() if k != "arms"}:
                     sys.exit(f"{checkpoint} was written with different settings; "
                              "remove it or choose another --out")
+                if not set(arms) <= had or row["conversation_id"] in done:
+                    continue
                 done.add(row["conversation_id"])
-                tasks.extend(row["tasks"])
+                tasks.extend(t for t in row["tasks"] if t["arm"] in arms)
                 for arm, counts in row["stats"].items():
-                    stats[arm].update(counts)
+                    if arm in arms:
+                        stats[arm].update(counts)
         logger.info("Resuming: %d conversations already done", len(done))
 
     for index, conv in enumerate(convs):
@@ -409,7 +509,8 @@ def main():
                 retrieve["adapter"] = lambda q, ad=ad: ad.recall_under_budget(
                     q, user_id=user, token_budget=args.token_budget, method="mmr")
 
-            plain_arms = [a for a in ("sdk_plain", "sdk_pack", "sdk_pack_full") if a in arms]
+            plain_arms = [a for a in ("sdk_plain", "sdk_pack", "sdk_pack_capped",
+                                      "sdk_pack_tagged") if a in arms]
             if plain_arms:
                 mem, db = sdk_memory(profile=None)
                 opened.append((mem.close, db))
@@ -419,58 +520,91 @@ def main():
                         [p["text"] for p in sdk_pool(mem, embedder, q, user, args.pool_k)],
                         args.token_budget)
 
-                def packed(q, mem=mem, cap=None):
-                    pool = sdk_pool(mem, embedder, q, user, max(args.pool_k, 30))
+                def packed(q, mem=mem, cap=None, tags=False):
+                    # recall()'s packing on a plain-vector pool of recall()'s size.
+                    pool = sdk_pool(mem, embedder, q, user,
+                                    max(args.pool_k, 30, args.token_budget // 8))
                     first_person = is_first_person_query(q)
                     for p in pool:
                         p["score"] *= role_prior(first_person, p["role"])
+                        if tags:
+                            p["context"] = (time_tag(p["timestamp"], p["turn_index"])
+                                            + (p["text"] or ""))
+                    pool.sort(key=lambda p: -p["score"])
                     chosen = select_under_budget(pool, args.token_budget, embed=embedder.encode,
                                                  lam=0.7, max_items=cap)
-                    return [p["text"] or "" for p in chosen]
+                    return [p.get("context") or p["text"] or "" for p in chosen]
                 if "sdk_pack" in arms:
                     retrieve["sdk_pack"] = packed
-                if "sdk_pack_full" in arms:
-                    retrieve["sdk_pack_full"] = lambda q: packed(q, cap=args.full_items)
+                if "sdk_pack_tagged" in arms:
+                    retrieve["sdk_pack_tagged"] = lambda q: packed(q, tags=True)
+                if "sdk_pack_capped" in arms:
+                    old_cap = min(10, max(4, args.token_budget // 35))
+                    retrieve["sdk_pack_capped"] = lambda q: packed(q, cap=old_cap)
 
-            def recall_arm(name, variants=(), **kwargs):
-                """One Memory serving `name` (recall() as shipped) and its
-                diagnostic variants, which repack the same search results."""
-                wanted = [a for a in (name,) + tuple(variants) if a in arms]
+            def shown(results):
+                """What goes in the prompt: a result's context (the text, marked
+                when the fact has since changed)."""
+                return [r.get("context") or r["text"] or "" for r in results]
+
+            def recall_arm(name, feed=None, **kwargs):
+                """One Memory serving `name` through recall() as shipped,
+                `name`_untagged (the same without time tags) and `name`_trunc,
+                which truncates the same search results."""
+                wanted = [a for a in variants(name) if a in arms]
                 if not wanted:
                     return
                 mem, db = sdk_memory(**kwargs)
                 opened.append((mem.close, db))
-                stored, committed = mem.add(messages, user_id=user), mem.consolidate()
+                if feed is None:
+                    stored, committed = mem.add(messages, user_id=user), mem.consolidate()
+                else:
+                    stored, committed = feed(mem)
+                store = [r["text"] or "" for r in
+                         mem.engine.get_records(mem.engine.scope_ids(user)) if r]
                 for arm in wanted:
                     conv_stats[arm]["stored"] += stored
                     conv_stats[arm]["committed"] += committed
                     conv_stats[arm]["superseded"] += len(mem.engine.superseded_ids())
-                    conv_stats[arm]["records"] += mem.engine.record_count()
-                retrieve[name] = lambda q, mem=mem: [
-                    r["text"] or "" for r in mem.recall(q, user_id=user,
-                                                        token_budget=args.token_budget,
-                                                        pool_k=args.pool_k)]
-
-                def pool_of(q, k, mem=mem):
-                    # recall() without a budget: the search results with the
-                    # role prior applied, before any packing.
-                    return mem.recall(q, user_id=user, top_k=k, resolve_beliefs=False)
-                retrieve[name + "_trunc"] = lambda q: truncate_to_budget(
-                    [p["text"] or "" for p in sorted(pool_of(q, args.pool_k),
-                                                     key=lambda p: -p["score"])],
+                    conv_stats[arm]["records"] += len(store)
+                    conv_stats[arm]["store_tokens"] += total_tokens(store)
+                    conv_stats[arm]["conversations"] += 1
+                retrieve[name] = lambda q, mem=mem: shown(
+                    mem.recall(q, user_id=user, token_budget=args.token_budget,
+                               pool_k=args.pool_k))
+                retrieve[name + "_untagged"] = lambda q, mem=mem: shown(
+                    mem.recall(q, user_id=user, token_budget=args.token_budget,
+                               pool_k=args.pool_k, time_tags=False))
+                retrieve[name + "_trunc"] = lambda q, mem=mem: truncate_to_budget(
+                    shown(mem.recall(q, user_id=user, top_k=args.pool_k, time_tags=False)),
                     args.token_budget)
-                retrieve[name + "_full"] = lambda q: [
-                    p["text"] or "" for p in select_under_budget(
-                        pool_of(q, max(args.pool_k, 30)), args.token_budget,
-                        embed=embedder.encode, lam=0.7, max_items=args.full_items)]
 
-            recall_arm("sdk_cognitive", ("sdk_cognitive_trunc", "sdk_cognitive_full"),
-                       refinement_cosine_threshold=None, contradiction_cosine_threshold=None)
+            def rolling(mem):
+                """The conversation in parts, compacting after each."""
+                stored = committed = 0
+                size = max(1, -(-len(messages) // max(1, args.rolling_passes)))
+                for start in range(0, len(messages), size):
+                    stored += mem.add(messages[start:start + size], user_id=user)
+                    committed += mem.consolidate()
+                return stored, committed
+
+            recall_arm("sdk_cognitive", refinement_cosine_threshold=None,
+                       contradiction_cosine_threshold=None)
+            recall_arm("sdk_cognitive_alpha1", refinement_cosine_threshold=None,
+                       contradiction_cosine_threshold=None, cognitive_alpha=1.0)
             recall_arm("sdk_belief")
-            recall_arm("sdk_belief_llm", ("sdk_belief_llm_full",), verifier=verifier)
+            recall_arm("sdk_belief_llm", verifier=verifier)
+            recall_arm("sdk_belief_llm_exclude", verifier=verifier, exclude_superseded=True)
+            recall_arm("sdk_belief_llm_nodemote", verifier=verifier,
+                       supersession_demotion_factor=1.0)
             recall_arm("sdk_evict", max_records=args.max_records)
             recall_arm("sdk_evict_gist", max_records=args.max_records,
                        gist_summarizer=summarizer)
+            recall_arm("sdk_budget", max_user_tokens=args.user_tokens,
+                       gist_summarizer=summarizer)
+            recall_arm("sdk_budget_rolling", feed=rolling, max_user_tokens=args.user_tokens,
+                       gist_summarizer=summarizer)
+            recall_arm("sdk_budget_delete", max_user_tokens=args.user_tokens)
 
             for q in questions:
                 for arm in arms:
@@ -490,6 +624,8 @@ def main():
                                          "tasks": conv_tasks,
                                          "stats": {a: dict(c) for a, c in conv_stats.items()}})
                              + "\n")
+            if summarizer is not None:
+                summarizer.flush()
         except Exception as e:  # noqa: BLE001 — one bad conversation must not sink the run
             logger.warning("conversation %s skipped for every arm: %s: %s", user,
                            type(e).__name__, e)
@@ -508,16 +644,68 @@ def main():
         stats[t["arm"]]["items"] += len(t["retrieved"])
         stats[t["arm"]]["tokens"] += total_tokens(t["retrieved"])
 
+    judge_model = getattr(judge, "model", "?")
+
+    # The judge sees a question, a context and the gold answer, never the arm:
+    # the same three get the same verdict, so each is judged once.
+    def what(task):
+        return json.dumps([task["query"], task["gold"], task["retrieved"]], sort_keys=True)
+
+    known = {}
+    # Verdicts this run already paid for: judging saves them as it goes, so
+    # an interrupted run started again does not ask for them twice.
+    if args.out and os.path.exists(args.out):
+        try:
+            with open(args.out, encoding="utf-8") as fh:
+                earlier = json.load(fh)
+        except (OSError, ValueError):
+            earlier = {}
+        if earlier.get("judge_model") == judge_model:
+            for t in earlier.get("tasks", []):
+                if t.get("correct") is not None:
+                    known[what(t)] = (t["prediction"], t["correct"])
+
     def save(summary=None):
         if args.out:
-            with open(args.out, "w", encoding="utf-8") as fh:
-                json.dump({"summary": summary, "tasks": tasks}, fh)
+            tmp = args.out + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"summary": summary, "judge_model": judge_model, "tasks": tasks}, fh)
+            os.replace(tmp, args.out)
 
+    def settle():
+        """Give every task whose context has a verdict that verdict."""
+        for t in tasks:
+            if t.get("correct") is None and what(t) in known:
+                t["prediction"], t["correct"] = known[what(t)]
+
+    own = sum(t.get("correct") is None and what(t) in known for t in tasks)
+    if own:
+        logger.info("%d answers already have a verdict in %s", own, args.out)
+        settle()
     save()  # contexts first: a judging failure can then be resumed with --rejudge
     embedder.flush()
-    pending = [t for t in tasks if t.get("correct") is None]
-    logger.info("Judging %d answers with %s (%d workers)", len(pending),
-                getattr(judge, "model", "?"), args.workers)
+
+    for path in (args.reuse.split(",") if args.reuse else []):
+        with open(path.strip(), encoding="utf-8") as fh:
+            earlier = json.load(fh)
+        if (earlier.get("summary") or {}).get("judge_model") != judge_model:
+            sys.exit(f"{path} was judged by another model; it cannot be reused")
+        for t in earlier["tasks"]:
+            if t.get("correct") is not None:
+                known[what(t)] = (t["prediction"], t["correct"])
+    for t in tasks:
+        if t.get("correct") is not None:
+            known[what(t)] = (t["prediction"], t["correct"])
+    distinct = {}
+    for t in tasks:
+        if t.get("correct") is None and what(t) not in known:
+            distinct.setdefault(what(t), t)
+    pending = list(distinct.values())
+    reused = sum(t.get("correct") is None and what(t) in known for t in tasks)
+    logger.info("Judging %d answers with %s (%d workers); %d more reuse an earlier verdict, "
+                "%d share a context with another arm", len(pending),
+                getattr(judge, "model", "?"), args.workers, reused,
+                sum(t.get("correct") is None for t in tasks) - reused - len(pending))
 
     def score(task):
         try:
@@ -528,9 +716,15 @@ def main():
             return None, None
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        for task, (prediction, correct) in zip(pending, pool.map(score, pending)):
-            task["prediction"], task["correct"] = prediction, correct
-    unjudged = sum(t["correct"] is None for t in tasks)
+        for count, (task, (prediction, correct)) in enumerate(
+                zip(pending, pool.map(score, pending)), 1):
+            if correct is not None:
+                known[what(task)] = (prediction, correct)
+            if count % 100 == 0:
+                settle()
+                save()
+    settle()
+    unjudged = sum(t.get("correct") is None for t in tasks)
     if unjudged:
         save()
         sys.exit(f"{unjudged} answers could not be judged; rerun with --rejudge {args.out}")
@@ -548,7 +742,8 @@ def main():
     logger.info("SHIPPED STACK — judged accuracy @ %d-token context, %d questions, judge %s",
                 args.token_budget, n_questions, getattr(judge, "model", "?"))
     types = sorted({k for arm in arms for k in by_type[arm] if k != "all"})
-    logger.info("  %-15s %7s  %s   ctx items/tokens", "arm", "overall",
+    wide = max([15] + [len(a) for a in arms])
+    logger.info("  %-*s %7s  %s   ctx items/tokens", wide, "arm", "overall",
                 "  ".join(f"{t.replace('single-session-', 'ss-')[:14]:>14}" for t in types))
     overall = {}
     for arm in arms:
@@ -556,10 +751,19 @@ def main():
         overall[arm] = c / n if n else 0.0
         cells = "  ".join(f"{(by_type[arm][t][1] / by_type[arm][t][0]) if by_type[arm][t][0] else 0:>14.2f}"
                           for t in types)
-        logger.info("  %-15s %7.3f  %s   %.1f / %.0f", arm, overall[arm], cells,
+        logger.info("  %-*s %7.3f  %s   %.1f / %.0f", wide, arm, overall[arm], cells,
                     stats[arm]["items"] / max(1, n), stats[arm]["tokens"] / max(1, n))
-    logger.info("  %-15s %7s  %s", "(questions)", n_questions,
+    logger.info("  %-*s %7s  %s", wide, "(questions)", n_questions,
                 "  ".join(f"{by_type[arms[0]][t][0]:>14d}" for t in types))
+    sized = [a for a in arms if stats[a]["conversations"]]
+    if sized:
+        logger.info("-" * 96)
+        logger.info("  what each store holds per conversation:")
+        for arm in sized:
+            n = stats[arm]["conversations"]
+            logger.info("  %-*s %6.1f records / %6.0f tokens   (%.1f superseded)", wide, arm,
+                        stats[arm]["records"] / n, stats[arm]["store_tokens"] / n,
+                        stats[arm]["superseded"] / n)
 
     def sign_test(wins, losses):
         """Two-sided exact p-value that wins and losses are equally likely."""
@@ -581,13 +785,14 @@ def main():
         p = sign_test(wins, losses)
         paired[f"{arm} vs {base}"] = {"wins": wins, "losses": losses, "p": round(p, 4),
                                       "delta": round(overall[arm] - overall[base], 4)}
-        logger.info("  %-32s %+.3f   %2d / %2d   p=%.2f", f"{arm} vs {base}",
+        logger.info("  %-*s %+.3f   %2d / %2d   p=%.2f", 2 * wide + 4, f"{arm} vs {base}",
                     overall[arm] - overall[base], wins, losses, p)
     logger.info("=" * 96)
 
     summary = {
         "token_budget": args.token_budget, "pool_k": args.pool_k, "limit": args.limit,
-        "max_records": args.max_records, "questions": n_questions, "arms": arms,
+        "max_records": args.max_records, "user_tokens": args.user_tokens,
+        "rolling_passes": args.rolling_passes, "questions": n_questions, "arms": arms,
         "overall": {a: round(v, 4) for a, v in overall.items()},
         "by_type": {a: {t: [by_type[a][t][1], by_type[a][t][0]] for t in types} for a in arms},
         "paired": paired, "stats": {a: dict(stats[a]) for a in arms},
@@ -598,6 +803,7 @@ def main():
         "verifier_requests": getattr(verifier, "calls", 0) if verifier else 0,
         "gist_model": getattr(summarizer, "model", None) if summarizer else None,
         "gist_calls": getattr(summarizer, "calls", 0) if summarizer else 0,
+        "gists_from_cache": getattr(summarizer, "hits", 0) if summarizer else 0,
         "embedding_cache_misses": embedder.misses,
         "extraction_cache_misses": extraction.misses,
         "extractor_calls": getattr(extraction.instance, "calls", 0),
