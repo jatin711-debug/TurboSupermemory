@@ -1979,3 +1979,45 @@ lexical gates; retraction of a supersession; maintenance reads counted as
 accesses (the new candidate search does it too); the first run of the CI
 workflow and anything on macOS; a real power-cut test; half-precision or
 partial device mirrors; and a measurement of `gpt-4o-mini` as the verifier.
+
+**Follow-up the same day: the first CI run, and `gpt-4o-mini` as the verifier.**
+- *CI.* The workflow's first run (the push of these commits) passed on all
+  four jobs: fmt and clippy, and 294 Rust + 83 SDK tests on each of Ubuntu,
+  Windows and macOS. The macOS runner is Apple Silicon
+  (`aarch64-apple-darwin`), so the NEON kernels and the linker flags in
+  `.cargo/config.toml` have now been built and run, not only linted. This
+  replaces "the workflow file itself has not run" and "not run: ... anything
+  on macOS, and any test on AArch64" above.
+- *`gpt-4o-mini`*, the verifier's default, measured with the owner's go-ahead
+  for the paid calls (267 short requests in all). Same pairs, prompt and
+  settings as above, at the default of 8 pairs per request.
+
+  | setup | layout | dev (56 updates, 62 still true) | test (54 updates, 58 still true) |
+  |---|---|---|---|
+  | `gpt-4o-mini`, 8 pairs per request | own store | 51 / 2 / 0.96 | 49 / 4 / 0.92 |
+  | `gpt-4o-mini`, 8 pairs per request | shared store | 52 / 4 / 0.91 | 50 / 8 / 0.83 |
+  | `gpt-4o-mini`, 1 pair per request | own store | 52 / 1 / 0.98 | not run |
+  | `gpt-4o-mini`, 1 pair per request | shared store | 53 / 3 / 0.93 | not run |
+
+  On the held-out half it retired every update it was shown (49 of 49). The
+  5 it missed had a MiniLM similarity below the 0.45 floor and never reached
+  it. Of the 52 still-true pairs it was shown it retired 4, against 7 for
+  the local model: three dated events ("We refinanced the house in 2020",
+  "We refinanced the house again in 2023"; PyCon in 2022 and in 2024; a
+  BlackBerry in 2009 and a Galaxy S4 in 2013) and a second credit card. In
+  the shared store 5 of the 8 came from another pair's statement: 4 that do
+  conflict within one person (a second job, car, university and flat) and 1
+  error (a water heater replaced in 2025 retiring a 2020 refinancing).
+
+  One pair per request was compared on `dev` only, before the held-out run:
+  1 more update and 1 fewer error for 7.6 times the requests (214 against
+  28). That is within noise for 118 pairs, so the default stayed at 8 and the
+  held-out half was run once, with the default.
+
+  What this changes: with its default model the verified path retires fewer
+  true facts than the unverified detection flags (4 against 8 of 58) while
+  catching three times as many updates (49 against 16). The remaining misses
+  are a candidate problem (the similarity floor, and behind it the embedder),
+  not a judgement problem. Still not measured: answer accuracy on LongMemEval.
+  `belief_pairs_eval.py --verifier llm` now reads the OpenAI key the way the
+  rest of the harness does (environment or the gitignored key file).

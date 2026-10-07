@@ -52,14 +52,13 @@ This file is only the short list of open engineering work, grouped by area.
   graph snapshot are versioned.
 - **A failed insert after the WAL append** (text-index failure) is reported as
   failed although the record is durable.
-- **The CI workflow has never run.** `.github/workflows/ci.yml` (fmt, clippy,
-  the Rust suite and the SDK suite on Linux and Windows, macOS non-blocking)
-  mirrors commands that passed in a Linux container, but the file itself
-  first runs when it is pushed. Expect to fix something on that first run,
-  most likely on macOS: its job and the linker flags in `.cargo/config.toml`
-  are untested. CI has no GPU, datasets or models, so `make gate` and the
-  CUDA tests stay local. AArch64 is only linted, and only for
-  `turbomemory_core` and `turbomemory_graph`.
+- **CI covers less than the local gate.** `.github/workflows/ci.yml` (fmt,
+  clippy, the Rust suite and the SDK suite) passed on its first run on
+  Linux, Windows and macOS on Apple Silicon: 294 Rust and 83 SDK tests on
+  each. It has no GPU, datasets or models, so `make gate` and the CUDA tests
+  stay local. The macOS job is still marked non-blocking; make it required
+  once it has a few green runs. Linux on AArch64 is only linted
+  (`turbomemory_core`, `turbomemory_graph`).
 - Request timeouts, body-size configuration and CORS on the REST server.
 - Metrics and tracing: the optimizer reports failures with `eprintln!`, and
   the Python extension initialises no logger, so the engine's warnings
@@ -117,22 +116,25 @@ are closed.
 Found by the audit, deliberately left as they are because fixing them changes
 recall results:
 
-- **Belief revision still retires facts that are true.** Measured on the
-  held-out half of `belief_pairs.jsonl` (54 updates, 58 pairs that both stay
-  true): the LLM verifier with a local 4.7B model catches 48 to 49 updates
-  (the engine's own detection: 16) but retires 7 to 9 of the 58 still-true
-  facts, no better than before (8 without a verifier, 6 with NLI). Six of
-  them are two things of one kind ("I play the guitar", "I play the piano").
+- **Belief revision still retires some facts that are true.** Measured on
+  the held-out half of `belief_pairs.jsonl` (54 updates, 58 pairs that both
+  stay true, every pair in its own store): the LLM verifier with
+  `gpt-4o-mini` catches 49 updates (the engine's own detection: 16) and
+  retires 4 of the 58 still-true facts (8 are flagged without a verifier; 6
+  are retired with NLI, 7 with a local 4.7B model). Three of the 4 are
+  dated events ("I attended PyCon in 2022", "I attended PyCon in 2024").
   Open, in order of expected value:
-  - measure `gpt-4o-mini` (the verifier's default) on the same pairs. It is
-    the model most users will run and it has not been measured; nothing here
-    made a paid call;
+  - the candidate floor: all 5 held-out misses had a MiniLM similarity below
+    0.45 and were never shown to the model, which retired every update it
+    did see. Lowering `candidate_min_cosine` costs more requests and more
+    chances to be wrong. Tune it on `--split dev` only, and treat the
+    held-out half as seen for this setting: its similarities have been
+    looked at;
   - a judged LongMemEval run with the LLM verifier, since pair-level numbers
     say nothing about answer accuracy;
-  - the candidate floor: 5 of the 6 held-out misses had a MiniLM similarity
-    below 0.45 and were never shown to the model. Lowering
-    `candidate_min_cosine` costs more requests and more chances to be
-    wrong; tune it on `--split dev` only;
+  - dated events in the prompt, and whether one pair per request is worth
+    7 to 8 times the requests (on `dev`: 1 error instead of 2 and 52 updates
+    instead of 51; not run on the held-out half);
   - pairs from real conversations. The 260 are single sentences written for
     the test.
 - **No way to retract a supersession**, and a pair the verifier gives no

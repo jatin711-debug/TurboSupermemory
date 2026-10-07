@@ -35,7 +35,10 @@ The pairs are split in half by position within each category. Tune on
 
     python benchmarks/cognitive_eval/belief_pairs_eval.py --verifier none
     python benchmarks/cognitive_eval/belief_pairs_eval.py --verifier nli --split test
-    # a chat model; any OpenAI-compatible server, here a local Ollama one
+    # a chat model: OpenAI (the key is read from the environment or the
+    # gitignored key file, see _secrets.py) ...
+    python benchmarks/cognitive_eval/belief_pairs_eval.py --verifier llm
+    # ... or any OpenAI-compatible server, here a local Ollama one
     python benchmarks/cognitive_eval/belief_pairs_eval.py --verifier llm \
         --llm-base-url http://localhost:11434/v1 --llm-model qwen3.5:4b
 """
@@ -201,6 +204,14 @@ def main():
         elif args.verifier == "llm":
             from tsm.verification import LLMVerifier
 
+            if not args.llm_base_url:
+                # OpenAI itself: the key comes from the environment or the
+                # gitignored key file, never from the command line.
+                sys.path.insert(0, HERE)
+                from _secrets import ensure_openai_key, key_file_hint
+
+                if not ensure_openai_key():
+                    sys.exit(key_file_hint())
             options = {}
             if args.min_cosine is not None:
                 options["candidate_min_cosine"] = args.min_cosine

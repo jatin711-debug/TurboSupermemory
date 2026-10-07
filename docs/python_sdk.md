@@ -77,15 +77,23 @@ message. `extractor="passthrough"` and `extractor="gliner"` keep writes local.
   |---|---|---|
   | none (ranked lower and flagged) | 16 of 54 | 8 of 58 |
   | `"nli"` (removed) | 16 of 54 | 6 of 58 |
+  | `"llm"` with `gpt-4o-mini`, the default (removed) | 49 to 50 of 54 | 4 to 8 of 58 |
   | `"llm"` with a local 4.7B model, `qwen3.5:4b` (removed) | 48 to 49 of 54 | 7 to 9 of 58 |
 
-  The LLM verifier finds the updates the other two miss. With this small
-  model it does not make fewer mistakes on facts that are still true: the
-  "still true" pairs are built to look like updates ("I play the guitar",
-  "I play the piano"), and it got 6 of those 12 wrong. Its default model,
-  `gpt-4o-mini`, has not been measured on these pairs. Five of its six
-  misses were updates worded so differently that their similarity fell
-  below 0.45 and the model was never asked (`candidate_min_cosine`).
+  In each range the first figure is with every pair in its own store and the
+  second with all pairs in one store, where statements of different pairs
+  collide as well: with `gpt-4o-mini`, 5 of the 8 came from another pair's
+  statement, 4 of them statements that do conflict within one person (a
+  second job, car, university and flat).
+
+  The LLM verifier finds the updates the other two miss. `gpt-4o-mini`
+  retired every update it was shown; the 5 it missed were worded so
+  differently that their similarity fell below 0.45 and it was never asked
+  (`candidate_min_cosine`). The "still true" pairs are built to look like
+  updates, and what it still gets wrong among them is mostly dated events
+  ("I attended PyCon in 2022", "I attended PyCon in 2024"). The small local
+  model also confuses two things of one kind ("I play the guitar", "I play
+  the piano").
 - Compress instead of delete: `Memory(db, max_records=500,
   gist_summarizer=OpenAIGistSummarizer())` (or the model-free
   `ExtractiveGistSummarizer()`, both in `tsm.gist`) folds eviction victims

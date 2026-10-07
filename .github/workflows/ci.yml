@@ -45,7 +45,7 @@ jobs:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     # macOS runners are ARM: the only place the NEON kernels are compiled and
-    # run. That job has never been green or red before, so it reports without
+    # run. That job passed on the workflow's first run; it reports without
     # blocking until it has a track record.
     continue-on-error: ${{ matrix.experimental }}
     strategy:
