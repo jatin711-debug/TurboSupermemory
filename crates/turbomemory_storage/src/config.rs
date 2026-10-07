@@ -383,6 +383,23 @@ pub struct TierConfig {
     /// similar semantic relevance, resolving stale knowledge update conflicts.
     /// Default 0.0 (disabled, pure semantic + graph boost).
     pub temporal_recency_weight: f32,
+    /// Search with the store's vectors kept resident on the GPU (see
+    /// `gpu_exact.rs`). Only has an effect in a build with the `cuda` feature
+    /// on a machine with a usable device; otherwise searches take the CPU
+    /// path as usual. Default true.
+    pub gpu_exact_search: bool,
+    /// The GPU search is used once the store holds at least this many
+    /// records. Below the default (one more than the exact-scan threshold) a
+    /// CPU scan is already as fast as a device round trip.
+    pub gpu_exact_min_records: usize,
+    /// Device memory the resident vectors may use, in MiB. `0` (default)
+    /// means half of the device memory that is free when the first GPU
+    /// search runs. A store that outgrows the budget falls back to the CPU.
+    pub gpu_memory_budget_mb: usize,
+    /// Run the resident-search code path on the host backend. For tests of
+    /// the engine-side logic on machines without a GPU; never faster.
+    #[doc(hidden)]
+    pub gpu_exact_on_cpu_backend: bool,
 }
 
 impl TierConfig {
@@ -482,6 +499,10 @@ impl TierConfig {
         gist_before_evict: false,
         gist_chunk_facts: 24,
         temporal_recency_weight: 0.0,
+        gpu_exact_search: true,
+        gpu_exact_min_records: 4097,
+        gpu_memory_budget_mb: 0,
+        gpu_exact_on_cpu_backend: false,
     };
 
     /// Recommended thresholds for a given vector dimension.

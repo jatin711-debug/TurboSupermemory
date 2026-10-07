@@ -868,7 +868,17 @@ fn deleted_records_do_not_take_result_slots() {
         let batch = engine
             .search_ann_batch(&[&q, &q], 10, None, None, None)
             .unwrap();
-        assert_eq!(batch[0], next);
+        // The same records in the same order. Scores are compared loosely:
+        // on a GPU a batch is one matrix product and a single query another
+        // kernel, and the two round differently in the last bit.
+        let ids = |hits: &[(String, f32)]| -> Vec<String> {
+            hits.iter().map(|(hit, _)| hit.clone()).collect()
+        };
+        assert_eq!(ids(&batch[0]), ids(&next));
+        assert_eq!(ids(&batch[1]), ids(&next));
+        for ((_, a), (_, b)) in batch[0].iter().zip(&next) {
+            assert!((a - b).abs() < 1e-5, "batch scored {a}, single {b}");
+        }
     }
     assert_eq!(engine.record_count(), TIERED - 30);
 }
@@ -1112,3 +1122,267 @@ fn failed_gist_keeps_the_memories_for_the_next_attempt() {
 }
 
 // ------------------------------------------------------ resident GPU search
+
+/// The resident-search path for a store of any size, on whatever backend this
+/// build has: the real device with the `cuda` feature, host emulation of the
+/// same calls without it. Everything stays in the Hot segment so the tests
+/// do not spend their time building indexes the path never reads.
+fn resident_config() -> StoreConfig {
+    let mut cfg = config(1_000_000, 1_000_000);
+    cfg.tier.gpu_exact_on_cpu_backend = true;
+    cfg.tier.gpu_exact_min_records = 0;
+    cfg
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    dot / (na * nb)
+}
+
+/// `hits` are the `top_k` best of `live` (seed, id) for `query`: the scores
+/// match a brute-force ranking position by position, and every hit is a live
+/// record scored as itself. Compared by score so that two records a rounding
+/// error apart may come back in either order.
+fn assert_exact(hits: &[(String, f32)], query: &[f32], live: &[(u64, String)], top_k: usize) {
+    let mut truth: Vec<f32> = live
+        .iter()
+        .map(|(seed, _)| cosine(query, &unit_vec(*seed)))
+        .collect();
+    truth.sort_by(|a, b| b.total_cmp(a));
+    truth.truncate(top_k);
+    assert_eq!(hits.len(), truth.len(), "result count");
+    let mut seen = HashSet::new();
+    for ((hit, score), want) in hits.iter().zip(&truth) {
+        assert!(
+            (score - want).abs() < 1e-4,
+            "{hit} scored {score}, the exact ranking has {want} here"
+        );
+        let (seed, _) = live
+            .iter()
+            .find(|(_, name)| name == hit)
+            .unwrap_or_else(|| panic!("{hit} is not a live record"));
+        assert!((cosine(query, &unit_vec(*seed)) - score).abs() < 1e-4);
+        assert!(seen.insert(hit.as_str()), "{hit} returned twice");
+    }
+}
+
+/// With the vectors resident on the device a search is one product over
+/// every row, so the answer has to be the exact one, and it has to keep being
+/// exact while the store is written to: new records, a reallocation, deletes
+/// and updates (whose old rows stay on the device and are masked).
+#[test]
+fn resident_search_is_exact_and_follows_writes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = StorageEngine::open(tmp.path(), resident_config()).unwrap();
+    let mut live: Vec<(u64, String)> = Vec::new();
+    let queries: Vec<Vec<f32>> = (0..8u64)
+        .map(|i| unit_vec(50_000 + i))
+        // not unit length: scores are cosines all the same
+        .chain([unit_vec(3).iter().map(|x| x * 4.0).collect()])
+        .collect();
+    let check = |live: &[(u64, String)], what: &str| {
+        for q in &queries {
+            let hits = engine.search_ann(q, 10).unwrap();
+            assert_exact(&hits, q, live, 10);
+        }
+        let refs: Vec<&[f32]> = queries.iter().map(|q| q.as_slice()).collect();
+        let batch = engine
+            .search_ann_batch(&refs, 10, None, None, None)
+            .unwrap();
+        for (q, hits) in queries.iter().zip(&batch) {
+            assert_exact(hits, q, live, 10);
+        }
+        let stats = engine.gpu_search_stats().expect(what);
+        assert!(stats.active, "{what}: {stats:?}");
+        assert!(stats.rows >= live.len(), "{what}: {stats:?}");
+    };
+
+    // The first search uploads everything.
+    fill(&engine, 0..1_500);
+    live.extend((0..1_500).map(|i| (i as u64, id(i))));
+    check(&live, "first upload");
+
+    // Later searches upload only what was added; 9,000 records outgrow the
+    // first allocation.
+    fill(&engine, 1_500..9_000);
+    live.extend((1_500..9_000).map(|i| (i as u64, id(i))));
+    check(&live, "after growing");
+
+    // Delete the ten best matches of the first query: the next ten take
+    // their place.
+    for (hit, _) in engine.search_ann(&queries[0], 10).unwrap() {
+        assert!(engine.delete_by_id(&hit).unwrap());
+        live.retain(|(_, name)| *name != hit);
+    }
+    check(&live, "after deletes");
+
+    // An update moves the record to a new row; the old one must not answer.
+    assert!(engine
+        .update(&id(7), "moved", &unit_vec(70_000), 0.5, &[])
+        .unwrap());
+    live.retain(|(_, name)| *name != id(7));
+    live.push((70_000, id(7)));
+    check(&live, "after an update");
+    let moved = engine.search_ann(&unit_vec(70_000), 1).unwrap();
+    assert_eq!(moved[0].0, id(7));
+    let old = engine.search_ann(&unit_vec(7), 1).unwrap();
+    assert!(old[0].1 < 0.999, "the replaced vector still answers");
+}
+
+/// Scope and payload filters bound the resident search exactly as they bound
+/// the CPU paths: the device scores every row, the host keeps only what the
+/// caller may see.
+#[test]
+fn resident_search_honours_scope_and_filter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = StorageEngine::open(tmp.path(), resident_config()).unwrap();
+    for i in 0..600usize {
+        let owner = if i % 3 == 0 { "alice" } else { "bob" };
+        insert_scoped(&engine, &id(i), "note", i as u64, owner);
+    }
+    let alice: Vec<(u64, String)> = (0..600)
+        .filter(|i| i % 3 == 0)
+        .map(|i| (i as u64, id(i)))
+        .collect();
+    let filter = Filter::Eq {
+        field: "owner".into(),
+        value: serde_json::json!("alice"),
+    };
+    // Queries that sit exactly on records of bob: the best match is his.
+    let queries: Vec<Vec<f32>> = [1u64, 2, 4, 5, 7].iter().map(|i| unit_vec(*i)).collect();
+    let refs: Vec<&[f32]> = queries.iter().map(|q| q.as_slice()).collect();
+    for q in &queries {
+        let scoped = engine
+            .search_ann_scoped(q, 10, None, Some("alice"))
+            .unwrap();
+        assert_exact(&scoped, q, &alice, 10);
+        let filtered = engine
+            .search_ann_candidates_filtered(q, 10, Some(&filter))
+            .unwrap();
+        assert_exact(&filtered, q, &alice, 10);
+    }
+    let batch = engine
+        .search_ann_batch(&refs, 10, None, Some(&filter), Some("alice"))
+        .unwrap();
+    assert_eq!(batch.len(), queries.len());
+    for (hits, q) in batch.iter().zip(&queries) {
+        assert_exact(hits, q, &alice, 10);
+    }
+    // A scope nobody wrote to matches nothing, and asking for more than the
+    // scope holds returns all of it.
+    assert!(engine
+        .search_ann_scoped(&queries[0], 10, None, Some("carol"))
+        .unwrap()
+        .is_empty());
+    let all = engine
+        .search_ann_scoped(&queries[0], 10_000, None, Some("alice"))
+        .unwrap();
+    assert_eq!(all.len(), alice.len());
+    assert!(engine.gpu_search_stats().unwrap().active);
+}
+
+/// A store that outgrows the device memory it was given stops using the
+/// device and keeps answering from the CPU.
+#[test]
+fn resident_search_falls_back_when_the_store_outgrows_its_budget() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = resident_config();
+    cfg.tier.gpu_memory_budget_mb = 1; // 16,384 rows of 16 floats
+    let engine = StorageEngine::open(tmp.path(), cfg).unwrap();
+    fill(&engine, 0..5_000);
+    assert_all_findable(&engine, 0..5_000);
+    let stats = engine.gpu_search_stats().unwrap();
+    assert!(stats.active && stats.rows == 5_000, "{stats:?}");
+    assert!(stats.memory_bytes <= stats.budget_bytes, "{stats:?}");
+
+    fill(&engine, 5_000..16_500);
+    assert_all_findable(&engine, 0..16_500);
+    let stats = engine.gpu_search_stats().unwrap();
+    assert!(!stats.active, "over budget but still active: {stats:?}");
+    assert_eq!(stats.memory_bytes, 0, "the device memory was not released");
+    // ... and stays off; searches are simply CPU searches now.
+    assert_all_findable(&engine, 16_000..16_500);
+    assert!(!engine.gpu_search_stats().unwrap().active);
+}
+
+/// Searches share one device mirror while writers keep extending the store.
+#[test]
+fn resident_search_runs_alongside_writers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = StorageEngine::open(tmp.path(), resident_config()).unwrap();
+    fill(&engine, 0..3_000);
+
+    let failures = Arc::new(AtomicUsize::new(0));
+    let failed = failures.clone();
+    finishes_within(180, move || {
+        std::thread::scope(|scope| {
+            for t in 0..6u64 {
+                let engine = &engine;
+                let failed = &failed;
+                scope.spawn(move || {
+                    for i in 0..300u64 {
+                        // A record written before the threads started is
+                        // always its own best match.
+                        let target = (t * 499 + i * 7) % 3_000;
+                        let q = unit_vec(target);
+                        let ok = if i % 5 == 0 {
+                            engine
+                                .search_ann_batch(
+                                    &[q.as_slice(), q.as_slice()],
+                                    5,
+                                    None,
+                                    None,
+                                    None,
+                                )
+                                .is_ok_and(|both| {
+                                    both.iter().all(|hits| hits[0].0 == id(target as usize))
+                                })
+                        } else {
+                            engine
+                                .search_ann(&q, 5)
+                                .is_ok_and(|hits| hits[0].0 == id(target as usize))
+                        };
+                        if !ok {
+                            failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+            for w in 0..2usize {
+                let engine = &engine;
+                let failed = &failed;
+                scope.spawn(move || {
+                    for i in 0..3_000usize {
+                        let n = 100_000 + w * 10_000 + i;
+                        if engine
+                            .insert(
+                                &id(n),
+                                "written during search",
+                                &unit_vec(n as u64),
+                                0.5,
+                                &[],
+                            )
+                            .is_err()
+                        {
+                            failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(engine.record_count(), 9_000);
+        // Everything written while the searches ran is on the device now.
+        assert_all_findable(&engine, 100_000..103_000);
+        assert_all_findable(&engine, 110_000..113_000);
+        let stats = engine.gpu_search_stats().unwrap();
+        assert!(stats.active && stats.rows == 9_000, "{stats:?}");
+        // Every search above went through the mirror: 240 single queries and
+        // 60 two-query batches per thread. Searches that queued behind one
+        // another shared a device call.
+        assert!(stats.queries >= 6 * (240 + 120), "{stats:?}");
+        assert!(stats.device_calls <= stats.queries, "{stats:?}");
+    });
+    assert_eq!(failures.load(Ordering::Relaxed), 0);
+}

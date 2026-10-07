@@ -86,6 +86,13 @@ This property reflects the runtime state of the GPU backend:
 - **Runtime**: A CUDA-capable device must be available and successfully initialized.
 - **Fallback**: If either condition is not met, all operations transparently use CPU paths.
 
+`engine.gpu_search_stats()` reports on the GPU search itself: `None` until a
+search has used it, then a dict with `active`, `rows`, `capacity_rows`,
+`budget_bytes`, `memory_bytes`, `queries` and `device_calls`. Constructor
+keywords: `gpu_exact_search` (default `True`), `gpu_exact_min_records`
+(default 4,097) and `gpu_memory_budget_mb` (default 0: half of the free
+device memory).
+
 ### 1.5 Batch Search API (GPU-Ready)
 
 The Python bindings support batch matrix search, which is the ideal shape for GPU acceleration:
@@ -103,12 +110,12 @@ results = engine.search_ann_batch(queries, top_k=10)
 # results is a list of list of (id, score) tuples
 ```
 
-Batch search releases the GIL and dispatches to the Rust engine, which can use GPU batched distance compute when available. Single-query search (`search_ann`) always runs on the CPU (GPU upload overhead dominates for single queries).
+Batch search releases the GIL and dispatches to the Rust engine.
 
-**GPU Acceleration Details:**
-- **Index Build**: on the CPU, with `usearch`. The GPU is not used to build or search indexes.
-- **Candidate Rerank**: when CUDA is enabled and a batch has at least 256 candidates in total, the batch rerank is a single cuBLAS `sgemm` call (M queries × N candidates). Queries are scaled to unit length first, so the scores are the same cosines the CPU path returns. On the one card it has been measured on (RTX 3050 4 GB) this was no faster than the CPU rerank; see [GPU acceleration](gpu_acceleration.md).
-- **Search Path**: per-query HNSW traversal stays on the CPU.
+**GPU Acceleration Details** (CUDA build, store above 4,096 records):
+- **Search Path**: the store's vectors are resident in device memory, and both `search_ann` and `search_ann_batch` are one cuBLAS product over all of them: exact results, no index traversal. A batch is a single `sgemm`; concurrent single queries are grouped into one as well. On an RTX 3050 (4 GB) with 100,000 × 384-d vectors: 1.35–1.55 ms per single query and 0.34–0.39 ms per query in a batch of 32, against 5.9–7.5 ms on the CPU path. See [GPU acceleration](gpu_acceleration.md).
+- **Fallback**: a store that does not fit the device memory budget, or any device error, moves searches back to the CPU path; a batch then reranks its candidates with one `sgemm`.
+- **Index Build**: on the CPU, with `usearch`. The GPU is not used to build indexes.
 
 **Testing:** The `test_batch_search.py` script validates that `search_ann_batch` produces identical results to individual `search_ann` calls, including after segment consolidation.
 

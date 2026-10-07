@@ -329,6 +329,18 @@ impl VectorReadView<'_> {
         mmap.get(start..end).map(bytemuck::cast_slice)
     }
 
+    /// The vectors at offsets `start..end` as one contiguous slice (row-major,
+    /// `dimension()` floats each), or `None` if the range is not populated.
+    pub fn rows(&self, start: usize, end: usize) -> Option<&[f32]> {
+        if start > end || end > self.inner.count {
+            return None;
+        }
+        let mmap = self.inner.mmap.as_ref()?;
+        let row = self.inner.dim * 4;
+        mmap.get(HEADER_SIZE + start * row..HEADER_SIZE + end * row)
+            .map(bytemuck::cast_slice)
+    }
+
     /// Return the number of populated slots in this view.
     pub fn count(&self) -> usize {
         self.inner.count

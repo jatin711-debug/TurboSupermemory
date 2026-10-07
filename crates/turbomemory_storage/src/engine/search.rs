@@ -14,6 +14,18 @@ use turbomemory_core::{cosine_similarity, validate_query};
 /// a lightly-configured HNSW index.
 const EXACT_FALLBACK_THRESHOLD: usize = 4096;
 
+/// `query` scaled to unit length (all zeros if it has no direction). The GPU
+/// scan computes dot products against unit-length rows, so a unit query makes
+/// those the cosines the CPU paths return.
+fn unit_length(query: &[f32]) -> Vec<f32> {
+    let norm = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm.is_normal() {
+        query.iter().map(|x| x / norm).collect()
+    } else {
+        vec![0.0; query.len()]
+    }
+}
+
 /// Exact-search order: best score first, the older record first on a tie, so
 /// equal scores always come back in the same order.
 fn best_first(a: &(PointOffset, f32), b: &(PointOffset, f32)) -> std::cmp::Ordering {
@@ -187,6 +199,19 @@ impl StorageEngine {
         if top_k == 0 {
             return Ok(Vec::new());
         }
+        // Vectors resident on the GPU: the exact answer from one device
+        // product, in place of the approximate tiered search below.
+        if records >= self.config.tier.gpu_exact_min_records {
+            if let Some(gpu) = self.gpu_exact() {
+                if let Some(scores) = gpu.scores(&self.vectors, &unit_length(query)) {
+                    return Ok(self.finish_exact(
+                        |want| self.top_of_scores(&scores, allowed, want),
+                        top_k,
+                        exclusion,
+                    ));
+                }
+            }
+        }
         if records <= EXACT_FALLBACK_THRESHOLD {
             let scored = self.exact_candidates(query, allowed);
             return Ok(self.finish_exact(
@@ -251,10 +276,12 @@ impl StorageEngine {
         }
     }
 
-    /// Batched ANN search for M queries. Runs each query's HNSW traversal on
-    /// CPU, then reranks all queries' candidate lists in a single GPU `gemm`
-    /// when CUDA is available (`search_gpu_batch`). Returns one result list
-    /// per query, each sorted by score desc and truncated to `top_k`.
+    /// Batched search for M queries. With the vectors resident on the GPU the
+    /// whole batch is one device matrix product (exact). Otherwise each
+    /// query's HNSW traversal runs on the CPU and, when CUDA is available,
+    /// the candidates of all queries are reranked in one `gemm`
+    /// (`search_gpu_batch`). Returns one result list per query, each sorted
+    /// by score desc and truncated to `top_k`.
     ///
     /// Filter and scope apply identically to every query in the batch.
     pub fn search_ann_batch(
@@ -277,6 +304,23 @@ impl StorageEngine {
         let top_k = top_k.min(records);
         if top_k == 0 {
             return Ok(vec![Vec::new(); m]);
+        }
+
+        if records >= self.config.tier.gpu_exact_min_records {
+            if let Some(gpu) = self.gpu_exact() {
+                let exclusion = self.superseded_exclusion_set();
+                let units: Vec<Vec<f32>> = queries.iter().map(|q| unit_length(q)).collect();
+                let results = gpu.scores_batch(&self.vectors, &units, |scores| {
+                    self.finish_exact(
+                        |want| self.top_of_scores(scores, allowed.as_ref(), want),
+                        top_k,
+                        exclusion.as_ref(),
+                    )
+                });
+                if let Some(results) = results {
+                    return Ok(results);
+                }
+            }
         }
 
         // Small collection: an exact scan per query (cheap), which is also
@@ -346,6 +390,44 @@ impl StorageEngine {
             None => live.iter().for_each(&mut score),
         }
         scored
+    }
+
+    /// The best `want` live records out of the scores the GPU computed for
+    /// every vector (`scores[i]` belongs to offset `i`). Deleted records and
+    /// anything outside `allowed` are masked here, on the host.
+    fn top_of_scores(
+        &self,
+        scores: &[f32],
+        allowed: Option<&RoaringBitmap>,
+        want: usize,
+    ) -> Vec<(PointOffset, f32)> {
+        let index = self.payload_index.read();
+        let live = index.all_offsets();
+        let is_live = |offset: PointOffset| live.contains(offset as u32);
+        match allowed {
+            // `Some` always filters, even when empty: a filter/scope that
+            // resolves to zero offsets must match NOTHING. A record inserted
+            // after the scores were computed has no score yet; it is simply
+            // not a candidate for this query.
+            Some(bitmap) => top_of(
+                bitmap.iter().filter_map(|offset| {
+                    scores
+                        .get(offset as usize)
+                        .map(|score| (offset as PointOffset, score.clamp(-1.0, 1.0)))
+                }),
+                want,
+                is_live,
+            ),
+            // Unrestricted: a straight pass over the score row.
+            None => top_of(
+                scores
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, score)| (offset as PointOffset, score.clamp(-1.0, 1.0))),
+                want,
+                is_live,
+            ),
+        }
     }
 
     /// Turn the head of an exact ranking into the `top_k` results, as

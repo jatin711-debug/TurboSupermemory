@@ -160,7 +160,7 @@ stateDiagram-v2
 
 ## 6. GPU Acceleration in Storage Engine
 
-The engine holds a lazily initialised `GpuBackend` (`gpu: Arc<Mutex<Option<Arc<dyn GpuBackend>>>>`). It is used in exactly one place: `search_ann_batch` on a store above the exact-scan threshold reranks the candidates of all its queries with one cuBLAS `gemm` (`SegmentSnapshot::search_gpu_batch`), falling back to the CPU rerank on any CUDA error. Segment builds, segment searches, and single-query reranks do not touch the GPU.
+The engine holds a lazily initialised `GpuBackend` (`gpu: Arc<Mutex<Option<Arc<dyn GpuBackend>>>>`). With a usable device it serves vector search directly: the store's vectors are mirrored in device memory (`gpu_exact.rs`), kept current by uploading the tail written since the last search, and a search is one cuBLAS product over every row, exact, with deleted and filtered rows masked on the host. When the mirror is off (no device, a store larger than the memory budget, a device error) searches use the segments, and `search_ann_batch` reranks the candidates of all its queries with one `gemm` (`SegmentSnapshot::search_gpu_batch`). Segment builds and segment searches do not touch the GPU, and segments are built in a CUDA build as well, since they are the fallback.
 
 Details and measurements: [GPU acceleration](gpu_acceleration.md).
 

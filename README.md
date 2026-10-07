@@ -219,7 +219,7 @@ The server flushes the store every `TURBO_FLUSH_INTERVAL_SECS` seconds (default 
 | `turbomemory_core` | `crates/turbomemory_core` | Vector math, SIMD FWHT, Lloyd-Max quantizers, MaxSim scoring. |
 | `turbomemory_graph` | `crates/turbomemory_graph` | BM25, PMI concept extraction, spreading activation, ACT-R decay, belief revision. |
 | `turbomemory_storage` | `crates/turbomemory_storage` | 3-Tier StorageEngine, lock-free `ArcSwap` snapshots, WAL, mmap segments. |
-| `turbomemory_gpu` | `crates/turbomemory_gpu` | Optional CUDA backend (cuBLAS batched rerank for batch search) with transparent CPU fallback. |
+| `turbomemory_gpu` | `crates/turbomemory_gpu` | Optional CUDA backend (exact search over device-resident vectors via cuBLAS) with transparent CPU fallback. |
 | `turbomemory_python` | `crates/turbomemory_python` | PyO3 C-extension facade with zero-copy NumPy bindings. |
 | `turbomemory_api` | `crates/turbomemory_api` | High-throughput gRPC (Tonic) and REST (Axum) server. |
 | `tsm` (Python) | `tsm/` | The SDK: `Memory` facade, budget recall, gist summarizers, pluggable embedder / extractor / verifier / reranker. |
@@ -232,10 +232,19 @@ The server flushes the store every `TURBO_FLUSH_INTERVAL_SECS` seconds (default 
 
 Two separate things use the GPU:
 
-* **The ColBERT reranker** in the SDK (`reranker="colbert"`) runs on CUDA through PyTorch. It needs no special build.
-* **The engine's `cuda` cargo feature** (`make build-python FEATURES=cuda`) moves one step to the GPU: the full-precision rerank of a *batch* search (`search_ann_batch`) becomes a single cuBLAS `gemm`. Index construction, index traversal, the quantized scans and single-query search always run on the CPU, and any CUDA error falls back to the CPU.
+* **The SDK's models** (local embedder, GLiNER extractor, NLI verifier, ColBERT reranker) run on CUDA through PyTorch when it is available. They need no special build.
+* **The engine's `cuda` cargo feature** (`make build-python FEATURES=cuda`) moves vector search to the GPU. The store's vectors are kept in device memory and a search is one cuBLAS product over all of them, so the result is **exact** (no index, recall 1.0). Searches that arrive together share one device call. It is used once a store holds more than 4,096 records and fits the device memory budget; a store that outgrows the budget, or any CUDA error, falls back to the CPU path.
 
-Measured on an RTX 3050 (4 GB), the CUDA build returns the same results as the CPU build and is not faster at anything tested; the numbers and the method are in [`docs/gpu_acceleration.md`](./docs/gpu_acceleration.md). Build with it if you want to experiment on a larger card, not for a speedup on a small one.
+Measured on an RTX 3050 Laptop (4 GB) against the CPU build on the same store files:
+
+| Store | Path | One query | Batch of 32, per query | 8 threads |
+| :--- | :--- | :--- | :--- | :--- |
+| 100,000 × 384-d | CPU | 5.9–7.5 ms | 6.0–9.2 ms | 128–174 /s |
+| | CUDA | **1.35–1.55 ms** | **0.34–0.39 ms** | **1,436–1,754 /s** |
+| 100,000 × 768-d | CPU | 13.2–15.8 ms | 13.6–15.8 ms | 69–71 /s |
+| | CUDA | **2.3–2.4 ms** | **0.34–0.39 ms** | **1,088–1,190 /s** |
+
+Single-query time on the GPU grows linearly with the store, and nothing above 100,000 records was measured. The method, the 20,000-record numbers, the limits and the options (`gpu_exact_search`, `gpu_memory_budget_mb`, `gpu_search_stats()`) are in [`docs/gpu_acceleration.md`](./docs/gpu_acceleration.md).
 
 ---
 

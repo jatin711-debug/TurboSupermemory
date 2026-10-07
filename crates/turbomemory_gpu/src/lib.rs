@@ -1,16 +1,23 @@
 //! GPU acceleration crate for TurboSuperMemory.
 //!
 //! Provides optional CUDA-backed kernels:
-//! - Batched distance computation (cuBLAS `gemv` / `gemm`). The storage
-//!   engine uses the `gemm` form to rerank the candidates of a whole batch
-//!   of queries in one call; that is the only GPU path the engine calls.
+//! - **Resident exact search** ([`ResidentMatrix`]): a store's full-precision
+//!   vectors are kept on the device, so a query is one small upload, one
+//!   cuBLAS `gemv` over every vector, and one download of the scores (a
+//!   batch of queries is one `gemm`). Nothing is re-uploaded per query,
+//!   which is what made the earlier per-query rerank slower than the CPU.
+//!   This is the path the storage engine uses for search.
+//! - Batched distance computation over a one-off upload (cuBLAS `gemv` /
+//!   `gemm`), used to rerank a batch's candidates when the resident index is
+//!   not active.
 //! - An 8-bit scalar quantized scan and a CSR spreading-activation step
 //!   (NVRTC kernels). These are tested here but not wired into the engine.
 //!
-//! There is no GPU index build and no GPU index search: HNSW construction
-//! and traversal are done on the CPU by usearch. (An earlier brute-force
-//! "GPU HNSW build" produced a graph nothing searched, at about twice the
-//! build time; it was removed.)
+//! There is no GPU graph index: the resident search is an exact scan, and
+//! HNSW construction and traversal stay on the CPU (usearch) as the path for
+//! stores that do not fit on the device. (An earlier brute-force "GPU HNSW
+//! build" produced a graph nothing searched, at about twice the build time;
+//! it was removed.)
 //!
 //! Every GPU path falls back to the CPU if CUDA is not available, GPU memory
 //! is insufficient, or any CUDA error occurs.
@@ -124,6 +131,104 @@ pub trait GpuBackend: Send + Sync {
         decay: f32,
         hops: usize,
     ) -> Result<Vec<f32>>;
+
+    /// Allocate a resident matrix with room for `capacity_rows` vectors of
+    /// `dim` components. It starts with zero rows.
+    fn resident_create(&self, dim: usize, capacity_rows: usize) -> Result<ResidentMatrix>;
+
+    /// Append rows (flat, row-major, `rows.len()` a multiple of the matrix
+    /// dimension) after the rows already present. Fails with
+    /// [`GpuError::InvalidArgument`] if they do not fit the capacity.
+    fn resident_append(&self, matrix: &mut ResidentMatrix, rows: &[f32]) -> Result<()>;
+
+    /// Dot product of `query` with every row: one score per row, in row
+    /// order. For unit-length rows and a unit-length query this is the
+    /// cosine similarity.
+    fn resident_scores(&self, matrix: &mut ResidentMatrix, query: &[f32]) -> Result<Vec<f32>>;
+
+    /// Dot products of `count` queries (flat, row-major) with every row.
+    /// Returns `count * rows` scores, one contiguous block per query:
+    /// `scores[q * rows + r]` is query `q` against row `r`.
+    fn resident_scores_batch(
+        &self,
+        matrix: &mut ResidentMatrix,
+        queries: &[f32],
+        count: usize,
+    ) -> Result<Vec<f32>>;
+
+    /// Free a resident matrix and give its memory back to the system.
+    /// Dropping the matrix frees it as well, but a device allocator may keep
+    /// freed memory reserved for this process until its next operation, which
+    /// never comes once the last engine is closed.
+    fn resident_release(&self, matrix: ResidentMatrix) {
+        drop(matrix);
+    }
+}
+
+/// A matrix of row vectors that lives on the backend's device for as long as
+/// the value does (on the host for [`CpuFallback`](init_backend)).
+///
+/// Rows are append-only and addressed by their position, so a caller that
+/// appends its vectors in storage order can use the row index as the record
+/// offset.
+pub struct ResidentMatrix {
+    dim: usize,
+    rows: usize,
+    capacity: usize,
+    inner: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl ResidentMatrix {
+    /// Rows currently stored.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+    /// Rows that fit without reallocating.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+    /// Device memory held by the matrix itself, in bytes.
+    pub fn memory_bytes(&self) -> usize {
+        self.capacity * self.dim * std::mem::size_of::<f32>()
+    }
+
+    /// Check an append against the matrix shape; returns the row count added.
+    fn check_append(&self, rows: &[f32]) -> Result<usize> {
+        if !rows.len().is_multiple_of(self.dim) {
+            return Err(GpuError::InvalidArgument(format!(
+                "appended data length {} is not a multiple of dim {}",
+                rows.len(),
+                self.dim
+            )));
+        }
+        let added = rows.len() / self.dim;
+        if self.rows + added > self.capacity {
+            return Err(GpuError::InvalidArgument(format!(
+                "resident matrix is full: {} rows + {added} exceeds capacity {}",
+                self.rows, self.capacity
+            )));
+        }
+        Ok(added)
+    }
+}
+
+fn validate_resident_shape(dim: usize, capacity_rows: usize) -> Result<usize> {
+    if dim == 0 || capacity_rows == 0 {
+        return Err(GpuError::InvalidArgument(
+            "resident matrix needs dim > 0 and capacity > 0".into(),
+        ));
+    }
+    // cuBLAS takes 32-bit dimensions.
+    if dim > i32::MAX as usize || capacity_rows > i32::MAX as usize {
+        return Err(GpuError::InvalidArgument(
+            "resident matrix dimensions exceed 32 bits".into(),
+        ));
+    }
+    dim.checked_mul(capacity_rows)
+        .ok_or_else(|| GpuError::InvalidArgument("resident matrix size overflows".into()))
 }
 
 /// Handle to a GPU device buffer (opaque — backend-specific).
@@ -396,6 +501,53 @@ mod cpu {
             }
             Ok(current)
         }
+
+        fn resident_create(&self, dim: usize, capacity_rows: usize) -> Result<ResidentMatrix> {
+            let len = validate_resident_shape(dim, capacity_rows)?;
+            Ok(ResidentMatrix {
+                dim,
+                rows: 0,
+                capacity: capacity_rows,
+                inner: Box::new(Vec::<f32>::with_capacity(len)),
+            })
+        }
+
+        fn resident_append(&self, matrix: &mut ResidentMatrix, rows: &[f32]) -> Result<()> {
+            let added = matrix.check_append(rows)?;
+            let data = matrix
+                .inner
+                .downcast_mut::<Vec<f32>>()
+                .ok_or_else(|| GpuError::InvalidArgument("CPU resident matrix mismatch".into()))?;
+            data.extend_from_slice(rows);
+            matrix.rows += added;
+            Ok(())
+        }
+
+        fn resident_scores(&self, matrix: &mut ResidentMatrix, query: &[f32]) -> Result<Vec<f32>> {
+            validate_queries(query, 1, matrix.dim)?;
+            let data = matrix
+                .inner
+                .downcast_ref::<Vec<f32>>()
+                .ok_or_else(|| GpuError::InvalidArgument("CPU resident matrix mismatch".into()))?;
+            Ok(data
+                .chunks_exact(matrix.dim)
+                .map(|row| dot_product(query, row))
+                .collect())
+        }
+
+        fn resident_scores_batch(
+            &self,
+            matrix: &mut ResidentMatrix,
+            queries: &[f32],
+            count: usize,
+        ) -> Result<Vec<f32>> {
+            validate_queries(queries, count, matrix.dim)?;
+            let mut out = Vec::with_capacity(count * matrix.rows);
+            for query in queries.chunks_exact(matrix.dim) {
+                out.extend(self.resident_scores(matrix, query)?);
+            }
+            Ok(out)
+        }
     }
 }
 
@@ -466,7 +618,6 @@ extern "C" __global__ void spreading_activation_csr_kernel(
 
     /// CUDA GPU backend using cudarc.
     pub struct CudaBackend {
-        #[allow(dead_code)]
         ctx: Arc<CudaContext>,
         stream: Arc<cudarc::driver::CudaStream>,
         total_mem: usize,
@@ -555,8 +706,11 @@ extern "C" __global__ void spreading_activation_csr_kernel(
         }
 
         fn available_memory(&self) -> usize {
-            // cudarc doesn't expose free memory directly; use total as conservative estimate
-            self.total_mem
+            // Free device memory right now; other processes share the card.
+            self.ctx
+                .mem_get_info()
+                .map(|(free, _total)| free)
+                .unwrap_or(self.total_mem)
         }
 
         fn upload_vectors(&self, vectors: &[f32], dim: usize) -> Result<DeviceBuffer> {
@@ -907,6 +1061,193 @@ extern "C" __global__ void spreading_activation_csr_kernel(
                 GpuError::KernelError(format!("Failed to download activation energies: {e}"))
             })
         }
+
+        fn resident_create(&self, dim: usize, capacity_rows: usize) -> Result<ResidentMatrix> {
+            let len = validate_resident_shape(dim, capacity_rows)?;
+            let bytes = (len + dim + capacity_rows) * std::mem::size_of::<f32>();
+            self.check_memory(bytes)?;
+            let oom = |_e: DriverError| GpuError::OutOfMemory {
+                need_mb: bytes / (1024 * 1024),
+                have_mb: self.available_memory() / (1024 * 1024),
+            };
+            // The matrix is left uninitialised: only rows that were appended
+            // are ever read (`gemv`/`gemm` are told the row count).
+            let data: CudaSlice<f32> = unsafe { self.stream.alloc(len) }.map_err(oom)?;
+            let query: CudaSlice<f32> = self.stream.alloc_zeros(dim).map_err(oom)?;
+            let scores: CudaSlice<f32> = self.stream.alloc_zeros(capacity_rows).map_err(oom)?;
+            Ok(ResidentMatrix {
+                dim,
+                rows: 0,
+                capacity: capacity_rows,
+                inner: Box::new(CudaResident {
+                    data,
+                    query,
+                    scores,
+                }),
+            })
+        }
+
+        fn resident_release(&self, matrix: ResidentMatrix) {
+            drop(matrix);
+            // Frees are ordered on the stream and land in the device's
+            // memory pool. The pool returns memory to the system when the
+            // stream is synchronized; trim it as well in case it holds more.
+            let released = self.stream.synchronize().and_then(|()| unsafe {
+                let pool =
+                    cudarc::driver::result::device::get_default_mem_pool(self.ctx.cu_device())?;
+                cudarc::driver::result::mem_pool::trim_to(pool, 0)
+            });
+            if let Err(e) = released {
+                log::debug!("device memory not returned to the system yet: {e}");
+            }
+        }
+
+        fn resident_append(&self, matrix: &mut ResidentMatrix, rows: &[f32]) -> Result<()> {
+            let added = matrix.check_append(rows)?;
+            if added == 0 {
+                return Ok(());
+            }
+            let start = matrix.rows * matrix.dim;
+            let resident = cuda_resident(&mut matrix.inner)?;
+            let mut tail = resident.data.slice_mut(start..start + rows.len());
+            self.stream
+                .memcpy_htod(rows, &mut tail)
+                .map_err(|e| GpuError::KernelError(format!("Failed to upload rows: {e}")))?;
+            matrix.rows += added;
+            Ok(())
+        }
+
+        fn resident_scores(&self, matrix: &mut ResidentMatrix, query: &[f32]) -> Result<Vec<f32>> {
+            validate_queries(query, 1, matrix.dim)?;
+            let (rows, dim) = (matrix.rows, matrix.dim);
+            if rows == 0 {
+                return Ok(Vec::new());
+            }
+            let resident = cuda_resident(&mut matrix.inner)?;
+            self.stream
+                .memcpy_htod(query, &mut resident.query)
+                .map_err(|e| GpuError::KernelError(format!("Failed to upload query: {e}")))?;
+            {
+                let cublas_guard = self.cublas()?;
+                let cublas = cublas_guard
+                    .as_ref()
+                    .ok_or_else(|| GpuError::CudaNotAvailable("cuBLAS not initialized".into()))?;
+                // The row-major rows x dim buffer is a column-major dim x rows
+                // matrix A; scores = A^T * query has one entry per row.
+                let mut out = resident.scores.slice_mut(0..rows);
+                unsafe {
+                    cublas
+                        .gemv(
+                            GemvConfig {
+                                trans: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T,
+                                m: dim as i32,
+                                n: rows as i32,
+                                alpha: 1.0f32,
+                                lda: dim as i32,
+                                incx: 1,
+                                beta: 0.0f32,
+                                incy: 1,
+                            },
+                            &resident.data,
+                            &resident.query,
+                            &mut out,
+                        )
+                        .map_err(|e| GpuError::KernelError(format!("cuBLAS gemv failed: {e}")))?;
+                }
+            }
+            let mut scores = vec![0.0f32; rows];
+            self.stream
+                .memcpy_dtoh(&resident.scores.slice(0..rows), &mut scores)
+                .map_err(|e| GpuError::KernelError(format!("Failed to download scores: {e}")))?;
+            self.stream
+                .synchronize()
+                .map_err(|e| GpuError::KernelError(format!("stream synchronize failed: {e}")))?;
+            Ok(scores)
+        }
+
+        fn resident_scores_batch(
+            &self,
+            matrix: &mut ResidentMatrix,
+            queries: &[f32],
+            count: usize,
+        ) -> Result<Vec<f32>> {
+            validate_queries(queries, count, matrix.dim)?;
+            let (rows, dim) = (matrix.rows, matrix.dim);
+            if rows == 0 || count == 0 {
+                return Ok(Vec::new());
+            }
+            if count > i32::MAX as usize {
+                return Err(GpuError::InvalidArgument("too many queries".into()));
+            }
+            let resident = cuda_resident(&mut matrix.inner)?;
+            let queries_dev: CudaSlice<f32> = self.stream.clone_htod(queries).map_err(|e| {
+                GpuError::KernelError(format!("Failed to upload query matrix: {e}"))
+            })?;
+            let mut scores_dev: CudaSlice<f32> =
+                self.stream.alloc_zeros(rows * count).map_err(|e| {
+                    GpuError::KernelError(format!("Failed to allocate scores matrix: {e}"))
+                })?;
+            {
+                let cublas_guard = self.cublas()?;
+                let cublas = cublas_guard
+                    .as_ref()
+                    .ok_or_else(|| GpuError::CudaNotAvailable("cuBLAS not initialized".into()))?;
+                // C (rows x count) = V^T (rows x dim) * Q (dim x count), with V
+                // the column-major dim x rows resident matrix and Q the
+                // column-major dim x count query matrix. Column q of C is
+                // query q against every row, i.e. one contiguous block each.
+                unsafe {
+                    cublas
+                        .gemm(
+                            GemmConfig {
+                                transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T,
+                                transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+                                m: rows as i32,
+                                n: count as i32,
+                                k: dim as i32,
+                                alpha: 1.0f32,
+                                lda: dim as i32,
+                                ldb: dim as i32,
+                                beta: 0.0f32,
+                                ldc: rows as i32,
+                            },
+                            &resident.data,
+                            &queries_dev,
+                            &mut scores_dev,
+                        )
+                        .map_err(|e| GpuError::KernelError(format!("cuBLAS gemm failed: {e}")))?;
+                }
+            }
+            let scores = self.stream.clone_dtoh(&scores_dev).map_err(|e| {
+                GpuError::KernelError(format!("Failed to download scores matrix: {e}"))
+            })?;
+            self.stream
+                .synchronize()
+                .map_err(|e| GpuError::KernelError(format!("stream synchronize failed: {e}")))?;
+            Ok(scores)
+        }
+    }
+
+    /// Device side of a [`ResidentMatrix`]: the vectors plus two scratch
+    /// buffers reused by every single-query search, so a search allocates
+    /// nothing on the device.
+    struct CudaResident {
+        data: CudaSlice<f32>,
+        query: CudaSlice<f32>,
+        scores: CudaSlice<f32>,
+    }
+
+    // SAFETY: the buffers are only touched through `&mut ResidentMatrix`, and
+    // every device call binds the context to the calling thread first.
+    unsafe impl Send for CudaResident {}
+    unsafe impl Sync for CudaResident {}
+
+    fn cuda_resident(
+        inner: &mut Box<dyn std::any::Any + Send + Sync>,
+    ) -> Result<&mut CudaResident> {
+        inner
+            .downcast_mut::<CudaResident>()
+            .ok_or_else(|| GpuError::InvalidArgument("CUDA resident matrix mismatch".into()))
     }
 
     /// Wrapper to make CudaSlice<f32> Send + Sync for Arc storage.
@@ -985,6 +1326,112 @@ mod tests {
         assert!(result[0] >= 1.0);
         assert!(result[1] > 0.0);
         assert!(result[2] > 0.0);
+    }
+
+    /// The resident matrix must return the dot product of the query with each
+    /// row, in row order, for single queries and for batches, across
+    /// appends. Runs on the CPU fallback, and on the device with `cuda`.
+    fn check_resident(backend: &dyn GpuBackend) {
+        let dim = 6;
+        let row = |i: usize| -> Vec<f32> {
+            (0..dim)
+                .map(|d| ((i * 7 + d * 3) % 11) as f32 - 5.0)
+                .collect()
+        };
+        let mut matrix = backend.resident_create(dim, 10).unwrap();
+        assert_eq!(
+            (matrix.rows(), matrix.capacity(), matrix.dim()),
+            (0, 10, dim)
+        );
+        assert!(backend
+            .resident_scores(&mut matrix, &row(0))
+            .unwrap()
+            .is_empty());
+
+        let first: Vec<f32> = (0..4).flat_map(row).collect();
+        backend.resident_append(&mut matrix, &first).unwrap();
+        let second: Vec<f32> = (4..7).flat_map(row).collect();
+        backend.resident_append(&mut matrix, &second).unwrap();
+        assert_eq!(matrix.rows(), 7);
+
+        let expect = |q: &[f32]| -> Vec<f32> {
+            (0..7)
+                .map(|i| row(i).iter().zip(q).map(|(a, b)| a * b).sum())
+                .collect()
+        };
+        for q in [row(2), row(9), vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0]] {
+            let got = backend.resident_scores(&mut matrix, &q).unwrap();
+            assert_eq!(got.len(), 7);
+            for (g, e) in got.iter().zip(expect(&q)) {
+                assert!((g - e).abs() < 1e-3, "{g} vs {e}");
+            }
+        }
+
+        let queries: Vec<f32> = [row(1), row(5), row(8)].concat();
+        let batch = backend
+            .resident_scores_batch(&mut matrix, &queries, 3)
+            .unwrap();
+        assert_eq!(batch.len(), 3 * 7);
+        for (qi, q) in [row(1), row(5), row(8)].iter().enumerate() {
+            for (r, e) in expect(q).iter().enumerate() {
+                assert!((batch[qi * 7 + r] - e).abs() < 1e-3, "query {qi} row {r}");
+            }
+        }
+
+        // Shape errors are reported, never read out of bounds.
+        assert!(backend.resident_append(&mut matrix, &[1.0; 5]).is_err());
+        assert!(backend
+            .resident_append(&mut matrix, &vec![0.0; dim * 4])
+            .is_err());
+        assert!(backend.resident_scores(&mut matrix, &[1.0; 5]).is_err());
+        assert!(backend
+            .resident_scores_batch(&mut matrix, &queries, 2)
+            .is_err());
+        assert!(backend.resident_create(0, 4).is_err());
+        assert_eq!(matrix.rows(), 7, "failed appends change nothing");
+    }
+
+    #[test]
+    fn test_cpu_fallback_resident_matrix() {
+        check_resident(&cpu::CpuFallback::new());
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_resident_matrix() {
+        // No device: nothing to check.
+        if let Ok(backend) = cuda::CudaBackend::init() {
+            check_resident(&backend);
+            assert!(backend.available_memory() <= backend.total_memory());
+        }
+    }
+
+    /// Releasing a matrix returns its memory to the device, not only to this
+    /// process's allocator: a closed engine must not keep holding it.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_resident_release_frees_device_memory() {
+        let Ok(backend) = cuda::CudaBackend::init() else {
+            return; // no device
+        };
+        const MIB: usize = 1024 * 1024;
+        let (dim, rows) = (256usize, 200_000usize); // 195 MiB
+        let mut matrix = backend.resident_create(dim, rows).unwrap();
+        backend
+            .resident_append(&mut matrix, &vec![0.5f32; dim * rows])
+            .unwrap();
+        backend
+            .resident_scores(&mut matrix, &vec![1.0f32; dim])
+            .unwrap();
+        let held = backend.available_memory();
+        backend.resident_release(matrix);
+        let after = backend.available_memory();
+        assert!(
+            after >= held + 150 * MIB,
+            "free device memory went from {} to {} MiB after releasing 195 MiB",
+            held / MIB,
+            after / MIB
+        );
     }
 
     #[cfg(feature = "cuda")]

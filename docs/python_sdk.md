@@ -77,6 +77,10 @@ message. `extractor="passthrough"` and `extractor="gliner"` keep writes local.
   next open replays the write-ahead log. (`mem.engine.recovery_report()` says
   what an open had to recover.) After a power loss, the writes since the last
   `flush()` / `close()` may be missing.
+- In a CUDA build (`make build-python FEATURES=cuda`) vector search runs on
+  the GPU once a store holds more than 4,096 records; nothing changes in the
+  API. `mem.engine.gpu_search_stats()` shows whether it is active. See
+  [GPU acceleration](gpu_acceleration.md).
 
 ### Supported Embedders & Rerankers
 

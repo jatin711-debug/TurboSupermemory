@@ -29,6 +29,7 @@
 
 use crate::access_counters::AccessCounters;
 use crate::config::StoreConfig;
+use crate::gpu_exact::{GpuExactIndex, GpuSearchStats};
 use crate::metadata_store::MetadataStore;
 use crate::optimizer::BackgroundOptimizer;
 use crate::payload_index::PayloadIndex;
@@ -44,7 +45,7 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use turbomemory_graph::{
     step_session_with_compressor, CognitiveCompressor, CompressedCognitiveState,
     DeterministicCompressor, MemoryGraph, SpreadingActivation, SpreadingConfig,
@@ -159,6 +160,10 @@ pub struct StorageEngine {
     /// Optional GPU backend for accelerated distance computation.
     /// Initialized lazily on first use; CPU fallback if CUDA unavailable.
     gpu: Arc<Mutex<Option<Arc<dyn turbomemory_gpu::GpuBackend>>>>,
+    /// The store's vectors mirrored on the GPU for exact search. Decided once,
+    /// at the first search that qualifies: `None` when the feature is off or
+    /// there is no usable device.
+    gpu_exact: Arc<OnceLock<Option<GpuExactIndex>>>,
     /// Seq-cursor for incremental supersession detection (W7): the `insert_seq`
     /// at/after which records still need supersession checking. Advanced past
     /// the current max seq after each consolidation. Only consulted when
@@ -191,6 +196,7 @@ impl Clone for StorageEngine {
             update_worker: self.update_worker.clone(),
             access_counters: self.access_counters.clone(),
             gpu: self.gpu.clone(),
+            gpu_exact: self.gpu_exact.clone(),
             supersession_watermark: self.supersession_watermark.clone(),
         }
     }
@@ -550,6 +556,7 @@ impl StorageEngine {
                 update_worker: Arc::new(update_worker),
                 access_counters,
                 gpu: Arc::new(Mutex::new(None)),
+                gpu_exact: Arc::new(OnceLock::new()),
                 // Records already present at open (reloaded history) are treated
                 // as already-checked; only inserts after this point need
                 // incremental supersession detection.
@@ -572,6 +579,37 @@ impl StorageEngine {
     /// Check if the GPU backend is actually GPU-accelerated (not CPU fallback).
     pub fn is_gpu_accelerated(&self) -> bool {
         turbomemory_gpu::is_gpu_accelerated(&self.gpu_backend())
+    }
+
+    /// The GPU exact-search mirror, if this engine uses one. The decision is
+    /// made once: the feature must be on and a real device must be present
+    /// (or host emulation requested, for tests).
+    pub(crate) fn gpu_exact(&self) -> Option<&GpuExactIndex> {
+        self.gpu_exact
+            .get_or_init(|| {
+                let tier = &self.config.tier;
+                if !tier.gpu_exact_search {
+                    return None;
+                }
+                let backend = self.gpu_backend();
+                if !turbomemory_gpu::is_gpu_accelerated(&backend) && !tier.gpu_exact_on_cpu_backend
+                {
+                    return None;
+                }
+                Some(GpuExactIndex::new(
+                    backend,
+                    self.config.dimension,
+                    tier.gpu_memory_budget_mb,
+                ))
+            })
+            .as_ref()
+    }
+
+    /// What the GPU search mirror holds. `None` when this engine has not
+    /// used one: the feature is off, there is no device, or no search has
+    /// qualified yet (the store is below `gpu_exact_min_records`).
+    pub fn gpu_search_stats(&self) -> Option<GpuSearchStats> {
+        self.gpu_exact.get()?.as_ref().map(GpuExactIndex::stats)
     }
 
     /// What the `open` call that produced this engine had to repair.

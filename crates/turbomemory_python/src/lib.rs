@@ -300,7 +300,10 @@ impl PyMemoryEngine {
         seed_hops_from=None,
         expansion_max_candidates=None,
         concept_expansion=None,
-        temporal_recency_weight=None
+        temporal_recency_weight=None,
+        gpu_exact_search=None,
+        gpu_exact_min_records=None,
+        gpu_memory_budget_mb=None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -366,6 +369,9 @@ impl PyMemoryEngine {
         expansion_max_candidates: Option<usize>,
         concept_expansion: Option<bool>,
         temporal_recency_weight: Option<f32>,
+        gpu_exact_search: Option<bool>,
+        gpu_exact_min_records: Option<usize>,
+        gpu_memory_budget_mb: Option<usize>,
     ) -> PyResult<Self> {
         let mut config = StoreConfig::default_for_dimension(dimension);
         if let Some(me) = max_edges {
@@ -641,6 +647,17 @@ impl PyMemoryEngine {
         if let Some(trw) = temporal_recency_weight {
             config.tier.temporal_recency_weight = trw.clamp(0.0, 2.0);
         }
+        // GPU exact search (CUDA builds only): keep the vectors resident on
+        // the device and answer a search with one product over all of them.
+        if let Some(on) = gpu_exact_search {
+            config.tier.gpu_exact_search = on;
+        }
+        if let Some(n) = gpu_exact_min_records {
+            config.tier.gpu_exact_min_records = n;
+        }
+        if let Some(mb) = gpu_memory_budget_mb {
+            config.tier.gpu_memory_budget_mb = mb;
+        }
 
         // Opening replays the write-ahead log and rebuilds the in-memory
         // indexes, which can take a while on a large store: do not hold the
@@ -778,10 +795,11 @@ impl PyMemoryEngine {
     /// array of shape `(num_queries, dimension)` (or a list of 1-D arrays) and
     /// returns `list[list[(id, score)]]` — one result list per query.
     ///
-    /// When the `cuda` feature is enabled and a GPU is present, the candidate
-    /// rerank runs as a single cuBLAS `gemm` (M queries × N candidate vectors)
-    /// — the one workload where GPU genuinely beats CPU. Per-query HNSW
-    /// traversal stays on CPU.
+    /// In a CUDA build with a GPU present the store's vectors are kept on the
+    /// device and the whole batch is one cuBLAS `gemm` over all of them: the
+    /// exact answer for every query (see `gpu_search_stats`). If that path is
+    /// off or the store does not fit in device memory, the per-query HNSW
+    /// traversal runs on the CPU and only the candidate rerank is one `gemm`.
     #[pyo3(signature = (queries, top_k, search_list_size=None, scope=None))]
     fn search_ann_batch(
         &self,
@@ -1029,6 +1047,31 @@ impl PyMemoryEngine {
     #[getter]
     fn gpu_accelerated(&self) -> PyResult<bool> {
         Ok(self.engine()?.is_gpu_accelerated())
+    }
+
+    /// What the GPU exact-search mirror holds, or `None` when this engine has
+    /// not used one (not a CUDA build, no device, `gpu_exact_search=False`,
+    /// or the store is still below `gpu_exact_min_records`).
+    ///
+    /// Keys: `backend`, `active` (False once the mirror was switched off: a
+    /// device error or a store larger than the budget; searches then run on
+    /// the CPU), `rows`, `capacity_rows`, `budget_bytes`, `memory_bytes`,
+    /// `queries` (answered from the mirror) and `device_calls` (the products
+    /// that answered them; fewer when concurrent searches shared one).
+    fn gpu_search_stats(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
+        let Some(stats) = self.engine()?.gpu_search_stats() else {
+            return Ok(None);
+        };
+        let dict = PyDict::new(py);
+        dict.set_item("backend", stats.backend)?;
+        dict.set_item("active", stats.active)?;
+        dict.set_item("rows", stats.rows)?;
+        dict.set_item("capacity_rows", stats.capacity_rows)?;
+        dict.set_item("budget_bytes", stats.budget_bytes)?;
+        dict.set_item("memory_bytes", stats.memory_bytes)?;
+        dict.set_item("queries", stats.queries)?;
+        dict.set_item("device_calls", stats.device_calls)?;
+        Ok(Some(dict.into()))
     }
 
     /// True once `close()` has run; every other method then raises

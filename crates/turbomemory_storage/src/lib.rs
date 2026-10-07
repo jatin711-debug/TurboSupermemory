@@ -3,6 +3,7 @@
 pub mod access_counters;
 pub mod config;
 pub mod engine;
+pub mod gpu_exact;
 pub mod metadata_store;
 pub mod optimizer;
 pub mod payload_index;
@@ -19,6 +20,7 @@ pub mod wal;
 pub use engine::GistCompressor;
 pub use engine::RecoveryReport;
 pub use engine::StorageEngine;
+pub use gpu_exact::GpuSearchStats;
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 

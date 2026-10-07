@@ -171,12 +171,31 @@ recall results:
 
 ## GPU
 
-- With the `cuda` feature the engine's one GPU path (batched rerank) is
-  correct but measured no faster than the CPU on an RTX 3050
-  ([`docs/gpu_acceleration.md`](./docs/gpu_acceleration.md)). Measure on a
-  larger card before investing further; the unused kernels (`gemv`, quantized
-  scan, SpMV) are candidates for removal otherwise.
-- `available_memory()` reports total, not free, GPU memory.
+- **Resident search is measured on one card, up to 100,000 vectors** (RTX 3050
+  Laptop, 4 GB: 4 to 7 times faster than the CPU path for one query, 5 to 17
+  times in throughput under 8 threads;
+  [`docs/gpu_acceleration.md`](./docs/gpu_acceleration.md)). Its cost grows
+  with the bytes scanned (there: about 1.1 ms per 150 MB plus 0.35 ms per
+  query), so a store several times larger hands the advantage back to an
+  index. Measure before relying on it beyond a few hundred thousand records,
+  and on a second card.
+- **Device rows are full `f32`.** Half-precision or 8-bit rows would hold 2 to
+  4 times as many records in the same memory and scan proportionally faster,
+  with the head re-scored at full precision on the host.
+- **A store that outgrows the memory budget turns the mirror off** for the
+  life of the engine. Keeping part of it on the device (the newest rows, or
+  one scope) is not implemented, and neither is turning it back on after a
+  transient device error.
+- **Without a GPU, search above 4,096 records is slower than a plain BLAS
+  scan at these sizes** (100,000 x 384: 5.9 to 7.5 ms against 5.0 to 6.4 ms
+  for NumPy's exact product) when segments are small (4,000 in the
+  benchmark): the number of segments searched dominates, not the index.
+  Larger or merged segments, or a BLAS exact scan up to a higher threshold,
+  would help CPU-only builds.
+- The quantized-scan and SpMV kernels in `turbomemory_gpu` are still unused;
+  remove them or find them a caller.
+- The CUDA build is tested by hand (`cargo test --features cuda`); no CI
+  runner has a GPU.
 
 ## Evaluation and claims
 

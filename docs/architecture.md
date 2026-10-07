@@ -26,7 +26,7 @@ graph TD
 * [**`turbomemory_graph`**](file:///d:/personal-projects/TurboSuperMemory/docs/cognitive_graph.md): The episodic-semantic memory graph, BM25 indexing, the bounded cognitive augmenter (single 1-hop graph-delta re-rank), Working Memory compression (CCS), synonym vocabulary evolution, and automatic importance recomputation.
 * [**`turbomemory_python`**](file:///d:/personal-projects/TurboSuperMemory/docs/bindings_api.md): High-performance PyO3 bindings exposing the memory engine as a Python package, including zero-copy NumPy array mappings and GIL-free concurrency.
 * [**`turbomemory_api`**](file:///d:/personal-projects/TurboSuperMemory/docs/bindings_api.md): Multi-protocol service providing REST (Axum) and gRPC (Tonic) frontends over a unified memory service.
-* [**`turbomemory_gpu`**](file:///d:/personal-projects/TurboSuperMemory/docs/gpu_acceleration.md): Optional GPU acceleration layer with a trait-based backend system (`GpuBackend`), CUDA implementation via `cudarc` (a cuBLAS batched rerank for batch search), and transparent CPU fallback.
+* [**`turbomemory_gpu`**](file:///d:/personal-projects/TurboSuperMemory/docs/gpu_acceleration.md): Optional GPU acceleration layer with a trait-based backend system (`GpuBackend`), CUDA implementation via `cudarc` (exact search over device-resident vectors, and a cuBLAS batched rerank as its fallback), and transparent CPU fallback.
 
 ---
 
@@ -42,7 +42,7 @@ Standard vector databases rebuild large monolithic indices, which can create hig
 3. **Warm**: 8-bit scalar quantized vectors (4x memory reduction) or 2-bit RaBitQ scanned via SIMD.
 4. **Cold**: 1-bit **RaBitQ** (Randomized Binary Quantization, 30.7x memory reduction) or TurboQuant MSE vectors scanned via fast bitwise XOR/popcount lookup tables.
 * **Universal Dimension Support**: Unlike TurboQuant (which requires strict power-of-two dimensions $2^k$), **RaBitQ** natively supports standard 384-d (MiniLM), 768-d (MPNet, Nomic), and 1536-d (OpenAI) embeddings with guaranteed $O(1/d)$ theoretical MSE distortion bounds.
-This keeps write latency low while optimizing search speeds for old/cold memories. The optional `turbomemory_gpu` crate can take over one step, the full-f32 rerank of a batch of queries; see [GPU acceleration](gpu_acceleration.md).
+This keeps write latency low while optimizing search speeds for old/cold memories. With the optional `turbomemory_gpu` crate and a CUDA device, the vector search itself moves to the GPU for stores that fit in device memory; see [GPU acceleration](gpu_acceleration.md).
 
 ### 2.3 Adaptive Prompt Budget Saliency (Submodular MMR)
 For agent prompt generation under tight token limits (150, 300, 1000+ tokens):
@@ -59,13 +59,13 @@ To achieve durability without duplicating large vector data:
 * Index segments are derived data. A segment that cannot be loaded is discarded on open and its records are indexed again.
 
 ### 2.5 GPU Acceleration Strategy
-GPU acceleration is **optional and narrow**:
+GPU acceleration is **optional**:
 * **Trait-based design**: `GpuBackend` allows other GPU APIs later (CUDA today).
 * **Silent fallback**: every GPU operation falls back to the CPU on error.
-* **One engine path**: with the `cuda` feature, the full-f32 rerank of `search_ann_batch` runs as a single cuBLAS `gemm`. Index construction, index search, the quantized scans, and single-query rerank stay on the CPU.
+* **Exact search on resident vectors**: with the `cuda` feature, a store above 4,096 records is searched by one cuBLAS product over a copy of its vectors kept in device memory (single queries and batches alike; concurrent queries share a call). If the store does not fit the device memory budget the engine uses the CPU path, where the full-f32 rerank of `search_ann_batch` runs as a single cuBLAS `gemm`. Index construction, index search and the quantized scans stay on the CPU.
 * **Opt-in compilation**: the `cuda` feature must be explicitly enabled; default builds are CPU-only.
 
-On the one GPU it has been measured on (RTX 3050 4 GB) the CUDA build is correct but not faster than the CPU build; see [GPU acceleration](gpu_acceleration.md) for the numbers.
+On the one GPU it has been measured on (RTX 3050 Laptop, 4 GB), resident search is 4–7× faster than the CPU path for a single query and 8–45× per query in a batch, at stores of 20,000 to 100,000 vectors; see [GPU acceleration](gpu_acceleration.md) for the numbers and their limits.
 
 ---
 
@@ -236,7 +236,7 @@ graph TB
 
 ### 3.4 GPU-Accelerated Search Path (Opt-in via `cuda` feature)
 
-When the `cuda` feature is enabled and a CUDA device is available, `search_ann_batch` reranks the candidates of all its queries in one cuBLAS `gemm`:
+When the `cuda` feature is enabled, a CUDA device is available, and the store does not fit the device memory budget, `search_ann_batch` reranks the candidates of all its queries in one cuBLAS `gemm`:
 
 ```mermaid
 flowchart TD
@@ -248,7 +248,7 @@ flowchart TD
     Cpu --> Top
 ```
 
-Single-query search does not use the GPU: uploading one query's candidates costs more than scoring them with SIMD.
+That is the fallback. When the store's vectors fit in device memory they stay there, and both single-query and batch search skip the segment search entirely: one product over every resident row, then a host-side pick of the best live, permitted rows (`gpu_exact.rs`).
 
 ---
 
@@ -265,7 +265,7 @@ For in-depth explanations of specific features, browse the detailed sub-document
 4. [**Python Bindings and API Services Subsystem**](file:///d:/personal-projects/TurboSuperMemory/docs/bindings_api.md)
    * PyO3 binding structures, zero-copy NumPy array operations, thread GIL releases, Tonic gRPC, and Axum REST controllers.
 5. [**GPU Acceleration Subsystem**](file:///d:/personal-projects/TurboSuperMemory/docs/gpu_acceleration.md)
-   * Trait-based GPU backend design, the cuBLAS batched rerank, transparent CPU fallback, and measured results.
+   * Trait-based GPU backend design, exact search over device-resident vectors, the batched rerank fallback, and measured results.
 
 ---
 
