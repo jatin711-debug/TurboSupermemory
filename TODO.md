@@ -47,8 +47,14 @@ This file is only the short list of open engineering work, grouped by area.
   graph snapshot are versioned.
 - **A failed insert after the WAL append** (text-index failure) is reported as
   failed although the record is durable.
-- **No CI.** `make gate` is the merge gate and it only runs locally. At minimum
-  run fmt, clippy, the Rust suite and `make test-python` on every PR.
+- **The CI workflow has never run.** `.github/workflows/ci.yml` (fmt, clippy,
+  the Rust suite and the SDK suite on Linux and Windows, macOS non-blocking)
+  mirrors commands that passed in a Linux container, but the file itself
+  first runs when it is pushed. Expect to fix something on that first run,
+  most likely on macOS: its job and the linker flags in `.cargo/config.toml`
+  are untested. CI has no GPU, datasets or models, so `make gate` and the
+  CUDA tests stay local. AArch64 is only linted, and only for
+  `turbomemory_core` and `turbomemory_graph`.
 - Request timeouts, body-size configuration and CORS on the REST server.
 - Metrics and tracing: the optimizer reports failures with `eprintln!`, and
   the Python extension initialises no logger, so the engine's warnings

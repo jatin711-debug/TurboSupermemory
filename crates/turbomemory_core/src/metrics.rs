@@ -88,8 +88,9 @@ pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: AArch64 guarantees NEON.
-        return unsafe { dot_product_neon(a, b) };
+        unsafe { dot_product_neon(a, b) }
     }
+    #[cfg(not(target_arch = "aarch64"))]
     dot_product_scalar(a, b)
 }
 
@@ -111,8 +112,9 @@ pub fn l2_distance_sq(a: &[f32], b: &[f32]) -> f32 {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        return unsafe { l2_distance_sq_neon(a, b) };
+        unsafe { l2_distance_sq_neon(a, b) }
     }
+    #[cfg(not(target_arch = "aarch64"))]
     l2_distance_sq_scalar(a, b)
 }
 
@@ -134,8 +136,9 @@ pub fn dot_and_norms(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        return unsafe { dot_and_norms_neon(a, b) };
+        unsafe { dot_and_norms_neon(a, b) }
     }
+    #[cfg(not(target_arch = "aarch64"))]
     dot_and_norms_scalar(a, b)
 }
 
@@ -265,11 +268,14 @@ fn dot_and_nb_x4(q: &[f32], v0: &[f32], v1: &[f32], v2: &[f32], v3: &[f32]) -> [
     #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: AArch64 guarantees NEON.
-        return unsafe { dot_and_nb_x4_neon(q, v0, v1, v2, v3) };
+        unsafe { dot_and_nb_x4_neon(q, v0, v1, v2, v3) }
     }
+    #[cfg(not(target_arch = "aarch64"))]
     dot_and_nb_x4_scalar(q, v0, v1, v2, v3)
 }
 
+// Portable fallbacks. Not compiled for AArch64, which always has NEON.
+#[cfg(not(target_arch = "aarch64"))]
 fn dot_and_nb_x4_scalar(
     q: &[f32],
     v0: &[f32],
@@ -298,10 +304,12 @@ fn dot_and_nb_x4_scalar(
     ]
 }
 
+#[cfg(not(target_arch = "aarch64"))]
 fn dot_product_scalar(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
+#[cfg(not(target_arch = "aarch64"))]
 fn l2_distance_sq_scalar(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
         .zip(b)
@@ -312,6 +320,7 @@ fn l2_distance_sq_scalar(a: &[f32], b: &[f32]) -> f32 {
         .sum()
 }
 
+#[cfg(not(target_arch = "aarch64"))]
 fn dot_and_norms_scalar(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
     let mut dot = 0.0f32;
     let mut norm_a = 0.0f32;

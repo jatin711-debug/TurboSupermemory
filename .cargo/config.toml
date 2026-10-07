@@ -1,0 +1,9 @@
+# macOS only: a Python extension module leaves the interpreter's symbols
+# undefined and resolves them when Python loads it. maturin passes these
+# flags itself; a plain `cargo build -p turbomemory_python` (what
+# `make build-python` and CI run) needs them here or the link fails.
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
