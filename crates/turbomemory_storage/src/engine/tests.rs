@@ -877,6 +877,15 @@ fn resolve_beliefs_walks_supersession_chain_to_head() {
     );
     assert!(!res[3].superseded);
     assert_eq!(res[3].chain, vec!["ghost".to_string()]);
+
+    // A superseded memory reports the factor its score is multiplied by, so
+    // a caller can tell where it ranked before; a current one reports 1.
+    let factor = engine.config.tier.supersession_demotion_factor;
+    assert!(factor < 1.0);
+    assert_eq!(res[0].demotion, factor);
+    assert_eq!(res[1].demotion, factor);
+    assert_eq!(res[2].demotion, 1.0);
+    assert_eq!(res[3].demotion, 1.0);
 }
 
 /// With no supersession edges at all (no cognitive flags enabled),

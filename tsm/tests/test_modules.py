@@ -58,6 +58,23 @@ class TestSelectUnderBudget(unittest.TestCase):
         chosen = select_under_budget(pool, 1000, embed=_embedder(pool))
         self.assertEqual([p["text"] for p in chosen], ["first", "other"])
 
+    def test_a_memory_and_the_one_it_replaced_are_not_duplicates(self):
+        # They read alike, but one is the current value and one the earlier.
+        pool = [dict(_item("lives in london", 0.9, _A), id="new"),
+                dict(_item("lives in paris", 0.5, _A_DUP), id="old", superseded_by="new"),
+                dict(_item("lives in a flat", 0.4, _A_DUP), id="other")]
+        chosen = select_under_budget(pool, 1000, embed=_embedder(pool))
+        self.assertEqual([p["id"] for p in chosen], ["new", "old"])
+
+    def test_the_shown_text_is_what_counts_against_the_budget(self):
+        pool = [dict(_item("a" * 40, 0.9, _A), context="[marked] " + "a" * 40),
+                _item("b" * 40, 0.8, _B)]
+        # 10 tokens of text each; the first is shown with 2 more.
+        chosen = select_under_budget(pool, 21, embed=_embedder(pool))
+        self.assertEqual([p["text"][0] for p in chosen], ["a"])
+        chosen = select_under_budget(pool, 22, embed=_embedder(pool))
+        self.assertEqual([p["text"][0] for p in chosen], ["a", "b"])
+
     def test_new_turn_bonus_prefers_uncovered_turn(self):
         # Same turn as the first pick but more relevant, vs. a new turn.
         pool = [_item("turn1 top", 0.9, _A, turn_index=1),

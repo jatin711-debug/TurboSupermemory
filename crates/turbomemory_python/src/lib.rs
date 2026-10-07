@@ -1212,7 +1212,9 @@ impl PyMemoryEngine {
     /// Resolve each id against the supersession graph — "what is true NOW" in
     /// place of that memory, with lineage. Returns a list of dicts with keys
     /// `id` / `current_id` / `superseded` / `chain` (chain = the full
-    /// supersession chain containing `id`, oldest first, head last). Works
+    /// supersession chain containing `id`, oldest first, head last) /
+    /// `demotion` (the factor a superseded memory's search score is
+    /// multiplied by; 1.0 for a current one). Works
     /// without any cognitive config flags: with no supersession edges every id
     /// resolves to itself (`superseded=False`, `chain=[id]`).
     fn resolve_beliefs(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<Vec<Py<PyDict>>> {
@@ -1226,6 +1228,7 @@ impl PyMemoryEngine {
                 d.set_item("current_id", r.current_id)?;
                 d.set_item("superseded", r.superseded)?;
                 d.set_item("chain", r.chain)?;
+                d.set_item("demotion", r.demotion)?;
                 Ok(d.unbind())
             })
             .collect()

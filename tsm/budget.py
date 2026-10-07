@@ -39,7 +39,14 @@ def select_under_budget(
     """Select the best set of ``pool`` items whose texts fit ``token_budget``.
 
     Each pool item is a dict with ``"text"`` and ``"score"`` (relevance) and
-    optionally ``"turn_index"``. Returns the chosen items in selection order.
+    optionally ``"turn_index"``. An item may also carry ``"context"``, the
+    text that will actually be shown (the fact with a marker in front, say):
+    its length is then what counts against the budget, while redundancy is
+    still measured on ``"text"``. A memory and the one it replaced (an item
+    whose ``"superseded_by"`` is the other's ``"id"``) are never redundant
+    with each other, however alike they read: one holds the current value
+    and the other the earlier one. Returns the chosen items in selection
+    order.
 
     ``method="mmr"`` (default): greedy submodular Maximal Marginal Relevance —
     each step adds the candidate maximizing
@@ -58,7 +65,8 @@ def select_under_budget(
         return []
     texts = [p["text"] or "" for p in pool]
     rel = np.array([float(p["score"]) for p in pool], dtype=np.float32)
-    toks = np.array([max(1, len(t) // 4) for t in texts], dtype=np.int64)
+    shown = [p.get("context") or t for p, t in zip(pool, texts)]
+    toks = np.array([max(1, len(t) // 4) for t in shown], dtype=np.int64)
     cap = max_items if max_items else len(pool)
 
     if method == "truncate":
@@ -80,6 +88,13 @@ def select_under_budget(
     embs = embs / (np.linalg.norm(embs, axis=1, keepdims=True) + 1e-9)
     sim = embs @ embs.T
 
+    def replaces(a: int, b: int) -> bool:
+        first, second = pool[a], pool[b]
+        return (first.get("superseded_by") is not None
+                and first.get("superseded_by") == second.get("id")) or (
+            second.get("superseded_by") is not None
+            and second.get("superseded_by") == first.get("id"))
+
     selected, used, remaining = [], 0, list(range(len(pool)))
     selected_turns = set()
     while remaining and len(selected) < cap:
@@ -87,7 +102,7 @@ def select_under_budget(
         for i in remaining:
             if used + int(toks[i]) > token_budget:
                 continue
-            red = max((float(sim[i, j]) for j in selected), default=0.0)
+            red = max((float(sim[i, j]) for j in selected if not replaces(i, j)), default=0.0)
             if red > MAX_REDUNDANCY:
                 continue
             t_idx = pool[i].get("turn_index")

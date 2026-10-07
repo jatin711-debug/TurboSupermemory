@@ -7,11 +7,11 @@ preset (``profile="conversational"``):
   - role-tagged, scope-filtered fact storage (user-scoped memories),
   - belief revision with refinement/contradiction thresholds 0.85 / 0.75,
   - cognitive search (``cognitive_alpha = 0.5``),
-  - verified supersession: consolidation proposes, a ``Verifier`` vets, only
-    accepted pairs are committed, and the superseded facts are then EXCLUDED
-    from results (the B1 ghost-memory fix). Without a verifier the engine's
-    own detection is not trusted to hide anything: superseded facts are
-    ranked lower and flagged instead,
+  - belief revision that keeps history: a superseded fact is ranked lower
+    and flagged, never removed. With a ``Verifier`` (consolidation proposes,
+    the verifier vets, only accepted pairs are committed) recall also marks
+    it as earlier in the text handed to a model and brings the fact that
+    replaced it in beside it,
   - access-aware eviction and importance auto-scoring,
   - concept extraction (bigram ngrams) for the memory graph,
   - MMR best-set recall under a token budget.
@@ -36,6 +36,10 @@ from .ranking import is_first_person_query, role_prior
 
 logger = logging.getLogger("tsm.memory")
 
+# Put in front of a superseded memory's text in a result's "context" when its
+# supersession was verified: it was true, and something newer replaced it.
+STALE_MARK = "[earlier, since changed] "
+
 # Engine methods this SDK cannot work without. The extension and the SDK ship
 # together; this guards against a stale locally-built turbomemory.pyd/.so.
 _REQUIRED_ENGINE_METHODS = ("get_records", "next_insert_seq", "recovery_report")
@@ -43,9 +47,10 @@ _REQUIRED_ENGINE_METHODS = ("get_records", "next_insert_seq", "recovery_report")
 # The proven conversational configuration, from the evaluation wins. Every key
 # is a MemoryEngine kwarg; explicit engine_kwargs passed to Memory() override
 # these. `defer_supersession_commit` is added by Memory depending on whether a
-# verifier is installed, and `exclude_superseded` only applies with one.
+# verifier is installed. Superseded facts stay in recall (pass
+# `exclude_superseded=True` to drop them): a question about what was true
+# earlier needs them, and removing them lost more judged answers than it won.
 CONVERSATIONAL_PROFILE = {
-    "exclude_superseded": True,          # B1: drop VERIFIED superseded facts from results
     "refinement_cosine_threshold": 0.85,
     "contradiction_cosine_threshold": 0.75,
     "cognitive_alpha": 0.5,
@@ -109,11 +114,13 @@ class Memory:
                 for the two in ``tsm.verification`` (``NLIVerifier``: a small
                 local cross-encoder; ``LLMVerifier``: a chat model, far more
                 accurate, one short request per few candidate pairs). When
-                installed, ``consolidate()`` runs propose -> verify -> commit
-                and superseded facts are excluded from recall. Without one,
-                superseded facts stay in results, ranked lower and flagged
-                (``superseded_by``): unverified detection hides true facts
-                too often to be allowed to remove them.
+                installed, ``consolidate()`` runs propose -> verify -> commit.
+                A superseded fact always stays in recall, ranked lower and
+                flagged (``superseded_by``). With a verifier its supersession
+                is trusted enough to act on: ``recall()`` marks it as earlier
+                in ``"context"`` and brings in the fact that replaced it.
+                Pass ``exclude_superseded=True`` to remove superseded facts
+                from recall instead.
             gist_summarizer: optional callable mapping a list of evicted fact
                 texts to a single gist string (typically an LLM call).
             reranker: optional ``Reranker`` implementation or ``"colbert"``
@@ -177,6 +184,11 @@ class Memory:
         self.embedder = embedder
         self.extractor = extractor
         self.verifier = verifier
+        # Supersessions a verifier accepted are reliable enough to show a
+        # model; the engine's unchecked ones stay metadata (on its own the
+        # detector also fires on facts that are both still true, "my sister
+        # lives in Vancouver" / "my brother lives in Vancouver").
+        self._verified = verifier is not None
         self.reranker = reranker
 
         self.dim = int(dimension or getattr(embedder, "dimension", None) or 1536)
@@ -189,12 +201,6 @@ class Memory:
         # A verifier only gets to vet supersessions if the engine does not
         # commit them first, whatever the profile.
         config["defer_supersession_commit"] = verifier is not None
-        # Hiding a fact is only safe once something has checked the pair: on
-        # its own the detector also fires on facts that are both still true
-        # ("my sister lives in Vancouver" / "my brother lives in Vancouver").
-        # Unverified supersessions rank lower and are flagged in recall().
-        if verifier is None and "exclude_superseded" in config:
-            config["exclude_superseded"] = False
         if gist_summarizer is not None:
             config["gist_before_evict"] = True
         config.update(engine_kwargs)  # explicit kwargs win over the profile
@@ -396,22 +402,27 @@ class Memory:
         """Search memories under ``user_id``'s scope.
 
         Returns a list of dicts, best first, each with at least ``"id"``,
-        ``"text"``, ``"score"``, ``"role"`` (the stored source role) and
-        ``"turn_index"``. With ``token_budget`` set, the result is instead the
+        ``"text"``, ``"context"`` (the text to put in a prompt: the same as
+        ``"text"`` unless marked, see below), ``"score"``, ``"role"`` (the
+        stored source role) and ``"turn_index"``. With ``token_budget`` set, the result is instead the
         best *set* that fits the budget (``tsm.budget.select_under_budget``:
         greedy MMR over a candidate pool), in selection order. The pool is
         ``pool_k`` candidates or more: it grows with the budget so a large
         budget can be filled. ``max_items`` limits the number of results as
         well; by default only the token budget does.
-        Superseded facts are excluded by the engine when the conversational
-        profile is active.
 
-        With ``resolve_beliefs`` (default True), results are ANNOTATED with
-        belief lineage: any returned memory that has been superseded gains
+        With ``resolve_beliefs`` (default True), a memory that has been
+        superseded stays in the results, ranked lower, with
         ``"superseded_by"`` (the current belief's id) and ``"chain"`` (the
-        full supersession chain, oldest first, head last), whether or not the
-        current belief is in the result set too. A result without
-        ``"superseded_by"`` is current.
+        full supersession chain, oldest first, head last). A result without
+        ``"superseded_by"`` is current. When a verifier is installed, two
+        more things happen, because its supersessions can be relied on:
+        the superseded memory's ``"context"`` starts with ``STALE_MARK``, so
+        a model reading it knows it was true earlier and has since changed;
+        and the memory that replaced it is ranked where the old one would
+        have been without its demotion, and added if the search did not find
+        it at all (an update is often worded differently from the fact it
+        replaces, so a question in the old wording finds only the old fact).
 
         With ``rerank=True`` or an active ``reranker`` (e.g. ``ColBertReranker``),
         retrieved candidate shortlists from TSM's cognitive graph are reranked
@@ -453,6 +464,8 @@ class Memory:
                          "turn_index": rec["payload"].get("turn_index")})
         if not pool:
             return []
+        if resolve_beliefs:
+            self._resolve_beliefs(pool, user_id)
 
         first_person = is_first_person_query(query)
         for p in pool:
@@ -468,34 +481,62 @@ class Memory:
                 for idx, p in enumerate(pool):
                     p["maxsim_score"] = float(rerank_scores[idx])
                     p["score"] = float(p["score"]) * (1.0 + float(norm_sim[idx]) * len(pool))
-                pool.sort(key=lambda x: x["score"], reverse=True)
 
+        # Best first by the score that is returned (the role prior and a
+        # brought-in current belief both move a memory's place).
+        # On a tie the current belief goes before the one it replaced.
+        pool.sort(key=lambda p: (-p["score"], "superseded_by" in p))
         if token_budget is None:
             final = pool[:top_k]
         else:
             final = select_under_budget(pool, token_budget, embed=self.embedder.encode,
                                         lam=lam, max_items=max_items)
-        if resolve_beliefs:
-            self._annotate_beliefs(final)
+        for p in final:
+            p.setdefault("context", p["text"] or "")
         return final
 
-    def _annotate_beliefs(self, results: List[Dict]) -> None:
-        """Attach ``superseded_by``/``chain`` lineage to superseded results.
+    def _resolve_beliefs(self, pool: List[Dict], user_id: Optional[str]) -> None:
+        """Mark the superseded memories in ``pool`` and, when supersessions are
+        verified, add the current belief of each one that is missing.
 
-        Every superseded result is annotated, also when its current belief is
-        in the result set: with both in front of it, a reader still has to be
-        told which of the two is the stale one. Older engines lacking
-        ``resolve_beliefs`` silently leave results unannotated.
+        Every superseded memory gets ``superseded_by`` and ``chain``, also
+        when its current belief is in the pool: with both in front of it, a
+        reader still has to be told which of the two is the stale one. Older
+        engines lacking ``resolve_beliefs`` leave the pool as it is.
         """
         resolve = getattr(self.engine, "resolve_beliefs", None)
-        if resolve is None or not results:
+        if resolve is None or not pool:
             return
-        by_id = {r["id"]: r for r in results}
-        for res in resolve([r["id"] for r in results]):
+        by_id = {p["id"]: p for p in pool}
+        # current belief -> the best score one of the memories it replaced
+        # had before its demotion: the place the current belief is owed when
+        # the query is worded like the old fact.
+        owed: Dict[str, float] = {}
+        for res in resolve(list(by_id)):
             current = res["current_id"]
-            if current != res["id"]:
-                by_id[res["id"]]["superseded_by"] = current
-                by_id[res["id"]]["chain"] = list(res["chain"])
+            if current == res["id"]:
+                continue
+            stale = by_id[res["id"]]
+            stale["superseded_by"] = current
+            stale["chain"] = list(res["chain"])
+            if not self._verified:
+                continue
+            stale["context"] = STALE_MARK + (stale["text"] or "")
+            before = stale["score"] / max(float(res.get("demotion") or 1.0), 1e-6)
+            owed[current] = max(owed.get(current, 0.0), before)
+        missing = [mid for mid in owed if mid not in by_id]
+        for mid, rec in (self._records(missing).items() if missing else ()):
+            if user_id is not None and rec["scope"] not in (None, user_id):
+                continue
+            by_id[mid] = {"id": mid, "text": rec["text"], "score": owed[mid],
+                          "role": rec["source_role"] or "",
+                          "turn_index": rec["payload"].get("turn_index")}
+            pool.append(by_id[mid])
+        for mid, score in owed.items():
+            head = by_id.get(mid)
+            if head is not None:
+                head["score"] = max(head["score"], score)
+                head["replaces"] = [p["id"] for p in pool if p.get("superseded_by") == mid]
 
     # maintenance -----------------------------------------------------------------
     def consolidate(self) -> int:
@@ -504,8 +545,8 @@ class Memory:
         The engine runs its consolidation cycle (dedup, importance, belief
         detection). When a ``Verifier`` is installed, supersession commitment
         is deferred: candidates are proposed, vetted against their stored
-        texts, and only accepted pairs are committed, after which the engine's
-        superseded-exclusion hides the stale facts from recall.
+        texts, and only accepted pairs are committed. ``recall()`` then marks
+        those stale facts and serves their replacements with them.
 
         Which candidates are proposed depends on the verifier. One that can
         judge meaning says so with a ``candidate_min_cosine`` attribute

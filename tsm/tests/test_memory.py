@@ -31,6 +31,7 @@ import numpy as np
 
 import tsm
 from tsm import CONVERSATIONAL_PROFILE, Memory
+from tsm.memory import STALE_MARK
 from tsm.verification import LLMVerifier
 
 
@@ -160,7 +161,8 @@ class TestProfileConfig(MemoryTestBase):
         self.assertEqual(CONVERSATIONAL_PROFILE["refinement_cosine_threshold"], 0.85)
         self.assertEqual(CONVERSATIONAL_PROFILE["contradiction_cosine_threshold"], 0.75)
         self.assertEqual(CONVERSATIONAL_PROFILE["cognitive_alpha"], 0.5)
-        self.assertIs(CONVERSATIONAL_PROFILE["exclude_superseded"], True)
+        # Superseded facts stay in recall unless a caller asks otherwise.
+        self.assertNotIn("exclude_superseded", CONVERSATIONAL_PROFILE)
         self.assertIs(CONVERSATIONAL_PROFILE["access_aware_eviction"], True)
         self.assertEqual(CONVERSATIONAL_PROFILE["belief_source_roles"], ["user"])
         self.assertEqual(CONVERSATIONAL_PROFILE["concept_max_ngram_len"], 2)
@@ -200,9 +202,27 @@ class TestSupersessionFlow(MemoryTestBase):
         self.assertGreaterEqual(verifier.calls, 1)
         self.assertGreaterEqual(committed, 1, "no supersession was committed")
 
+        after = mem.recall("user lives", user_id="alice", top_k=10)
+        texts = [r["text"] for r in after]
+        # The correction is served first; the fact it replaced is still
+        # there (a question about the past needs it), flagged and marked.
+        self.assertLess(texts.index(new_fact), texts.index(old_fact))
+        by_text = {r["text"]: r for r in after}
+        self.assertEqual(by_text[old_fact]["superseded_by"], "alice_2")
+        self.assertEqual(by_text[old_fact]["context"], STALE_MARK + old_fact)
+        self.assertEqual(by_text[new_fact]["context"], new_fact)
+        self.assertNotIn("superseded_by", by_text[new_fact])
+
+    def test_superseded_facts_can_be_excluded_instead(self):
+        mem = self.make_memory(verifier=AcceptAllVerifier(), exclude_superseded=True)
+        old_fact = "user user user user lives in paris"
+        new_fact = "user user user user lives in london"
+        mem.add([{"role": "user", "content": old_fact + "."}], user_id="alice")
+        mem.add([{"role": "user", "content": new_fact + "."}], user_id="alice")
+        self.assertGreaterEqual(mem.consolidate(), 1)
         after = [r["text"] for r in mem.recall("user lives", user_id="alice", top_k=10)]
         self.assertIn(new_fact, after)
-        self.assertNotIn(old_fact, after, "stale fact not excluded after supersession")
+        self.assertNotIn(old_fact, after)
 
 
 class _EngineWithoutResolve:
@@ -245,15 +265,30 @@ class TestBeliefResolution(MemoryTestBase):
         mem = self._memory_with_correction()
         old_id, new_id = "alice_1", "alice_2"
 
-        results = mem.recall(self.OLD_FACT, user_id="alice", top_k=1)
-        self.assertEqual(len(results), 1)
-        stale = results[0]
-        self.assertEqual(stale["id"], old_id)
+        results = mem.recall(self.OLD_FACT, user_id="alice", top_k=2)
+        self.assertEqual([r["id"] for r in results], [new_id, old_id])
+        stale = results[1]
         self.assertEqual(stale["text"], self.OLD_FACT)
+        self.assertEqual(stale["context"], STALE_MARK + self.OLD_FACT)
         self.assertEqual(stale["superseded_by"], new_id,
                          "stale result must point at the current belief")
         self.assertEqual(stale["chain"], [old_id, new_id],
                          "chain is the full lineage, oldest first, head last")
+
+    def test_current_belief_is_brought_in_when_the_search_missed_it(self):
+        mem = self._memory_with_correction()
+        # top_k=1 and a query in the old wording: the search returns only the
+        # stale fact. What is believed now is what comes back.
+        hits = mem.engine.search(query_text=self.OLD_FACT,
+                                 query_embedding=FakeEmbedder().encode(self.OLD_FACT),
+                                 top_k=1, scope="alice")
+        self.assertEqual([mid for mid, _ in hits], ["alice_1"])
+        results = mem.recall(self.OLD_FACT, user_id="alice", top_k=1)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["id"], "alice_2")
+        self.assertEqual(results[0]["text"], self.NEW_FACT)
+        self.assertEqual(results[0]["replaces"], ["alice_1"])
+        self.assertNotIn("superseded_by", results[0])
 
     def test_stale_result_is_flagged_next_to_its_current_belief_too(self):
         mem = self._memory_with_correction()
@@ -266,16 +301,21 @@ class TestBeliefResolution(MemoryTestBase):
         self.assertNotIn("superseded_by", results["alice_2"])
         self.assertNotIn("chain", results["alice_2"])
 
-    def test_mmr_budget_recall_annotates_stale_result(self):
+    def test_mmr_budget_recall_serves_the_current_belief_first(self):
         mem = self._memory_with_correction()
-        # Budget fits only one of the two facts; the exact-query stale fact
-        # has the highest relevance, so it is selected and annotated.
+        # A budget with room for one fact: the current belief takes it, even
+        # though the query is worded like the stale one.
         results = mem.recall(self.OLD_FACT, user_id="alice", token_budget=9)
-        self.assertEqual(len(results), 1)
-        stale = results[0]
-        self.assertEqual(stale["id"], "alice_1")
+        self.assertEqual([r["id"] for r in results], ["alice_2"])
+        # With room for more, the stale fact follows, marked. Its marker
+        # counts against the budget.
+        results = mem.recall(self.OLD_FACT, user_id="alice", token_budget=40)
+        self.assertEqual([r["id"] for r in results], ["alice_2", "alice_1"])
+        stale = results[1]
         self.assertEqual(stale["superseded_by"], "alice_2")
         self.assertEqual(stale["chain"], ["alice_1", "alice_2"])
+        self.assertTrue(stale["context"].startswith(STALE_MARK))
+        self.assertLessEqual(sum(len(r["context"]) // 4 for r in results), 40)
 
     def test_resolve_beliefs_false_skips_annotation(self):
         mem = self._memory_with_correction()
@@ -525,9 +565,9 @@ class TestDurability(MemoryTestBase):
         self.assertEqual(verifier.seen_texts,
                          {"alice_1": self.OLD_FACT, "alice_2": self.NEW_FACT})
 
-        after = [r["text"] for r in mem.recall("user lives", user_id="alice", top_k=10)]
-        self.assertIn(self.NEW_FACT, after)
-        self.assertNotIn(self.OLD_FACT, after)
+        after = {r["text"]: r for r in mem.recall("user lives", user_id="alice", top_k=10)}
+        self.assertNotIn("superseded_by", after[self.NEW_FACT])
+        self.assertEqual(after[self.OLD_FACT]["superseded_by"], "alice_2")
 
 
 class PoisonableEmbedder(FakeEmbedder):
@@ -797,8 +837,11 @@ class TestLLMVerifiedRevision(MemoryTestBase):
         asked = judge.requests[0]["messages"][-1]["content"]
         self.assertIn(f"OLDER: {self.OLD_FACT}\nNEWER: {self.NEW_FACT}", asked)
         recalled = self._recalled(mem)
-        self.assertIn(self.NEW_FACT, recalled)
-        self.assertNotIn(self.OLD_FACT, recalled, "the verified stale fact is still served")
+        self.assertLess(recalled.index(self.NEW_FACT), recalled.index(self.OLD_FACT),
+                        "the fact that replaced it must be served first")
+        stale = [r for r in mem.recall("user works", user_id="alice", top_k=10)
+                 if r["text"] == self.OLD_FACT][0]
+        self.assertEqual(stale["context"], STALE_MARK + self.OLD_FACT)
         # A second pass has nothing left to ask: the pair is settled.
         requests = len(judge.requests)
         self.assertEqual(mem.consolidate(), 0)

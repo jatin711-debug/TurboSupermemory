@@ -43,10 +43,24 @@ message. `extractor="passthrough"` and `extractor="gliner"` keep writes local.
 
 ### Results, budgets, and lifecycle
 
-- `recall()` returns dicts with `id`, `text`, `score`, `role` (the stored
-  source role) and `turn_index`. A superseded fact also carries
-  `superseded_by` (the id of the current belief) and `chain`; a result
-  without `superseded_by` is current.
+- `recall()` returns dicts, best first, with `id`, `text`, `context`,
+  `score`, `role` (the stored source role) and `turn_index`. `context` is
+  the text to put in a prompt: the same as `text` unless the fact is marked
+  (next point).
+- A fact that a newer one replaced is never removed from recall. It is
+  ranked lower and carries `superseded_by` (the id of the current belief)
+  and `chain`; a result without `superseded_by` is current. With a verifier
+  installed, two more things happen: its `context` starts with
+  `[earlier, since changed] `, so a model reading it knows what it is, and
+  the fact that replaced it is ranked where the old one would have been and
+  brought in if the search missed it (a question in the old wording often
+  finds only the old fact). Pass `exclude_superseded=True` to drop
+  superseded facts from recall instead: a question about what was true
+  earlier then has nothing to go on. The lower rank (its score is multiplied
+  by `supersession_demotion_factor`, 0.4) keeps a replaced fact out of a
+  small context almost always; `supersession_demotion_factor=1.0` leaves it
+  where it ranks, marked, next to the fact that replaced it. Judged answers
+  came out level between the two.
 - `recall(..., token_budget=N)` returns the best *set* that fits `N` tokens
   instead of the top-k: greedy MMR over a candidate pool with a redundancy
   cutoff and a cross-turn coverage bonus (`tsm.budget.select_under_budget`).
@@ -57,8 +71,9 @@ message. `extractor="passthrough"` and `extractor="gliner"` keep writes local.
   - `verifier="llm"` (`tsm.verification.LLMVerifier`): every new fact is
     paired with its closest older facts (similarity at least 0.45, the
     closest one and at most one more about as close) and a chat model
-    decides whether it replaces them. Accepted pairs are committed and the
-    older fact is removed from recall. Any OpenAI-compatible endpoint works
+    decides whether it replaces them. Accepted pairs are committed, and
+    recall marks the older fact as earlier and serves the newer one with
+    it. Any OpenAI-compatible endpoint works
     (`LLMVerifier(base_url="http://localhost:11434/v1", model=...)` for a
     local server); one short request per few pairs, verdicts cached under
     `<db_path>/tsm_cache`.
@@ -66,9 +81,9 @@ message. `extractor="passthrough"` and `extractor="gliner"` keep writes local.
     pairs the engine's own lexical detection proposes. Free and offline, but
     it only sees what that detection finds, and it cannot tell a changed
     value from a second person or a second item.
-  - no verifier: the engine's detection runs unchecked, so nothing is
-    removed. A fact it marks as superseded is ranked lower and flagged with
-    `superseded_by`. Pass `exclude_superseded=True` to remove them anyway.
+  - no verifier: the engine's detection runs unchecked, so its results
+    are not shown to a model. A fact it marks as superseded is ranked lower
+    and flagged with `superseded_by`; its `context` is left as it is.
 
   Measured on 127 held-out labeled pairs (`benchmarks/cognitive_eval/
   belief_pairs_eval.py --split test`, MiniLM embeddings; details in
@@ -76,10 +91,10 @@ message. `extractor="passthrough"` and `extractor="gliner"` keep writes local.
 
   | verifier | real updates caught | still-true facts marked stale |
   |---|---|---|
-  | none (ranked lower and flagged) | 16 of 54 | 8 of 58 |
-  | `"nli"` (removed) | 16 of 54 | 6 of 58 |
-  | `"llm"` with `gpt-4o-mini`, the default (removed) | 49 to 50 of 54 | 4 to 8 of 58 |
-  | `"llm"` with a local 4.7B model, `qwen3.5:4b` (removed) | 48 to 49 of 54 | 7 to 9 of 58 |
+  | none | 16 of 54 | 8 of 58 |
+  | `"nli"` | 16 of 54 | 6 of 58 |
+  | `"llm"` with `gpt-4o-mini`, the default | 49 to 50 of 54 | 4 to 8 of 58 |
+  | `"llm"` with a local 4.7B model, `qwen3.5:4b` | 48 to 49 of 54 | 7 to 9 of 58 |
 
   In each range the first figure is with every pair in its own store and the
   second with all pairs in one store, where statements of different pairs

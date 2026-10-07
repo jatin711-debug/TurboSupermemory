@@ -273,16 +273,30 @@ impl StorageEngine {
     /// resolves to itself (`superseded = false`, `chain = [id]`). Unknown ids
     /// also resolve to themselves.
     pub fn resolve_beliefs(&self, ids: &[String]) -> Vec<BeliefResolution> {
+        // Read before the graph lock is taken: no other path holds both.
+        let demotions: Vec<f32> = {
+            let id_index = self.id_index.read();
+            ids.iter()
+                .map(|id| {
+                    id_index
+                        .get(id.as_str())
+                        .map(|&offset| self.meta.demotion_factor(offset))
+                        .unwrap_or(crate::metadata_store::NO_DEMOTION)
+                })
+                .collect()
+        };
         let guard = self.graph.read();
         let graph = guard.graph();
         ids.iter()
-            .map(|id| {
+            .zip(demotions)
+            .map(|(id, demotion)| {
                 let current_id = graph.belief_head(id);
                 BeliefResolution {
                     id: id.clone(),
                     superseded: current_id != *id,
                     current_id,
                     chain: graph.belief_lineage(id),
+                    demotion,
                 }
             })
             .collect()
@@ -787,7 +801,7 @@ pub struct ProposedSupersession {
 /// The resolution of one memory id against the supersession graph — the
 /// "revises beliefs" read contract: what is believed NOW in place of `id`,
 /// and the lineage that led there. Produced by `StorageEngine::resolve_beliefs`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BeliefResolution {
     /// The queried id.
     pub id: String,
@@ -799,6 +813,11 @@ pub struct BeliefResolution {
     /// The full supersession chain containing `id`, oldest first, head last.
     /// `[id]` when `id` has no supersession edges.
     pub chain: Vec<String>,
+    /// The factor cognitive search multiplies this memory's score by because
+    /// it was superseded; 1.0 when it never was. A returned score divided by
+    /// it is the score the memory had before, which is where its current
+    /// belief belongs in a ranking when the query matched the old wording.
+    pub demotion: f32,
 }
 
 /// Whether a memory's provenance `role` may participate in belief revision

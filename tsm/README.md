@@ -49,9 +49,11 @@ with Memory("./my_db") as mem:                       # conversational profile
   uses a small local cross-encoder instead (`NLIVerifier`, needs `torch` +
   `transformers`): free, but it only vets the pairs the engine's lexical
   detection proposes and misses most reworded updates. Either way only
-  accepted pairs are committed, and those stale facts are removed from
-  recall. Without a verifier nothing is removed: facts the engine marks as
-  superseded are ranked lower and returned with `superseded_by`.
+  accepted pairs are committed. A replaced fact is never removed from
+  recall: it is ranked lower and returned with `superseded_by`. With a
+  verifier, `recall()` also marks it in the result's `context`
+  (`[earlier, since changed] ...`) and serves the fact that replaced it with
+  it. `exclude_superseded=True` drops replaced facts instead.
 - The engine is the only store: text, role, and scope are read back from it,
   and ids come from its durable insert sequence, so a reopened database keeps
   appending and recalls the same way it did before the restart.
