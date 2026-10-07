@@ -2516,7 +2516,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cudarc",
- "fastrand",
  "log",
  "ndarray",
  "rayon",

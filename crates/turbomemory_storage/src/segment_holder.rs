@@ -10,7 +10,7 @@ use crate::segments::warm::WarmSegment;
 use crate::segments::{kway_merge_topk, merge_candidates, ScoredPoint, VectorSegment};
 use crate::vector_store::VectorStore;
 use arc_swap::ArcSwap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use std::collections::HashSet;
@@ -39,13 +39,20 @@ impl SegmentSnapshot {
         }
     }
 
-    fn point_count(&self) -> usize {
+    pub(crate) fn point_count(&self) -> usize {
         self.segments
             .iter()
             .map(|s| s.read().point_count())
             .sum::<usize>()
     }
 
+    /// Search every segment, merge the candidates, and rerank them against
+    /// the full f32 vectors on the CPU.
+    ///
+    /// The rerank is deliberately not offloaded to the GPU: for one query the
+    /// host-to-device copy of the candidate vectors costs more than scoring
+    /// them with SIMD (measured 1.7-2x slower on an RTX 3050 at every pool
+    /// size from 256 to 2,000). Only the batched path below uses the GPU.
     pub(crate) fn search(
         &self,
         query: &[f32],
@@ -54,32 +61,35 @@ impl SegmentSnapshot {
         vectors: &VectorStore,
         allowed_offsets: Option<&RoaringBitmap>,
     ) -> crate::Result<Vec<ScoredPoint>> {
-        self.search_gpu(query, top_k, ef, vectors, allowed_offsets, None)
+        let pool_k = self.pool_width(top_k, ef, allowed_offsets);
+        let candidates = self.candidates(query, pool_k, vectors, allowed_offsets)?;
+        let mut reranked = cpu_rerank_candidates(query, &candidates, vectors);
+        reranked.sort_by(|a, b| turbomemory_core::cmp_score_desc(a.score, b.score));
+        reranked.truncate(top_k);
+        Ok(reranked)
     }
 
-    /// GPU-accelerated search with optional backend.
-    pub(crate) fn search_gpu(
+    /// Per-segment candidate pool width.
+    ///
+    /// Qdrant-style ef semantics: floor the pool at the caller-provided `ef`
+    /// (or the configured search list size), then apply an over-fetch
+    /// multiplier that grows with filter strictness and the number of
+    /// segments. The automatic multiplier is capped to bound rerank cost, but
+    /// an explicit caller `ef` is always honored as the floor. The result
+    /// never exceeds the number of points, so a huge `top_k` cannot drive
+    /// allocations.
+    fn pool_width(
         &self,
-        query: &[f32],
         top_k: usize,
         ef: Option<usize>,
-        vectors: &VectorStore,
         allowed_offsets: Option<&RoaringBitmap>,
-        gpu: Option<&Arc<dyn turbomemory_gpu::GpuBackend>>,
-    ) -> crate::Result<Vec<ScoredPoint>> {
-        // Use Qdrant-style ef semantics: floor the per-segment candidate pool at
-        // the caller-provided `ef` (or the configured search list size), then
-        // apply an over-fetch multiplier that grows with filter strictness and
-        // the number of segments.
+    ) -> usize {
+        let total = self.point_count().max(1);
         let base_ef = ef.unwrap_or(self.config.search_list_size);
         let base_multiplier = if allowed_offsets.is_some() { 8 } else { 4 };
         let segment_count = self.segments.len().max(1);
         let selectivity = allowed_offsets
-            .map(|b| {
-                let total = self.point_count().max(1);
-                let allowed = b.len() as usize;
-                (allowed as f32) / (total as f32)
-            })
+            .map(|b| (b.len() as usize as f32) / (total as f32))
             .unwrap_or(1.0f32);
         let multiplier = if selectivity < 0.01 {
             // Very selective filters rely on the exact fallback in each segment.
@@ -92,64 +102,41 @@ impl SegmentSnapshot {
                 (1.0f32 + (segment_count.saturating_sub(1)) as f32 * 0.25f32).clamp(1.0f32, 2.5f32);
             (base_multiplier as f32 * selectivity_factor * segment_factor) as usize
         };
-        // The automatic multiplier is capped to bound rerank cost, but an
-        // explicit caller `ef` must always be honored as the pool floor. Apply
-        // the cap to the multiplier-derived width first, then floor at base_ef,
-        // so a large caller-provided ef widens the HNSW beam instead of being
-        // silently clamped back down to top_k*48.
-        let pool_k = top_k
+        top_k
             .saturating_mul(multiplier)
             .min(top_k.saturating_mul(48))
-            .max(base_ef);
+            .max(base_ef)
+            .min(total)
+    }
 
-        let segments = self.segments.clone();
-        let lists: Vec<Vec<ScoredPoint>> = if segments.len() <= 1 {
+    /// Search every segment for `pool_k` candidates and merge the lists.
+    fn candidates(
+        &self,
+        query: &[f32],
+        pool_k: usize,
+        vectors: &VectorStore,
+        allowed_offsets: Option<&RoaringBitmap>,
+    ) -> crate::Result<Vec<ScoredPoint>> {
+        let lists: Vec<Vec<ScoredPoint>> = if self.segments.len() <= 1 {
             // Avoid Rayon's thread-pool overhead when there is only one segment
             // (the common small-collection case).
-            segments
-                .into_iter()
+            self.segments
+                .iter()
                 .map(|seg| seg.read().search(query, pool_k, vectors, allowed_offsets))
                 .collect::<crate::Result<Vec<_>>>()?
         } else {
-            segments
-                .into_par_iter()
+            self.segments
+                .par_iter()
                 .map(|seg| seg.read().search(query, pool_k, vectors, allowed_offsets))
                 .collect::<crate::Result<Vec<_>>>()?
         };
         // Merge per-segment candidates with a k-way heap merge (PR-B).
         // Fall back to the old sort-based merge for very small result sets.
-        let candidates = if lists.len() >= 4 && pool_k >= 64 {
+        Ok(if lists.len() >= 4 && pool_k >= 64 {
             kway_merge_topk(&lists, pool_k)
         } else {
             merge_candidates(lists, pool_k)
-        };
-
-        // Final rerank with full f32 embeddings from the vector store.
-        // Use GPU for large rerank pools if available.
-        let reranked = if let Some(backend) = gpu {
-            if turbomemory_gpu::is_gpu_accelerated(backend) && candidates.len() >= 256 {
-                match gpu_rerank_candidates(query, &candidates, vectors, backend) {
-                    Ok(results) => results,
-                    Err(e) => {
-                        log::warn!("GPU rerank failed ({}), falling back to CPU", e);
-                        cpu_rerank_candidates(query, &candidates, vectors)
-                    }
-                }
-            } else {
-                cpu_rerank_candidates(query, &candidates, vectors)
-            }
-        } else {
-            cpu_rerank_candidates(query, &candidates, vectors)
-        };
-
-        let mut reranked = reranked;
-        reranked.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        reranked.truncate(top_k);
-        Ok(reranked)
+        })
     }
 
     /// Batched search over the snapshot for M queries at once. Per-query HNSW
@@ -175,59 +162,16 @@ impl SegmentSnapshot {
         }
         // Single query: defer to the established single-query path.
         if m == 1 {
-            let r = self.search_gpu(queries[0], top_k, ef, vectors, allowed_offsets, gpu)?;
+            let r = self.search(queries[0], top_k, ef, vectors, allowed_offsets)?;
             return Ok(vec![r]);
         }
 
-        // Compute the per-segment candidate pool width once (same logic as
-        // search_gpu, independent of the query).
-        let base_ef = ef.unwrap_or(self.config.search_list_size);
-        let base_multiplier = if allowed_offsets.is_some() { 8 } else { 4 };
-        let segment_count = self.segments.len().max(1);
-        let selectivity = allowed_offsets
-            .map(|b| {
-                let total = self.point_count().max(1);
-                (b.len() as usize as f32) / (total as f32)
-            })
-            .unwrap_or(1.0f32);
-        let multiplier = if selectivity < 0.01 {
-            base_multiplier
-        } else {
-            let selectivity_factor = (1.0f32 / selectivity.sqrt()).clamp(1.0f32, 16.0f32);
-            let segment_factor =
-                (1.0f32 + (segment_count.saturating_sub(1)) as f32 * 0.25f32).clamp(1.0f32, 2.5f32);
-            (base_multiplier as f32 * selectivity_factor * segment_factor) as usize
-        };
-        let pool_k = top_k
-            .saturating_mul(multiplier)
-            .min(top_k.saturating_mul(48))
-            .max(base_ef);
-
-        let segments = self.segments.clone();
-
         // Per-query: run CPU HNSW search across all segments and merge, giving
-        // each query its own candidate list. Queries are independent, so this
-        // parallelizes across queries (and within, across segments).
+        // each query its own candidate list.
+        let pool_k = self.pool_width(top_k, ef, allowed_offsets);
         let per_query_candidates: Vec<Vec<ScoredPoint>> = queries
             .iter()
-            .map(|q| -> crate::Result<Vec<ScoredPoint>> {
-                let lists: Vec<Vec<ScoredPoint>> = if segments.len() <= 1 {
-                    segments
-                        .iter()
-                        .map(|seg| seg.read().search(q, pool_k, vectors, allowed_offsets))
-                        .collect::<crate::Result<Vec<_>>>()?
-                } else {
-                    segments
-                        .par_iter()
-                        .map(|seg| seg.read().search(q, pool_k, vectors, allowed_offsets))
-                        .collect::<crate::Result<Vec<_>>>()?
-                };
-                Ok(if lists.len() >= 4 && pool_k >= 64 {
-                    kway_merge_topk(&lists, pool_k)
-                } else {
-                    merge_candidates(lists, pool_k)
-                })
-            })
+            .map(|q| self.candidates(q, pool_k, vectors, allowed_offsets))
             .collect::<crate::Result<Vec<_>>>()?;
 
         // Batched rerank. GPU path needs a meaningful candidate union to be
@@ -257,11 +201,7 @@ impl SegmentSnapshot {
         let mut results: Vec<Vec<ScoredPoint>> = Vec::with_capacity(m);
         for (q, cands) in queries.iter().zip(per_query_candidates.iter()) {
             let mut reranked = cpu_rerank_candidates(q, cands, vectors);
-            reranked.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            reranked.sort_by(|a, b| turbomemory_core::cmp_score_desc(a.score, b.score));
             reranked.truncate(top_k);
             results.push(reranked);
         }
@@ -270,103 +210,42 @@ impl SegmentSnapshot {
 }
 
 /// CPU rerank of candidate points with full f32 embeddings.
+///
+/// Runs on the calling thread. It must not hand work to the Rayon pool while
+/// it holds the vector-store read view: a queued writer (an insert) blocks new
+/// readers, the pool's workers are such readers (segment searches for other
+/// queries), and a rerank waiting on those workers while holding the lock the
+/// writer needs is a deadlock. Scoring a few thousand candidates with SIMD
+/// takes well under a millisecond, so there is nothing to gain from fanning
+/// it out either.
 fn cpu_rerank_candidates(
     query: &[f32],
     candidates: &[ScoredPoint],
     vectors: &VectorStore,
 ) -> Vec<ScoredPoint> {
     let view = vectors.read_view();
-    let reranked: Vec<ScoredPoint> = if candidates.len() >= 256 {
-        let chunks: Vec<&[ScoredPoint]> = candidates.chunks(64).collect();
-        chunks
-            .into_par_iter()
-            .flat_map(|chunk| {
-                let mut pairs = Vec::with_capacity(chunk.len());
-                for c in chunk {
-                    if let Some(v) = view.get(c.offset) {
-                        pairs.push((*c, v));
-                    }
-                }
-                let refs: Vec<&[f32]> = pairs.iter().map(|(_, v)| *v).collect();
-                let scores = turbomemory_core::cosine_similarity_batch(query, &refs);
-                pairs
-                    .into_iter()
-                    .zip(scores)
-                    .map(|((c, _), score)| ScoredPoint {
-                        offset: c.offset,
-                        score,
-                        tier: c.tier,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect()
-    } else {
-        candidates
-            .chunks(64)
-            .flat_map(|chunk| {
-                let mut pairs = Vec::with_capacity(chunk.len());
-                for c in chunk {
-                    if let Some(v) = view.get(c.offset) {
-                        pairs.push((c, v));
-                    }
-                }
-                let refs: Vec<&[f32]> = pairs.iter().map(|(_, v)| *v).collect();
-                let scores = turbomemory_core::cosine_similarity_batch(query, &refs);
-                pairs
-                    .into_iter()
-                    .zip(scores)
-                    .map(|((c, _), score)| ScoredPoint {
-                        offset: c.offset,
-                        score,
-                        tier: c.tier,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect()
-    };
-    reranked
-}
-
-/// GPU-accelerated rerank of candidate points with full f32 embeddings.
-fn gpu_rerank_candidates(
-    query: &[f32],
-    candidates: &[ScoredPoint],
-    vectors: &VectorStore,
-    backend: &Arc<dyn turbomemory_gpu::GpuBackend>,
-) -> turbomemory_gpu::Result<Vec<ScoredPoint>> {
-    let dim = vectors.dimension();
-    let view = vectors.read_view();
-
-    // Collect candidate vectors into a contiguous flat buffer
-    let mut flat_vectors: Vec<f32> = Vec::with_capacity(candidates.len() * dim);
-    let mut valid_candidates: Vec<ScoredPoint> = Vec::with_capacity(candidates.len());
-    for c in candidates {
-        if let Some(v) = view.get(c.offset) {
-            flat_vectors.extend_from_slice(v);
-            valid_candidates.push(*c);
+    let mut reranked = Vec::with_capacity(candidates.len());
+    for chunk in candidates.chunks(64) {
+        let mut pairs = Vec::with_capacity(chunk.len());
+        for c in chunk {
+            if let Some(v) = view.get(c.offset) {
+                pairs.push((c, v));
+            }
         }
+        let refs: Vec<&[f32]> = pairs.iter().map(|(_, v)| *v).collect();
+        let scores = turbomemory_core::cosine_similarity_batch(query, &refs);
+        reranked.extend(
+            pairs
+                .into_iter()
+                .zip(scores)
+                .map(|((c, _), score)| ScoredPoint {
+                    offset: c.offset,
+                    score,
+                    tier: c.tier,
+                }),
+        );
     }
-    drop(view);
-
-    if valid_candidates.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Upload to GPU and compute batched cosine similarity
-    let device_buf = backend.upload_vectors(&flat_vectors, dim)?;
-    let scores = backend.batch_cosine_similarity(query, &device_buf)?;
-
-    // Build reranked points preserving tier info
-    let reranked: Vec<ScoredPoint> = valid_candidates
-        .into_iter()
-        .zip(scores)
-        .map(|(c, score)| ScoredPoint {
-            offset: c.offset,
-            score,
-            tier: c.tier,
-        })
-        .collect();
-    Ok(reranked)
+    reranked
 }
 
 /// Batched GPU rerank for M queries at once. This is where the GPU genuinely
@@ -398,14 +277,16 @@ fn gpu_rerank_candidates_batch(
     let mut offset_to_union_idx: HashMap<PointOffset, usize> = HashMap::new();
     for cands in per_query_candidates {
         for c in cands {
-            if offset_to_union_idx
-                .insert(c.offset, union_offsets.len())
-                .is_some()
+            // Only a NEW offset gets an index. (Re-inserting an offset another
+            // query already contributed used to overwrite its index with the
+            // current length, so that candidate was scored against a
+            // different vector, or read past the end of the score matrix.)
+            if let std::collections::hash_map::Entry::Vacant(slot) =
+                offset_to_union_idx.entry(c.offset)
             {
-                // already present
-                continue;
+                slot.insert(union_offsets.len());
+                union_offsets.push(c.offset);
             }
-            union_offsets.push(c.offset);
         }
     }
     if union_offsets.is_empty() {
@@ -426,10 +307,18 @@ fn gpu_rerank_candidates_batch(
     }
     drop(view);
 
-    // 3. Flatten the M queries into one M×dim buffer.
+    // 3. Flatten the M queries into one M×dim buffer, scaled to unit length:
+    //    the GPU computes dot products, and the stored vectors are unit
+    //    length, so a unit query makes the result the cosine the CPU path
+    //    returns (a query of any other length would scale every score).
     let mut flat_queries: Vec<f32> = Vec::with_capacity(m * dim);
     for q in queries {
-        flat_queries.extend_from_slice(q);
+        let norm = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm.is_normal() {
+            flat_queries.extend(q.iter().map(|x| x / norm));
+        } else {
+            flat_queries.extend(std::iter::repeat_n(0.0f32, dim));
+        }
     }
 
     // 4. ONE gemm: M queries × N union vectors → M·N row-major scores.
@@ -450,11 +339,7 @@ fn gpu_rerank_candidates_batch(
                 }
             })
             .collect();
-        scored.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        scored.sort_by(|a, b| turbomemory_core::cmp_score_desc(a.score, b.score));
         scored.truncate(top_k);
         results.push(scored);
     }
@@ -494,16 +379,46 @@ pub struct SegmentHolder {
     next_segment_id: AtomicU64,
     base_path: PathBuf,
     snapshot: Arc<ArcSwap<SegmentSnapshot>>,
+    /// Directories of segments that were replaced (compacted or found
+    /// obsolete) but could not be removed yet, typically because a search
+    /// still has their files mapped. Retried on every flush.
+    pending_deletion: Mutex<Vec<PathBuf>>,
+}
+
+/// Tier directory names that hold `segment_<id>` subdirectories.
+fn tier_dirs() -> [&'static str; 3] {
+    [SEALED_HOT_DIR, Tier::Warm.name(), Tier::Cold.name()]
+}
+
+/// The numeric id of a `segment_<id>` directory name.
+fn segment_dir_id(name: &str) -> Option<u64> {
+    name.strip_prefix("segment_")?.parse().ok()
 }
 
 impl SegmentHolder {
     pub fn new(config: StoreConfig, base_path: impl AsRef<Path>) -> crate::Result<Self> {
         let base_path = base_path.as_ref().to_path_buf();
         std::fs::create_dir_all(&base_path)?;
+        // Segment directories are named by a counter. Start it past every
+        // directory already on disk: starting from zero on each open made a
+        // later session build its new segments on top of the ones that were
+        // loaded and still mapped.
+        let mut next_id = 0u64;
+        for tier in tier_dirs() {
+            let Ok(entries) = std::fs::read_dir(base_path.join(tier)) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if let Some(id) = entry.file_name().to_str().and_then(segment_dir_id) {
+                    next_id = next_id.max(id + 1);
+                }
+            }
+        }
         let holder = Self {
             hot: Arc::new(RwLock::new(HotSegment::new(&config)?)),
             lists: RwLock::new(SegmentLists::default()),
-            next_segment_id: AtomicU64::new(0),
+            next_segment_id: AtomicU64::new(next_id),
+            pending_deletion: Mutex::new(Vec::new()),
             base_path,
             snapshot: Arc::new(ArcSwap::from_pointee(SegmentSnapshot::empty(
                 config.clone(),
@@ -530,6 +445,20 @@ impl SegmentHolder {
             }
         }
         Ok(holder)
+    }
+
+    /// Remove a replaced segment's directory, or remember it for a later
+    /// attempt if its files are still in use.
+    pub(crate) fn discard_segment_dir(&self, path: PathBuf) {
+        if std::fs::remove_dir_all(&path).is_err() && path.exists() {
+            self.pending_deletion.lock().push(path);
+        }
+    }
+
+    /// Retry the removal of directories that were in use last time.
+    pub(crate) fn cleanup_pending_dirs(&self) {
+        let mut pending = self.pending_deletion.lock();
+        pending.retain(|path| std::fs::remove_dir_all(path).is_err() && path.exists());
     }
 
     pub(crate) fn snapshot_handle(&self) -> Arc<ArcSwap<SegmentSnapshot>> {
@@ -848,6 +777,10 @@ impl SegmentHolder {
 
         // 3. Install the Cold segment and remove exactly the compacted warm
         //    segments by pointer identity.
+        let warm_paths: Vec<PathBuf> = warm_targets
+            .iter()
+            .filter_map(|seg| seg.read().segment_path().map(Path::to_path_buf))
+            .collect();
         {
             let mut lists = self.lists.write();
             if let Some(cold) = cold {
@@ -860,6 +793,12 @@ impl SegmentHolder {
                 .retain(|seg| !warm_targets.iter().any(|t| Arc::ptr_eq(t, seg)));
         }
         self.publish_snapshot();
+        // 4. The warm segments now live on only as the Cold copy; remove their
+        //    directories so they are not loaded again on the next open.
+        drop(warm_targets);
+        for path in warm_paths {
+            self.discard_segment_dir(path);
+        }
         Ok(())
     }
 
@@ -959,6 +898,7 @@ impl SegmentHolder {
     }
 
     pub fn flush(&self) -> crate::Result<()> {
+        self.cleanup_pending_dirs();
         (self.hot.read().flusher())()?;
         let lists = self.lists.read();
         for plain in &lists.sealing_plain {

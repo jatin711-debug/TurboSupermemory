@@ -32,8 +32,21 @@ pub struct TextIndex {
 }
 
 impl TextIndex {
+    /// Create an empty index at `path`, discarding whatever was there.
+    ///
+    /// The text index is derived data: the engine re-adds every live record
+    /// on open. Starting from an empty directory keeps it from accumulating a
+    /// second copy of every document each time the store is opened, and means
+    /// a damaged index directory can never stop the store from opening.
     pub fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
         let path = path.as_ref().to_path_buf();
+        // If the old directory cannot be removed (a file in it is still held
+        // open by something else), fall back to emptying the existing index.
+        let removed = match std::fs::remove_dir_all(&path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => !path.join("meta.json").exists(),
+        };
         std::fs::create_dir_all(&path)?;
 
         let mut schema_builder = Schema::builder();
@@ -41,17 +54,25 @@ impl TextIndex {
         let offset_field = schema_builder.add_u64_field(OFFSET_FIELD, INDEXED | FAST | STORED);
         let schema = schema_builder.build();
 
-        let index = if path.join("meta.json").exists() {
-            Index::open_in_dir(&path)
-                .map_err(|e| StorageError::IndexError(format!("tantivy open: {e}")))?
-        } else {
+        let index = if removed {
             Index::create_in_dir(&path, schema)
                 .map_err(|e| StorageError::IndexError(format!("tantivy create: {e}")))?
+        } else {
+            Index::open_in_dir(&path)
+                .map_err(|e| StorageError::IndexError(format!("tantivy open: {e}")))?
         };
 
-        let writer = index
+        let mut writer: IndexWriter = index
             .writer(50_000_000)
             .map_err(|e| StorageError::IndexError(format!("tantivy writer: {e}")))?;
+        if !removed {
+            writer
+                .delete_all_documents()
+                .map_err(|e| StorageError::IndexError(format!("tantivy clear: {e}")))?;
+            writer
+                .commit()
+                .map_err(|e| StorageError::IndexError(format!("tantivy commit: {e}")))?;
+        }
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -160,6 +181,11 @@ impl TextIndex {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Number of committed documents visible to searches.
+    pub fn num_docs(&self) -> u64 {
+        self.reader.searcher().num_docs()
     }
 
     pub fn flush(&self) -> crate::Result<()> {

@@ -16,7 +16,6 @@ rayon = { workspace = true }
 ndarray = { workspace = true }
 # CUDA support - optional, enabled via 'cuda' feature
 cudarc = { workspace = true, optional = true }
-fastrand = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

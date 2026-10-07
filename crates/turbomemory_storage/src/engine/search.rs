@@ -3,13 +3,61 @@
 
 use super::StorageEngine;
 use crate::payload_index::Filter;
+use crate::record::PointOffset;
+use crate::segment_holder::SegmentSnapshot;
+use crate::segments::ScoredPoint;
 use roaring::RoaringBitmap;
 use std::collections::HashSet;
-use turbomemory_core::{cosine_similarity, validate_dimension};
+use turbomemory_core::{cosine_similarity, validate_query};
 
 /// For small collections an exact scan is deterministic and higher-recall than
 /// a lightly-configured HNSW index.
 const EXACT_FALLBACK_THRESHOLD: usize = 4096;
+
+/// Exact-search order: best score first, the older record first on a tie, so
+/// equal scores always come back in the same order.
+fn best_first(a: &(PointOffset, f32), b: &(PointOffset, f32)) -> std::cmp::Ordering {
+    turbomemory_core::cmp_score_desc(a.1, b.1).then_with(|| a.0.cmp(&b.0))
+}
+
+/// The best `want` of `candidates` (which must arrive in offset order), best
+/// first, in one pass and without holding more than `2 * want` of them.
+///
+/// Candidates are kept in a small buffer that is cut back to the best `want`
+/// whenever it fills; the worst score kept becomes a floor, and since every
+/// later candidate is a newer record, one that only ties the floor would
+/// rank after everything kept and is skipped without being stored.
+///
+/// `admit` is asked only about candidates that beat the floor, so a check
+/// that costs a lookup (is this row still a live record?) runs for a handful
+/// of rows instead of for all of them.
+fn top_of(
+    candidates: impl Iterator<Item = (PointOffset, f32)>,
+    want: usize,
+    admit: impl Fn(PointOffset) -> bool,
+) -> Vec<(PointOffset, f32)> {
+    if want == 0 {
+        return Vec::new();
+    }
+    let cap = want.saturating_mul(2).max(64);
+    let mut kept: Vec<(PointOffset, f32)> = Vec::new();
+    let mut floor = f32::NEG_INFINITY;
+    for (offset, score) in candidates {
+        // Written so that a NaN score is skipped as well.
+        if score.partial_cmp(&floor) != Some(std::cmp::Ordering::Greater) || !admit(offset) {
+            continue;
+        }
+        kept.push((offset, score));
+        if kept.len() >= cap {
+            kept.select_nth_unstable_by(want - 1, best_first);
+            kept.truncate(want);
+            floor = kept[want - 1].1;
+        }
+    }
+    kept.sort_unstable_by(best_first);
+    kept.truncate(want);
+    kept
+}
 
 impl StorageEngine {
     pub fn search_ann(
@@ -80,66 +128,133 @@ impl StorageEngine {
         ef: Option<usize>,
         scope: Option<&str>,
     ) -> crate::Result<Vec<(String, f32)>> {
-        validate_dimension(query_embedding, self.config.dimension)?;
-        let mut allowed_offsets = match filter {
+        validate_query(query_embedding, self.config.dimension)?;
+        let allowed = self.allowed_offsets(filter, scope)?;
+        self.ann_top_k(query_embedding, top_k, ef, allowed.as_ref())
+    }
+
+    /// The offsets a payload filter and/or scope allow. `None` means the
+    /// search is unrestricted; `Some` always restricts, even when empty (a
+    /// filter or scope that matches nothing must return nothing).
+    fn allowed_offsets(
+        &self,
+        filter: Option<&Filter>,
+        scope: Option<&str>,
+    ) -> crate::Result<Option<RoaringBitmap>> {
+        let mut allowed = match filter {
             Some(f) => Some(self.evaluate_filter(f)?),
             None => None,
         };
         if let Some(s) = scope {
             let scope_bitmap = self.scope_index.read().query(Some(s));
-            allowed_offsets = Some(match allowed_offsets {
+            allowed = Some(match allowed {
                 Some(existing) => existing & scope_bitmap,
                 None => scope_bitmap,
             });
         }
-        // B1: with superseded exclusion enabled, snapshot the superseded id
-        // set once and over-fetch so the stale ids can be dropped while still
-        // filling top_k. `None` (flag off / no supersessions) keeps fetch_k
-        // == top_k and skips the filter entirely.
+        Ok(allowed)
+    }
+
+    /// The `top_k` nearest live records, best first.
+    ///
+    /// `top_k` is clamped to the number of records, so a caller-supplied
+    /// value can never size an allocation.
+    fn ann_top_k(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        ef: Option<usize>,
+        allowed: Option<&RoaringBitmap>,
+    ) -> crate::Result<Vec<(String, f32)>> {
+        // B1: snapshot the superseded id set once per query. `None` (flag off
+        // or no supersessions) skips the exclusion entirely.
         let exclusion = self.superseded_exclusion_set();
-        let fetch_k = Self::exclusion_fetch_k(&exclusion, top_k);
-        if self.record_count() <= EXACT_FALLBACK_THRESHOLD {
-            let mut results = match &allowed_offsets {
-                Some(bitmap) => self.exact_top_k_filtered(query_embedding, fetch_k, Some(bitmap)),
-                None => self.exact_top_k(query_embedding, fetch_k),
-            };
-            Self::apply_superseded_exclusion(&mut results, top_k, exclusion.as_ref());
-            for (id, _) in &results {
-                self.bump_access_by_id(id);
-            }
-            return Ok(results);
+        self.ann_top_k_excluding(query, top_k, ef, allowed, exclusion.as_ref())
+    }
+
+    /// `ann_top_k` with the ids to leave out supplied by the caller (`None`:
+    /// leave nothing out).
+    fn ann_top_k_excluding(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        ef: Option<usize>,
+        allowed: Option<&RoaringBitmap>,
+        exclusion: Option<&HashSet<String>>,
+    ) -> crate::Result<Vec<(String, f32)>> {
+        let records = self.record_count();
+        let top_k = top_k.min(records);
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+        if records <= EXACT_FALLBACK_THRESHOLD {
+            let scored = self.exact_candidates(query, allowed);
+            return Ok(self.finish_exact(
+                |want| top_of(scored.iter().copied(), want, |_| true),
+                top_k,
+                exclusion,
+            ));
         }
         let snapshot = self.segment_snapshot.load_full();
-        let gpu = self.gpu_backend();
-        let scored = snapshot.search_gpu(
-            query_embedding,
-            fetch_k,
-            ef,
-            &self.vectors,
-            allowed_offsets.as_ref(),
-            Some(&gpu),
-        )?;
-        let mut results = Vec::with_capacity(scored.len());
-        for c in scored {
-            if let Some(meta_rec) = self.meta.get(c.offset)? {
-                if let Some(set) = &exclusion {
-                    if set.contains(&meta_rec.id) {
-                        continue;
-                    }
+        let fetch = Self::first_fetch(exclusion, top_k);
+        let scored = snapshot.search(query, fetch, ef, &self.vectors, allowed)?;
+        self.live_top_k(
+            &snapshot, scored, fetch, query, top_k, ef, allowed, exclusion,
+        )
+    }
+
+    /// Reduce a segment search result to the `top_k` live, non-superseded
+    /// records, searching again with a wider pool while that leaves a
+    /// shortfall the index could still fill.
+    ///
+    /// Immutable segments keep the offsets of records that were deleted,
+    /// updated, or evicted until they are rebuilt, and superseded records are
+    /// still indexed. Both are dropped here, after the segment search has
+    /// already cut its results to `fetch`; without the retry, deleting the
+    /// ten best matches for a query made that query return nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn live_top_k(
+        &self,
+        snapshot: &SegmentSnapshot,
+        mut scored: Vec<ScoredPoint>,
+        mut fetch: usize,
+        query: &[f32],
+        top_k: usize,
+        ef: Option<usize>,
+        allowed: Option<&RoaringBitmap>,
+        exclusion: Option<&HashSet<String>>,
+    ) -> crate::Result<Vec<(String, f32)>> {
+        let total = snapshot.point_count();
+        loop {
+            let mut live: Vec<(PointOffset, String, f32)> = Vec::with_capacity(scored.len());
+            for c in &scored {
+                let Some(meta_rec) = self.meta.get(c.offset)? else {
+                    continue;
+                };
+                if exclusion.is_some_and(|set| set.contains(&meta_rec.id)) {
+                    continue;
                 }
-                self.bump_access(c.offset);
-                results.push((meta_rec.id, c.score));
+                live.push((c.offset, meta_rec.id, c.score));
             }
+            let exhausted = scored.len() < fetch || fetch >= total;
+            if live.len() >= top_k || exhausted {
+                live.truncate(top_k);
+                let mut results = Vec::with_capacity(live.len());
+                for (offset, id, score) in live {
+                    self.bump_access(offset);
+                    results.push((id, score));
+                }
+                return Ok(results);
+            }
+            fetch = fetch.saturating_mul(2).min(total);
+            scored = snapshot.search(query, fetch, ef, &self.vectors, allowed)?;
         }
-        results.truncate(top_k);
-        Ok(results)
     }
 
     /// Batched ANN search for M queries. Runs each query's HNSW traversal on
     /// CPU, then reranks all queries' candidate lists in a single GPU `gemm`
-    /// when CUDA is available (`search_gpu_batch`), which is the workload
-    /// where GPU genuinely beats CPU. Returns one result list per query, each
-    /// sorted by score desc and truncated to `top_k`.
+    /// when CUDA is available (`search_gpu_batch`). Returns one result list
+    /// per query, each sorted by score desc and truncated to `top_k`.
     ///
     /// Filter and scope apply identically to every query in the batch.
     pub fn search_ann_batch(
@@ -155,103 +270,127 @@ impl StorageEngine {
             return Ok(Vec::new());
         }
         for q in queries {
-            validate_dimension(q, self.config.dimension)?;
+            validate_query(q, self.config.dimension)?;
         }
-        let mut allowed_offsets = match filter {
-            Some(f) => Some(self.evaluate_filter(f)?),
-            None => None,
-        };
-        if let Some(s) = scope {
-            let scope_bitmap = self.scope_index.read().query(Some(s));
-            allowed_offsets = Some(match allowed_offsets {
-                Some(existing) => existing & scope_bitmap,
-                None => scope_bitmap,
-            });
+        let allowed = self.allowed_offsets(filter, scope)?;
+        let records = self.record_count();
+        let top_k = top_k.min(records);
+        if top_k == 0 {
+            return Ok(vec![Vec::new(); m]);
         }
-        // B1: superseded exclusion applies identically to every query in the
-        // batch — one snapshot for the whole batch, same over-fetch pool.
+
+        // Small collection: an exact scan per query (cheap), which is also
+        // what the single-query path does.
+        if records <= EXACT_FALLBACK_THRESHOLD {
+            return queries
+                .iter()
+                .map(|q| self.ann_top_k(q, top_k, ef, allowed.as_ref()))
+                .collect();
+        }
+
+        // Large collection: batched snapshot search (GPU gemm rerank). B1:
+        // superseded exclusion applies identically to every query in the
+        // batch, from one snapshot of the superseded set.
         let exclusion = self.superseded_exclusion_set();
-        let fetch_k = Self::exclusion_fetch_k(&exclusion, top_k);
-
-        // Small collection: batch the exact scan (per-query, but cheap).
-        if self.record_count() <= EXACT_FALLBACK_THRESHOLD {
-            let mut out = Vec::with_capacity(m);
-            for q in queries {
-                let mut results = match &allowed_offsets {
-                    Some(bitmap) => self.exact_top_k_filtered(q, fetch_k, Some(bitmap)),
-                    None => self.exact_top_k(q, fetch_k),
-                };
-                Self::apply_superseded_exclusion(&mut results, top_k, exclusion.as_ref());
-                for (id, _) in &results {
-                    self.bump_access_by_id(id);
-                }
-                out.push(results);
-            }
-            return Ok(out);
-        }
-
-        // Large collection: batched snapshot search (GPU gemm rerank).
+        let fetch = Self::first_fetch(exclusion.as_ref(), top_k);
         let snapshot = self.segment_snapshot.load_full();
         let gpu = self.gpu_backend();
         let batch_scored = snapshot.search_gpu_batch(
             queries,
-            fetch_k,
+            fetch,
             ef,
             &self.vectors,
-            allowed_offsets.as_ref(),
+            allowed.as_ref(),
             Some(&gpu),
         )?;
 
-        // Map offsets → ids per query and bump access counters.
         let mut out = Vec::with_capacity(m);
-        for scored in batch_scored {
-            let mut results = Vec::with_capacity(scored.len());
-            for c in scored {
-                if let Some(meta_rec) = self.meta.get(c.offset)? {
-                    if let Some(set) = &exclusion {
-                        if set.contains(&meta_rec.id) {
-                            continue;
-                        }
-                    }
-                    self.bump_access(c.offset);
-                    results.push((meta_rec.id, c.score));
-                }
-            }
-            results.truncate(top_k);
-            out.push(results);
+        for (q, scored) in queries.iter().zip(batch_scored) {
+            out.push(self.live_top_k(
+                &snapshot,
+                scored,
+                fetch,
+                q,
+                top_k,
+                ef,
+                allowed.as_ref(),
+                exclusion.as_ref(),
+            )?);
         }
         Ok(out)
     }
 
-    fn exact_top_k(&self, query: &[f32], top_k: usize) -> Vec<(String, f32)> {
-        self.exact_top_k_filtered(query, top_k, None)
-    }
-
-    fn exact_top_k_filtered(
+    /// Exact CPU scan: the cosine of `query` with every live record that
+    /// `allowed` admits, as `(offset, score)` in offset order.
+    fn exact_candidates(
         &self,
         query: &[f32],
-        top_k: usize,
-        allowed_offsets: Option<&RoaringBitmap>,
-    ) -> Vec<(String, f32)> {
+        allowed: Option<&RoaringBitmap>,
+    ) -> Vec<(PointOffset, f32)> {
         let view = self.vectors.read_view();
-        let mut all: Vec<(String, f32)> = Vec::new();
-        let _ = self.meta.for_each_record(|offset, rec| {
+        let index = self.payload_index.read();
+        let live = index.all_offsets();
+        let mut scored: Vec<(PointOffset, f32)> = Vec::with_capacity(live.len() as usize);
+        let mut score = |offset: u32| {
+            if let Some(v) = view.get(offset as PointOffset) {
+                scored.push((offset as PointOffset, cosine_similarity(query, v)));
+            }
+        };
+        match allowed {
             // `Some` always filters, even when empty: a filter/scope that
-            // resolves to zero offsets must match NOTHING (previously an empty
-            // bitmap was treated as "unfiltered", leaking other scopes).
-            if let Some(bitmap) = allowed_offsets {
-                if !bitmap.contains(offset as u32) {
-                    return;
+            // resolves to zero offsets must match NOTHING.
+            Some(bitmap) => bitmap
+                .iter()
+                .filter(|offset| live.contains(*offset))
+                .for_each(&mut score),
+            None => live.iter().for_each(&mut score),
+        }
+        scored
+    }
+
+    /// Turn the head of an exact ranking into the `top_k` results, as
+    /// `(id, score)` with superseded ids dropped.
+    ///
+    /// `top(want)` returns the best `want` candidates, best first (fewer when
+    /// there are no more). Ids are looked up only for those, and the head is
+    /// asked for again, wider, when superseded or just-deleted records took
+    /// slots that live results should have had.
+    fn finish_exact(
+        &self,
+        top: impl Fn(usize) -> Vec<(PointOffset, f32)>,
+        top_k: usize,
+        exclusion: Option<&HashSet<String>>,
+    ) -> Vec<(String, f32)> {
+        let mut want = Self::first_fetch(exclusion, top_k);
+        loop {
+            let head = top(want);
+            let exhausted = head.len() < want;
+            let mut results: Vec<(PointOffset, String, f32)> = Vec::with_capacity(top_k);
+            for (offset, score) in head {
+                // A record deleted since the candidates were collected has
+                // no id any more.
+                let Some(id) = self.meta.id_of(offset) else {
+                    continue;
+                };
+                if exclusion.is_some_and(|set| set.contains(&id)) {
+                    continue;
+                }
+                results.push((offset, id, score));
+                if results.len() == top_k {
+                    break;
                 }
             }
-            if let Some(v) = view.get(offset) {
-                let score = cosine_similarity(query, v);
-                all.push((rec.id.clone(), score));
+            if results.len() == top_k || exhausted {
+                return results
+                    .into_iter()
+                    .map(|(offset, id, score)| {
+                        self.bump_access(offset);
+                        (id, score)
+                    })
+                    .collect();
             }
-        });
-        all.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        all.truncate(top_k);
-        all
+            want = want.saturating_mul(2);
+        }
     }
 
     /// Snapshot of the graph's superseded-id set for one query (B1: the A-TMA
@@ -278,28 +417,15 @@ impl StorageEngine {
         }
     }
 
-    /// Candidate-pool size used when superseded exclusion is active: over-fetch
-    /// `top_k * 2 + 5` so that dropping the stale ids still leaves enough
-    /// candidates to fill `top_k` (the pool size proven in the B1 eval adapter).
-    fn exclusion_fetch_k(exclusion: &Option<HashSet<String>>, top_k: usize) -> usize {
+    /// Size of the first segment search. With superseded exclusion active it
+    /// over-fetches `top_k * 2 + 5` (the pool size proven in the B1 eval
+    /// adapter), so dropping the stale ids usually still fills `top_k` in one
+    /// pass; `live_top_k` widens it when that is not enough.
+    fn first_fetch(exclusion: Option<&HashSet<String>>, top_k: usize) -> usize {
         if exclusion.is_some() {
-            top_k * 2 + 5
+            top_k.saturating_mul(2).saturating_add(5)
         } else {
             top_k
-        }
-    }
-
-    /// Drop superseded ids from an over-fetched result list and truncate back
-    /// to `top_k`. No-op when `exclusion` is `None` (flag off or no
-    /// supersessions), preserving the exact prior behavior.
-    fn apply_superseded_exclusion(
-        results: &mut Vec<(String, f32)>,
-        top_k: usize,
-        exclusion: Option<&HashSet<String>>,
-    ) {
-        if let Some(set) = exclusion {
-            results.retain(|(id, _)| !set.contains(id));
-            results.truncate(top_k);
         }
     }
 
@@ -356,12 +482,18 @@ impl StorageEngine {
     /// `exclusion` is the per-query superseded-id snapshot (B1): when `Some`,
     /// those ids are dropped before the top-k truncation (the callers already
     /// over-fetch the graph candidate pool to compensate).
+    ///
+    /// `allowed` is the scope/filter bitmap of the query. The graph is shared
+    /// by every scope, so each candidate is checked against it here as well:
+    /// nothing outside the caller's scope or filter can be returned, whatever
+    /// the expansion produced.
     fn hydrate_and_fuse(
         &self,
         results: Vec<(String, f32)>,
         query_embedding: &[f32],
         top_k: usize,
         exclusion: Option<&HashSet<String>>,
+        allowed: Option<&RoaringBitmap>,
     ) -> crate::Result<Vec<(String, f32)>> {
         if results.is_empty() {
             return Ok(Vec::new());
@@ -382,7 +514,11 @@ impl StorageEngine {
         let mut hydrated: Vec<(String, f32)> = results
             .into_iter()
             .filter_map(|(id, act)| {
-                self.find_record_by_id(&id).map(|rec| {
+                let offset = self.id_index.read().get(id.as_str()).copied()?;
+                if allowed.is_some_and(|bitmap| !bitmap.contains(offset as u32)) {
+                    return None;
+                }
+                self.get_record(offset).map(|rec| {
                     let cos = cosine_similarity(query_embedding, rec.embedding_f32());
                     // Absolute, saturating graph boost: `act / (1 + act)` depends
                     // on the candidate's OWN graph signal, not the result-set
@@ -400,12 +536,7 @@ impl StorageEngine {
 
                     // Supersession demotion: a memory superseded by a newer one
                     // carries a persisted factor < 1.0.
-                    let demotion = self
-                        .id_index
-                        .read()
-                        .get(id.as_str())
-                        .map(|&offset| self.meta.demotion_factor(offset))
-                        .unwrap_or(crate::metadata_store::NO_DEMOTION);
+                    let demotion = self.meta.demotion_factor(offset);
                     (id, fused * demotion)
                 })
             })
@@ -415,7 +546,9 @@ impl StorageEngine {
         if let Some(set) = exclusion {
             hydrated.retain(|(id, _)| !set.contains(id));
         }
-        hydrated.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Ties broken by id so equal scores come back in a stable order.
+        hydrated
+            .sort_by(|a, b| turbomemory_core::cmp_score_desc(a.1, b.1).then_with(|| a.0.cmp(&b.0)));
         hydrated.truncate(top_k);
         Ok(hydrated)
     }
@@ -438,62 +571,7 @@ impl StorageEngine {
         ef: Option<usize>,
         scope: Option<&str>,
     ) -> crate::Result<Option<Vec<(String, f32)>>> {
-        validate_dimension(query_embedding, self.config.dimension)?;
-
-        let seeds = self.search_ann_candidates_filtered_with_ef(
-            query_embedding,
-            top_k.max(10),
-            None,
-            ef,
-            scope,
-        )?;
-
-        let graph = self.graph.read();
-        // B1: snapshot the superseded id set while the graph read lock is
-        // already held (once per query). `None` when exclusion is disabled
-        // or the graph has no supersessions — the zero-cost fast path.
-        let exclusion: Option<HashSet<String>> = if self.config.tier.exclude_superseded {
-            let set: HashSet<String> = graph.graph().superseded_ids().into_iter().collect();
-            if set.is_empty() {
-                None
-            } else {
-                Some(set)
-            }
-        } else {
-            None
-        };
-        // Request more candidates from the graph than the final top_k so
-        // that memories reached through multi-hop traversal (abstraction
-        // edges, refinement edges) have a chance to be in the candidate
-        // set even if their graph activation is lower than direct matches.
-        // The fusion step (hydrate_and_fuse) will then re-rank using the
-        // combination of cosine + graph activation and truncate to top_k.
-        // With superseded exclusion active, over-fetch at least the
-        // B1-proven `top_k * 2 + 5` pool so dropping stale ids still
-        // leaves enough candidates to fill top_k.
-        let mut graph_k = (top_k * 3).max(top_k + 5);
-        if exclusion.is_some() {
-            graph_k = graph_k.max(top_k * 2 + 5);
-        }
-        let activated = graph.search(query_text, &seeds, graph_k);
-        drop(graph);
-        if let Some(results) = activated {
-            let hydrated =
-                self.hydrate_and_fuse(results, query_embedding, top_k, exclusion.as_ref())?;
-            if hydrated.is_empty() {
-                return Ok(None);
-            }
-            for (id, _) in &hydrated {
-                self.bump_access_by_id(id);
-            }
-            // One graph write lock for the whole batch of hits (rehearsal),
-            // not one per hit.
-            let hit_ids: Vec<&str> = hydrated.iter().map(|(id, _)| id.as_str()).collect();
-            self.reinforce_graph_ids(&hit_ids);
-            Ok(Some(hydrated))
-        } else {
-            Ok(None)
-        }
+        self.cognitive_search(query_text, query_embedding, top_k, None, ef, scope)
     }
 
     pub fn search_ann_filtered(
@@ -537,14 +615,28 @@ impl StorageEngine {
         ef: Option<usize>,
         scope: Option<&str>,
     ) -> crate::Result<Option<Vec<(String, f32)>>> {
-        validate_dimension(query_embedding, self.config.dimension)?;
-        let seeds = self.search_ann_candidates_filtered_with_ef(
-            query_embedding,
-            top_k.max(10),
-            Some(filter),
-            ef,
-            scope,
-        )?;
+        self.cognitive_search(query_text, query_embedding, top_k, Some(filter), ef, scope)
+    }
+
+    /// Cognitive search: ANN seeds, graph and lexical expansion, then fusion
+    /// with exact cosine. The filter and scope bound every stage, not only
+    /// the seeds: the expansion walks a graph and a lexical index shared by
+    /// all scopes, so it is given the same restriction, and the fusion step
+    /// checks each candidate once more.
+    fn cognitive_search(
+        &self,
+        query_text: &str,
+        query_embedding: &[f32],
+        top_k: usize,
+        filter: Option<&Filter>,
+        ef: Option<usize>,
+        scope: Option<&str>,
+    ) -> crate::Result<Option<Vec<(String, f32)>>> {
+        validate_query(query_embedding, self.config.dimension)?;
+        let top_k = top_k.min(self.record_count());
+        let allowed = self.allowed_offsets(filter, scope)?;
+        let seeds = self.ann_top_k(query_embedding, top_k.max(10), ef, allowed.as_ref())?;
+
         let graph = self.graph.read();
         // B1: snapshot the superseded id set while the graph read lock is
         // already held (once per query). `None` when exclusion is disabled
@@ -559,29 +651,53 @@ impl StorageEngine {
         } else {
             None
         };
-        let mut graph_k = (top_k * 3).max(top_k + 5);
+        // Request more candidates from the graph than the final top_k so
+        // that memories reached through multi-hop traversal (abstraction
+        // edges, refinement edges) have a chance to be in the candidate
+        // set even if their graph activation is lower than direct matches.
+        // The fusion step (hydrate_and_fuse) will then re-rank using the
+        // combination of cosine + graph activation and truncate to top_k.
+        // With superseded exclusion active, over-fetch at least the
+        // B1-proven `top_k * 2 + 5` pool so dropping stale ids still
+        // leaves enough candidates to fill top_k.
+        let mut graph_k = top_k.saturating_mul(3).max(top_k.saturating_add(5));
         if exclusion.is_some() {
-            graph_k = graph_k.max(top_k * 2 + 5);
+            graph_k = graph_k.max(top_k.saturating_mul(2).saturating_add(5));
         }
-        let activated = graph.search(query_text, &seeds, graph_k);
+        let activated = match &allowed {
+            Some(bitmap) => {
+                let in_scope = |id: &str| {
+                    self.id_index
+                        .read()
+                        .get(id)
+                        .is_some_and(|offset| bitmap.contains(*offset as u32))
+                };
+                graph.search_restricted(query_text, &seeds, graph_k, Some(&in_scope))
+            }
+            None => graph.search(query_text, &seeds, graph_k),
+        };
         drop(graph);
-        if let Some(results) = activated {
-            let hydrated =
-                self.hydrate_and_fuse(results, query_embedding, top_k, exclusion.as_ref())?;
-            if hydrated.is_empty() {
-                return Ok(None);
-            }
-            for (id, _) in &hydrated {
-                self.bump_access_by_id(id);
-            }
-            // One graph write lock for the whole batch of hits (rehearsal),
-            // not one per hit.
-            let hit_ids: Vec<&str> = hydrated.iter().map(|(id, _)| id.as_str()).collect();
-            self.reinforce_graph_ids(&hit_ids);
-            Ok(Some(hydrated))
-        } else {
-            Ok(None)
+        let Some(results) = activated else {
+            return Ok(None);
+        };
+        let hydrated = self.hydrate_and_fuse(
+            results,
+            query_embedding,
+            top_k,
+            exclusion.as_ref(),
+            allowed.as_ref(),
+        )?;
+        if hydrated.is_empty() {
+            return Ok(None);
         }
+        for (id, _) in &hydrated {
+            self.bump_access_by_id(id);
+        }
+        // One graph write lock for the whole batch of hits (rehearsal),
+        // not one per hit.
+        let hit_ids: Vec<&str> = hydrated.iter().map(|(id, _)| id.as_str()).collect();
+        self.reinforce_graph_ids(&hit_ids);
+        Ok(Some(hydrated))
     }
 
     /// Evaluate a filter against the payload and full-text indexes.

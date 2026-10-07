@@ -198,7 +198,28 @@ impl SpreadingActivation {
         semantic_seeds: &[(String, f32)],
         top_k: usize,
     ) -> Option<Vec<(String, f32)>> {
+        self.search_restricted(query_text, semantic_seeds, top_k, None)
+    }
+
+    /// [`search`](Self::search) restricted to the memories `allow` accepts.
+    ///
+    /// The graph, the concept layer and the BM25 index are shared by every
+    /// scope in the store, so an unrestricted expansion reaches memories the
+    /// caller's scope or filter excludes. With `allow` set, a memory it
+    /// rejects is never added as a candidate, never counts toward the
+    /// expansion cap, and never influences the lexical normalization. The
+    /// seeds are assumed to be allowed already (they come from a scoped ANN
+    /// search).
+    pub fn search_restricted(
+        &self,
+        query_text: &str,
+        semantic_seeds: &[(String, f32)],
+        top_k: usize,
+        allow: Option<&dyn Fn(&str) -> bool>,
+    ) -> Option<Vec<(String, f32)>> {
         use std::collections::HashMap;
+
+        let allowed = |id: &str| allow.is_none_or(|f| f(id));
 
         // Step 1: ANN candidates are the floor — we never drop them. `delta`
         // holds the pure graph signal (cosine is NOT folded in); `seed_scores`
@@ -223,7 +244,8 @@ impl SpreadingActivation {
         }
 
         // Step 2: BM25 lexical boost contributes to the graph delta.
-        let lexical = self.bm25.score(query_text);
+        let mut lexical = self.bm25.score(query_text);
+        lexical.retain(|(id, _)| allowed(id));
         let max_lex = lexical.iter().map(|(_, s)| *s).fold(0.0f32, f32::max);
         let lex_norm = if max_lex > 0.0 { 1.0 / max_lex } else { 0.0 };
         for (id, score) in lexical {
@@ -245,7 +267,11 @@ impl SpreadingActivation {
                 .filter(|(k, _)| k.starts_with("mem:"))
                 .map(|(k, v)| (k.clone(), *v))
                 .collect();
-            seed_list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            // Ties broken by id so the same query always expands from the
+            // same seeds (the map this list came from has no stable order).
+            seed_list.sort_by(|a, b| {
+                turbomemory_core::cmp_score_desc(a.1, b.1).then_with(|| a.0.cmp(&b.0))
+            });
             seed_list.truncate(seed_hops_from);
 
             // Collect all memory nodes reachable in 1 hop from seeds.
@@ -289,7 +315,10 @@ impl SpreadingActivation {
                                             Some(NodeKind::Memory)
                                         )
                                     {
-                                        if let Some(mid) = self.graph.node_external_id(cedge.target)
+                                        if let Some(mid) = self
+                                            .graph
+                                            .node_external_id(cedge.target)
+                                            .filter(|mid| allowed(mid))
                                         {
                                             let key = format!("mem:{mid}");
                                             *normal.entry(key).or_insert(0.0) +=
@@ -323,14 +352,22 @@ impl SpreadingActivation {
                         EdgeKind::Refines | EdgeKind::Contradicts
                             if matches!(target_kind, Some(NodeKind::Memory)) =>
                         {
-                            if let Some(tid) = self.graph.node_external_id(edge.target) {
+                            if let Some(tid) = self
+                                .graph
+                                .node_external_id(edge.target)
+                                .filter(|tid| allowed(tid))
+                            {
                                 let signal = seed_score * edge.weight * decay;
                                 *strong.entry(format!("mem:{tid}")).or_insert(0.0) += signal;
                             }
                         }
                         // mem -> mem sequential edge.
                         EdgeKind::Temporal if matches!(target_kind, Some(NodeKind::Memory)) => {
-                            if let Some(tid) = self.graph.node_external_id(edge.target) {
+                            if let Some(tid) = self
+                                .graph
+                                .node_external_id(edge.target)
+                                .filter(|tid| allowed(tid))
+                            {
                                 let signal = seed_score * edge.weight * decay;
                                 *temporal.entry(format!("mem:{tid}")).or_insert(0.0) += signal;
                             }
@@ -365,7 +402,11 @@ impl SpreadingActivation {
                                     && cedge.target != seed_nid
                                 {
                                     // concept -> sibling memory (2 hops).
-                                    if let Some(mid) = self.graph.node_external_id(cedge.target) {
+                                    if let Some(mid) = self
+                                        .graph
+                                        .node_external_id(cedge.target)
+                                        .filter(|mid| allowed(mid))
+                                    {
                                         let key = format!("mem:{mid}");
                                         let signal = seed_score * concept_w * cedge.weight * decay;
                                         *normal.entry(key).or_insert(0.0) += signal;
@@ -415,8 +456,10 @@ impl SpreadingActivation {
                                             {
                                                 continue;
                                             }
-                                            if let Some(mid) =
-                                                self.graph.node_external_id(sedge.target)
+                                            if let Some(mid) = self
+                                                .graph
+                                                .node_external_id(sedge.target)
+                                                .filter(|mid| allowed(mid))
                                             {
                                                 let key = format!("mem:{mid}");
                                                 let signal = seed_score
@@ -495,7 +538,10 @@ impl SpreadingActivation {
             })
             .collect();
 
-        memories.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        // Ties broken by id: `delta` is a hash map, so without this the
+        // candidates that survive the cut would differ from call to call.
+        memories
+            .sort_by(|a, b| turbomemory_core::cmp_score_desc(a.2, b.2).then_with(|| a.0.cmp(&b.0)));
         memories.truncate(top_k);
 
         if memories.is_empty() {

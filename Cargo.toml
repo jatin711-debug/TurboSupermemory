@@ -51,5 +51,10 @@ fastrand = "2"
 [profile.release]
 lto = true
 codegen-units = 1
-panic = "abort"
+# Unwind, do not abort: this code runs inside other programs (a Python
+# process through the extension, long-lived server tasks). With "abort" any
+# panic in the engine killed the whole host with no exception and no chance
+# to flush; with "unwind" PyO3 raises it as an exception and the server
+# loses one request.
+panic = "unwind"
 debug = false

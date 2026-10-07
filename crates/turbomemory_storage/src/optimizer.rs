@@ -299,8 +299,11 @@ impl BackgroundOptimizer {
             }
             Err(e) => {
                 // On failure, put the plain segment back so records stay
-                // searchable and we can retry later.
+                // searchable and we can retry later. Remove the half-written
+                // directory: every retry takes a fresh one, so leaving them
+                // would pile up a directory per attempt.
                 eprintln!("turbo-optimizer: failed to build segment: {e}");
+                let _ = std::fs::remove_dir_all(&job.path);
                 segments.push_sealing_plain(job.plain);
                 return Err(e);
             }
@@ -317,12 +320,19 @@ impl BackgroundOptimizer {
         if draining.load(Ordering::Acquire) {
             return;
         }
-        let _ = engine.trigger_consolidation();
+        // Nobody is waiting on this thread for a result, so a failure here is
+        // reported instead of dropped: a flush that keeps failing means
+        // nothing is being made durable.
+        if let Err(e) = engine.trigger_consolidation() {
+            eprintln!("turbo-optimizer: consolidation failed: {e}");
+        }
         // Drain any pending seal builds within the resource budget. The remaining
         // work will be picked up by the next optimizer tick.
         Self::process_pending_seals(engine, budget);
         Self::process_pending_merges(engine, budget, pending_deletion, draining);
-        let _ = engine.flush();
+        if let Err(e) = engine.flush() {
+            eprintln!("turbo-optimizer: flush failed: {e}");
+        }
     }
 
     fn process_pending_merges(
@@ -413,6 +423,7 @@ impl BackgroundOptimizer {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("turbo-optimizer: failed to build merged segment: {e}");
+                let _ = std::fs::remove_dir_all(&new_path);
                 return Err(e);
             }
         };

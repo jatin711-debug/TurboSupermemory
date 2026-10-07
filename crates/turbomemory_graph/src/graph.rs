@@ -1011,7 +1011,7 @@ impl MemoryGraph {
             let b = b_key.strip_prefix("concept:").unwrap_or(&b_key).to_string();
             let a_set = concept_memories.get(&a).map(|s| s.len()).unwrap_or(0);
             let b_set = concept_memories.get(&b).map(|s| s.len()).unwrap_or(0);
-            let union = a_set + b_set - count;
+            let union = (a_set + b_set).saturating_sub(count);
             if union == 0 {
                 continue;
             }
@@ -1021,8 +1021,7 @@ impl MemoryGraph {
             }
         }
         candidates.sort_by(|a, b| {
-            b.2.partial_cmp(&a.2)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            turbomemory_core::cmp_score_desc(a.2, b.2)
                 .then(a.0.cmp(&b.0))
                 .then(a.1.cmp(&b.1))
         });
@@ -1625,11 +1624,7 @@ impl MemoryGraph {
                 .cmp(b_src)
                 .then(a_tgt.cmp(b_tgt))
                 .then(a.kind.cmp(&b.kind))
-                .then(
-                    a.weight
-                        .partial_cmp(&b.weight)
-                        .unwrap_or(std::cmp::Ordering::Equal),
-                )
+                .then(a.weight.total_cmp(&b.weight))
         });
         let mut vocab_aliases: Vec<(String, String)> = self
             .vocab
@@ -1714,11 +1709,7 @@ impl MemoryGraph {
                 .cmp(&b_src)
                 .then(a_tgt.cmp(&b_tgt))
                 .then(a.kind.cmp(&b.kind))
-                .then(
-                    a.weight
-                        .partial_cmp(&b.weight)
-                        .unwrap_or(std::cmp::Ordering::Equal),
-                )
+                .then(a.weight.total_cmp(&b.weight))
         });
         self.int_adjacency.rebuild(&self.int_edges);
     }

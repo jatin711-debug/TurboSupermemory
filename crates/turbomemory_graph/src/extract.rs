@@ -485,11 +485,7 @@ pub fn extract_concepts_with_config(text: &str, config: &ExtractorConfig) -> Vec
     }
 
     // Sort by descending score, then alphabetically for determinism.
-    candidates.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
+    candidates.sort_by(|a, b| turbomemory_core::cmp_score_desc(a.1, b.1).then(a.0.cmp(&b.0)));
 
     // Greedy selection with subsumption suppression.
     let mut selected: Vec<String> = Vec::with_capacity(config.max_concepts);

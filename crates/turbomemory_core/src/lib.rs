@@ -31,6 +31,8 @@ pub enum TurboError {
     DimensionMismatch { expected: usize, got: usize },
     #[error("vector is zero-norm")]
     ZeroNorm,
+    #[error("vector contains NaN or infinite values")]
+    NonFinite,
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
     #[error("quantization error: {0}")]
@@ -51,16 +53,82 @@ pub fn validate_dimension(vec: &[f32], dim: usize) -> Result<()> {
     }
 }
 
+/// Validates that every component is finite (no NaN, no infinity).
+///
+/// A single non-finite component makes every similarity against the vector
+/// NaN, which poisons ranking for every later query, so it is rejected at the
+/// boundary instead of being stored.
+pub fn validate_finite(vec: &[f32]) -> Result<()> {
+    if vec.iter().all(|x| x.is_finite()) {
+        Ok(())
+    } else {
+        Err(TurboError::NonFinite)
+    }
+}
+
+/// Validates a query vector: expected dimension and all components finite.
+pub fn validate_query(vec: &[f32], dim: usize) -> Result<()> {
+    validate_dimension(vec, dim)?;
+    validate_finite(vec)
+}
+
 /// In-place L2 normalization.
+///
+/// Returns [`TurboError::NonFinite`] for a vector containing NaN or infinity
+/// and [`TurboError::ZeroNorm`] for an all-zero vector. Finite inputs whose
+/// sum of squares would overflow or underflow are rescaled by their largest
+/// magnitude first, so they still normalize to the right unit vector.
 pub fn normalize(v: &mut [f32]) -> Result<()> {
-    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm == 0.0 {
+    let mut max_abs = 0.0f32;
+    for x in v.iter() {
+        if !x.is_finite() {
+            return Err(TurboError::NonFinite);
+        }
+        max_abs = max_abs.max(x.abs());
+    }
+    if max_abs == 0.0 {
         return Err(TurboError::ZeroNorm);
     }
+    // Ordinary magnitudes: the plain norm is exact enough and keeps results
+    // bit-identical to what earlier builds stored.
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm.is_normal() {
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
+        return Ok(());
+    }
+    // The sum of squares overflowed or underflowed: rescale first. Divide
+    // (rather than multiply by a reciprocal) so a subnormal `max_abs` cannot
+    // overflow the scale factor.
+    let norm: f32 = v
+        .iter()
+        .map(|x| {
+            let s = x / max_abs;
+            s * s
+        })
+        .sum::<f32>()
+        .sqrt();
+    // `norm` is in [1, sqrt(len)] here: finite and non-zero by construction.
     for x in v.iter_mut() {
-        *x /= norm;
+        *x = (*x / max_abs) / norm;
     }
     Ok(())
+}
+
+/// Total order for similarity scores, highest first, with NaN last.
+///
+/// Sorting scores with `partial_cmp(..).unwrap_or(Equal)` is not a total order
+/// once a NaN is present, and the standard sort may panic on that. Use this
+/// comparator for every "best first" sort so a stray NaN (for example from a
+/// vector stored by an older build) sinks to the bottom instead.
+pub fn cmp_score_desc(a: f32, b: f32) -> std::cmp::Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (false, false) => b.total_cmp(&a),
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+    }
 }
 
 /// Fast Walsh-Hadamard Transform in O(d log d). `v.len()` must be a power of two.
@@ -138,6 +206,43 @@ mod tests {
         let a = vec![1.0f32, 0.0, 0.0];
         let b = vec![0.0f32, 1.0, 0.0];
         assert!((cosine_similarity(&a, &b)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalize_rejects_non_finite_and_zero() {
+        let mut nan = vec![1.0f32, f32::NAN, 0.5];
+        assert!(matches!(normalize(&mut nan), Err(TurboError::NonFinite)));
+        let mut inf = vec![f32::INFINITY, 1.0];
+        assert!(matches!(normalize(&mut inf), Err(TurboError::NonFinite)));
+        let mut zero = vec![0.0f32; 4];
+        assert!(matches!(normalize(&mut zero), Err(TurboError::ZeroNorm)));
+        assert!(validate_query(&[1.0, f32::NAN], 2).is_err());
+        assert!(validate_query(&[1.0, 2.0], 3).is_err());
+        assert!(validate_query(&[1.0, 2.0], 2).is_ok());
+    }
+
+    #[test]
+    fn normalize_survives_extreme_magnitudes() {
+        // Squaring these overflows f32; the result must still be the unit vector.
+        let mut big = vec![3.0e19f32, 4.0e19];
+        normalize(&mut big).unwrap();
+        assert!((big[0] - 0.6).abs() < 1e-6 && (big[1] - 0.8).abs() < 1e-6);
+        // Squaring these underflows to zero.
+        let mut tiny = vec![3.0e-30f32, 4.0e-30];
+        normalize(&mut tiny).unwrap();
+        assert!((tiny[0] - 0.6).abs() < 1e-6 && (tiny[1] - 0.8).abs() < 1e-6);
+        // Subnormal input: a reciprocal of the maximum would overflow.
+        let mut sub = vec![1.0e-45f32, 0.0];
+        normalize(&mut sub).unwrap();
+        assert!((sub[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cmp_score_desc_is_total_with_nan() {
+        let mut scores = [0.2f32, f32::NAN, 0.9, -0.5, f32::NAN, 0.9];
+        scores.sort_by(|a, b| cmp_score_desc(*a, *b));
+        assert_eq!(&scores[..4], &[0.9, 0.9, 0.2, -0.5]);
+        assert!(scores[4].is_nan() && scores[5].is_nan());
     }
 
     #[test]

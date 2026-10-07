@@ -45,8 +45,9 @@ impl ApiError {
 }
 
 /// True for storage errors caused by the caller, mapping to HTTP 400 /
-/// gRPC InvalidArgument. This includes dimension mismatches and invalid
-/// arguments reported by the core crate (`StorageError::Core`).
+/// gRPC InvalidArgument. This includes dimension mismatches, unusable
+/// vectors (all-zero, or containing NaN / infinity) and invalid arguments
+/// reported by the core crate (`StorageError::Core`).
 fn is_invalid_argument(se: &turbomemory_storage::StorageError) -> bool {
     use turbomemory_storage::StorageError as SE;
     match se {
@@ -55,6 +56,8 @@ fn is_invalid_argument(se: &turbomemory_storage::StorageError) -> bool {
             ce,
             turbomemory_core::TurboError::DimensionMismatch { .. }
                 | turbomemory_core::TurboError::InvalidArgument(_)
+                | turbomemory_core::TurboError::ZeroNorm
+                | turbomemory_core::TurboError::NonFinite
         ),
         _ => false,
     }
@@ -617,6 +620,16 @@ mod tests {
             ),
             (
                 ApiError::Storage(StorageError::Core(turbomemory_core::TurboError::ZeroNorm)),
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+            ),
+            (
+                ApiError::Storage(StorageError::Core(turbomemory_core::TurboError::NonFinite)),
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+            ),
+            (
+                ApiError::Storage(StorageError::Corrupted("x".into())),
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
             ),

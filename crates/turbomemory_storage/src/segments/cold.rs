@@ -3,7 +3,7 @@
 use crate::config::{Flusher, QuantizerKind, Tier};
 use crate::record::{PointOffset, Record};
 use crate::segments::mmap_array::{MmapBuffer, MmapFileWriter};
-use crate::segments::{ScoredPoint, VectorSegment};
+use crate::segments::{write_manifest_atomic, ScoredPoint, VectorSegment, MANIFEST_FILE};
 use crate::vector_store::VectorStore;
 use crate::StorageError;
 use roaring::RoaringBitmap;
@@ -16,7 +16,6 @@ use turbomemory_core::turbo_quant::{TurboQuantMseQuantizer, TurboQuantProdQuanti
 use turbomemory_core::{cosine_similarity_batch, validate_dimension};
 
 const DATA_FILE: &str = "data.bin";
-const MANIFEST_FILE: &str = "manifest.json";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Manifest {
@@ -108,7 +107,7 @@ impl ColdSegment {
         let manifest_json = serde_json::to_string_pretty(&manifest).map_err(|e| {
             StorageError::Serialize(Box::new(bincode::ErrorKind::Custom(e.to_string())))
         })?;
-        fs::write(path.join(MANIFEST_FILE), manifest_json)?;
+        write_manifest_atomic(&path, manifest_json.as_bytes())?;
 
         Ok(Self {
             dim,
@@ -253,11 +252,7 @@ impl VectorSegment for ColdSegment {
                 tier: Tier::Cold,
             })
             .collect();
-        reranked.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        reranked.sort_by(|a, b| turbomemory_core::cmp_score_desc(a.score, b.score));
         reranked.truncate(top_k);
         Ok(reranked)
     }

@@ -26,7 +26,7 @@ graph TD
 * [**`turbomemory_graph`**](file:///d:/personal-projects/TurboSuperMemory/docs/cognitive_graph.md): The episodic-semantic memory graph, BM25 indexing, the bounded cognitive augmenter (single 1-hop graph-delta re-rank), Working Memory compression (CCS), synonym vocabulary evolution, and automatic importance recomputation.
 * [**`turbomemory_python`**](file:///d:/personal-projects/TurboSuperMemory/docs/bindings_api.md): High-performance PyO3 bindings exposing the memory engine as a Python package, including zero-copy NumPy array mappings and GIL-free concurrency.
 * [**`turbomemory_api`**](file:///d:/personal-projects/TurboSuperMemory/docs/bindings_api.md): Multi-protocol service providing REST (Axum) and gRPC (Tonic) frontends over a unified memory service.
-* [**`turbomemory_gpu`**](file:///d:/personal-projects/TurboSuperMemory/docs/gpu_acceleration.md): Optional GPU acceleration layer with a trait-based backend system (`GpuBackend`), CUDA implementation via `cudarc` (cuBLAS batched distance + custom HNSW build), and transparent CPU fallback.
+* [**`turbomemory_gpu`**](file:///d:/personal-projects/TurboSuperMemory/docs/gpu_acceleration.md): Optional GPU acceleration layer with a trait-based backend system (`GpuBackend`), CUDA implementation via `cudarc` (a cuBLAS batched rerank for batch search), and transparent CPU fallback.
 
 ---
 
@@ -38,11 +38,11 @@ Memory engines for AI agents are highly CPU-bound (due to dense vector math and 
 ### 2.2 Why Segmented Tiers & Swappable Quantization?
 Standard vector databases rebuild large monolithic indices, which can create high write latencies. TurboSuperMemory splits storage into four distinct tiers:
 1. **Hot**: Appendable in-memory buffers (fast writes, brute-force exact scan).
-2. **SealedHot**: Indexed HNSW files built asynchronously in the background (CPU via `usearch` or GPU via `CudaAnnIndex` when `cuda` feature is enabled).
+2. **SealedHot**: Indexed HNSW files built asynchronously in the background (on the CPU, with `usearch`).
 3. **Warm**: 8-bit scalar quantized vectors (4x memory reduction) or 2-bit RaBitQ scanned via SIMD.
 4. **Cold**: 1-bit **RaBitQ** (Randomized Binary Quantization, 30.7x memory reduction) or TurboQuant MSE vectors scanned via fast bitwise XOR/popcount lookup tables.
 * **Universal Dimension Support**: Unlike TurboQuant (which requires strict power-of-two dimensions $2^k$), **RaBitQ** natively supports standard 384-d (MiniLM), 768-d (MPNet, Nomic), and 1536-d (OpenAI) embeddings with guaranteed $O(1/d)$ theoretical MSE distortion bounds.
-This keeps write latency low while optimizing search speeds for old/cold memories. GPU acceleration is available for HNSW build and exact-scan reranking via the optional `turbomemory_gpu` crate.
+This keeps write latency low while optimizing search speeds for old/cold memories. The optional `turbomemory_gpu` crate can take over one step, the full-f32 rerank of a batch of queries; see [GPU acceleration](gpu_acceleration.md).
 
 ### 2.3 Adaptive Prompt Budget Saliency (Submodular MMR)
 For agent prompt generation under tight token limits (150, 300, 1000+ tokens):
@@ -55,35 +55,17 @@ To achieve durability without duplicating large vector data:
 * Vector float arrays are written directly to the mmap'd `vectors.bin` file.
 * Metadata and record attributes are appended immediately to a lightweight Write-Ahead Log (`wal_meta.bin`).
 * A snapshot is written lazily to `redb` (`memory.redb`) during background consolidation.
-* On crash/reboot, the engine replays the lightweight WAL over the last `redb` snapshot.
+* On open, the engine replays the lightweight WAL over the last `redb` snapshot. Each WAL insert carries a checksum of its vector, and replay reads the vector straight from its slot in `vectors.bin`, so a process that is killed loses nothing it acknowledged. (The WAL is fsynced on `flush()`, not per write: after a power loss, writes since the last flush may be missing; they are never half-applied.)
+* Index segments are derived data. A segment that cannot be loaded is discarded on open and its records are indexed again.
 
 ### 2.5 GPU Acceleration Strategy
-GPU acceleration is treated as an **optional performance multiplier**, not a requirement:
-* **Trait-based design**: `GpuBackend` trait enables multiple GPU APIs (CUDA today, Vulkan/ROCm tomorrow).
-* **Silent fallback**: Every GPU operation falls back to CPU on error — no crashes, no user-visible errors.
-* **Build-focused wins**: GPU accelerates HNSW index construction (the clear GPU win), not single-query search (upload overhead dominates).
-* **Opt-in compilation**: The `cuda` feature must be explicitly enabled; default builds are CPU-only.
+GPU acceleration is **optional and narrow**:
+* **Trait-based design**: `GpuBackend` allows other GPU APIs later (CUDA today).
+* **Silent fallback**: every GPU operation falls back to the CPU on error.
+* **One engine path**: with the `cuda` feature, the full-f32 rerank of `search_ann_batch` runs as a single cuBLAS `gemm`. Index construction, index search, the quantized scans, and single-query rerank stay on the CPU.
+* **Opt-in compilation**: the `cuda` feature must be explicitly enabled; default builds are CPU-only.
 
-```mermaid
-graph TD
-    subgraph GPU_Strategy["GPU Acceleration Strategy"]
-        Trait["Trait-based: GpuBackend"]
-        Fallback["Silent CPU fallback"]
-        OptIn["Opt-in: cuda feature"]
-        BuildFocus["Build-focused: HNSW construction"]
-    end
-    
-    subgraph Integration["Storage Engine Integration"]
-        Lazy["Lazy init: first call to gpu_backend()"]
-        ArcSwap["ArcSwap: lock-free GPU state"]
-        Transparent["Transparent to callers"]
-    end
-    
-    Trait --> Integration
-    Fallback --> Integration
-    OptIn --> Integration
-    BuildFocus --> Integration
-```
+On the one GPU it has been measured on (RTX 3050 4 GB) the CUDA build is correct but not faster than the CPU build; see [GPU acceleration](gpu_acceleration.md) for the numbers.
 
 ---
 
@@ -100,10 +82,10 @@ sequenceDiagram
     
     App->>Core: Ingest Record (ID, Text, Vector, Scope, Concepts)
     Core->>VS: Append raw f32 vector
-    Core->>WAL: Append metadata entry (WalOp::Insert) & flush to disk
+    Core->>WAL: Append metadata entry + vector checksum (WalOp::Insert)
     Core->>Cache: Add record to metadata cache
     Core->>Core: Update memory indices (ID index, Scope index, Text index)
-    Note over Core: Record is now durable and searchable in Hot segment
+    Note over Core: Record is searchable, and recoverable after a process kill
 ```
 
 ### 3.2 Read Path (Cognitive Retrieval & 2-Stage Late Interaction)
@@ -179,7 +161,7 @@ graph TB
     
     subgraph Tiers["Segment Tiers"]
         Hot["Hot (FP32, exact scan)"]
-        SealedHot["SealedHot (HNSW: usearch or GPU)"]
+        SealedHot["SealedHot (HNSW: usearch)"]
         Warm["Warm (8-bit scalar/TurboQuant)"]
         Cold["Cold (1-bit sign/TurboQuant MSE)"]
     end
@@ -187,7 +169,6 @@ graph TB
     subgraph GPU["GPU Layer (turbomemory_gpu, optional)"]
         GpuBackend["GpuBackend Trait"]
         CudaBackend["CudaBackend (cudarc + cuBLAS)"]
-        CudaAnnIndex["CudaAnnIndex (custom HNSW)"]
         CpuFallback["CpuFallback"]
     end
     
@@ -234,7 +215,6 @@ graph TB
     Segments --> Cold
     
     Hot --> SIMD
-    SealedHot --> CudaAnnIndex
     Warm --> Quantizers
     Cold --> Quantizers
     
@@ -256,34 +236,19 @@ graph TB
 
 ### 3.4 GPU-Accelerated Search Path (Opt-in via `cuda` feature)
 
-When the `cuda` feature is enabled and a CUDA device is available, the search path can leverage GPU acceleration for exact-scan and HNSW build operations:
+When the `cuda` feature is enabled and a CUDA device is available, `search_ann_batch` reranks the candidates of all its queries in one cuBLAS `gemm`:
 
 ```mermaid
 flowchart TD
-    subgraph GPU_Backend["GPU Backend (turbomemory_gpu)"]
-        Cuda["CudaBackend: cudarc + cuBLAS"]
-        Fallback["CpuFallback: transparent fallback"]
-    end
-    
-    subgraph Search_Ops["Search Operations"]
-        Exact["Hot Segment Exact Scan"]
-        Rerank["Quantized Tier Candidate Rerank"]
-        HNSW["SealedHot HNSW Build"]
-    end
-    
-    Cuda --"sgemv batched dot"--> Exact
-    Cuda --"sgemv batched dot"--> Rerank
-    Cuda --"CudaAnnIndex build"--> HNSW
-    Fallback -."any CUDA error".- Exact
-    Fallback -."any CUDA error".- Rerank
-    Fallback -."any CUDA error".- HNSW
+    Q["M queries"] --> Cand["Per-query candidates (CPU: HNSW + quantized tiers)"]
+    Cand --> Union["Union of candidate vectors, uploaded once"]
+    Union --> Gemm["cuBLAS gemm: M x N cosine scores"]
+    Gemm --> Top["Per-query sort and top_k"]
+    Gemm -. "any CUDA error" .-> Cpu["CPU rerank"]
+    Cpu --> Top
 ```
 
-**GPU Path Design Principles:**
-1. **Trait-based backend**: `GpuBackend` trait allows future Vulkan/ROCm/Metal implementations without touching storage code.
-2. **Silent CPU fallback**: Every GPU operation falls back to CPU on error (CUDA unavailable, OOM, kernel error).
-3. **Opt-in only**: GPU acceleration is only active when the `cuda` feature is enabled at compile time AND a CUDA device is detected at runtime.
-4. **HNSW build focus**: GPU accelerates the HNSW graph build (the clear GPU win), not single-query search (upload overhead dominates for single queries).
+Single-query search does not use the GPU: uploading one query's candidates costs more than scoring them with SIMD.
 
 ---
 
@@ -300,7 +265,7 @@ For in-depth explanations of specific features, browse the detailed sub-document
 4. [**Python Bindings and API Services Subsystem**](file:///d:/personal-projects/TurboSuperMemory/docs/bindings_api.md)
    * PyO3 binding structures, zero-copy NumPy array operations, thread GIL releases, Tonic gRPC, and Axum REST controllers.
 5. [**GPU Acceleration Subsystem**](file:///d:/personal-projects/TurboSuperMemory/docs/gpu_acceleration.md)
-   * Trait-based GPU backend design, CUDA implementation with cuBLAS batched distance compute, custom HNSW build algorithm, and transparent CPU fallback architecture.
+   * Trait-based GPU backend design, the cuBLAS batched rerank, transparent CPU fallback, and measured results.
 
 ---
 
@@ -320,7 +285,7 @@ The development of TurboSuperMemory follows a structured progression outlined in
 * **Stage 1.5: GPU Acceleration (Completed 2026-06-21)**
   * [x] **G1: GPU Backend Trait** (`GpuBackend` with `CudaBackend` + `CpuFallback`).
   * [x] **G2: cuBLAS Batched Distance** (cuBLAS `sgemv` for exact scan and rerank).
-  * [x] **G3: CUDA HNSW Build** (Custom `CudaAnnIndex` with brute-force + random projection).
+  * [x] **G3: CUDA HNSW Build** (removed 2026-10-06: the graph it built was never searched and doubled sealing time).
   * [x] **G4: GPU Integration** (Storage engine integration, Python `gpu_accelerated` property).
 * **Stage 2: Structural Scaling (In Progress / Next)**
   * [ ] **S1: Collection Sharding** (Distribute partitions).

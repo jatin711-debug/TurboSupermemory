@@ -39,7 +39,9 @@ with Memory("./my_db") as mem:                       # conversational profile
 - Compress instead of delete: with `max_records` set, pass
   `gist_summarizer=OpenAIGistSummarizer()` (or the model-free
   `ExtractiveGistSummarizer()`, both in `tsm.gist`) and eviction victims are
-  folded into searchable gist records instead of being dropped.
+  folded into searchable gist records instead of being dropped. If the
+  summarizer raises, the affected memories are kept and retried on the next
+  eviction; only an empty summary drops them.
 - Verified supersession: pass `verifier=NLIVerifier()` (`tsm.verification`,
   needs `torch` + `transformers`) — consolidation then proposes, NLI-vets
   (accept contradiction/entailment, reject neutral), and commits only the
@@ -50,6 +52,26 @@ with Memory("./my_db") as mem:                       # conversational profile
 - `close()` (or leaving the `with` block) flushes and releases the database;
   the same path can be reopened immediately. A closed `Memory` raises
   `RuntimeError` on further calls.
+- A process that dies without `close()` loses nothing it was told was stored:
+  the next open replays the write-ahead log (`mem.engine.recovery_report()`).
+- `add()` is all-or-nothing per call and safe to call from several threads.
+  Recall is scoped by the engine itself: other users' records never show up
+  and never take result slots.
+
+## When a backend misbehaves
+
+- A rejected API key or a malformed request fails at once with the HTTP
+  status in the message; only transient errors (rate limits, timeouts, 5xx)
+  are retried with backoff.
+- The OpenAI extractor never drops a message: a reply that is cut off or is
+  not valid JSON is requested again with a larger budget, and if that fails
+  the message itself is stored as one fact. Only well-formed replies are
+  cached.
+- `OpenAIEmbedder(dim=512)` asks the API for 512-dimensional vectors
+  (text-embedding-3 models); a vector of an unexpected size is an error at
+  the embedder, not at insert time.
+- The embedding cache is read with a loader that accepts arrays only, so a
+  cache file in a database directory you were given cannot run code.
 
 ## Tests
 

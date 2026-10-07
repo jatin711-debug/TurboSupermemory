@@ -80,7 +80,7 @@ sequenceDiagram
     participant redb as "redb Snapshot (lazy)"
 
     App->>VS: Append float embedding
-    App->>WAL: Append metadata (WalOp::Insert) & sync
+    App->>WAL: Append metadata + vector checksum (WalOp::Insert)
     App->>Cache: Cache MetaRecord (in-memory)
     Note over App, redb: Transaction Complete
     Note over redb: On flush() or background consolidation
@@ -90,21 +90,31 @@ sequenceDiagram
 
 ### 4.1 Write-Ahead Log (WAL)
 Every metadata write (insert, update, delete) is appended to an append-only Write-Ahead Log (`wal_meta.bin`).
-* **Frame format**: `[magic: 4 bytes "TMSW"] [version: u32] [payload length: u32] [payload bytes (bincode WalOp)] [crc32-c: u32]`.
-* **Zero Embeddings in WAL**: Full embeddings are written directly to `VectorStore` and are *never* written to the WAL. The WAL only logs the `PointOffset`, `MetaRecord` (attributes, text, concepts), and monotonic `seq` number. This keeps the write throughput high.
+* **File format**: an 8-byte header (`"TMSW"`, version), then frames of `[payload length: u32] [payload bytes (bincode WalOp)] [crc32: u32]`. Version 2 is current; version-1 logs left by older builds are still replayed.
+* **Zero Embeddings in WAL**: Full embeddings are written directly to `VectorStore` and are *never* written to the WAL. An insert logs the `PointOffset`, the `MetaRecord` (attributes, text, concepts), the monotonic `seq`, and a **CRC32 of the vector**, which is what lets recovery confirm the vector reached the file.
+* **Operations**: `Insert`, `Delete`, and `Replace` (an update: old offset out, new offset in, as one frame, so a crash can never leave the id pointing at nothing).
+* **Sync policy**: frames are written with one `write` call each (batch inserts: one call for the batch) and fsynced by `flush()`. A killed process loses nothing; a power loss can lose the writes since the last flush.
 
 ### 4.2 Lazy Snapshotting via `redb`
 `redb` acts as a lazy snapshot database (`memory.redb`):
 * All records are stored in the `records` table, keyed by `PointOffset`, serialized using `bincode`.
 * Engine configurations, current sequence counters, serialized cognitive graph state, and Compressed Cognitive State (CCS) are stored in the `meta` key-value table.
-* The WAL is truncated/cleared only when `redb` is successfully flushed to disk.
+* The WAL is truncated/cleared only when `redb` is successfully flushed to disk. If the snapshot transaction fails, the dirty set is restored so the next flush retries the same records.
 
 ### 4.3 Crash Recovery Protocol
 On database open:
 1. Load the last consistent snapshot from `memory.redb` (populating the graph, CCS, and metadata cache).
-2. Open the WAL. Replay any records found in the WAL that have a sequence number higher than the snapshot.
-3. Repopulate the in-memory indexes (ID index, text search index, scope index, payload filter index).
-4. Persist the updated snapshot to `memory.redb` and truncate the WAL.
+2. Replay the WAL frames with a sequence number higher than the snapshot. For each insert, the vector is read **directly from its slot** in `vectors.bin` and checked against the logged CRC. (The vector file's header count is only stamped by `flush`, so it cannot be used to decide what exists; relying on it used to discard every insert since the last flush.) An insert whose vector fails the check is dropped: the vector never reached the file.
+3. Stop at the first frame that is torn, fails its checksum, or cannot be decoded, and truncate the log there. A bad tail costs the damaged records, never the store.
+4. Verify the two primary files agree: a record with no vector (`vectors.bin` missing or truncated) or vectors with no metadata (`memory.redb` missing or replaced) is reported as `StorageError::Corrupted`.
+5. Load the segment directories. One without a manifest is an abandoned build and is removed. One that fails to load (bad manifest, missing or damaged index file, checksum mismatch) is discarded and its records go back to the Hot segment to be indexed again.
+6. Repopulate the in-memory indexes (ID index, text search index, scope index, payload filter index), dropping graph nodes of records that no longer exist.
+7. Persist the recovered snapshot to `memory.redb` and clear the WAL.
+
+`StorageEngine::recovery_report()` (Python: `MemoryEngine.recovery_report()`) returns what steps 2–6 had to repair; it is all zeros after a clean shutdown.
+
+### 4.4 Segment Files
+Segment directories are named `segment_<n>` from a counter that continues past every directory already on disk. A segment's data file is written and synced first; its `manifest.json` is written last, to a temporary name and renamed into place, so a directory is either a complete segment or has no manifest. For HNSW segments the manifest records the index file's length and CRC32, checked before the file is mapped.
 
 ---
 
@@ -131,78 +141,28 @@ stateDiagram-v2
 ### 5.1 Hot Segment
 * New insertions land here.
 * Searches perform a fast brute-force dot product of the query against the memory slice.
-* **GPU Acceleration**: When the `cuda` feature is enabled and a CUDA device is available, `SegmentSnapshot::search_gpu()` uses cuBLAS `sgemv` for batched exact scan over Hot segment offsets, falling back to CPU SIMD on any error.
 
 ### 5.2 SealedHot Segment
 * Once the Hot capacity (e.g., 10,000 records) is reached, the Hot segment is sealed.
-* A background thread builds an HNSW (Hierarchical Navigable Small World) index. Two implementations are available:
-  - **`usearch` HNSW** (default CPU path): Header-only HNSW library. Index file written to `segments/sealed_hot/`.
-  - **`CudaAnnIndex` HNSW** (GPU path, `cuda` feature): Custom CUDA HNSW implementation. For small N (≤4096), uses GPU brute-force all-pairs; for large N, uses random-projection bucketing + local search + probabilistic hierarchical layer construction. Transparently falls back to `usearch` on CUDA error.
+* The optimizer (or the next `flush()`) builds an HNSW (Hierarchical Navigable Small World) index with `usearch`, on the CPU, and writes it to `segments/sealed_hot/`.
+* Searches from more threads than the index has search contexts wait for a free one (they used to fail).
 
 ### 5.3 Warm Segment
 * Compresses embeddings to 8-bit integers using `ScalarQuantizer`, `TurboQuantProdQuantizer`, or 2-bit `RaBitQuantizer`.
 * Computes similarity using LUTs and AVX2-accelerated math directly on quantized bytes, then reranks the top candidates with full floats.
-* **GPU Rerank**: When `cuda` feature is enabled, quantized tier candidate reranking can use GPU batched exact scan via `exact_search_over_offsets_gpu()`.
 
 ### 5.4 Cold Segment
 * Compresses embeddings to 1-bit representations using `RaBitQuantizer` (universal dimension support), `SignQuantizer`, or `TurboQuantMseQuantizer`.
 * In 1-bit RaBitQ mode, stores $100\text{ bytes/vector}$ @ 768-dim (**$30.7\times$ compression**) and scores in $<8\text{ns}$ using precomputed 8-bit query lookup tables.
 * Computes similarity using bitwise XOR and popcount lookups (extremely compact).
-* **GPU Rerank**: Same GPU rerank path as Warm tier when `cuda` feature is enabled.
 
 ---
 
 ## 6. GPU Acceleration in Storage Engine
 
-The `StorageEngine` integrates GPU acceleration through a lazy-initialized, trait-based backend:
+The engine holds a lazily initialised `GpuBackend` (`gpu: Arc<Mutex<Option<Arc<dyn GpuBackend>>>>`). It is used in exactly one place: `search_ann_batch` on a store above the exact-scan threshold reranks the candidates of all its queries with one cuBLAS `gemm` (`SegmentSnapshot::search_gpu_batch`), falling back to the CPU rerank on any CUDA error. Segment builds, segment searches, and single-query reranks do not touch the GPU.
 
-```mermaid
-graph TD
-    subgraph StorageEngine["StorageEngine"]
-        gpu_field["gpu: Arc<Mutex<Option<Arc<dyn GpuBackend>>>>"]
-        gpu_backend["gpu_backend() -> Option<Arc<dyn GpuBackend>>"]
-        is_gpu["is_gpu_accelerated() -> bool"]
-    end
-    
-    subgraph GpuBackend_Trait["GpuBackend Trait"]
-        init["init() -> Result<Self>"]
-        upload["upload_vectors(vectors) -> GpuBuffer"]
-        batch_dot["batch_dot(query, vectors) -> Vec<f32>"]
-        exact_topk["exact_topk(query, vectors, k) -> Vec<(idx, score)>"]
-        build_hnsw["build_hnsw(vectors) -> GpuHnswIndex"]
-    end
-    
-    subgraph CudaBackend_Impl["CudaBackend (cuda feature)"]
-        cudarc["cudarc: CudaContext + CudaBlas"]
-        sgemv["cuBLAS sgemv: vectors^T × query"]
-        cuda_ann["CudaAnnIndex: custom HNSW"]
-    end
-    
-    subgraph CpuFallback_Impl["CpuFallback"]
-        unavailable["Always returns GpuUnavailable"]
-    end
-    
-    gpu_field --> gpu_backend
-    gpu_backend --> GpuBackend_Trait
-    GpuBackend_Trait --> CudaBackend_Impl
-    GpuBackend_Trait --> CpuFallback_Impl
-```
-
-### 6.1 GPU-Accelerated Search Paths
-
-When `cuda` feature is enabled and a CUDA device is detected:
-
-1. **Hot Segment Exact Scan**: `SegmentSnapshot::search_gpu()` uploads the query and candidate offset vectors to GPU, computes batched cosine similarity via cuBLAS `sgemv`, and returns top-k results.
-2. **Quantized Tier Rerank**: After quantized LUT scan produces candidates, `gpu_rerank_candidates()` can optionally rerank using GPU exact distance compute.
-3. **HNSW Build**: `SealedHotSegment::from_vectors()` attempts `GpuHnswIndex::build()` first; on any error, transparently falls back to CPU `UsearchIndex::build()`.
-
-### 6.2 Transparent Fallback
-
-Every GPU path implements silent CPU fallback:
-- **CUDA unavailable** (no driver, no device): `CpuFallback` returns `GpuUnavailable` on `init()`.
-- **Out of GPU memory**: `CudaBackend` catches allocation errors and propagates them as fallback triggers.
-- **Kernel errors**: Any CUDA API error triggers fallback to the equivalent CPU path.
-- **Runtime detection**: `is_gpu_accelerated()` checks both feature flag AND device availability at runtime.
+Details and measurements: [GPU acceleration](gpu_acceleration.md).
 
 ---
 
@@ -212,4 +172,4 @@ The [`BackgroundOptimizer`](file:///d:/personal-projects/TurboSuperMemory/crates
 * **Consolidation**: Merges fragmented small segments into larger ones to keep search parallelization balanced.
 * **Tiering**: Promotes/demotes segments based on access frequency. Frequently accessed Cold records can be promoted back to Hot via `promote_hot` if configured.
 * **Vacuuming**: Deletes marked records from indices and rewrites segment tables to reclaim storage space.
-* **GPU HNSW Build**: When the `cuda` feature is enabled, the optimizer attempts GPU-accelerated HNSW construction for sealed segments. If the GPU path fails (OOM, CUDA error), it falls back to the standard CPU `usearch` build transparently. The build uses a `Weak<StorageEngine>` reference so the optimizer does not keep the engine alive if the engine is dropped.
+* **Index builds**: sealed segments are built on the CPU. The optimizer only holds a `Weak<StorageEngine>`, so it never keeps a closed engine alive.

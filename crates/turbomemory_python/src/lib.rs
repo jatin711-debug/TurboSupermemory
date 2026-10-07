@@ -26,7 +26,8 @@ fn storage_err(e: turbomemory_storage::StorageError) -> PyErr {
         E::Core(
             turbomemory_core::TurboError::DimensionMismatch { .. }
             | turbomemory_core::TurboError::InvalidArgument(_)
-            | turbomemory_core::TurboError::ZeroNorm,
+            | turbomemory_core::TurboError::ZeroNorm
+            | turbomemory_core::TurboError::NonFinite,
         ) => PyValueError::new_err(e.to_string()),
         E::NotFound(_) => PyKeyError::new_err(e.to_string()),
         _ => PyRuntimeError::new_err(e.to_string()),
@@ -212,15 +213,26 @@ pub struct PyMemoryEngine {
     /// `None` once `close()` has run. Dropping the `Arc` is what releases the
     /// database lock, mmaps, and worker threads, so `close()` takes it out
     /// rather than leaving release to Python's garbage collector.
-    inner: Option<Arc<StorageEngine>>,
+    ///
+    /// Behind a mutex so `close()` works through a shared reference: every
+    /// method clones the `Arc` and releases the mutex before doing any work,
+    /// so `close()` from one thread cannot collide with a call that is still
+    /// running on another (which simply finishes on its own clone).
+    inner: Mutex<Option<Arc<StorageEngine>>>,
 }
 
 impl PyMemoryEngine {
     /// The live engine, or `RuntimeError` after `close()`.
-    fn engine(&self) -> PyResult<&Arc<StorageEngine>> {
-        self.inner
-            .as_ref()
+    fn engine(&self) -> PyResult<Arc<StorageEngine>> {
+        self.handle()
+            .clone()
             .ok_or_else(|| PyRuntimeError::new_err("engine is closed"))
+    }
+
+    fn handle(&self) -> std::sync::MutexGuard<'_, Option<Arc<StorageEngine>>> {
+        // Nothing panics while this is held, but a poisoned handle must
+        // still be closable.
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -292,6 +304,7 @@ impl PyMemoryEngine {
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
+        py: Python<'_>,
         db_path: &str,
         dimension: usize,
         max_edges: Option<usize>,
@@ -629,8 +642,15 @@ impl PyMemoryEngine {
             config.tier.temporal_recency_weight = trw.clamp(0.0, 2.0);
         }
 
-        let inner = StorageEngine::open(db_path, config).map_err(storage_err)?;
-        Ok(Self { inner: Some(inner) })
+        // Opening replays the write-ahead log and rebuilds the in-memory
+        // indexes, which can take a while on a large store: do not hold the
+        // interpreter lock for it.
+        let inner = py
+            .allow_threads(|| StorageEngine::open(db_path, config))
+            .map_err(storage_err)?;
+        Ok(Self {
+            inner: Mutex::new(Some(inner)),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -860,9 +880,7 @@ impl PyMemoryEngine {
     /// ```
     fn set_llm_compressor(&self, callable: Py<PyAny>) -> PyResult<()> {
         let engine = self.engine()?;
-        let compressor = Arc::new(PythonCompressor {
-            callable: Mutex::new(callable),
-        });
+        let compressor = Arc::new(PythonCompressor { callable });
         engine.set_compressor(compressor);
         Ok(())
     }
@@ -871,11 +889,13 @@ impl PyMemoryEngine {
     /// gist-before-evict. Only consulted when the engine was constructed with
     /// `gist_before_evict=True`. The callable receives one argument — a list
     /// of evicted fact texts (one chunk, same scope, chronological order) —
-    /// and must return either `None` (drop this chunk) or a
-    /// `(gist_text, embedding)` tuple: the compressed gist plus the vector to
-    /// store it under (typically from the same embedder used for facts). If
-    /// the callable raises or returns a malformed value, the chunk is dropped
-    /// and eviction proceeds.
+    /// and must return either `None` (nothing worth keeping: the chunk is
+    /// deleted without a gist) or a `(gist_text, embedding)` tuple: the
+    /// compressed gist plus the vector to store it under (typically from the
+    /// same embedder used for facts). If the callable raises or returns a
+    /// malformed value, that chunk's records are NOT deleted; they stay in
+    /// the store and are tried again on the next eviction, so a summarizer
+    /// outage cannot silently erase memories.
     ///
     /// Example:
     /// ```python
@@ -887,9 +907,7 @@ impl PyMemoryEngine {
     /// ```
     fn set_gist_compressor(&self, callable: Py<PyAny>) -> PyResult<()> {
         let engine = self.engine()?;
-        let compressor = Arc::new(PythonGistCompressor {
-            callable: Mutex::new(callable),
-        });
+        let compressor = Arc::new(PythonGistCompressor { callable });
         engine.set_gist_compressor(Some(compressor));
         Ok(())
     }
@@ -1017,7 +1035,34 @@ impl PyMemoryEngine {
     /// `RuntimeError("engine is closed")`.
     #[getter]
     fn closed(&self) -> bool {
-        self.inner.is_none()
+        self.handle().is_none()
+    }
+
+    /// What opening this store had to repair, as a dict of counters. All
+    /// zeros when the store was closed cleanly last time.
+    ///
+    /// - `wal_ops_replayed`: writes recovered from the write-ahead log.
+    /// - `wal_inserts_without_vector`: logged inserts dropped because their
+    ///   vector never reached disk.
+    /// - `wal_bytes_discarded`: bytes cut from a torn or corrupt log tail.
+    /// - `segments_discarded`: unreadable index segments (their records are
+    ///   indexed again).
+    /// - `segment_dirs_removed`: incomplete or superseded segment directories.
+    /// - `graph_nodes_pruned`: graph nodes of records that no longer exist.
+    fn recovery_report(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let engine = self.engine()?;
+        let report = engine.recovery_report();
+        let dict = PyDict::new(py);
+        dict.set_item("wal_ops_replayed", report.wal_ops_replayed)?;
+        dict.set_item(
+            "wal_inserts_without_vector",
+            report.wal_inserts_without_vector,
+        )?;
+        dict.set_item("wal_bytes_discarded", report.wal_bytes_discarded)?;
+        dict.set_item("segments_discarded", report.segments_discarded)?;
+        dict.set_item("segment_dirs_removed", report.segment_dirs_removed)?;
+        dict.set_item("graph_nodes_pruned", report.graph_nodes_pruned)?;
+        Ok(dict.unbind())
     }
 
     // ---- Graph introspection API (C7) -------------------------------------
@@ -1216,8 +1261,8 @@ impl PyMemoryEngine {
     /// are stopped and the database lock, mmaps, and index files are let go, so
     /// the same `db_path` can be reopened immediately. Idempotent. The engine
     /// is released even when the final flush fails; that error is still raised.
-    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
-        let Some(engine) = self.inner.take() else {
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let Some(engine) = self.handle().take() else {
             return Ok(());
         };
         // Drop the Python callbacks while the GIL is held. A gist/LLM callback
@@ -1239,7 +1284,7 @@ impl PyMemoryEngine {
     }
 
     fn __exit__<'py>(
-        &mut self,
+        &self,
         py: Python<'py>,
         _exc_type: &Bound<'py, PyAny>,
         _exc_value: &Bound<'py, PyAny>,
@@ -1250,12 +1295,18 @@ impl PyMemoryEngine {
 }
 
 /// A `CognitiveCompressor` backed by a Python callable. The callable is
-/// invoked with the GIL re-acquired for each compression call; a Mutex makes
-/// the wrapper `Sync` as required by the trait. Errors from Python or from
-/// parsing the returned JSON fall back to the deterministic compressor so a
-/// misbehaving callback cannot corrupt the working-memory state.
+/// invoked with the GIL re-acquired for each compression call. Errors from
+/// Python or from parsing the returned JSON fall back to the deterministic
+/// compressor so a misbehaving callback cannot corrupt the working-memory
+/// state.
+///
+/// The callable is held without a lock (`Py<PyAny>` is `Send + Sync`, and
+/// the GIL already serializes the call). A lock taken after the GIL and held
+/// across the call deadlocked two threads as soon as the callback released
+/// the GIL: one held the lock and waited for the GIL, the other held the GIL
+/// and waited for the lock.
 struct PythonCompressor {
-    callable: Mutex<Py<PyAny>>,
+    callable: Py<PyAny>,
 }
 
 impl CognitiveCompressor for PythonCompressor {
@@ -1267,12 +1318,8 @@ impl CognitiveCompressor for PythonCompressor {
     ) -> CompressedCognitiveState {
         let ccs_json = ccs.to_json();
         let result = Python::with_gil(|py| {
-            let callable = self
-                .callable
-                .lock()
-                .map_err(|e| PyRuntimeError::new_err(format!("compressor lock poisoned: {e}")))?;
             let args = (ccs_json, user_input, assistant_response);
-            let output = callable.call1(py, args)?;
+            let output = self.callable.call1(py, args)?;
             let json_str: String = output.extract(py)?;
             Ok::<_, PyErr>(json_str)
         });
@@ -1293,22 +1340,27 @@ impl CognitiveCompressor for PythonCompressor {
 
 /// Gist compressor backed by a Python callable (B4 gist-before-evict). The
 /// callable maps a chunk of evicted texts to `(gist_text, embedding)` or
-/// `None`; any exception or malformed return skips the chunk so eviction is
-/// never blocked by a compressor failure.
+/// `None`. `None` is an abstention (the chunk is deleted without a gist); an
+/// exception or a malformed return is a failure, reported to the engine so
+/// it keeps the chunk's records instead of deleting them unsummarized.
 struct PythonGistCompressor {
-    callable: Mutex<Py<PyAny>>,
+    callable: Py<PyAny>,
 }
 
 impl GistCompressor for PythonGistCompressor {
-    fn compress(&self, texts: &[String]) -> Option<(String, Vec<f32>)> {
+    fn compress(&self, texts: &[String]) -> Result<Option<(String, Vec<f32>)>, String> {
         Python::with_gil(|py| {
-            let callable = self.callable.lock().ok()?;
-            let output = callable.call1(py, (texts.to_vec(),)).ok()?;
+            let output = self
+                .callable
+                .call1(py, (texts.to_vec(),))
+                .map_err(|e| format!("gist callback raised: {e}"))?;
             if output.is_none(py) {
-                return None;
+                return Ok(None);
             }
-            let (text, embedding): (String, Vec<f32>) = output.extract(py).ok()?;
-            Some((text, embedding))
+            output
+                .extract::<(String, Vec<f32>)>(py)
+                .map(Some)
+                .map_err(|e| format!("gist callback must return None or (text, embedding): {e}"))
         })
     }
 }

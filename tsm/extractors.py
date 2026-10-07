@@ -5,14 +5,20 @@ message text (+ recent context) so the same message is never extracted (paid
 for) twice. The API key is read from the ``OPENAI_API_KEY`` environment
 variable only — it is never handled or logged. The ``openai`` package is
 imported lazily, so ``tsm`` imports fine without it.
+
+A message is never dropped because extraction went wrong: when the model's
+reply is cut off or is not the expected JSON, the request is repeated once
+with a larger reply budget, and if that fails too the message itself is
+returned as a single fact. Only a well-formed reply is cached.
 """
 
 import hashlib
 import json
 import logging
 import os
-import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
+
+from ._retry import call_with_retries
 
 logger = logging.getLogger("tsm.extractors")
 
@@ -38,18 +44,23 @@ def _cache_key(message: str, context: Optional[List[str]] = None) -> str:
 
 class OpenAIExtractor:
     def __init__(self, model: str = "gpt-4o-mini", max_retries: int = 6,
-                 request_timeout: float = 30.0, cache_dir: str = None):
-        if not os.environ.get("OPENAI_API_KEY"):
-            raise RuntimeError(
-                "OPENAI_API_KEY is not set. The default OpenAIExtractor needs "
-                "it; pass a custom extractor to tsm.Memory to use another "
-                "backend (see tsm.interfaces.Extractor)."
-            )
-        from openai import OpenAI
+                 request_timeout: float = 30.0, cache_dir: str = None,
+                 max_tokens: int = 400, client=None):
+        if client is None:
+            if not os.environ.get("OPENAI_API_KEY"):
+                raise RuntimeError(
+                    "OPENAI_API_KEY is not set. The default OpenAIExtractor needs "
+                    "it; pass client=... for another OpenAI-compatible endpoint, or "
+                    "a custom extractor to tsm.Memory to use another backend "
+                    "(see tsm.interfaces.Extractor)."
+                )
+            from openai import OpenAI
 
-        self._client = OpenAI(timeout=request_timeout)
+            client = OpenAI(timeout=request_timeout)
+        self._client = client
         self.model = model
         self.max_retries = max_retries
+        self.max_tokens = max_tokens
         self.calls = 0
         cdir = cache_dir or os.path.join(os.path.expanduser("~"), ".cache", "tsm")
         os.makedirs(cdir, exist_ok=True)
@@ -70,36 +81,55 @@ class OpenAIExtractor:
         self._dirty += 1
         if force or self._dirty >= 200:
             try:
-                with open(self._cache_path, "w", encoding="utf-8") as f:
+                # Write beside the cache and rename: a crash mid-write must
+                # not leave a half-written file that resets the whole cache.
+                tmp = self._cache_path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
                     json.dump(self._cache, f)
+                os.replace(tmp, self._cache_path)
                 self._dirty = 0
             except OSError as e:
                 logger.warning("extract cache write failed: %s", e)
 
-    def _chat_json(self, message: str, context: Optional[List[str]]) -> str:
+    def _chat_json(self, message: str, context: Optional[List[str]],
+                   max_tokens: int) -> Tuple[Optional[str], Optional[str]]:
+        """One extraction request: ``(reply text, finish reason)``."""
         ctx = ""
         if context:
             ctx = "Recent context:\n" + "\n".join(f"- {c}" for c in context[-3:]) + "\n\n"
         user = f"{ctx}Message:\n\"{message}\""
-        for attempt in range(self.max_retries):
-            try:
-                self.calls += 1
-                resp = self._client.chat.completions.create(
-                    model=self.model,
-                    messages=[{"role": "system", "content": _SYS},
-                              {"role": "user", "content": user}],
-                    temperature=0.0,
-                    max_tokens=400,
-                    response_format={"type": "json_object"},
-                )
-                return resp.choices[0].message.content or "{}"
-            except Exception as e:  # noqa: BLE001 — transient API errors: backoff + retry
-                # 429s can be per-minute windows; back off long enough to outlast them.
-                wait = min(5.0 * (2 ** attempt), 120.0)
-                logger.warning("OpenAI extract failed (attempt %d/%d): %s; retry in %.0fs",
-                               attempt + 1, self.max_retries, e, wait)
-                time.sleep(wait)
-        raise RuntimeError("OpenAI extraction failed after retries")
+
+        def request():
+            self.calls += 1
+            resp = self._client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "system", "content": _SYS},
+                          {"role": "user", "content": user}],
+                temperature=0.0,
+                max_tokens=max_tokens,
+                response_format={"type": "json_object"},
+            )
+            choice = resp.choices[0]
+            return choice.message.content, getattr(choice, "finish_reason", None)
+
+        return call_with_retries(request, "OpenAI extraction", self.max_retries, logger)
+
+    @staticmethod
+    def _parse(raw: Optional[str]) -> Optional[List[str]]:
+        """Facts from a reply, or ``None`` when the reply is not usable (no
+        content, not JSON, or not the ``{"facts": [...]}`` shape)."""
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        got = data.get("facts", [])
+        if not isinstance(got, list):
+            return None
+        return [str(f).strip() for f in got if str(f).strip()]
 
     # Extractor protocol ----------------------------------------------------------
     def extract_facts(self, message: str, context: Optional[List[str]] = None) -> List[str]:
@@ -108,22 +138,31 @@ class OpenAIExtractor:
         key = _cache_key(message, context)
         if key in self._cache:
             return self._cache[key]
-        raw = self._chat_json(message, context)
-        facts: List[str] = []
-        try:
-            data = json.loads(raw)
-            got = data.get("facts", [])
-            if isinstance(got, list):
-                facts = [str(f).strip() for f in got if str(f).strip()]
-        except json.JSONDecodeError:
-            facts = []
+        facts: Optional[List[str]] = None
+        # A cut-off reply (finish reason "length") is not valid JSON, and a
+        # refusal has no content at all. Either used to be read as "this
+        # message contains no facts" and cached as such, so the message was
+        # dropped now and on every later attempt. Ask again with room for a
+        # longer reply before giving up on extraction.
+        for budget in (self.max_tokens, self.max_tokens * 4):
+            raw, finish = self._chat_json(message, context, budget)
+            parsed = self._parse(raw)
+            if parsed is not None and finish != "length":
+                facts = parsed
+                break
+        if facts is None:
+            logger.warning(
+                "extraction reply was cut off or malformed for a %d-character message; "
+                "storing the message itself as one fact", len(message))
+            return [message.strip()]  # not cached: the next run may do better
         self._cache[key] = facts
         self._persist()
         return facts
 
     def flush_cache(self):
         """Write any unpersisted cache entries to disk."""
-        self._persist(force=True)
+        if self._dirty:
+            self._persist(force=True)
 
 
 class GlinerExtractor:

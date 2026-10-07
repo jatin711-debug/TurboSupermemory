@@ -7,16 +7,12 @@
 
 use crate::config::{Flusher, StoreConfig, Tier};
 use crate::record::{PointOffset, Record};
-#[cfg(feature = "cuda")]
-use crate::segments::gpu_hnsw_index::GpuHnswIndex;
 use crate::segments::vector_index::{VectorIndex, VectorIndexManifest};
-use crate::segments::{ScoredPoint, VectorSegment};
+use crate::segments::{write_manifest_atomic, ScoredPoint, VectorSegment, MANIFEST_FILE};
 use crate::vector_store::VectorStore;
 use crate::StorageError;
 use roaring::RoaringBitmap;
 use std::path::{Path, PathBuf};
-
-const MANIFEST_FILE: &str = "manifest.json";
 
 /// Immutable sealed Hot segment backed by a persisted [`VectorIndex`].
 pub struct SealedHotSegment {
@@ -40,7 +36,6 @@ impl SealedHotSegment {
     }
 
     /// Bulk-build a sealed segment from `(offset, vector)` pairs.
-    /// Uses GPU HNSW if CUDA is available and enabled, otherwise falls back to usearch.
     pub fn from_vectors(
         path: impl AsRef<Path>,
         config: &StoreConfig,
@@ -53,24 +48,6 @@ impl SealedHotSegment {
         }
         let path = path.as_ref().to_path_buf();
 
-        // Try GPU HNSW first if CUDA feature is enabled
-        #[cfg(feature = "cuda")]
-        let index: Box<dyn VectorIndex> = {
-            match GpuHnswIndex::build(&path, config, vectors) {
-                Ok(gpu_index) => {
-                    log::info!("SealedHotSegment: using GPU HNSW index");
-                    Box::new(gpu_index)
-                }
-                Err(e) => {
-                    log::warn!("GPU HNSW build failed ({}), falling back to usearch", e);
-                    Box::new(crate::segments::UsearchIndex::build(
-                        &path, config, vectors,
-                    )?)
-                }
-            }
-        };
-
-        #[cfg(not(feature = "cuda"))]
         let index: Box<dyn VectorIndex> = Box::new(crate::segments::UsearchIndex::build(
             &path, config, vectors,
         )?);
@@ -100,15 +77,15 @@ impl SealedHotSegment {
         let index: Box<dyn VectorIndex> = match manifest.index_type.as_str() {
             "usearch" => Box::new(crate::segments::UsearchIndex::open(&path, config)?),
             "gpu_hnsw" => {
-                // GPU HNSW indices are not persisted; rewrite manifest to usearch
-                // and load the underlying usearch index that was built as fallback
-                log::warn!("GPU HNSW index reload: rewriting manifest to usearch");
+                // Written by older CUDA builds, which always stored an
+                // ordinary usearch index alongside: relabel the manifest and
+                // load that.
                 let mut usearch_manifest = manifest;
                 usearch_manifest.index_type = "usearch".into();
                 let manifest_json = serde_json::to_vec(&usearch_manifest).map_err(|e| {
                     StorageError::InvalidArgument(format!("manifest serialization failed: {e}"))
                 })?;
-                std::fs::write(path.join(MANIFEST_FILE), &manifest_json)?;
+                write_manifest_atomic(&path, &manifest_json)?;
                 Box::new(crate::segments::UsearchIndex::open(&path, config)?)
             }
             other => {

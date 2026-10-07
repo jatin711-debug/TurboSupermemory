@@ -1602,3 +1602,171 @@ threshold is tightened.
 re-embedding in budget recall, vacuum, the remaining O(N) consolidation
 passes, CI.
 
+---
+
+# Robustness pass — durability, scope isolation, bad input, concurrency, CUDA (2026-10-06)
+
+No new evaluation numbers. A from-scratch audit (four independent read-throughs
+plus probes against the built extension, CPU and CUDA) found defects that were
+each reproduced before being fixed. Every fix is pinned by a test in
+`crates/turbomemory_storage/tests/robustness.rs` (26 tests) or
+`tsm/tests/test_memory.py::TestRobustness` (7 tests). Run against the previous
+engine code, 25 of the 26 Rust tests fail (the 26th only fails in a CUDA build).
+
+**1. Durability.**
+- *Unflushed writes were lost on any exit without `close()`.* `vectors.bin`'s
+  header count is only stamped by `flush`; WAL replay asked the vector store
+  for each logged vector, got nothing past that count, skipped the record, and
+  then cleared the WAL. 800 acknowledged inserts came back as 0; 50 SDK
+  `add()` calls came back as 0; a script that simply ended without `close()`
+  lost its session. WAL inserts now carry a CRC of their vector and replay
+  reads the slot directly (`VectorStore::recover`). 800 of 800 and 50 of 50
+  after the fix. In debug builds the same reopen failed outright with a header
+  CRC mismatch (the header struct had implicit padding the CRC covered); the
+  padding is now an explicit field.
+- *A store broke in later sessions once it had sealed a segment.* Segment
+  directory numbers restarted at zero on every open, so a new segment was
+  written into the directory of a loaded one (`Permission denied` on Windows;
+  an overwrite of a mapped file elsewhere). Three sessions of 2,500 records
+  kept 5,000; now 7,500. The counter continues past existing directories.
+- *A rejected `update` deleted the record* (delete, then validate). Writes now
+  validate everything first, and an update is one `WalOp::Replace` record.
+- A torn or corrupt WAL tail is cut at the last good frame instead of making
+  the store unopenable (and no longer hides later writes). A failed `redb`
+  snapshot no longer drops its dirty set. A segment build failure no longer
+  stops the durable part of `flush`.
+- Segment files: manifest written last and atomically, HNSW index file checked
+  against a length + CRC before it is mapped (a truncated one used to
+  segfault in the native library), unreadable segments discarded and rebuilt,
+  abandoned build directories and already-compacted Warm segments removed on
+  open, the text index no longer gains a copy of every document per open.
+- A missing or truncated `vectors.bin` / `memory.redb` is now an error on open
+  instead of a store that reports its records and returns none of them.
+- `StorageEngine::recovery_report()` (Python `recovery_report()`) reports what
+  an open repaired. The API server flushes on shutdown and handles SIGTERM.
+
+**2. Scope isolation.** Scoped (and filtered) cognitive search applied the
+scope to the ANN seeds only; the BM25 union and the concept expansion run over
+a graph shared by all scopes. With a query word only the other user used, 900
+of 1,000 results belonged to the other user. The SDK filtered them afterwards,
+so a user with three memories got zero results when another user had 40
+similar facts. The restriction is now passed into the expansion
+(`SpreadingActivation::search_restricted`) and re-checked at fusion: 0 of
+1,000, and the SDK case returns all three. Deduplication no longer merges
+across scopes, and `commit_supersessions_by_id` rejects cross-scope and self
+pairs. Still shared by design: the `max_records` cap, importance
+normalization, vocabulary evolution, `step_session` (see `TODO.md`).
+
+**3. Input that took the process down.** Release builds aborted on panic, so
+each of these killed the Python host: a NaN embedding (accepted, stored, then
+a sort over NaN scores panicked), `top_k = 2^40` on a tiered store (allocation
+sized by `top_k`), a truncated index file (segfault), a truncated
+`memory.redb` (assert inside redb). Non-finite vectors and queries are now
+rejected, `top_k` is clamped to the record count, score sorts use a total
+order (`cmp_score_desc`), and release builds unwind (`panic = "unwind"`).
+
+**4. Concurrency.**
+- *Search + insert hung* on a tiered store (4 searchers and 1 writer never
+  finished a 10 s workload, 4 of 4 runs): the rerank held the vector-store
+  read lock while waiting on the Rayon pool, an insert queued for the write
+  lock, and the pool's workers queued behind it. The rerank is now sequential
+  on the caller's thread. 16 searchers + 2 writers: 92,555 searches and 2,800
+  inserts in 20 s, no errors; search-only throughput also rose (26,023 to
+  48,800 searches in 10 s).
+- *Parallel searches failed* in the process that built an HNSW segment
+  (37–82% of calls at 4–32 threads, "Reserve capacity ahead of searches!"):
+  the index kept only the build's thread contexts. It is re-reserved for
+  search and gated by a semaphore; 0 failures at 32 and 48 threads.
+- Deleting the top 10 results of a query made the same query return nothing on
+  a tiered store (dead offsets were filtered after the cut). The tiered path
+  now refills with a wider pool; this also covers long supersession chains
+  under `exclude_superseded`.
+- Two threads inserting one id could both succeed (now exactly one); the PyO3
+  callback wrappers could deadlock against the GIL (lock removed); `close()`
+  no longer needs exclusive access to the engine object.
+
+**5. Gist-before-evict.** When the summarizer raised, timed out, or returned a
+wrong-dimension vector, the victims were deleted with no gist and no error
+(40 deleted, 0 gists). `GistCompressor::compress` now distinguishes an
+abstention (`Ok(None)`: delete without a gist, as before) from a failure
+(`Err`: keep the chunk's records and retry at the next eviction). The SDK
+callback re-raises instead of swallowing.
+
+**6. CUDA (RTX 3050 4 GB).** The CUDA build's batch rerank indexed shared
+candidates wrongly (recall@10 0.86 against 1.00 on CPU, scores off by up to
+0.14, then an out-of-bounds panic), its "GPU HNSW build" produced a graph
+nothing searched on top of the normal CPU build (sealing about 2x slower), a
+single-query GPU rerank ran 1.7–2x slower than SIMD, and non-unit queries
+were scored by dot product. The batch rerank is fixed and scales queries to
+unit length; the extra build and the single-query GPU rerank are gone. Batch
+and single-query results are now identical on both builds, and the CUDA build
+is neither slower nor faster than the CPU build on this card
+(`docs/gpu_acceleration.md`, `benchmarks/gpu_parity.py`).
+
+**Behaviour changes that can move results**
+- Score ties are broken deterministically (exact scan: older record first;
+  expansion and fusion: by id; eviction: oldest first). The LongMemEval smoke
+  edge count, which had varied between 248 and 251, was 247 on three
+  consecutive runs of this code.
+- A supersession or dedup neighbour search now runs inside the record's
+  scope, so in a store holding several scopes it can find pairs that other
+  scopes used to crowd out of the top 10.
+- `tsm.Memory.add()` stores one validated batch per call instead of one insert
+  per fact (same records, ids and payloads; all-or-nothing).
+- `insert_batch` rejects parallel arrays that are longer than `ids` (it used to
+  ignore the extra entries) and empty ids.
+
+**Gate:** `make gate` 8/8 — fmt, clippy, 285 Rust tests, 51 SDK tests,
+synthetic belief +1.00 / false-demotion 0.00 (both modes), LongMemEval smoke
+KU +0.00, edges 247, worst single-session +0.00, recall 100%. With
+`--features cuda` on the GPU: 3 GPU + 107 storage unit + 4 crash-recovery +
+26 robustness tests pass.
+
+**Not changed** (listed in `TODO.md`): everything the audit found that alters
+what recall returns — belief-revision precision (a 12-pair spot check on the
+default profile retired 1 of 4 real updates and 2 of 8 unrelated facts),
+maintenance reads counted as accesses, eviction of never-queried records,
+dedup tie-breaking — plus power-loss durability (the WAL is fsynced on flush,
+not per write), API tenancy, the extractor's truncated-reply cache, and the
+quantizer findings (RaBitQ transform at non-power-of-two dimensions, the 3-bit
+Lloyd-Max table).
+
+**Follow-up the same day: SDK backends, API server, verified supersession.**
+- *The OpenAI extractor dropped messages.* A reply cut off at the 400-token
+  cap (or a refusal, or non-JSON) was read as "no facts" and cached, so the
+  message was lost on every later attempt too. It now asks again with four
+  times the budget and, failing that, stores the message itself as one fact;
+  only well-formed replies are cached. Extraction caches written before this
+  date can still hold such empty entries.
+- *Permanent API errors were retried for about 4.5 minutes* (five backoffs and
+  a final sleep) before a generic failure. `tsm/_retry.py` now fails at once on
+  HTTP 400/401/403/404/413/422, backs off only on transient errors, and names
+  the error type and status without repeating the provider's message.
+- *The embedding cache could run code*: it was a `pickle.load` of a file kept
+  inside the database directory. It is read with an arrays-only loader; the
+  harness's existing 90,853-entry cache loads unchanged.
+- `OpenAIEmbedder(dim=N)` now requests `dimensions=N` (text-embedding-3
+  models), and a vector of the wrong size is an error at the embedder.
+  `Memory(embedder="openai")` is accepted; an unknown backend name is rejected
+  at construction. `Memory.close()` flushes the extraction and embedding caches.
+- *A verifier was bypassed outside the conversational profile*: deferral was
+  only set by that profile, so with `profile=None` the engine committed
+  supersessions before the verifier saw them. Deferral now follows the
+  verifier. With `incremental_supersession_detection` the engine advanced its
+  cursor before the caller's `propose_supersessions`, which therefore never
+  proposed anything; the proposal pass now advances it.
+- *API server*: a background flush every `TURBO_FLUSH_INTERVAL_SECS` (default
+  30). Before, a running server never fsynced, never truncated its
+  write-ahead log, and never built an index segment unless a client called
+  `/flush`. Run end to end for the first time (REST): scoped `/search`
+  returns only the caller's scope, a non-JSON payload or a wrong-dimension
+  update is a 400 that changes nothing, `top_k = 10^12` is answered, and after
+  a hard kill every record is back.
+
+Nothing the gate measures changed in this follow-up. Harness scripts that call
+`OpenAIExtractor` directly see a different result only where a reply used to
+be cut off: the message itself instead of nothing.
+
+**Gate after the follow-up:** `make gate` 8/8 with 286 Rust tests and 68 SDK
+tests (17 added in this follow-up, 15 of them against fake API clients); LongMemEval smoke KU +0.00,
+edges 247 for the fourth consecutive run, recall 100%.

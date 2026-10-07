@@ -16,9 +16,9 @@ user-asserted facts are prioritized and generic assistant advice is dropped.
 
 import logging
 import os
-import time
 from typing import Optional, Sequence
 
+from ._retry import call_with_retries
 from .budget import fit_complete_facts_to_budget
 
 logger = logging.getLogger("tsm.gist")
@@ -90,36 +90,32 @@ class OpenAIGistSummarizer:
         if len(facts) == 1:
             return single_fact(facts[0])
         joined = "\n".join(f"- {t}" for t in facts)
-        for attempt in range(self.max_retries):
-            try:
-                self.calls += 1
-                kwargs = {
-                    "model": self.model,
-                    "messages": [{"role": "system", "content": GIST_SYSTEM_PROMPT},
-                                 {"role": "user", "content": f"Facts:\n{joined}\n\nGist:"}],
-                    "temperature": 0.0,
-                    "max_tokens": max_tokens or self.max_tokens,
-                }
-                if self.extra_body:
-                    kwargs["extra_body"] = self.extra_body
-                r = self._client.chat.completions.create(
-                    **kwargs,
-                )
-                if r.usage:
-                    self.input_tokens += r.usage.prompt_tokens or 0
-                    self.output_tokens += r.usage.completion_tokens or 0
-                content = (r.choices[0].message.content or "").strip()
-                if getattr(r.choices[0], "finish_reason", None) == "length":
-                    # Cut off mid-fact: keep only the complete lines.
-                    lines = content.splitlines()
-                    content = "\n".join(lines[:-1]).strip() if len(lines) > 1 else ""
-                return content
-            except Exception as e:  # noqa: BLE001
-                wait = min(5.0 * (2 ** attempt), 120.0)
-                logger.warning("gist failed (attempt %d/%d): %s; retry %.0fs",
-                               attempt + 1, self.max_retries, e, wait)
-                time.sleep(wait)
-        raise RuntimeError("gist summarization failed after retries")
+
+        def request():
+            self.calls += 1
+            kwargs = {
+                "model": self.model,
+                "messages": [{"role": "system", "content": GIST_SYSTEM_PROMPT},
+                             {"role": "user", "content": f"Facts:\n{joined}\n\nGist:"}],
+                "temperature": 0.0,
+                "max_tokens": max_tokens or self.max_tokens,
+            }
+            if self.extra_body:
+                kwargs["extra_body"] = self.extra_body
+            r = self._client.chat.completions.create(
+                **kwargs,
+            )
+            if r.usage:
+                self.input_tokens += r.usage.prompt_tokens or 0
+                self.output_tokens += r.usage.completion_tokens or 0
+            content = (r.choices[0].message.content or "").strip()
+            if getattr(r.choices[0], "finish_reason", None) == "length":
+                # Cut off mid-fact: keep only the complete lines.
+                lines = content.splitlines()
+                content = "\n".join(lines[:-1]).strip() if len(lines) > 1 else ""
+            return content
+
+        return call_with_retries(request, "gist summarization", self.max_retries, logger)
 
 
 class ExtractiveGistSummarizer:

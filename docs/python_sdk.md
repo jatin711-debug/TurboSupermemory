@@ -56,13 +56,27 @@ message. `extractor="passthrough"` and `extractor="gliner"` keep writes local.
 - Compress instead of delete: `Memory(db, max_records=500,
   gist_summarizer=OpenAIGistSummarizer())` (or the model-free
   `ExtractiveGistSummarizer()`, both in `tsm.gist`) folds eviction victims
-  into searchable gist records.
+  into searchable gist records. A memory is only deleted once its gist is
+  stored: if the summarizer raises, that chunk's memories stay and are tried
+  again on the next eviction. A summarizer that returns an empty string is
+  saying there is nothing worth keeping, and the chunk is dropped.
+- `add()` stores the facts of one call as a single validated batch: it either
+  stores all of them or raises having stored none, and it can be called from
+  several threads.
+- Scoping is enforced by the engine at every stage of a search, so one
+  user's records never appear in, or use up slots of, another user's recall.
+  `user_id=None` means "no scope" on both `add` and `recall`: such facts are
+  visible to everyone, and such a recall sees everything.
 - The engine is the only store. Reopening a `db_path` — in the same process
   or a later one — continues exactly where it left off: `add` keeps
   appending with fresh ids, and role, scope and text are read back from the
   database. `close()` flushes and releases the database lock, mmaps and
   worker threads; the path can be reopened immediately, and further calls on
   the closed object raise `RuntimeError`.
+- Nothing acknowledged is lost if the process dies without `close()`: the
+  next open replays the write-ahead log. (`mem.engine.recovery_report()` says
+  what an open had to recover.) After a power loss, the writes since the last
+  `flush()` / `close()` may be missing.
 
 ### Supported Embedders & Rerankers
 
@@ -140,4 +154,19 @@ engine.get_records(["mem_001", "missing"])
 
 engine.next_insert_seq()   # durable, monotonically increasing; never reused
 engine.closed              # False until close()
+engine.recovery_report()   # what this open had to repair; all zeros after a clean close
+# {'wal_ops_replayed': 0, 'wal_inserts_without_vector': 0, 'wal_bytes_discarded': 0,
+#  'segments_discarded': 0, 'segment_dirs_removed': 0, 'graph_nodes_pruned': 0}
 ```
+
+### Input rules
+
+- Vectors must have the store's dimension, be finite, and not be all zero;
+  ids must be non-empty; payloads must be valid JSON. Anything else raises
+  `ValueError` and changes nothing (a batch is rejected as a whole, and a
+  rejected `update` leaves the existing record as it was).
+- `top_k` is clamped to the number of records.
+- `update(id, ...)` replaces the record atomically and returns `False` when
+  the id does not exist.
+- A store whose `vectors.bin` or `memory.redb` is missing or truncated raises
+  `RuntimeError` ("corrupted store: ...") on open instead of opening empty.

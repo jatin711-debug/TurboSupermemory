@@ -46,4 +46,12 @@ pub struct VectorIndexManifest {
     pub index_type: String,
     pub dimension: usize,
     pub offsets: Vec<PointOffset>,
+    /// Length and CRC32 of the index file, recorded when the index is built
+    /// and checked before the file is mapped (a truncated or overwritten
+    /// index file would otherwise be read out of bounds by the native index
+    /// library). Absent in manifests written by older builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_crc: Option<u32>,
 }

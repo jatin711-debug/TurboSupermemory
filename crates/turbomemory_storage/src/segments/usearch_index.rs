@@ -3,16 +3,18 @@
 use crate::config::{Flusher, StoreConfig, Tier};
 use crate::record::PointOffset;
 use crate::segments::vector_index::{VectorIndex, VectorIndexManifest};
-use crate::segments::{exact_search_over_offsets, ScoredPoint};
+use crate::segments::{
+    exact_search_over_offsets, file_len_and_crc, write_manifest_atomic, ScoredPoint, MANIFEST_FILE,
+};
 use crate::vector_store::VectorStore;
 use crate::StorageError;
+use parking_lot::{Condvar, Mutex};
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use std::path::{Path, PathBuf};
 use turbomemory_core::validate_dimension;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
-const MANIFEST_FILE: &str = "manifest.json";
 const INDEX_FILE: &str = "index.usearch";
 
 /// Number of points inserted single-threaded before switching to parallel
@@ -34,6 +36,52 @@ fn build_threads(config: &StoreConfig) -> usize {
     (cpus / concurrent).clamp(1, 16)
 }
 
+/// Number of searches an index is given thread contexts for.
+///
+/// usearch keeps one scratch context per concurrent operation and fails an
+/// operation outright ("Reserve capacity ahead of searches!") when none is
+/// free. A loaded or viewed index gets `hardware_concurrency()` contexts from
+/// the library; a freshly built one is re-reserved to the same number.
+fn search_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// Counting semaphore over an index's search contexts, so that more
+/// concurrent searches than contexts wait for a free one instead of failing.
+struct SearchSlots {
+    free: Mutex<usize>,
+    released: Condvar,
+}
+
+struct SearchSlot<'a>(&'a SearchSlots);
+
+impl SearchSlots {
+    fn new(slots: usize) -> Self {
+        Self {
+            free: Mutex::new(slots.max(1)),
+            released: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> SearchSlot<'_> {
+        let mut free = self.free.lock();
+        while *free == 0 {
+            self.released.wait(&mut free);
+        }
+        *free -= 1;
+        SearchSlot(self)
+    }
+}
+
+impl Drop for SearchSlot<'_> {
+    fn drop(&mut self) {
+        *self.0.free.lock() += 1;
+        self.0.released.notify_one();
+    }
+}
+
 /// `usearch`-backed HNSW index.
 pub struct UsearchIndex {
     dim: usize,
@@ -41,6 +89,7 @@ pub struct UsearchIndex {
     index: Index,
     path: PathBuf,
     offsets: Vec<PointOffset>,
+    search_slots: SearchSlots,
 }
 
 impl UsearchIndex {
@@ -103,6 +152,13 @@ impl UsearchIndex {
             })?;
         }
 
+        // The build reserved contexts for the build threads only; searches
+        // arrive from as many threads as the host has.
+        let slots = search_threads();
+        index
+            .reserve_capacity_and_threads(vectors.len().max(1), slots.max(threads))
+            .map_err(|e| StorageError::IndexError(format!("usearch reserve failed: {e}")))?;
+
         let index_path = path.join(INDEX_FILE);
         let index_path_str = index_path
             .to_str()
@@ -110,18 +166,29 @@ impl UsearchIndex {
         index
             .save(index_path_str)
             .map_err(|e| StorageError::IndexError(format!("usearch save failed: {e}")))?;
+        // Sync through a writable handle: Windows refuses to flush a file
+        // opened read-only.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&index_path)?
+            .sync_all()?;
+        let (index_len, index_crc) = file_len_and_crc(&index_path)?;
 
+        // The manifest is written last and atomically: its presence is what
+        // marks the directory as a complete segment.
         let offsets: Vec<PointOffset> = vectors.iter().map(|(offset, _)| *offset).collect();
         let manifest = VectorIndexManifest {
             version: 1,
             index_type: "usearch".to_string(),
             dimension: config.dimension,
             offsets: offsets.clone(),
+            index_len: Some(index_len),
+            index_crc: Some(index_crc),
         };
         let manifest_json = serde_json::to_string_pretty(&manifest).map_err(|e| {
             StorageError::Serialize(Box::new(bincode::ErrorKind::Custom(e.to_string())))
         })?;
-        std::fs::write(path.join(MANIFEST_FILE), manifest_json)?;
+        write_manifest_atomic(&path, manifest_json.as_bytes())?;
 
         Ok(Self {
             dim: config.dimension,
@@ -129,6 +196,7 @@ impl UsearchIndex {
             index,
             path,
             offsets,
+            search_slots: SearchSlots::new(slots),
         })
     }
 
@@ -155,6 +223,25 @@ impl UsearchIndex {
             .to_str()
             .ok_or_else(|| StorageError::InvalidArgument("invalid usearch index path".into()))?;
 
+        // Check the file against the manifest before handing it to the native
+        // library: mapping a truncated or overwritten index reads out of
+        // bounds there (a crash, not an error).
+        if let (Some(expected_len), Some(expected_crc)) = (manifest.index_len, manifest.index_crc) {
+            let (len, crc) = file_len_and_crc(&index_path)?;
+            if len != expected_len || crc != expected_crc {
+                return Err(StorageError::Corrupted(format!(
+                    "index file {} does not match its manifest \
+                     (length {len} vs {expected_len}, checksum {crc:#010x} vs {expected_crc:#010x})",
+                    index_path.display()
+                )));
+            }
+        } else if std::fs::metadata(&index_path)?.len() == 0 {
+            return Err(StorageError::Corrupted(format!(
+                "index file {} is empty",
+                index_path.display()
+            )));
+        }
+
         let options = Self::index_options(config.dimension, config);
         let index = Index::new(&options)
             .map_err(|e| StorageError::IndexError(format!("usearch index creation failed: {e}")))?;
@@ -164,6 +251,14 @@ impl UsearchIndex {
                 .load(index_path_str)
                 .map_err(|e| StorageError::IndexError(format!("usearch load failed: {e}")))?;
         }
+        if index.size() != manifest.offsets.len() {
+            return Err(StorageError::Corrupted(format!(
+                "index file {} holds {} vectors but its manifest lists {}",
+                index_path.display(),
+                index.size(),
+                manifest.offsets.len()
+            )));
+        }
 
         Ok(Self {
             dim: config.dimension,
@@ -171,6 +266,7 @@ impl UsearchIndex {
             index,
             path,
             offsets: manifest.offsets,
+            search_slots: SearchSlots::new(search_threads()),
         })
     }
 
@@ -190,10 +286,18 @@ impl UsearchIndex {
 
     /// Raw `usearch` search without filtering.
     fn search_unfiltered(&self, query: &[f32], top_k: usize) -> crate::Result<Vec<ScoredPoint>> {
-        let matches = self
-            .index
-            .search(query, top_k)
-            .map_err(|e| StorageError::IndexError(format!("usearch search failed: {e}")))?;
+        // Never ask for more results than the index holds: the native search
+        // allocates for the requested count.
+        let top_k = top_k.min(self.offsets.len());
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+        let matches = {
+            let _slot = self.search_slots.acquire();
+            self.index
+                .search(query, top_k)
+                .map_err(|e| StorageError::IndexError(format!("usearch search failed: {e}")))?
+        };
         Ok(matches
             .keys
             .into_iter()
@@ -242,7 +346,7 @@ impl VectorIndex for UsearchIndex {
             .unwrap_or_else(|| top_k.saturating_mul(16));
         let mut fetch_k = top_k;
         for _ in 0..4 {
-            let mut results = Vec::with_capacity(top_k);
+            let mut results = Vec::with_capacity(top_k.min(self.offsets.len()));
             let candidates = self.search_unfiltered(query, fetch_k)?;
             for candidate in candidates {
                 if let Some(bitmap) = allowed_offsets {

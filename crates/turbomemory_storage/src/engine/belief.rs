@@ -229,7 +229,10 @@ impl StorageEngine {
     /// shape that survives a round-trip through an external (Python) verifier,
     /// which does not see internal offsets. Offsets are re-resolved from the id
     /// index at commit time (robust if the layout shifted since `propose_*`).
-    /// Pairs whose ids are no longer live are silently skipped.
+    /// Pairs whose ids are no longer live are silently skipped, and so are
+    /// pairs that cannot be a supersession: a record paired with itself, and
+    /// two records from different scopes (one user's fact must never retire
+    /// another user's).
     pub fn commit_supersessions_by_id(
         &self,
         pairs: &[(String, String, SupersessionKind)],
@@ -239,8 +242,16 @@ impl StorageEngine {
             pairs
                 .iter()
                 .filter_map(|(old_id, new_id, kind)| {
+                    if old_id == new_id {
+                        return None;
+                    }
                     let old_offset = *id_index.get(old_id.as_str())?;
                     let new_offset = *id_index.get(new_id.as_str())?;
+                    let old_scope = self.meta.get(old_offset).ok().flatten()?.scope;
+                    let new_scope = self.meta.get(new_offset).ok().flatten()?.scope;
+                    if old_scope != new_scope {
+                        return None;
+                    }
                     Some(ProposedSupersession {
                         old_id: old_id.clone(),
                         new_id: new_id.clone(),
@@ -354,7 +365,9 @@ impl StorageEngine {
         floor: f32,
         allowed_roles: Option<&[String]>,
     ) -> crate::Result<Option<String>> {
-        let neighbors = self.search_ann_candidates(embedding, 10)?;
+        // Search within the record's own scope so other scopes cannot fill
+        // the short list (the scope check below still drops shared records).
+        let neighbors = self.search_ann_scoped(embedding, 10, None, scope.as_deref())?;
         let id_index = self.id_index.read();
         let view = self.vectors.read_view();
         for (nid, _) in neighbors {
@@ -558,9 +571,18 @@ impl StorageEngine {
     /// external verifier, then `commit_supersessions` on the survivors. When no
     /// verifier is installed, consolidation instead auto-commits via
     /// `check_refinements` + `check_contradictions` (identical detection logic).
+    ///
+    /// With a deferred commit this call is the detection pass of the cycle,
+    /// so it is what advances the incremental cursor (to the sequence number
+    /// current when it started).
     pub fn propose_supersessions(&self) -> crate::Result<Vec<ProposedSupersession>> {
+        let examined_up_to = self.meta.next_seq();
         let mut proposed = self.propose_refinements()?;
         proposed.extend(self.propose_contradictions()?);
+        if self.config.tier.defer_supersession_commit {
+            self.supersession_watermark
+                .store(examined_up_to, Ordering::Relaxed);
+        }
         Ok(proposed)
     }
 }

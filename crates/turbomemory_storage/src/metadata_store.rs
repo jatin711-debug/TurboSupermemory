@@ -76,7 +76,20 @@ impl MetadataStore {
         let db_path = db_path.as_ref().to_path_buf();
         std::fs::create_dir_all(&db_path)?;
         let db_file = db_path.join("memory.redb");
-        let db = redb(Database::create(db_file))?;
+        // redb asserts on some kinds of file damage (a truncated file, for
+        // one) instead of returning an error. Turn that into an error too: a
+        // damaged store must be reported, not take the caller down.
+        let opened =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Database::create(&db_file)));
+        let db = match opened {
+            Ok(result) => redb(result)?,
+            Err(_) => {
+                return Err(StorageError::Corrupted(format!(
+                    "{} is damaged and cannot be opened (restore it from a backup)",
+                    db_file.display()
+                )))
+            }
+        };
         let records = Self::load_records(&db)?;
         let record_count = AtomicU64::new(records.len() as u64);
         let demotion = Self::load_demotion(&db)?;
@@ -185,6 +198,11 @@ impl MetadataStore {
     /// Look up a metadata record from the in-memory cache.
     pub fn get(&self, offset: PointOffset) -> crate::Result<Option<MetaRecord>> {
         Ok(self.records.read().get(&offset).cloned())
+    }
+
+    /// The id of the record at `offset`, without cloning the rest of it.
+    pub fn id_of(&self, offset: PointOffset) -> Option<String> {
+        self.records.read().get(&offset).map(|rec| rec.id.clone())
     }
 
     /// Read the supersession demotion factor for a record.
@@ -337,11 +355,38 @@ impl MetadataStore {
             return Ok(());
         }
 
+        let result = self.write_snapshot(
+            &dirty,
+            &demotion_dirty,
+            &access_history_dirty,
+            last_applied_seq,
+        );
+        if result.is_err() {
+            // The transaction did not commit (disk full, I/O error). Put the
+            // dirty sets back: otherwise the next flush would write nothing
+            // for these records, report success, and let the caller clear the
+            // WAL that still holds the only durable copy of them.
+            self.dirty.lock().extend(dirty);
+            self.demotion_dirty.lock().extend(demotion_dirty);
+            self.access_history_dirty
+                .lock()
+                .extend(access_history_dirty);
+        }
+        result
+    }
+
+    fn write_snapshot(
+        &self,
+        dirty: &HashSet<PointOffset>,
+        demotion_dirty: &HashSet<PointOffset>,
+        access_history_dirty: &HashSet<PointOffset>,
+        last_applied_seq: u64,
+    ) -> crate::Result<()> {
         let records = self.records.read();
         let txn = redb(self.db.begin_write())?;
         {
             let mut table = redb(txn.open_table(RECORDS_TABLE))?;
-            for offset in &dirty {
+            for offset in dirty {
                 if let Some(rec) = records.get(offset) {
                     let bytes = bincode::serialize(rec)?;
                     redb(table.insert(*offset, bytes.as_slice()))?;
@@ -353,7 +398,7 @@ impl MetadataStore {
         if !demotion_dirty.is_empty() {
             let demotion = self.demotion.read();
             let mut table = redb(txn.open_table(DEMOTION_TABLE))?;
-            for offset in &demotion_dirty {
+            for offset in demotion_dirty {
                 if let Some(factor) = demotion.get(offset) {
                     redb(table.insert(*offset, *factor))?;
                 } else {
@@ -364,7 +409,7 @@ impl MetadataStore {
         if !access_history_dirty.is_empty() {
             let access_history = self.access_history.read();
             let mut table = redb(txn.open_table(ACCESS_HISTORY_TABLE))?;
-            for offset in &access_history_dirty {
+            for offset in access_history_dirty {
                 if let Some(ring) = access_history.get(offset) {
                     let bytes = bincode::serialize(ring)?;
                     redb(table.insert(*offset, bytes.as_slice()))?;
@@ -384,6 +429,20 @@ impl MetadataStore {
         }
         redb(txn.commit())?;
         Ok(())
+    }
+
+    /// True when the snapshot has never been written: no records and no
+    /// counters. A store that has been used and flushed is never fresh, even
+    /// if every record was deleted since.
+    pub fn is_fresh(&self) -> bool {
+        self.record_count() == 0
+            && self.last_applied_seq().is_none()
+            && self.load_meta_str("next_offset").is_none()
+    }
+
+    /// The largest offset that has a live metadata record, if any.
+    pub fn max_live_offset(&self) -> Option<PointOffset> {
+        self.records.read().keys().copied().max()
     }
 
     pub fn save_meta(&self, key: &str, value: &str) -> crate::Result<()> {

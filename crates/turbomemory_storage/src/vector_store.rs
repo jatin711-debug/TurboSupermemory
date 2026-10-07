@@ -22,6 +22,11 @@ struct Header {
     magic: [u8; 4],
     version: u32,
     dimension: u32,
+    /// Explicit padding so the struct has no implicit (indeterminate) padding
+    /// bytes: the header CRC covers these four bytes, and `Pod` requires that
+    /// every byte is initialized. Occupies the same bytes the compiler used to
+    /// insert before `count`, so the on-disk layout is unchanged.
+    pad0: u32,
     count: u64,
     header_crc: u32,
     reserved0: u32,
@@ -127,6 +132,7 @@ impl VectorStore {
             magic: *MAGIC,
             version: VERSION,
             dimension: dim as u32,
+            pad0: 0,
             count: 0,
             header_crc: 0,
             reserved0: 0,
@@ -169,7 +175,7 @@ impl VectorStore {
                 "vector store file is too small".into(),
             ));
         }
-        let header: Header = *bytemuck::from_bytes(&mmap[..HEADER_SIZE]);
+        let header: Header = bytemuck::pod_read_unaligned(&mmap[..HEADER_SIZE]);
         validate_header(&header, dim)?;
         let file_len = mmap.len();
         let slots = file_len.saturating_sub(HEADER_SIZE).saturating_div(dim * 4);
@@ -198,9 +204,53 @@ impl VectorStore {
             grow_inner(&mut inner, idx)?;
         }
         let dim = inner.dim;
-        write_vector(inner.mmap.as_mut().unwrap(), dim, idx, vector);
+        write_vector(mapped_mut(&mut inner)?, dim, idx, vector);
         inner.count = inner.count.max(idx + 1);
         Ok(())
+    }
+
+    /// Number of vector slots the file currently has room for.
+    pub fn slots(&self) -> usize {
+        self.inner.read().slots
+    }
+
+    /// Recover a vector that was written but not yet counted in the header.
+    ///
+    /// `put` only advances the in-memory count; the header count is stamped
+    /// by `flush`. After a process exit without a flush the bytes of every
+    /// completed `put` are still in the file, so WAL replay calls this for
+    /// each logged insert instead of `get` (which stops at the header count).
+    ///
+    /// The slot is accepted when it lies inside the file and its contents
+    /// match `expected_crc` (the checksum logged with the insert). Entries
+    /// logged by builds that did not record a checksum pass `None`; those are
+    /// accepted when the slot holds a finite, non-zero vector (a slot that was
+    /// never written is all zeros, and stored vectors are unit length).
+    /// On success the slot is counted and its contents returned.
+    pub fn recover(&self, offset: PointOffset, expected_crc: Option<u32>) -> Option<Vec<f32>> {
+        let mut inner = self.inner.write();
+        let idx = offset as usize;
+        if idx >= inner.slots {
+            return None;
+        }
+        let dim = inner.dim;
+        let start = HEADER_SIZE + idx * dim * 4;
+        let end = start + dim * 4;
+        let mmap = inner.mmap.as_ref()?;
+        let bytes = mmap.get(start..end)?;
+        let ok = match expected_crc {
+            Some(crc) => crc32fast::hash(bytes) == crc,
+            None => {
+                let floats: &[f32] = bytemuck::cast_slice(bytes);
+                floats.iter().all(|x| x.is_finite()) && floats.iter().any(|x| *x != 0.0)
+            }
+        };
+        if !ok {
+            return None;
+        }
+        let vector: Vec<f32> = bytemuck::cast_slice::<u8, f32>(bytes).to_vec();
+        inner.count = inner.count.max(idx + 1);
+        Some(vector)
     }
 
     /// Return a read guard for the vector at `offset`, or `None` if the slot
@@ -211,12 +261,13 @@ impl VectorStore {
         if idx >= inner.count {
             return None;
         }
-        Some(RwLockReadGuard::map(inner, |inner| {
-            let mmap = inner.mmap.as_ref().unwrap();
+        RwLockReadGuard::try_map(inner, |inner| {
+            let mmap = inner.mmap.as_ref()?;
             let start = HEADER_SIZE + idx * inner.dim * 4;
             let end = start + inner.dim * 4;
-            bytemuck::cast_slice(&mmap[start..end])
-        }))
+            mmap.get(start..end).map(bytemuck::cast_slice)
+        })
+        .ok()
     }
 
     /// Return a stable read view of the vector store.
@@ -249,8 +300,8 @@ impl VectorStore {
     pub fn flush(&self) -> crate::Result<()> {
         let mut inner = self.inner.write();
         let count = inner.count;
-        let mmap = inner.mmap.as_mut().unwrap();
-        let mut header: Header = *bytemuck::from_bytes(&mmap[..HEADER_SIZE]);
+        let mmap = mapped_mut(&mut inner)?;
+        let mut header: Header = bytemuck::pod_read_unaligned(&mmap[..HEADER_SIZE]);
         header.count = count as u64;
         let crc = compute_header_crc(&header);
         header.header_crc = crc;
@@ -272,10 +323,10 @@ impl VectorReadView<'_> {
         if idx >= self.inner.count {
             return None;
         }
-        let mmap = self.inner.mmap.as_ref().unwrap();
+        let mmap = self.inner.mmap.as_ref()?;
         let start = HEADER_SIZE + idx * self.inner.dim * 4;
         let end = start + self.inner.dim * 4;
-        Some(bytemuck::cast_slice(&mmap[start..end]))
+        mmap.get(start..end).map(bytemuck::cast_slice)
     }
 
     /// Return the number of populated slots in this view.
@@ -287,6 +338,21 @@ impl VectorReadView<'_> {
     pub fn dimension(&self) -> usize {
         self.inner.dim
     }
+}
+
+/// The checksum WAL insert entries carry for their vector (see
+/// [`VectorStore::recover`]).
+pub fn vector_crc(vector: &[f32]) -> u32 {
+    crc32fast::hash(bytemuck::cast_slice(vector))
+}
+
+/// The live mapping, or an error if a failed resize left the store unmapped.
+fn mapped_mut(inner: &mut Inner) -> crate::Result<&mut MmapMut> {
+    inner.mmap.as_mut().ok_or_else(|| {
+        StorageError::Io(std::io::Error::other(
+            "vector store is not mapped (an earlier resize failed)",
+        ))
+    })
 }
 
 fn write_header(mmap: &mut MmapMut, header: Header) {
@@ -312,14 +378,20 @@ fn grow_inner(inner: &mut Inner, min_idx: usize) -> crate::Result<()> {
         .checked_add(data_bytes)
         .ok_or_else(|| StorageError::InvalidArgument("vector store grow overflow".into()))?;
 
-    // Unmap before resizing the file, then remap.
+    // Unmap before resizing the file (required on Windows), then remap. If
+    // the resize fails (disk full, quota) map the file again at its old size
+    // so the store keeps serving reads and the caller just sees the error.
     let _ = inner.mmap.take();
-    inner.file.set_len(len as u64)?;
+    if let Err(e) = inner.file.set_len(len as u64) {
+        inner.mmap = unsafe { MmapMut::map_mut(&inner.file) }.ok();
+        return Err(e.into());
+    }
     let mut mmap = unsafe { MmapMut::map_mut(&inner.file)? };
     let header = Header {
         magic: *MAGIC,
         version: VERSION,
         dimension: inner.dim as u32,
+        pad0: 0,
         count: inner.count as u64,
         header_crc: 0,
         reserved0: 0,
@@ -375,6 +447,38 @@ mod tests {
         let got = store.get(1).unwrap();
         assert_eq!(&*got, &[4.0f32, 5.0, 6.0]);
         assert!(store.get(2).is_none());
+    }
+
+    #[test]
+    fn recover_reads_uncounted_slots_and_checks_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("vectors.bin");
+        let a = [0.6f32, 0.8, 0.0];
+        {
+            let store = VectorStore::new(&path, 3).unwrap();
+            store.put(0, &a).unwrap();
+            // No flush: the header still says zero vectors.
+        }
+        let store = VectorStore::open(&path, 3, 0).unwrap();
+        assert_eq!(store.count(), 0);
+        assert!(store.get(0).is_none(), "uncounted slot is invisible to get");
+
+        // Wrong checksum, an unwritten slot, and an out-of-file slot are refused.
+        assert!(store.recover(0, Some(vector_crc(&a) ^ 1)).is_none());
+        assert!(store.recover(5, None).is_none(), "all-zero slot");
+        assert!(store.recover(10_000_000, None).is_none());
+        assert_eq!(store.count(), 0);
+
+        assert_eq!(store.recover(0, Some(vector_crc(&a))).unwrap(), a);
+        assert_eq!(store.count(), 1);
+        assert_eq!(&*store.get(0).unwrap(), &a);
+    }
+
+    #[test]
+    fn header_has_no_implicit_padding() {
+        // `Pod` is only sound, and the header CRC only stable, if every byte
+        // of the struct is a named field.
+        assert_eq!(HEADER_SIZE, 4 + 4 + 4 + 4 + 8 + 4 + 4 + 4 + 4);
     }
 
     #[test]

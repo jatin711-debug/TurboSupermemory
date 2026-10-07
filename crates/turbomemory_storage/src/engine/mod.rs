@@ -10,6 +10,14 @@
 //!   4. On open we replay any un-flushed WAL entries, persist a snapshot, then
 //!      rebuild the id index, graph, and tiered segments from the snapshot.
 //!
+//! Recovery never depends on a clean shutdown. A WAL insert carries a
+//! checksum of its vector, and replay reads the vector straight from its slot
+//! in the vector file, so everything a writer was told succeeded is back after
+//! a kill. A torn or corrupt WAL tail is cut off at the last good frame.
+//! Segment files are derived data: one that cannot be loaded is discarded and
+//! its records are indexed again. What `open` had to repair is reported by
+//! [`StorageEngine::recovery_report`].
+//!
 //! `StorageEngine` is one type whose methods are grouped by concern:
 //!   - this file: the struct, `open`, record lookup, the consolidation cycle,
 //!     `flush`, and `shutdown`;
@@ -34,7 +42,7 @@ use crate::wal::{Wal, WalOp};
 use ahash::HashMap as AHashMap;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use turbomemory_graph::{
@@ -52,14 +60,51 @@ pub use belief::{BeliefResolution, ProposedSupersession, SupersessionKind};
 const WAL_DIR: &str = "wal";
 
 /// Compresses one chunk of eviction-victim texts into a single gist plus the
-/// embedding to store it under (B4 gist-before-evict). Returning `None` skips
-/// the chunk (the victims are then dropped outright). Install via
+/// embedding to store it under (B4 gist-before-evict). Install via
 /// `StorageEngine::set_gist_compressor`; only consulted when
 /// `TierConfig::gist_before_evict` is enabled. Typically backed by an LLM
 /// call plus an embedder — both live outside the engine, so the callback
 /// supplies the vector, mirroring how `insert` takes caller embeddings.
+///
+/// The three outcomes mean different things to eviction:
+/// - `Ok(Some((gist, embedding)))`: the gist is stored, then the victims are
+///   deleted.
+/// - `Ok(None)`: the compressor abstains (nothing in the chunk is worth
+///   keeping); the victims are deleted without a gist.
+/// - `Err(reason)`: the compressor failed (model unreachable, malformed
+///   output). The victims are kept and tried again on the next eviction,
+///   because deleting them now would lose the memories with nothing in their
+///   place.
 pub trait GistCompressor: Send + Sync {
-    fn compress(&self, texts: &[String]) -> Option<(String, Vec<f32>)>;
+    fn compress(&self, texts: &[String]) -> Result<Option<(String, Vec<f32>)>, String>;
+}
+
+/// What [`StorageEngine::open`] had to repair. Every field is zero for a store
+/// that was shut down cleanly.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecoveryReport {
+    /// Unflushed operations replayed from the write-ahead log.
+    pub wal_ops_replayed: usize,
+    /// Logged inserts dropped because their vector never reached the vector
+    /// file (the process died between the two writes, or power was lost).
+    pub wal_inserts_without_vector: usize,
+    /// Bytes cut from the end of the log: a torn or corrupt tail.
+    pub wal_bytes_discarded: u64,
+    /// Segments that could not be loaded and were discarded. Their records
+    /// are searchable again immediately and are re-indexed in the background.
+    pub segments_discarded: usize,
+    /// Segment directories removed because they were incomplete (a build
+    /// that never finished) or superseded (already merged or compacted).
+    pub segment_dirs_removed: usize,
+    /// Graph memory nodes dropped because their record no longer exists.
+    pub graph_nodes_pruned: usize,
+}
+
+impl RecoveryReport {
+    /// True when the store opened without any repair.
+    pub fn is_clean(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// The main storage engine.
@@ -101,6 +146,13 @@ pub struct StorageEngine {
     /// write whose WAL entry it is about to truncate (which would silently
     /// drop the record on restart).
     flush_barrier: Arc<RwLock<()>>,
+    /// Serializes the commit section of every write (id check, offset and
+    /// sequence allocation, vector write, WAL append, index apply). Without
+    /// it two writers could both pass the "id is free" check and both insert,
+    /// and WAL order could differ from sequence order.
+    write_lock: Arc<Mutex<()>>,
+    /// What `open` had to repair.
+    recovery: Arc<RecoveryReport>,
     optimizer: Arc<BackgroundOptimizer>,
     update_worker: Arc<UpdateWorker>,
     access_counters: Arc<AccessCounters>,
@@ -133,6 +185,8 @@ impl Clone for StorageEngine {
             text_index: self.text_index.clone(),
             wal: self.wal.clone(),
             flush_barrier: self.flush_barrier.clone(),
+            write_lock: self.write_lock.clone(),
+            recovery: self.recovery.clone(),
             optimizer: self.optimizer.clone(),
             update_worker: self.update_worker.clone(),
             access_counters: self.access_counters.clone(),
@@ -177,24 +231,60 @@ impl StorageEngine {
         let wal_path = db_path.join(WAL_DIR);
         let mut wal = Wal::open(&wal_path)?;
 
+        // Both must be read before replay changes them.
+        let metadata_was_fresh = meta.is_fresh();
+        let vectors_at_open = vectors.count();
+
         // Replay any un-flushed WAL entries into the metadata cache and vector store.
+        let mut report = RecoveryReport::default();
         let last_applied = meta.last_applied_seq().unwrap_or(0);
         let mut max_seq = last_applied;
         let mut max_offset = 0u64;
         let mut replayed = false;
-        for op in wal.iter()? {
+        let mut wal_iter = wal.iter()?;
+        for op in wal_iter.by_ref() {
             match op? {
                 WalOp::Insert {
                     offset,
                     seq,
                     meta: meta_rec,
+                    vector_crc,
                 } => {
                     if seq > last_applied {
-                        // The embedding lives in the VectorStore mmap. If it is
-                        // missing we have a partial write; skip the metadata.
-                        if let Some(vec) = vectors.get(offset) {
-                            let record = meta_rec.with_embedding(Arc::from(Vec::from(&*vec)));
-                            meta.put(offset, &record)?;
+                        // The embedding lives in the VectorStore mmap, in a
+                        // slot the header may not count yet (the count is
+                        // only stamped by flush). Read the slot itself and
+                        // check it against the logged checksum; a mismatch
+                        // means the vector never reached the file.
+                        match vectors.recover(offset, vector_crc) {
+                            Some(vec) => {
+                                meta.put(offset, &meta_rec.with_embedding(Arc::from(vec)))?;
+                                report.wal_ops_replayed += 1;
+                            }
+                            None => report.wal_inserts_without_vector += 1,
+                        }
+                        max_offset = max_offset.max(offset);
+                        max_seq = max_seq.max(seq);
+                        replayed = true;
+                    }
+                }
+                WalOp::Replace {
+                    old_offset,
+                    offset,
+                    seq,
+                    meta: meta_rec,
+                    vector_crc,
+                } => {
+                    if seq > last_applied {
+                        // An update: swap old for new only if the new vector
+                        // is really there, otherwise the old record stays.
+                        match vectors.recover(offset, Some(vector_crc)) {
+                            Some(vec) => {
+                                meta.remove(old_offset)?;
+                                meta.put(offset, &meta_rec.with_embedding(Arc::from(vec)))?;
+                                report.wal_ops_replayed += 1;
+                            }
+                            None => report.wal_inserts_without_vector += 1,
                         }
                         max_offset = max_offset.max(offset);
                         max_seq = max_seq.max(seq);
@@ -205,13 +295,27 @@ impl StorageEngine {
                     meta.remove(offset)?;
                     // Vector data is left in place; it will be ignored because
                     // the metadata record is gone.
+                    report.wal_ops_replayed += 1;
                     replayed = true;
                 }
                 WalOp::Flush { .. } => {}
             }
         }
+        // Anything after the last readable frame is a torn or corrupt tail.
+        // Cut it off so new entries are appended behind a good frame, not
+        // behind garbage that the next replay would stop at.
+        report.wal_bytes_discarded = wal_iter.discarded_bytes();
+        let wal_valid_end = wal_iter.valid_end();
+        drop(wal_iter);
+        if report.wal_bytes_discarded > 0 {
+            log::warn!(
+                "WAL: discarded {} unreadable bytes after the last complete record",
+                report.wal_bytes_discarded
+            );
+            wal.truncate_to(wal_valid_end)?;
+        }
 
-        if replayed {
+        if replayed || wal.needs_upgrade() {
             meta.advance_offset_past(max_offset);
             meta.advance_seq_past(max_seq);
             // Persist the recovered snapshot and discard the now-redundant WAL.
@@ -219,6 +323,32 @@ impl StorageEngine {
             meta.flush(max_seq)?;
             wal.flush()?;
             wal.clear()?;
+        }
+
+        // The reverse of the check below: vectors that were flushed, but no
+        // metadata at all and nothing in the log to rebuild it from. The
+        // snapshot file was deleted or replaced by an empty one. Opening would
+        // silently present an empty store on top of the old files.
+        if metadata_was_fresh && !replayed && vectors_at_open > 0 {
+            return Err(crate::StorageError::Corrupted(format!(
+                "vectors.bin holds {vectors_at_open} vectors but memory.redb has no records:                  the metadata file is missing or was replaced (restore it from a backup)"
+            )));
+        }
+
+        // Every live record must have its vector. The header count is stamped
+        // before the metadata snapshot on every flush, and replay counts what
+        // it recovers, so a record beyond the count means the vector file was
+        // truncated, replaced, or deleted. Opening anyway would report the
+        // records as present while no search could ever return them.
+        if let Some(max_live) = meta.max_live_offset() {
+            if max_live as usize >= vectors.count() {
+                return Err(crate::StorageError::Corrupted(format!(
+                    "metadata holds a record at offset {max_live} but vectors.bin only has \
+                     {} vectors: the vector file is missing or truncated (restore it from a \
+                     backup; the record texts are intact in memory.redb)",
+                    vectors.count()
+                )));
+            }
         }
 
         // Collect metadata records once (no full HashMap clone) and rebuild
@@ -275,57 +405,77 @@ impl StorageEngine {
         let saved_graph = meta
             .load_meta_bytes("graph")
             .or_else(|| meta.load_meta_str("graph").map(String::into_bytes));
-        let graph = rebuild_graph(&records_vec, saved_graph, &config.spreading);
+        let graph = rebuild_graph(
+            &records_vec,
+            saved_graph,
+            &config.spreading,
+            &mut report.graph_nodes_pruned,
+        );
         let ccs = meta
             .load_meta_str("ccs")
             .and_then(|s| serde_json::from_str::<CompressedCognitiveState>(&s).ok());
 
         // Load any sealed Hot, Warm, and Cold segments that were persisted before
         // the last flush.  Their offsets are excluded from the rebuilt Hot segment.
-        let mut sealed_offsets = HashSet::new();
-        let mut sealed_segments = Vec::new();
-        let mut warm_segments = Vec::new();
-        let mut cold_segments = Vec::new();
-
+        // Segments are derived from the records and vectors, so one that cannot
+        // be loaded is discarded rather than failing the open: its records
+        // simply land in the Hot segment below and are indexed again.
         let segments_dir = db_path.join("segments");
-        let sealed_dir = segments_dir.join(crate::segment_holder::SEALED_HOT_DIR);
-        if sealed_dir.exists() {
-            for entry in std::fs::read_dir(&sealed_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.is_dir() && path.join("manifest.json").exists() {
-                    let seg = crate::segments::sealed_hot::SealedHotSegment::open(&path, &config)?;
-                    sealed_offsets.extend(seg.offsets().iter().copied());
-                    sealed_segments.push(seg);
-                }
-            }
-        }
+        let sealed_loaded = load_segment_dirs(
+            &segments_dir.join(crate::segment_holder::SEALED_HOT_DIR),
+            &mut report,
+            |path| crate::segments::sealed_hot::SealedHotSegment::open(path, &config),
+        )?;
+        let warm_loaded = load_segment_dirs(
+            &segments_dir.join(crate::config::Tier::Warm.name()),
+            &mut report,
+            |path| crate::segments::warm::WarmSegment::open(path),
+        )?;
+        let cold_loaded = load_segment_dirs(
+            &segments_dir.join(crate::config::Tier::Cold.name()),
+            &mut report,
+            |path| crate::segments::cold::ColdSegment::open(path),
+        )?;
 
-        let warm_dir = segments_dir.join(crate::config::Tier::Warm.name());
-        if warm_dir.exists() {
-            for entry in std::fs::read_dir(&warm_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.is_dir() && path.join("manifest.json").exists() {
-                    let seg = crate::segments::warm::WarmSegment::open(&path)?;
-                    sealed_offsets.extend(seg.offsets().iter().copied());
-                    warm_segments.push(seg);
-                }
+        let mut sealed_offsets: HashSet<PointOffset> = HashSet::new();
+        let mut cold_segments = Vec::with_capacity(cold_loaded.len());
+        for (_, seg) in cold_loaded {
+            sealed_offsets.extend(seg.offsets().iter().copied());
+            cold_segments.push(seg);
+        }
+        // A Warm segment whose records are all in a Cold segment was already
+        // compacted (the process stopped before its directory was removed).
+        let cold_offsets = sealed_offsets.clone();
+        let mut warm_segments = Vec::with_capacity(warm_loaded.len());
+        for (path, seg) in warm_loaded {
+            if seg.offsets().iter().all(|o| cold_offsets.contains(o)) {
+                drop(seg);
+                remove_superseded_dir(&path, &mut report);
+            } else {
+                sealed_offsets.extend(seg.offsets().iter().copied());
+                warm_segments.push(seg);
             }
         }
-
-        let cold_dir = segments_dir.join(crate::config::Tier::Cold.name());
-        if cold_dir.exists() {
-            for entry in std::fs::read_dir(&cold_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.is_dir() && path.join("manifest.json").exists() {
-                    let seg = crate::segments::cold::ColdSegment::open(&path)?;
-                    sealed_offsets.extend(seg.offsets().iter().copied());
-                    cold_segments.push(seg);
-                }
+        // Likewise a sealed Hot segment fully covered by larger ones is a
+        // leftover from a merge. Largest first, so the merged segment wins.
+        let mut sealed_loaded = sealed_loaded;
+        sealed_loaded.sort_by(|a, b| {
+            b.1.point_count()
+                .cmp(&a.1.point_count())
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let mut hot_offsets: HashSet<PointOffset> = HashSet::new();
+        let mut sealed_segments = Vec::with_capacity(sealed_loaded.len());
+        for (path, seg) in sealed_loaded {
+            if seg.offsets().iter().all(|o| hot_offsets.contains(o)) {
+                drop(seg);
+                remove_superseded_dir(&path, &mut report);
+            } else {
+                hot_offsets.extend(seg.offsets().iter().copied());
+                sealed_segments.push(seg);
             }
         }
+        sealed_offsets.extend(hot_offsets);
 
         let segments = SegmentHolder::from_records(
             config.clone(),
@@ -334,6 +484,9 @@ impl StorageEngine {
             &sealed_offsets,
             &vectors,
         )?;
+        if !report.is_clean() {
+            log::warn!("store recovered on open: {report:?}");
+        }
         for seg in sealed_segments {
             segments.add_sealed_hot(seg);
         }
@@ -391,6 +544,8 @@ impl StorageEngine {
                 text_index,
                 wal: Arc::new(Mutex::new(wal)),
                 flush_barrier: Arc::new(RwLock::new(())),
+                write_lock: Arc::new(Mutex::new(())),
+                recovery: Arc::new(report),
                 optimizer: Arc::new(optimizer),
                 update_worker: Arc::new(update_worker),
                 access_counters,
@@ -417,6 +572,11 @@ impl StorageEngine {
     /// Check if the GPU backend is actually GPU-accelerated (not CPU fallback).
     pub fn is_gpu_accelerated(&self) -> bool {
         turbomemory_gpu::is_gpu_accelerated(&self.gpu_backend())
+    }
+
+    /// What the `open` call that produced this engine had to repair.
+    pub fn recovery_report(&self) -> &RecoveryReport {
+        &self.recovery
     }
 
     /// The `insert_seq` the next inserted record will receive. Durable and
@@ -609,8 +769,13 @@ impl StorageEngine {
         // Advance the incremental watermark past everything inserted so far, so
         // the next cycle only checks records added after this one. (When the
         // flag is off the watermark is never read, so this is harmless.)
-        self.supersession_watermark
-            .store(self.meta.next_seq(), Ordering::Relaxed);
+        // Only when detection actually ran here: with a deferred commit the
+        // caller's `propose_supersessions` does the detecting, and advancing
+        // the cursor first would leave it nothing to propose.
+        if !self.config.tier.defer_supersession_commit {
+            self.supersession_watermark
+                .store(self.meta.next_seq(), Ordering::Relaxed);
+        }
 
         // Cognitive-layer learning: decay stale reinforced edges and build
         // abstraction hierarchies from concept co-occurrence. Both are opt-in
@@ -682,9 +847,21 @@ impl StorageEngine {
 
         // 1. Build any pending plain segments so the durable snapshot captures
         //    them as persisted HNSW / quantized segments rather than in-memory
-        //    plain indexes. Seal failures propagate: swallowing them here
-        //    would masquerade as "no more seals" and skip needed work.
-        while self.optimizer.process_one_seal(self)? {}
+        //    plain indexes. A build failure must not stop the durable part of
+        //    the flush: segments are rebuildable, the records are not. The
+        //    plain segment stays searchable and the error is returned once
+        //    everything else is safely on disk.
+        let mut seal_error = None;
+        loop {
+            match self.optimizer.process_one_seal(self) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    seal_error = Some(e);
+                    break;
+                }
+            }
+        }
 
         // 2. Drain access counters into the metadata cache before snapshotting it.
         self.access_counters.drain_into(&self.meta)?;
@@ -716,7 +893,10 @@ impl StorageEngine {
             wal.clear()?;
         }
 
-        Ok(())
+        match seal_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     pub fn record_count(&self) -> usize {
@@ -788,6 +968,7 @@ fn rebuild_graph(
     records: &[(PointOffset, Record)],
     saved_graph: Option<Vec<u8>>,
     config: &SpreadingConfig,
+    pruned: &mut usize,
 ) -> SpreadingActivation {
     let Some(bytes) = saved_graph else {
         return build_graph(records, config);
@@ -807,10 +988,26 @@ fn rebuild_graph(
     // process them in insertion order, preserving temporal chaining for the
     // new tail. We track the last memory id seen so temporal edges chain
     // correctly from the last persisted memory to the first new one.
-    let existing_mem_ids: HashSet<String> = graph
+    let mut existing_mem_ids: HashSet<String> = graph
         .iter_memory_nodes()
         .map(|(k, _)| k.strip_prefix("mem:").unwrap_or(&k).to_string())
         .collect();
+    // Drop memory nodes whose record is gone. The snapshot is saved at
+    // consolidation and flush, while deletes take effect immediately, so after
+    // an unclean stop it can still hold deleted memories: their text, and any
+    // supersession edge through which a deleted record would keep hiding a
+    // live one.
+    let live_ids: HashSet<&str> = records.iter().map(|(_, r)| r.id.as_str()).collect();
+    let stale: Vec<String> = existing_mem_ids
+        .iter()
+        .filter(|id| !live_ids.contains(id.as_str()))
+        .cloned()
+        .collect();
+    for id in &stale {
+        graph.remove_memory(id);
+        existing_mem_ids.remove(id);
+    }
+    *pruned += stale.len();
     // Reset last_memory_id so new temporal edges chain from the most recent
     // persisted memory (if any) rather than from an arbitrary one. We find
     // the last memory by scanning the existing set — the graph stores nodes
@@ -858,6 +1055,56 @@ fn graph_reset_last_memory(_graph: &mut MemoryGraph, _id: &str) {
     // No-op: the deserialized graph already carries `last_memory_id` from the
     // last `add_memory` call before serialization. New records will chain
     // from it naturally. See `rebuild_graph` for the rationale.
+}
+
+/// Load every segment directory under `dir`, sorted by path.
+///
+/// A directory without a manifest is a build that never finished and is
+/// removed. A directory whose segment fails to load is discarded too; the
+/// caller indexes its records again.
+fn load_segment_dirs<T>(
+    dir: &Path,
+    report: &mut RecoveryReport,
+    open: impl Fn(&Path) -> crate::Result<T>,
+) -> crate::Result<Vec<(PathBuf, T)>> {
+    let mut loaded = Vec::new();
+    if !dir.exists() {
+        return Ok(loaded);
+    }
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    for path in paths {
+        if !path.join(crate::segments::MANIFEST_FILE).exists() {
+            if std::fs::remove_dir_all(&path).is_ok() {
+                report.segment_dirs_removed += 1;
+            }
+            continue;
+        }
+        match open(&path) {
+            Ok(segment) => loaded.push((path, segment)),
+            Err(e) => {
+                log::warn!(
+                    "discarding unreadable segment {}: {e}; its records will be indexed again",
+                    path.display()
+                );
+                report.segments_discarded += 1;
+                let _ = std::fs::remove_dir_all(&path);
+            }
+        }
+    }
+    Ok(loaded)
+}
+
+fn remove_superseded_dir(path: &Path, report: &mut RecoveryReport) {
+    if std::fs::remove_dir_all(path).is_ok() {
+        report.segment_dirs_removed += 1;
+    }
 }
 
 pub(crate) fn now_secs() -> u64 {

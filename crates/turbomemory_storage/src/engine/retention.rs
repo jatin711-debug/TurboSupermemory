@@ -73,15 +73,17 @@ impl StorageEngine {
             }
         })?;
 
-        // Collect victims by id (dedup via a set of offsets).
+        // Collect victims as (offset, id), deduplicated via a set of offsets.
+        // The offset pins the exact record: an id can be updated to a newer
+        // record while the (slow) gist step below runs.
         let mut victim_offsets: HashSet<PointOffset> = HashSet::new();
-        let mut victims: Vec<String> = Vec::new();
+        let mut victims: Vec<(PointOffset, String)> = Vec::new();
 
         // Floor pass: anything below the score floor is a victim.
         if let Some(floor) = floor {
             for (offset, id, score) in &scored {
                 if *score < floor && victim_offsets.insert(*offset) {
-                    victims.push(id.clone());
+                    victims.push((*offset, id.clone()));
                 }
             }
         }
@@ -94,17 +96,20 @@ impl StorageEngine {
                 .saturating_sub(max_records);
             if over > 0 {
                 // Survivors not already marked, sorted by ascending score.
+                // Equal scores (common: every never-queried record scores 0)
+                // go oldest first; the metadata map has no stable order, so
+                // without the tie-break the choice of victim would be random.
                 let mut survivors: Vec<&(PointOffset, String, f64)> = scored
                     .iter()
                     .filter(|(offset, _, _)| !victim_offsets.contains(offset))
                     .collect();
-                survivors.sort_by(|a, b| a.2.total_cmp(&b.2));
+                survivors.sort_by(|a, b| a.2.total_cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
                 for (offset, id, _) in survivors {
                     if over == 0 {
                         break;
                     }
                     if victim_offsets.insert(*offset) {
-                        victims.push(id.clone());
+                        victims.push((*offset, id.clone()));
                         over -= 1;
                     }
                 }
@@ -114,16 +119,28 @@ impl StorageEngine {
         // B4 gist-before-evict: compress the victims into searchable gist
         // records BEFORE deleting them, so evicted content stays retrievable.
         // No-op unless the flag is on AND a GistCompressor is installed.
+        // Victims whose gist could not be produced or stored are spared this
+        // cycle: "compress instead of delete" must not quietly become
+        // "delete" because the summarizer was unreachable.
         if tier.gist_before_evict && !victims.is_empty() {
             let compressor = self.gist_compressor.read().clone();
             if let Some(compressor) = compressor {
-                self.gist_victims(&victim_offsets, compressor.as_ref(), tier.gist_chunk_facts)?;
+                let spared =
+                    self.gist_victims(&victim_offsets, compressor.as_ref(), tier.gist_chunk_facts)?;
+                if !spared.is_empty() {
+                    log::warn!(
+                        "gist-before-evict: kept {} records whose gist failed; \
+                         they will be retried on the next eviction",
+                        spared.len()
+                    );
+                    victims.retain(|(offset, _)| !spared.contains(offset));
+                }
             }
         }
 
         let mut evicted = 0usize;
-        for id in &victims {
-            if self.delete_by_id(id)? {
+        for (offset, id) in &victims {
+            if self.delete_by_id_at(id, *offset)? {
                 evicted += 1;
             }
         }
@@ -137,34 +154,55 @@ impl StorageEngine {
     /// `{"gist": true, "victims": n}` payload. The role keeps gists out of
     /// belief-revision detection (`belief_source_roles` gating) while scope-
     /// based retrieval keeps them visible to the memories they summarize.
+    ///
+    /// Returns the offsets of victims that must NOT be deleted: those in a
+    /// chunk whose compressor call failed or whose gist could not be stored.
+    /// A chunk the compressor abstained on (`Ok(None)` or an empty gist) is
+    /// not spared; abstaining is the compressor saying there is nothing to
+    /// keep.
     fn gist_victims(
         &self,
         victim_offsets: &HashSet<PointOffset>,
         compressor: &dyn GistCompressor,
         chunk_facts: usize,
-    ) -> crate::Result<()> {
-        // Collect victim (scope, seq, text), then compress per scope in
-        // chronological (insert_seq) order — for_each_record does not
+    ) -> crate::Result<HashSet<PointOffset>> {
+        // Collect victim (scope, seq, offset, text), then compress per scope
+        // in chronological (insert_seq) order — for_each_record does not
         // iterate in insertion order.
-        let mut by_scope: std::collections::HashMap<Option<String>, Vec<(u64, String)>> =
-            std::collections::HashMap::new();
+        type Victim = (u64, PointOffset, String);
+        let mut by_scope: std::collections::BTreeMap<Option<String>, Vec<Victim>> =
+            std::collections::BTreeMap::new();
         self.meta.for_each_record(|offset, rec| {
             if victim_offsets.contains(&offset) {
-                by_scope
-                    .entry(rec.scope.clone())
-                    .or_default()
-                    .push((rec.insert_seq, rec.text.clone()));
+                by_scope.entry(rec.scope.clone()).or_default().push((
+                    rec.insert_seq,
+                    offset,
+                    rec.text.clone(),
+                ));
             }
         })?;
 
+        let mut spared: HashSet<PointOffset> = HashSet::new();
         let chunk_facts = chunk_facts.max(1);
         let now = now_secs();
-        for (scope, mut texts) in by_scope {
-            texts.sort_by_key(|(seq, _)| *seq);
-            let texts: Vec<String> = texts.into_iter().map(|(_, text)| text).collect();
-            for chunk in texts.chunks(chunk_facts) {
-                let Some((gist, embedding)) = compressor.compress(chunk) else {
-                    continue;
+        for (scope, mut entries) in by_scope {
+            entries.sort_by_key(|(seq, _, _)| *seq);
+            for chunk in entries.chunks(chunk_facts) {
+                let texts: Vec<String> = chunk.iter().map(|(_, _, text)| text.clone()).collect();
+                let mut spare = |reason: &str| {
+                    log::warn!(
+                        "gist-before-evict: {reason}; keeping {} records",
+                        chunk.len()
+                    );
+                    spared.extend(chunk.iter().map(|(_, offset, _)| *offset));
+                };
+                let (gist, embedding) = match compressor.compress(&texts) {
+                    Ok(Some(out)) => out,
+                    Ok(None) => continue,
+                    Err(reason) => {
+                        spare(&format!("compressor failed: {reason}"));
+                        continue;
+                    }
                 };
                 if gist.trim().is_empty() {
                     continue;
@@ -177,8 +215,6 @@ impl StorageEngine {
                     n
                 );
                 let payload = format!("{{\"gist\":true,\"victims\":{}}}", chunk.len());
-                // A failed gist insert must not abort eviction — the victims
-                // are being deleted either way. Log and continue.
                 if let Err(e) = self.insert_with_payload_role(
                     &gist_id,
                     &gist,
@@ -189,11 +225,11 @@ impl StorageEngine {
                     scope.clone(),
                     Some("gist".to_string()),
                 ) {
-                    log::warn!("gist-before-evict: failed to insert {gist_id}: {e}");
+                    spare(&format!("could not store {gist_id}: {e}"));
                 }
             }
         }
-        Ok(())
+        Ok(spared)
     }
 
     /// Semantic consolidation: merge near-duplicate records.
@@ -204,6 +240,9 @@ impl StorageEngine {
     /// the other is deleted. The survivor inherits the victim's concept edges
     /// so graph relationships are not lost. Returns the number of records
     /// merged away.
+    ///
+    /// Only records in the same scope are ever merged: two users who each
+    /// store the same sentence keep their own copy.
     ///
     /// Opt-in: a no-op when `dedup_cosine_threshold` is `None`. Work is bounded
     /// by `dedup_max_pairs_per_cycle`. Candidate neighbors are found via the
@@ -231,6 +270,7 @@ impl StorageEngine {
             importance: f32,
             insert_seq: u64,
             concepts: Vec<String>,
+            scope: Option<String>,
         }
         let mut cands: Vec<Cand> = Vec::new();
         self.meta.for_each_record(|offset, rec| {
@@ -241,8 +281,11 @@ impl StorageEngine {
                 importance: rec.importance,
                 insert_seq: rec.insert_seq,
                 concepts: rec.concepts.clone(),
+                scope: rec.scope.clone(),
             });
         })?;
+        // Deterministic pass order (the metadata map has none).
+        cands.sort_by_key(|c| c.insert_seq);
 
         // Higher salience wins. Returns true if `a` should be kept over `b`.
         let keeps = |a: &Cand, b: &Cand| -> bool {
@@ -254,8 +297,8 @@ impl StorageEngine {
         };
 
         let mut merged_offsets: HashSet<PointOffset> = HashSet::new();
-        // (survivor_id, victim_id, victim_concepts)
-        let mut merges: Vec<(String, String, Vec<String>)> = Vec::new();
+        // (survivor_id, victim_id, victim_offset, victim_concepts)
+        let mut merges: Vec<(String, String, PointOffset, Vec<String>)> = Vec::new();
 
         'outer: for cand in &cands {
             if merged_offsets.contains(&cand.offset) {
@@ -268,8 +311,10 @@ impl StorageEngine {
             let embedding: Vec<f32> = vec.to_vec();
             drop(view);
 
-            // Find near neighbors via ANN, then verify exact cosine.
-            let neighbors = self.search_ann_candidates(&embedding, 5)?;
+            // Find near neighbors via ANN (within the candidate's own scope,
+            // so other scopes cannot crowd the short list), then verify exact
+            // cosine.
+            let neighbors = self.search_ann_scoped(&embedding, 5, None, cand.scope.as_deref())?;
             for (nid, _) in neighbors {
                 if nid == cand.id {
                     continue;
@@ -277,6 +322,11 @@ impl StorageEngine {
                 let Some(other) = cands.iter().find(|c| c.id == nid) else {
                     continue;
                 };
+                // Never merge across scopes: that would delete one user's
+                // memory because another user said the same thing.
+                if other.scope != cand.scope {
+                    continue;
+                }
                 if merged_offsets.contains(&other.offset) {
                     continue;
                 }
@@ -299,6 +349,7 @@ impl StorageEngine {
                 merges.push((
                     survivor.id.clone(),
                     victim.id.clone(),
+                    victim.offset,
                     victim.concepts.clone(),
                 ));
                 if merges.len() >= max_pairs {
@@ -313,29 +364,26 @@ impl StorageEngine {
         }
 
         let mut count = 0usize;
-        for (survivor_id, victim_id, victim_concepts) in &merges {
+        for (survivor_id, victim_id, victim_offset, victim_concepts) in &merges {
             // Transfer the victim's concept edges to the survivor before
-            // deleting it, so relationships are preserved.
-            if !victim_concepts.is_empty() {
-                if let Some(survivor) = self.find_record_by_id(survivor_id) {
-                    let mut concepts = survivor.concepts.clone();
-                    for c in victim_concepts {
-                        if !concepts.contains(c) {
-                            concepts.push(c.clone());
-                        }
-                    }
-                    let mut graph = self.graph.write();
-                    graph.add_memory_scoped(
+            // deleting it, so relationships are preserved. Only the concepts
+            // the survivor lacks are added: re-adding the whole memory would
+            // duplicate every edge it already has.
+            if let Some(survivor) = self.find_meta_by_id(survivor_id) {
+                let missing: Vec<String> = victim_concepts
+                    .iter()
+                    .filter(|c| !survivor.concepts.contains(c))
+                    .cloned()
+                    .collect();
+                if !missing.is_empty() {
+                    self.graph.write().add_concepts_to_memory(
                         survivor_id,
-                        &survivor.text,
-                        &concepts,
+                        &missing,
                         survivor.importance,
-                        survivor.scope.as_deref(),
                     );
-                    drop(graph);
                 }
             }
-            if self.delete_by_id(victim_id)? {
+            if self.delete_by_id_at(victim_id, *victim_offset)? {
                 count += 1;
             }
         }

@@ -21,6 +21,7 @@ OpenAI-backed and read the key from ``OPENAI_API_KEY``.
 
 import json
 import logging
+import threading
 from typing import Callable, Dict, List, Optional
 
 import numpy as np
@@ -35,7 +36,7 @@ logger = logging.getLogger("tsm.memory")
 
 # Engine methods this SDK cannot work without. The extension and the SDK ship
 # together; this guards against a stale locally-built turbomemory.pyd/.so.
-_REQUIRED_ENGINE_METHODS = ("get_records", "next_insert_seq")
+_REQUIRED_ENGINE_METHODS = ("get_records", "next_insert_seq", "recovery_report")
 
 # The proven conversational configuration, from the evaluation wins. Every key
 # is a MemoryEngine kwarg; explicit engine_kwargs passed to Memory() override
@@ -113,8 +114,21 @@ class Memory:
                 reranking (e.g. ``LFM2.5-ColBERT-350M``).
             **engine_kwargs: forwarded to ``turbomemory.MemoryEngine``.
         """
+        # Backend names are resolved here; anything else that is a string is a
+        # typo, and is reported now rather than at the first add().
+        for kind, value, known in (
+            ("embedder", embedder, ("openai", "sentence_transformer", "local", "minilm")),
+            ("extractor", extractor, ("openai", "gliner", "passthrough")),
+            ("reranker", reranker, ("colbert",)),
+        ):
+            if isinstance(value, str) and value not in known:
+                raise ValueError(
+                    f"unknown {kind} {value!r}: use one of {', '.join(known)} "
+                    f"or pass an instance")
+        if embedder == "openai":
+            embedder = None
         cache_dir = None
-        if embedder is None or extractor is None:
+        if embedder is None or extractor is None or extractor == "openai":
             import os
 
             cache_dir = os.path.join(db_path, "tsm_cache")
@@ -152,9 +166,11 @@ class Memory:
         config: Dict = {}
         if profile == "conversational":
             config.update(CONVERSATIONAL_PROFILE)
-            config["defer_supersession_commit"] = verifier is not None
         elif profile is not None:
             raise ValueError(f"unknown profile: {profile!r} (use 'conversational' or None)")
+        # A verifier only gets to vet supersessions if the engine does not
+        # commit them first, whatever the profile.
+        config["defer_supersession_commit"] = verifier is not None
         if gist_summarizer is not None:
             config["gist_before_evict"] = True
         config.update(engine_kwargs)  # explicit kwargs win over the profile
@@ -166,6 +182,9 @@ class Memory:
             db_path=db_path, dimension=self.dim, **config
         )
         self._closed = False
+        # One writer at a time: id minting and the insert it feeds must not
+        # interleave between threads sharing this Memory.
+        self._write_lock = threading.Lock()
         missing = [m for m in _REQUIRED_ENGINE_METHODS if not hasattr(self.engine, m)]
         if missing:
             self.close()
@@ -176,6 +195,7 @@ class Memory:
         if gist_summarizer is not None:
             set_compressor = getattr(self.engine, "set_gist_compressor", None)
             if set_compressor is None:
+                self.close()  # do not leave the database locked behind the error
                 raise ValueError(
                     "gist_summarizer requires an engine build with gist-before-evict "
                     "support (set_gist_compressor); rebuild the turbomemory extension"
@@ -203,6 +223,10 @@ class Memory:
             The number of facts stored. Exact-text duplicates within the same
             batch are skipped (write gate); cross-batch near-duplicates are
             the engine's job (dedup config / belief revision).
+
+        The facts of one call are stored as a single batch that the engine
+        validates before writing anything, so a call either stores all of its
+        facts or raises having stored none. Safe to call from several threads.
         """
         self._require_open()
         if isinstance(messages, str):
@@ -237,31 +261,40 @@ class Memory:
         if not facts:
             return 0
 
-        embeddings = np.asarray(self.embedder.encode(facts), dtype=np.float32)
-        assigned_turns: Dict[int, int] = {}
-        for fact, meta, emb in zip(facts, metas, embeddings):
-            memory_id = self._next_id(user_id)
-            # A caller-supplied turn index wins. Otherwise the turn is keyed by
-            # the sequence number of its first stored fact: unique per message
-            # and durable across restarts, like the ids themselves.
-            turn_index = meta["turn_index"]
-            if turn_index is None:
-                turn_index = assigned_turns.setdefault(meta["turn"], self._insert_counter)
-            self.engine.insert(
-                id=memory_id,
-                text=fact,
-                embedding=emb.astype(np.float32),
-                importance_score=1.0,
-                concepts=extract_concepts(fact),
-                payload=json.dumps({
+        embeddings = np.ascontiguousarray(self.embedder.encode(facts), dtype=np.float32)
+        if embeddings.ndim != 2 or embeddings.shape != (len(facts), self.dim):
+            raise ValueError(
+                f"embedder returned shape {embeddings.shape} for {len(facts)} facts; "
+                f"expected ({len(facts)}, {self.dim})"
+            )
+        with self._write_lock:
+            assigned_turns: Dict[int, int] = {}
+            ids: List[str] = []
+            payloads: List[str] = []
+            for meta in metas:
+                ids.append(self._next_id(user_id))
+                # A caller-supplied turn index wins. Otherwise the turn is keyed
+                # by the sequence number of its first stored fact: unique per
+                # message and durable across restarts, like the ids themselves.
+                turn_index = meta["turn_index"]
+                if turn_index is None:
+                    turn_index = assigned_turns.setdefault(meta["turn"], self._insert_counter)
+                payloads.append(json.dumps({
                     "timestamp": meta["timestamp"],
                     "role": meta["role"],
                     "user_id": user_id,
                     "original_message": meta["content"],
                     "turn_index": turn_index,
-                }),
-                scope=user_id,
-                source_role=meta["role"],
+                }))
+            self.engine.insert_batch(
+                ids,
+                facts,
+                embeddings,
+                [1.0] * len(facts),
+                [extract_concepts(fact) for fact in facts],
+                payloads,
+                [user_id] * len(facts) if user_id is not None else None,
+                [str(meta["role"]) for meta in metas],
             )
         return len(facts)
 
@@ -270,8 +303,14 @@ class Memory:
 
         Summarizes one chunk of eviction victims with the user-supplied
         ``gist_summarizer`` and embeds the gist with this Memory's embedder.
-        Returns ``(gist_text, embedding)`` or ``None`` — any failure abstains
-        so eviction is never blocked by the summarizer.
+        Returns ``(gist_text, embedding)``, or ``None`` when the summarizer
+        produced nothing (it found nothing worth keeping, so the chunk is
+        dropped without a gist).
+
+        A failure is NOT an abstention: if the summarizer or the embedder
+        raises, the exception is passed on to the engine, which then keeps
+        this chunk's memories and tries again on the next eviction. Swallowing
+        it would delete them with no gist in their place.
         """
         try:
             gist = (self._gist_summarizer(texts) or "").strip()
@@ -279,9 +318,10 @@ class Memory:
                 return None
             emb = np.asarray(self.embedder.encode([gist]), dtype=np.float32)[0]
             return gist, emb.tolist()
-        except Exception as e:  # noqa: BLE001 — never block eviction
-            logger.warning("gist summarizer failed for %d texts: %s", len(texts), e)
-            return None
+        except Exception as e:  # noqa: BLE001 — logged here, handled by the engine
+            logger.warning("gist summarizer failed for %d texts (kept, will retry): %s",
+                           len(texts), e)
+            raise
 
     def _require_open(self) -> None:
         if self._closed:
@@ -363,7 +403,7 @@ class Memory:
             top_k=fetch_k,
             scope=user_id,
         )
-        if not results:  # empty, or the FOK gate rejected the query
+        if not results:  # nothing in this scope matched
             return []
 
         records = self._records([mid for mid, _ in results])
@@ -469,8 +509,23 @@ class Memory:
         ``RuntimeError``.
         """
         if not self._closed:
-            self._closed = True
-            self.engine.close()
+            try:
+                self.engine.close()
+            finally:
+                # The engine handle is released even when its final flush
+                # raises, so this object is closed either way.
+                self._closed = True
+                # Persist the backends' paid-for caches (extractions,
+                # embeddings); they otherwise only reach disk every few
+                # hundred entries or at interpreter exit.
+                for backend, method in ((self.extractor, "flush_cache"),
+                                        (self.embedder, "flush")):
+                    flush = getattr(backend, method, None)
+                    if callable(flush):
+                        try:
+                            flush()
+                        except Exception as e:  # noqa: BLE001 — never fail close()
+                            logger.warning("cache flush failed on close: %s", e)
 
     def __enter__(self) -> "Memory":
         return self

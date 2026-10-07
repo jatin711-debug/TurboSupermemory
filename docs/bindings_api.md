@@ -56,9 +56,11 @@ sequenceDiagram
 
 ### 1.3 Exception Mapping
 Crate-level `StorageError` variants are mapped to standard Python exception types:
-* `DuplicateId`, `DimensionMismatch`, `InvalidArgument` $\rightarrow$ `ValueError`
+* `DuplicateId`, `DimensionMismatch`, `InvalidArgument`, and unusable vectors (all-zero, or containing NaN / infinity) $\rightarrow$ `ValueError`
 * `NotFound` $\rightarrow$ `KeyError`
-* All other storage, database, and I/O errors $\rightarrow$ `RuntimeError`
+* All other storage, database, and I/O errors, including `Corrupted` (a damaged or missing primary file) $\rightarrow$ `RuntimeError`
+
+Release builds unwind on panic, so an internal panic surfaces as PyO3's `PanicException` instead of ending the Python process.
 
 ### 1.4 Pluggable Python Callables (LLM Compressor)
 A custom Python function can be injected into the Rust engine to act as the working memory compressor:
@@ -101,12 +103,12 @@ results = engine.search_ann_batch(queries, top_k=10)
 # results is a list of list of (id, score) tuples
 ```
 
-Batch search releases the GIL and dispatches to the Rust engine, which can use GPU batched distance compute when available. Single-query search (`search_ann`) uses CPU paths by default (GPU upload overhead dominates for single queries).
+Batch search releases the GIL and dispatches to the Rust engine, which can use GPU batched distance compute when available. Single-query search (`search_ann`) always runs on the CPU (GPU upload overhead dominates for single queries).
 
 **GPU Acceleration Details:**
-- **Index Build**: GPU HNSW construction uses brute-force all-pairs neighbor selection for collections up to 20,000 vectors (fast and exact on GPU). Beyond this threshold, the engine falls back to the proven CPU `usearch` HNSW implementation.
-- **Candidate Rerank**: When CUDA is enabled and the candidate pool is large enough (≥256 candidates), batch rerank uses a single cuBLAS `sgemm` call (M queries × N candidates) — the one workload where GPU genuinely beats CPU.
-- **Search Path**: Per-query HNSW traversal stays on CPU; GPU accelerates only the batched distance computation during rerank.
+- **Index Build**: on the CPU, with `usearch`. The GPU is not used to build or search indexes.
+- **Candidate Rerank**: when CUDA is enabled and a batch has at least 256 candidates in total, the batch rerank is a single cuBLAS `sgemm` call (M queries × N candidates). Queries are scaled to unit length first, so the scores are the same cosines the CPU path returns. On the one card it has been measured on (RTX 3050 4 GB) this was no faster than the CPU rerank; see [GPU acceleration](gpu_acceleration.md).
+- **Search Path**: per-query HNSW traversal stays on the CPU.
 
 **Testing:** The `test_batch_search.py` script validates that `search_ann_batch` produces identical results to individual `search_ann` calls, including after segment consolidation.
 

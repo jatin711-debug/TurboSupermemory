@@ -13,12 +13,48 @@ import atexit
 import logging
 import os
 import pickle
-import time
 from typing import List, Optional
 
 import numpy as np
 
+from ._retry import call_with_retries
+
 logger = logging.getLogger("tsm.embedders")
+
+
+class _ArrayCacheUnpickler(pickle.Unpickler):
+    """Loads the embedding cache (a dict of text -> float array) and nothing else.
+
+    The cache lives next to the database when ``tsm.Memory`` creates the
+    embedder, and a database directory can come from someone else. A plain
+    ``pickle.load`` runs whatever the file tells it to; this loader only ever
+    resolves the handful of numpy names an array needs and refuses the rest.
+    """
+
+    _ALLOWED = frozenset({
+        ("numpy", "ndarray"),
+        ("numpy", "dtype"),
+        ("numpy.core.multiarray", "_reconstruct"),
+        ("numpy._core.multiarray", "_reconstruct"),
+        ("numpy.core.multiarray", "scalar"),
+        ("numpy._core.multiarray", "scalar"),
+        ("numpy.core.numeric", "_frombuffer"),
+        ("numpy._core.numeric", "_frombuffer"),
+    })
+
+    def find_class(self, module, name):
+        if (module, name) in self._ALLOWED:
+            return super().find_class(module, name)
+        raise pickle.UnpicklingError(
+            f"embedding cache may only contain arrays, found {module}.{name}")
+
+
+def _load_cache(path: str) -> dict:
+    with open(path, "rb") as f:
+        cache = _ArrayCacheUnpickler(f).load()
+    if not isinstance(cache, dict):
+        raise pickle.UnpicklingError("embedding cache is not a dict")
+    return cache
 
 # Native output dimensions per model (used to size the engine's index).
 _MODEL_DIM = {
@@ -30,18 +66,28 @@ _MODEL_DIM = {
 
 class OpenAIEmbedder:
     def __init__(self, model="text-embedding-3-small", dim=None, batch=256,
-                 max_retries=6, request_timeout=30.0, cache_dir=None):
-        if not os.environ.get("OPENAI_API_KEY"):
-            raise RuntimeError(
-                "OPENAI_API_KEY is not set. The default OpenAIEmbedder needs "
-                "it; pass a custom embedder to tsm.Memory to use another "
-                "backend (see tsm.interfaces.Embedder)."
-            )
-        from openai import OpenAI
+                 max_retries=6, request_timeout=30.0, cache_dir=None, client=None):
+        if client is None:
+            if not os.environ.get("OPENAI_API_KEY"):
+                raise RuntimeError(
+                    "OPENAI_API_KEY is not set. The default OpenAIEmbedder needs "
+                    "it; pass client=... for another OpenAI-compatible endpoint, or "
+                    "a custom embedder to tsm.Memory to use another backend "
+                    "(see tsm.interfaces.Embedder)."
+                )
+            from openai import OpenAI
 
-        self._client = OpenAI(timeout=request_timeout)
+            client = OpenAI(timeout=request_timeout)
+        self._client = client
         self.model = model
-        self._dim = dim or _MODEL_DIM.get(model, 1536)
+        native = _MODEL_DIM.get(model)
+        self._dim = dim or native or 1536
+        # A dimension other than the model's native one has to be requested
+        # from the API (text-embedding-3 models shorten on request). Reporting
+        # it without requesting it made every insert fail on a size mismatch.
+        # For any other model `dim` only declares the size it returns.
+        shortens = native is not None and model.startswith("text-embedding-3")
+        self._request_dim = self._dim if (shortens and dim and dim != native) else None
         self.batch = batch
         self.max_retries = max_retries
         self.calls = 0
@@ -49,15 +95,16 @@ class OpenAIEmbedder:
         self._dirty = 0
         cache_dir = cache_dir or os.path.join(os.path.expanduser("~"), ".cache", "tsm")
         os.makedirs(cache_dir, exist_ok=True)
-        self._cache_path = os.path.join(cache_dir, f"emb_{model}.pkl")
+        # Shortened vectors get their own cache file: the cache is keyed by text.
+        suffix = f"_{self._request_dim}d" if self._request_dim else ""
+        self._cache_path = os.path.join(cache_dir, f"emb_{model}{suffix}.pkl")
         if os.path.exists(self._cache_path):
             try:
-                with open(self._cache_path, "rb") as f:
-                    self._cache = pickle.load(f)
+                self._cache = _load_cache(self._cache_path)
                 logger.info("Loaded %d cached embeddings from %s",
                             len(self._cache), os.path.basename(self._cache_path))
             except Exception as e:  # noqa: BLE001
-                logger.warning("embed cache load failed: %s", e)
+                logger.warning("embed cache ignored (could not be loaded safely): %s", e)
                 self._cache = {}
         atexit.register(self.flush)
 
@@ -96,17 +143,22 @@ class OpenAIEmbedder:
 
     # internals ------------------------------------------------------------------
     def _embed_batch(self, chunk):
-        for attempt in range(self.max_retries):
-            try:
-                self.calls += 1
-                r = self._client.embeddings.create(model=self.model, input=chunk)
-                return [np.asarray(d.embedding, dtype=np.float32) for d in r.data]
-            except Exception as e:  # noqa: BLE001
-                wait = min(5.0 * (2 ** attempt), 120.0)
-                logger.warning("embed failed (attempt %d/%d): %s; retry %.0fs",
-                               attempt + 1, self.max_retries, e, wait)
-                time.sleep(wait)
-        raise RuntimeError("embedding failed after retries")
+        def request():
+            self.calls += 1
+            kwargs = {"model": self.model, "input": chunk}
+            if self._request_dim:
+                kwargs["dimensions"] = self._request_dim
+            r = self._client.embeddings.create(**kwargs)
+            return [np.asarray(d.embedding, dtype=np.float32) for d in r.data]
+
+        vectors = call_with_retries(request, "OpenAI embedding", self.max_retries, logger)
+        if len(vectors) != len(chunk) or any(v.shape != (self._dim,) for v in vectors):
+            got = sorted({v.shape for v in vectors})
+            raise RuntimeError(
+                f"embedding API returned {len(vectors)} vectors of shape {got} for "
+                f"{len(chunk)} texts; expected dimension {self._dim} "
+                f"(pass dim= to OpenAIEmbedder for a model whose size is not known)")
+        return vectors
 
     def flush(self):
         if not self._dirty:

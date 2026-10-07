@@ -4,10 +4,10 @@
 [![Python](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#license)
 [![Status: Beta](https://img.shields.io/badge/status-beta-yellow.svg)](#verification)
-[![CUDA](https://img.shields.io/badge/CUDA-12.6%20accelerated-76B900.svg?logo=nvidia)](#gpu-acceleration-opt-in-via-cuda-feature)
-[![Tests](https://img.shields.io/badge/tests-252%20Rust%20%2B%2044%20SDK-brightgreen.svg)](#verification)
+[![CUDA](https://img.shields.io/badge/CUDA-12.6%20optional-76B900.svg?logo=nvidia)](#gpu-acceleration)
+[![Tests](https://img.shields.io/badge/tests-286%20Rust%20%2B%2068%20SDK-brightgreen.svg)](#verification)
 
-> **TurboSuperMemory** is a high-performance, bare-metal cognitive memory engine for AI agents — written in native Rust, accelerated by CUDA, and equipped with 3-tier TurboQuant hardware compression and Stage-2 ColBERT late interaction.
+> **TurboSuperMemory** is a high-performance, bare-metal cognitive memory engine for AI agents — written in native Rust, with optional CUDA acceleration, and equipped with 3-tier TurboQuant hardware compression and Stage-2 ColBERT late interaction.
 
 ---
 
@@ -18,11 +18,11 @@ Most "agent memory" solutions today are thin Python wrappers around vector datab
 **TurboSuperMemory (TSM) is engineered from the silicon up:**
 
 * ⚡ **$0.00 Write-Time Ingestion**: Open-vocabulary statistical PMI concept extraction in native Rust ($<0.05\text{ms}$ latency) — zero LLM token burn on write.
-* 💥 **30.7× RaBitQ & 32× TurboQuant Hardware Compression**: Universal dimension support (384-d, 768-d, 1536-d) shrinking 768-d vectors to **100 bytes/vec** with randomized orthogonal transforms and fast AVX2/CUDA LUT popcount scoring.
+* 💥 **30.7× RaBitQ & 32× TurboQuant Hardware Compression**: Universal dimension support (384-d, 768-d, 1536-d) shrinking 768-d vectors to **100 bytes/vec** with randomized orthogonal transforms and fast AVX2 LUT popcount scoring.
 * 🧠 **Cognitive Biology & Graph Layer**: ACT-R power-law recency decay, spreading activation across concept hubs, and NLI-based non-destructive belief revision.
 * 🎯 **2-Stage Retrieval & ColBERT MaxSim**: Fast Stage-1 candidate retrieval ($<1\text{ms}$) + optional Stage-2 token-level late interaction (`LiquidAI/LFM2.5-ColBERT-350M`) on CUDA.
 * 🛡️ **Adaptive Saliency Cap & Submodular MMR**: Prevents prompt context-stuffing across 150 to 1,000+ token budgets, maintaining superior accuracy against Mem0 across all budget sizes.
-* 🔒 **Zero-Crash Storage Engine**: Lock-free atomic `ArcSwap` snapshots, segmented mmap buffers, and Write-Ahead Logging (WAL) that never block live queries.
+* 🔒 **Crash-Safe Storage Engine**: Lock-free atomic `ArcSwap` snapshots, segmented mmap buffers, and a checksummed Write-Ahead Log. A process that is killed loses nothing it acknowledged, an update is atomic, damaged index segments are rebuilt on open, and a scope or filter bounds every stage of a search.
 
 ---
 
@@ -76,7 +76,7 @@ Memory automatically flows downward through three storage tiers as it ages:
   ┌────────────────────────────────────────────────────────────────────────────────────────┐
   │ 2. WARM TIER (mmap): Scalar (8-bit) / RaBitQ-2Bit / TurboQuant-Prod                     │
   │ • Storage: 4.0× to 15.7× Compression (196 - 768 bytes/vector @ 768-dim)                │
-  │ • Search: AVX2/CUDA Quantized Scan shortlist ──► FP32 Rerank                           │
+  │ • Search: AVX2 Quantized Scan shortlist ──► FP32 Rerank                                │
   └────────────────────────────────────────────┬───────────────────────────────────────────┘
                                                │ (When Warm reaches `warm_capacity` compaction)
                                                ▼
@@ -204,6 +204,8 @@ make build-api
 TURBO_DB_PATH=./server_db TURBO_DIMENSION=768 make api-server
 ```
 
+The server flushes the store every `TURBO_FLUSH_INTERVAL_SECS` seconds (default 30) and on shutdown (Ctrl-C or SIGTERM). Writes are recoverable from the write-ahead log after a kill either way.
+
 * **gRPC Endpoint**: `localhost:50051` (Proto definitions in `crates/turbomemory_api/proto/turbomemory.proto`)
 * **REST Health Check**: `GET http://localhost:8080/health`
 * **REST Search**: `POST http://localhost:8080/search`
@@ -217,10 +219,35 @@ TURBO_DB_PATH=./server_db TURBO_DIMENSION=768 make api-server
 | `turbomemory_core` | `crates/turbomemory_core` | Vector math, SIMD FWHT, Lloyd-Max quantizers, MaxSim scoring. |
 | `turbomemory_graph` | `crates/turbomemory_graph` | BM25, PMI concept extraction, spreading activation, ACT-R decay, belief revision. |
 | `turbomemory_storage` | `crates/turbomemory_storage` | 3-Tier StorageEngine, lock-free `ArcSwap` snapshots, WAL, mmap segments. |
-| `turbomemory_gpu` | `crates/turbomemory_gpu` | CUDA acceleration kernels (NVRTC + cuBLAS) with transparent CPU fallback. |
+| `turbomemory_gpu` | `crates/turbomemory_gpu` | Optional CUDA backend (cuBLAS batched rerank for batch search) with transparent CPU fallback. |
 | `turbomemory_python` | `crates/turbomemory_python` | PyO3 C-extension facade with zero-copy NumPy bindings. |
 | `turbomemory_api` | `crates/turbomemory_api` | High-throughput gRPC (Tonic) and REST (Axum) server. |
 | `tsm` (Python) | `tsm/` | The SDK: `Memory` facade, budget recall, gist summarizers, pluggable embedder / extractor / verifier / reranker. |
+
+---
+
+<a id="gpu-acceleration"></a>
+
+## ⚙️ GPU Acceleration (opt-in)
+
+Two separate things use the GPU:
+
+* **The ColBERT reranker** in the SDK (`reranker="colbert"`) runs on CUDA through PyTorch. It needs no special build.
+* **The engine's `cuda` cargo feature** (`make build-python FEATURES=cuda`) moves one step to the GPU: the full-precision rerank of a *batch* search (`search_ann_batch`) becomes a single cuBLAS `gemm`. Index construction, index traversal, the quantized scans and single-query search always run on the CPU, and any CUDA error falls back to the CPU.
+
+Measured on an RTX 3050 (4 GB), the CUDA build returns the same results as the CPU build and is not faster at anything tested; the numbers and the method are in [`docs/gpu_acceleration.md`](./docs/gpu_acceleration.md). Build with it if you want to experiment on a larger card, not for a speedup on a small one.
+
+---
+
+## 🧯 Durability & Recovery
+
+* Every write is validated before anything changes; a rejected insert, batch or update leaves the store as it was.
+* Writes are logged with a checksum of their vector. If the process dies without `close()`, the next open replays the log and reads each vector back from disk: nothing acknowledged is lost. `engine.recovery_report()` says what an open had to repair.
+* The log is fsynced by `flush()` / `close()`, not per write. After a **power loss**, writes since the last flush can be missing; they are never half-applied.
+* Index segments are derived data: one that is damaged or incomplete is discarded on open and rebuilt from the vectors.
+* A store whose vector file or metadata file is missing or truncated refuses to open with a clear error instead of opening empty.
+
+The failures these rules come from are pinned in [`crates/turbomemory_storage/tests/robustness.rs`](./crates/turbomemory_storage/tests/robustness.rs).
 
 ---
 
@@ -235,6 +262,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 # Rust suite
 cargo test --workspace --exclude turbomemory_python
+cargo test -p turbomemory_storage --test robustness   # durability, isolation, bad input, concurrency
 
 # Python extension, engine verification, SDK unit suite
 make build-python

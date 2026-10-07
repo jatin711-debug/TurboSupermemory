@@ -17,6 +17,7 @@ pub mod visited_pool;
 pub mod wal;
 
 pub use engine::GistCompressor;
+pub use engine::RecoveryReport;
 pub use engine::StorageEngine;
 
 pub type Result<T> = std::result::Result<T, StorageError>;
@@ -45,4 +46,8 @@ pub enum StorageError {
     InvalidArgument(String),
     #[error("index error: {0}")]
     IndexError(String),
+    /// On-disk state that is damaged or inconsistent and cannot be repaired
+    /// automatically (derived files that can be rebuilt are rebuilt instead).
+    #[error("corrupted store: {0}")]
+    Corrupted(String),
 }

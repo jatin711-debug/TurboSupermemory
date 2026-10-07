@@ -13,8 +13,11 @@ supersession-exclusion path exercised here is the engine's, not a mock's.
 import hashlib
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import textwrap
+import threading
 import unittest
 
 # Repo root = two levels up from this file (tsm/tests/ -> tsm/ -> root). Makes
@@ -522,6 +525,187 @@ class TestDurability(MemoryTestBase):
         after = [r["text"] for r in mem.recall("user lives", user_id="alice", top_k=10)]
         self.assertIn(self.NEW_FACT, after)
         self.assertNotIn(self.OLD_FACT, after)
+
+
+class PoisonableEmbedder(FakeEmbedder):
+    """Returns a NaN vector for any text containing "poison" while armed."""
+
+    armed = True
+
+    def _vec(self, text):
+        v = super()._vec(text)
+        if self.armed and "poison" in text:
+            v[0] = np.nan
+        return v
+
+
+class TestRobustness(MemoryTestBase):
+    """Failures that were reproduced against the SDK: writes lost when the
+    process died, one user's facts crowding out another's, an add() that
+    stored half its facts, and a summarizer outage that erased memories."""
+
+    def test_adds_survive_a_process_that_dies_without_close(self):
+        tests_dir = os.path.dirname(os.path.abspath(__file__))
+        child = textwrap.dedent(f"""
+            import os, sys
+            sys.path.insert(0, {_ROOT!r})
+            sys.path.insert(0, {tests_dir!r})
+            from test_memory import FakeEmbedder, FakeExtractor
+            from tsm import Memory
+            mem = Memory(db_path={self.db_path!r}, embedder=FakeEmbedder(),
+                         extractor=FakeExtractor())
+            for i in range(25):
+                mem.add([{{"role": "user", "content": f"zebra fact number {{i}}."}}],
+                        user_id="alice")
+            os._exit(0)  # no close(), no flush(): what a crash leaves behind
+        """)
+        subprocess.run([sys.executable, "-c", child], check=True)
+
+        mem = self.make_memory()
+        self.assertEqual(mem.engine.record_count(), 25)
+        self.assertEqual(mem.engine.recovery_report()["wal_ops_replayed"], 25)
+        results = mem.recall("zebra fact", user_id="alice", top_k=25)
+        self.assertEqual(len(results), 25)
+        # New ids continue after the recovered ones.
+        mem.add([{"role": "user", "content": "one more zebra fact."}], user_id="alice")
+        self.assertEqual(mem.engine.record_count(), 26)
+        self.assertTrue(mem.engine.contains_id("alice_26"))
+
+    def test_clean_close_leaves_nothing_to_recover(self):
+        mem = self.make_memory()
+        mem.add([{"role": "user", "content": "I adopted a dog named Rex."}], user_id="alice")
+        mem.close()
+        mem = self.make_memory()
+        self.assertFalse(any(mem.engine.recovery_report().values()))
+        self.assertEqual(mem.engine.record_count(), 1)
+
+    def test_other_users_matching_facts_do_not_starve_recall(self):
+        mem = self.make_memory()
+        for i in range(40):
+            mem.add([{"role": "user",
+                      "content": f"salary payroll bonus detail number {i}."}], user_id="bob")
+        mem.add([{"role": "user", "content": "my salary is 185000."}], user_id="alice")
+        mem.add([{"role": "user", "content": "I live in Lisbon."}], user_id="alice")
+        mem.add([{"role": "user", "content": "I play guitar."}], user_id="alice")
+
+        mine = mem.recall("salary payroll", user_id="alice", top_k=3)
+        self.assertEqual(len(mine), 3, f"alice has three memories, got {mine}")
+        self.assertTrue(all(r["id"].startswith("alice_") for r in mine))
+        theirs = mem.recall("salary lisbon guitar", user_id="bob", top_k=40)
+        self.assertEqual(len(theirs), 40)
+        self.assertTrue(all(r["id"].startswith("bob_") for r in theirs))
+        # The same holds under a token budget (a different engine pool size).
+        budgeted = mem.recall("salary payroll", user_id="alice", token_budget=200)
+        self.assertTrue(budgeted)
+        self.assertTrue(all(r["id"].startswith("alice_") for r in budgeted))
+
+    def test_failed_add_stores_nothing_and_can_be_retried(self):
+        embedder = PoisonableEmbedder()
+        self.mem = mem = Memory(db_path=self.db_path, embedder=embedder,
+                                extractor=FakeExtractor())
+        message = [{"role": "user",
+                    "content": "good fact one. poison fact two. good fact three."}]
+        with self.assertRaises(ValueError):
+            mem.add(message, user_id="alice")
+        self.assertEqual(mem.engine.record_count(), 0,
+                         "a rejected add must not leave some of its facts behind")
+
+        embedder.armed = False
+        self.assertEqual(mem.add(message, user_id="alice"), 3)
+        self.assertEqual(mem.engine.record_count(), 3)
+
+    def test_summarizer_outage_keeps_the_memories(self):
+        outage = {"down": True}
+
+        def summarizer(texts):
+            if outage["down"]:
+                raise RuntimeError("summarizer unreachable")
+            return " ; ".join(texts)
+
+        mem = self.make_memory(gist_summarizer=summarizer, max_records=2)
+        mem.add([{"role": "user", "content": f"fact number {i} about topic {i}."}
+                 for i in range(4)], user_id="alice")
+
+        with self.assertLogs("tsm.memory", level="WARNING"):
+            evicted = mem.engine.evict()
+        self.assertEqual(evicted, 0, "nothing may be deleted without its gist")
+        self.assertEqual(mem.engine.record_count(), 4)
+
+        outage["down"] = False
+        self.assertEqual(mem.engine.evict(), 2)
+        self.assertEqual(mem.engine.record_count(), 3)  # 2 survivors + 1 gist
+
+    def test_concurrent_adds_all_land_with_distinct_ids(self):
+        mem = self.make_memory()
+        errors = []
+
+        def worker(t):
+            try:
+                for i in range(10):
+                    mem.add([{"role": "user", "content": f"thread {t} fact {i}."}],
+                            user_id="alice")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(mem.engine.record_count(), 80)
+
+    def test_verifier_decides_even_without_the_conversational_profile(self):
+        class RejectAll(AcceptAllVerifier):
+            def verify(self, proposals, id_to_text):
+                self.calls += 1
+                self.proposed = list(proposals)
+                return []
+
+        verifier = RejectAll()
+        mem = self.make_memory(verifier=verifier, profile=None,
+                               refinement_cosine_threshold=0.85, exclude_superseded=True,
+                               concept_max_ngram_len=2, max_concepts=10)
+        mem.add([{"role": "user", "content": TestDurability.OLD_FACT + "."}], user_id="alice")
+        mem.add([{"role": "user", "content": TestDurability.NEW_FACT + "."}], user_id="alice")
+
+        self.assertEqual(mem.consolidate(), 0)
+        self.assertEqual(verifier.calls, 1)
+        self.assertEqual(len(verifier.proposed), 1, "the pair reached the verifier")
+        # The verifier said no, so nothing was retired behind its back.
+        self.assertEqual(mem.engine.superseded_ids(), [])
+        texts = [r["text"] for r in mem.recall("user lives", user_id="alice", top_k=10)]
+        self.assertIn(TestDurability.OLD_FACT, texts)
+        self.assertIn(TestDurability.NEW_FACT, texts)
+
+    def test_backend_names_are_checked_at_construction(self):
+        for kwargs in ({"embedder": "opnai"}, {"extractor": "gpt"}, {"reranker": "bert"}):
+            args = {"embedder": FakeEmbedder(), "extractor": FakeExtractor(), **kwargs}
+            with self.assertRaises(ValueError) as ctx:
+                Memory(db_path=self.db_path, **args)
+            self.assertIn("unknown", str(ctx.exception))
+        # Nothing was opened by the failed attempts: the path is free.
+        saved = os.environ.pop("OPENAI_API_KEY", None)
+        try:
+            # "openai" is a known name: it gets as far as needing the key.
+            with self.assertRaises(RuntimeError) as ctx:
+                Memory(db_path=self.db_path, embedder="openai", extractor=FakeExtractor())
+            self.assertIn("OPENAI_API_KEY", str(ctx.exception))
+        finally:
+            if saved is not None:
+                os.environ["OPENAI_API_KEY"] = saved
+        self.make_memory().add([{"role": "user", "content": "still usable."}], user_id="alice")
+
+    def test_bad_embeddings_and_queries_are_rejected(self):
+        mem = self.make_memory()
+        mem.add([{"role": "user", "content": "I adopted a dog named Rex."}], user_id="alice")
+        bad = np.full(mem.dim, np.nan, dtype=np.float32)
+        with self.assertRaises(ValueError):
+            mem.engine.insert("x", "t", bad, 1.0, [])
+        with self.assertRaises(ValueError):
+            mem.engine.search_ann(bad, 5)
+        # An absurd top_k is clamped, not allocated.
+        self.assertEqual(len(mem.engine.search_ann(mem.embedder.encode("dog Rex"), 2 ** 40)), 1)
 
 
 if __name__ == "__main__":

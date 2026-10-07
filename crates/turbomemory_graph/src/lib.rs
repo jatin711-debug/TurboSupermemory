@@ -1,9 +1,14 @@
 //! Cognitive graph layer for TurboSuperMemory.
 //!
 //! Implements an in-memory episodic-semantic graph, BM25 lexical triggering,
-//! spreading activation with lateral inhibition, Feeling-of-Knowing gating,
-//! a deterministic Compressed Cognitive State (CCS) stub, and lightweight
-//! concept extraction from text.
+//! a bounded one-pass graph expansion that augments ANN candidates
+//! ([`SpreadingActivation::search`]), a deterministic Compressed Cognitive
+//! State (CCS) stub, and lightweight concept extraction from text.
+//!
+//! The expansion is deliberately a single bounded pass. The earlier
+//! multi-iteration spreading activation with lateral inhibition and a
+//! Feeling-of-Knowing gate was removed from the query path (see
+//! `docs/cognitive_graph.md`); nothing here gates a query.
 
 pub mod activation;
 pub mod bm25;

@@ -1,7 +1,6 @@
 //! Tiered vector segments.
 
 pub mod cold;
-pub mod gpu_hnsw_index;
 pub mod hot;
 pub mod mmap_array;
 pub mod sealed_hot;
@@ -16,8 +15,8 @@ use crate::StorageError;
 use ahash::AHashSet;
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
+use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::Arc;
 use turbomemory_core::{cosine_similarity_batch, validate_dimension};
 
 pub use cold::ColdSegment;
@@ -136,10 +135,8 @@ impl PartialOrd for HeapScored {
 
 impl Ord for HeapScored {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0
-            .score
-            .partial_cmp(&other.0.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        // Ascending by score with NaN lowest (the reverse of "best first").
+        turbomemory_core::cmp_score_desc(other.0.score, self.0.score)
     }
 }
 
@@ -153,7 +150,9 @@ pub fn top_k_minheap(scored: impl Iterator<Item = ScoredPoint>, k: usize) -> Vec
         return Vec::new();
     }
 
-    let mut heap: BinaryHeap<Reverse<HeapScored>> = BinaryHeap::with_capacity(k);
+    let (lower, upper) = scored.size_hint();
+    let cap = k.min(upper.unwrap_or(lower.max(1024)));
+    let mut heap: BinaryHeap<Reverse<HeapScored>> = BinaryHeap::with_capacity(cap);
     for point in scored {
         if heap.len() < k {
             heap.push(Reverse(HeapScored(point)));
@@ -182,43 +181,7 @@ pub fn exact_search_over_offsets(
     offsets: &[PointOffset],
     tier: Tier,
 ) -> crate::Result<Vec<ScoredPoint>> {
-    exact_search_over_offsets_gpu(query, top_k, vectors, offsets, tier, None)
-}
-
-/// GPU-accelerated exact brute-force search over a specific set of offsets.
-///
-/// If `gpu` is provided and the segment is large enough to justify GPU
-/// transfer overhead, vectors are uploaded to GPU and scored with cuBLAS.
-/// Otherwise falls back to CPU SIMD batch scoring.
-pub fn exact_search_over_offsets_gpu(
-    query: &[f32],
-    top_k: usize,
-    vectors: &VectorStore,
-    offsets: &[PointOffset],
-    tier: Tier,
-    gpu: Option<&Arc<dyn turbomemory_gpu::GpuBackend>>,
-) -> crate::Result<Vec<ScoredPoint>> {
     validate_dimension(query, vectors.dimension())?;
-
-    // Only use GPU for sufficiently large segments to amortize transfer overhead.
-    // Threshold: ~1,000 vectors at 768-dim = ~3 MiB of data.
-    const GPU_THRESHOLD: usize = 1024;
-    let use_gpu = gpu
-        .map(|g| turbomemory_gpu::is_gpu_accelerated(g) && offsets.len() >= GPU_THRESHOLD)
-        .unwrap_or(false);
-
-    if use_gpu {
-        if let Some(backend) = gpu {
-            match gpu_exact_search(query, top_k, vectors, offsets, tier, backend) {
-                Ok(results) => return Ok(results),
-                Err(e) => {
-                    log::warn!("GPU exact search failed ({}), falling back to CPU", e);
-                }
-            }
-        }
-    }
-
-    // CPU fallback path
     let view = vectors.read_view();
 
     const CHUNK: usize = 64;
@@ -242,83 +205,62 @@ pub fn exact_search_over_offsets_gpu(
     }
     drop(view);
 
-    scored.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    scored.sort_by(|a, b| turbomemory_core::cmp_score_desc(a.score, b.score));
     scored.truncate(top_k);
     Ok(scored)
 }
 
-/// GPU-accelerated exact search using cuBLAS batched dot product.
-fn gpu_exact_search(
-    query: &[f32],
-    top_k: usize,
-    vectors: &VectorStore,
-    offsets: &[PointOffset],
-    tier: Tier,
-    backend: &Arc<dyn turbomemory_gpu::GpuBackend>,
-) -> turbomemory_gpu::Result<Vec<ScoredPoint>> {
-    let dim = vectors.dimension();
-    let view = vectors.read_view();
+/// Write a segment manifest so it either exists complete or not at all.
+///
+/// The manifest is what makes a segment directory loadable, so it is written
+/// last, to a temporary name, synced, and renamed into place. A crash at any
+/// earlier point leaves a directory without a manifest, which `open` treats
+/// as an abandoned build and removes.
+pub(crate) fn write_manifest_atomic(dir: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = dir.join(format!("{MANIFEST_FILE}.tmp"));
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, dir.join(MANIFEST_FILE))?;
+    Ok(())
+}
 
-    // Collect vectors into a contiguous flat buffer for GPU upload
-    let mut flat_vectors: Vec<f32> = Vec::with_capacity(offsets.len() * dim);
-    let mut valid_offsets: Vec<PointOffset> = Vec::with_capacity(offsets.len());
-    for &offset in offsets {
-        if let Some(v) = view.get(offset) {
-            flat_vectors.extend_from_slice(v);
-            valid_offsets.push(offset);
+/// Name of the manifest file every persisted segment directory carries.
+pub(crate) const MANIFEST_FILE: &str = "manifest.json";
+
+/// Length and CRC32 of a file, read in chunks.
+pub(crate) fn file_len_and_crc(path: &Path) -> Result<(u64, u32)> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = crc32fast::Hasher::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut len = 0u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
         }
+        hasher.update(&buf[..n]);
+        len += n as u64;
     }
-    drop(view);
-
-    if valid_offsets.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Upload to GPU and compute batched cosine similarity
-    let device_buf = backend.upload_vectors(&flat_vectors, dim)?;
-    let scores = backend.batch_cosine_similarity(query, &device_buf)?;
-
-    // Build scored points
-    let mut scored: Vec<ScoredPoint> = valid_offsets
-        .into_iter()
-        .zip(scores)
-        .map(|(offset, score)| ScoredPoint {
-            offset,
-            score,
-            tier,
-        })
-        .collect();
-
-    scored.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    scored.truncate(top_k);
-    Ok(scored)
+    Ok((len, hasher.finalize()))
 }
 
 /// Merge candidate lists from multiple segments, preserving the highest scores.
 /// If the same offset appears in multiple lists (e.g. after promotion), keep
 /// the highest score and drop the duplicates.
 pub fn merge_candidates(lists: Vec<Vec<ScoredPoint>>, top_k: usize) -> Vec<ScoredPoint> {
-    let mut merged: SmallVec<[ScoredPoint; 64]> = SmallVec::with_capacity(top_k * lists.len());
+    let total: usize = lists.iter().map(|l| l.len()).sum();
+    let mut merged: SmallVec<[ScoredPoint; 64]> = SmallVec::with_capacity(total);
     for list in lists {
         merged.extend(list);
     }
-    merged.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    merged.sort_by(|a, b| turbomemory_core::cmp_score_desc(a.score, b.score));
 
     // Deduplicate by offset, keeping the first (highest-scoring) occurrence.
     let mut seen = AHashSet::with_capacity(merged.len());
-    let mut deduped: SmallVec<[ScoredPoint; 64]> = SmallVec::with_capacity(top_k);
+    let mut deduped: SmallVec<[ScoredPoint; 64]> = SmallVec::with_capacity(top_k.min(total));
     for candidate in merged {
         if seen.insert(candidate.offset) {
             deduped.push(candidate);
@@ -369,9 +311,7 @@ pub fn kway_merge_topk(lists: &[Vec<ScoredPoint>], k: usize) -> Vec<ScoredPoint>
     }
     impl Ord for Item {
         fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-            self.score
-                .partial_cmp(&other.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            turbomemory_core::cmp_score_desc(other.score, self.score)
         }
     }
 
@@ -386,8 +326,9 @@ pub fn kway_merge_topk(lists: &[Vec<ScoredPoint>], k: usize) -> Vec<ScoredPoint>
         }
     }
 
+    let total: usize = lists.iter().map(|l| l.len()).sum();
     let mut seen = AHashSet::with_capacity(k.min(1024));
-    let mut out = Vec::with_capacity(k);
+    let mut out = Vec::with_capacity(k.min(total));
     while let Some(item) = heap.pop() {
         let candidate = lists[item.list][item.idx];
         if seen.insert(candidate.offset) {

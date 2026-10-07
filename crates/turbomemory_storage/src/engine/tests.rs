@@ -558,6 +558,57 @@ fn legacy_json_graph_snapshot_still_loads_on_open() {
     assert!(engine.meta.load_meta_str("graph").is_none());
 }
 
+/// Deferred commit + incremental detection: consolidation must leave the
+/// cursor alone so the caller's `propose_supersessions` still sees the new
+/// records (it used to advance first, and nothing was ever proposed), and a
+/// second proposal pass does not repeat pairs already examined.
+#[test]
+fn deferred_commit_with_incremental_detection_still_proposes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = small_config(8);
+    config.tier.refinement_cosine_threshold = Some(0.5);
+    config.tier.refinement_max_pairs_per_cycle = 100;
+    config.tier.incremental_supersession_detection = true;
+    config.tier.defer_supersession_commit = true;
+    let engine = StorageEngine::open(tmp.path(), config).unwrap();
+    engine
+        .insert(
+            "old",
+            "Rust memory safety",
+            &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            1.0,
+            &["rust".to_string()],
+        )
+        .unwrap();
+    engine
+        .insert(
+            "new",
+            "Rust borrow checker safety",
+            &[0.9f32, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            1.0,
+            &["rust".to_string()],
+        )
+        .unwrap();
+
+    engine.trigger_consolidation().unwrap();
+    assert_eq!(
+        engine.graph.read().graph().refinement_count(),
+        0,
+        "deferred: consolidation commits nothing"
+    );
+    let props = engine.propose_supersessions().unwrap();
+    assert_eq!(props.len(), 1, "the pair is still there to propose");
+    assert_eq!(
+        (props[0].old_id.as_str(), props[0].new_id.as_str()),
+        ("old", "new")
+    );
+    assert_eq!(engine.commit_supersessions(&props).unwrap(), 1);
+
+    // Already examined: the next cycle proposes nothing new.
+    engine.trigger_consolidation().unwrap();
+    assert!(engine.propose_supersessions().unwrap().is_empty());
+}
+
 /// The propose/commit split (W3): `propose_*` detects pairs WITHOUT
 /// mutating the graph or demoting; `commit_supersessions` is what applies
 /// the edge + demotion. A verifier can drop pairs between the two steps.
@@ -1679,15 +1730,15 @@ fn actr_eviction_prefers_spaced_over_burst() {
 /// deletion, so their content stays retrievable under the same scope.
 struct JoinCompressor;
 impl GistCompressor for JoinCompressor {
-    fn compress(&self, texts: &[String]) -> Option<(String, Vec<f32>)> {
-        Some((texts.join(" | "), make_vec(8, 7)))
+    fn compress(&self, texts: &[String]) -> Result<Option<(String, Vec<f32>)>, String> {
+        Ok(Some((texts.join(" | "), make_vec(8, 7))))
     }
 }
 
 struct NullCompressor;
 impl GistCompressor for NullCompressor {
-    fn compress(&self, _texts: &[String]) -> Option<(String, Vec<f32>)> {
-        None
+    fn compress(&self, _texts: &[String]) -> Result<Option<(String, Vec<f32>)>, String> {
+        Ok(None)
     }
 }
 

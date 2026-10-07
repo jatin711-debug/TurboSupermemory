@@ -131,7 +131,7 @@ impl Bm25Index {
             }
         }
         let mut out: Vec<_> = scores.into_iter().collect();
-        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        out.sort_by(|a, b| turbomemory_core::cmp_score_desc(a.1, b.1));
         out
     }
 }

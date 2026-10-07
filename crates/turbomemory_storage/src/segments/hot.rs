@@ -110,11 +110,7 @@ impl VectorSegment for HotSegment {
         }
         drop(view);
 
-        scored.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        scored.sort_by(|a, b| turbomemory_core::cmp_score_desc(a.score, b.score));
         scored.truncate(top_k);
         Ok(scored)
     }

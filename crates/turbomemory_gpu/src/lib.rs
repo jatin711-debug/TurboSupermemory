@@ -1,14 +1,19 @@
 //! GPU acceleration crate for TurboSuperMemory.
 //!
-//! Provides optional CUDA-backed paths for:
-//! - HNSW index construction (cuVS/RAFT CAGRA or custom CUDA HNSW)
-//! - Batched distance computation (cuBLAS)
-//! - Quantized tier scanning (CUDA kernels for scalar/sign/TurboQuant)
+//! Provides optional CUDA-backed kernels:
+//! - Batched distance computation (cuBLAS `gemv` / `gemm`). The storage
+//!   engine uses the `gemm` form to rerank the candidates of a whole batch
+//!   of queries in one call; that is the only GPU path the engine calls.
+//! - An 8-bit scalar quantized scan and a CSR spreading-activation step
+//!   (NVRTC kernels). These are tested here but not wired into the engine.
 //!
-//! All GPU paths silently fall back to CPU if:
-//! - CUDA is not available (no GPU, no drivers)
-//! - GPU memory is insufficient
-//! - Any CUDA error occurs
+//! There is no GPU index build and no GPU index search: HNSW construction
+//! and traversal are done on the CPU by usearch. (An earlier brute-force
+//! "GPU HNSW build" produced a graph nothing searched, at about twice the
+//! build time; it was removed.)
+//!
+//! Every GPU path falls back to the CPU if CUDA is not available, GPU memory
+//! is insufficient, or any CUDA error occurs.
 //!
 //! The design is trait-based so future backends (Vulkan, ROCm, Metal) can be added.
 
@@ -96,24 +101,6 @@ pub trait GpuBackend: Send + Sync {
         device_vectors: &DeviceBuffer,
     ) -> Result<Vec<f32>>;
 
-    /// Build an approximate nearest neighbor index on GPU.
-    ///
-    /// Returns a GPU-native index handle. The index format is backend-specific.
-    fn build_ann_index(
-        &self,
-        device_vectors: &DeviceBuffer,
-        dim: usize,
-        config: &AnnBuildConfig,
-    ) -> Result<Box<dyn GpuAnnIndex>>;
-
-    /// Search the GPU ANN index.
-    fn ann_search(
-        &self,
-        index: &dyn GpuAnnIndex,
-        query: &[f32],
-        top_k: usize,
-    ) -> Result<Vec<(usize, f32)>>;
-
     /// Scan quantized vectors (Warm/Cold tier) on GPU.
     ///
     /// `quantized` is backend-specific (e.g., CUDA uint8 array).
@@ -160,45 +147,6 @@ impl DeviceBuffer {
     }
     pub fn memory_bytes(&self) -> usize {
         self.bytes
-    }
-}
-
-/// GPU-native approximate nearest neighbor index (opaque).
-pub trait GpuAnnIndex: Send + Sync {
-    fn len(&self) -> usize;
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-    fn dim(&self) -> usize;
-    fn memory_bytes(&self) -> usize;
-    /// Downcast to concrete type for backend-specific operations.
-    fn as_any(&self) -> &dyn std::any::Any;
-}
-
-/// Configuration for GPU ANN index building.
-#[derive(Debug, Clone)]
-pub struct AnnBuildConfig {
-    /// HNSW M (connectivity) or CAGRA graph degree.
-    pub max_edges: usize,
-    /// Construction beam width (HNSW ef_construction or CAGRA build params).
-    pub ef_construction: usize,
-    /// Search beam width.
-    pub ef_search: usize,
-    /// Target recall (0.0-1.0). Higher = slower build, better quality.
-    pub target_recall: f32,
-    /// Maximum GPU memory to use for build (bytes). 0 = unlimited.
-    pub max_build_memory: usize,
-}
-
-impl Default for AnnBuildConfig {
-    fn default() -> Self {
-        Self {
-            max_edges: 64,
-            ef_construction: 800,
-            ef_search: 256,
-            target_recall: 0.95,
-            max_build_memory: 0,
-        }
     }
 }
 
@@ -378,29 +326,6 @@ mod cpu {
                 scores[i * n..(i + 1) * n].copy_from_slice(&row);
             }
             Ok(scores)
-        }
-
-        fn build_ann_index(
-            &self,
-            _device_vectors: &DeviceBuffer,
-            _dim: usize,
-            _config: &AnnBuildConfig,
-        ) -> Result<Box<dyn GpuAnnIndex>> {
-            Err(GpuError::BackendNotCompiled(
-                "CPU fallback cannot build ANN index — use turbomemory_storage::UsearchIndex"
-                    .into(),
-            ))
-        }
-
-        fn ann_search(
-            &self,
-            _index: &dyn GpuAnnIndex,
-            _query: &[f32],
-            _top_k: usize,
-        ) -> Result<Vec<(usize, f32)>> {
-            Err(GpuError::BackendNotCompiled(
-                "CPU fallback cannot search ANN index".into(),
-            ))
         }
 
         fn quantized_scan(
@@ -842,48 +767,6 @@ extern "C" __global__ void spreading_activation_csr_kernel(
             Ok(row_major)
         }
 
-        fn build_ann_index(
-            &self,
-            device_vectors: &DeviceBuffer,
-            dim: usize,
-            config: &AnnBuildConfig,
-        ) -> Result<Box<dyn GpuAnnIndex>> {
-            // Use GPU-accelerated HNSW construction
-            let wrapper = device_vectors
-                .inner
-                .downcast_ref::<CudaBufferWrapper>()
-                .ok_or_else(|| GpuError::InvalidArgument("CUDA buffer mismatch".into()))?;
-
-            let n = device_vectors.n;
-            log::info!("GPU HNSW: building index for {} vectors of dim {}", n, dim);
-
-            let index = gpu_hnsw_build::build_hnsw_on_gpu(self, &wrapper.slice, n, dim, config)?;
-
-            Ok(Box::new(index))
-        }
-
-        fn ann_search(
-            &self,
-            _index: &dyn GpuAnnIndex,
-            _query: &[f32],
-            _top_k: usize,
-        ) -> Result<Vec<(usize, f32)>> {
-            // GPU-native HNSW search is intentionally not implemented. The
-            // previous `search_hnsw_on_gpu` ran on the CPU (over the CPU-
-            // resident `CudaAnnIndex.vectors`) with a greedy hill-climbing
-            // algorithm that has poor recall, so it was neither GPU-
-            // accelerated nor correct. Search is delegated to the usearch
-            // fallback index persisted alongside the GPU-built index; the GPU
-            // accelerates search via the batched `gemm` rerank path
-            // (`batch_cosine_similarity_matrix`) instead, which is the one
-            // workload where the GPU actually beats CPU.
-            Err(GpuError::BackendNotCompiled(
-                "GPU HNSW search is not implemented — use the usearch fallback \
-                 or the batched gemm rerank path"
-                    .into(),
-            ))
-        }
-
         fn quantized_scan(
             &self,
             quantized: &DeviceBuffer,
@@ -1041,274 +924,6 @@ extern "C" __global__ void spreading_activation_csr_kernel(
 
     unsafe impl Send for CudaU8BufferWrapper {}
     unsafe impl Sync for CudaU8BufferWrapper {}
-
-    /// GPU-native approximate nearest neighbor index using HNSW.
-    pub struct CudaAnnIndex {
-        pub n: usize,
-        pub dim: usize,
-        pub memory_bytes: usize,
-        /// Hierarchical layers: layer[i] contains edges for nodes at level i
-        /// Level 0 is the base layer (most edges), higher levels have fewer nodes
-        pub layers: Vec<Vec<Vec<usize>>>, // layers[level][node] = list of neighbor indices
-        /// All vectors stored on host for search (GPU memory is limited)
-        pub vectors: Vec<f32>, // flat n×dim
-    }
-
-    impl GpuAnnIndex for CudaAnnIndex {
-        fn len(&self) -> usize {
-            self.n
-        }
-        fn dim(&self) -> usize {
-            self.dim
-        }
-        fn memory_bytes(&self) -> usize {
-            self.memory_bytes
-        }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
-
-    /// GPU HNSW construction using batched distance computation and parallel edge selection.
-    mod gpu_hnsw_build {
-        use super::*;
-        use cudarc::driver::CudaSlice;
-        use std::cmp::Reverse;
-        use std::collections::BinaryHeap;
-
-        /// Build an HNSW index on GPU.
-        ///
-        /// Algorithm: Simplified GPU-friendly HNSW
-        /// 1. Compute all pairwise distances in batches on GPU (for small N) or
-        ///    use random projection for candidate generation (for large N)
-        /// 2. For each node, select top-M neighbors using GPU-accelerated search
-        /// 3. Build hierarchical layers by probabilistic assignment
-        pub fn build_hnsw_on_gpu(
-            backend: &CudaBackend,
-            device_vectors: &CudaSlice<f32>,
-            n: usize,
-            dim: usize,
-            config: &AnnBuildConfig,
-        ) -> Result<CudaAnnIndex> {
-            let start = std::time::Instant::now();
-            let max_edges = config.max_edges;
-            let _ef_construction = config.ef_construction;
-
-            // For small collections, use brute-force all-pairs on GPU
-            // For large collections, use batched approach
-            let vectors = backend
-                .stream
-                .clone_dtoh(device_vectors)
-                .map_err(|e| GpuError::KernelError(format!("Failed to download vectors: {e}")))?;
-
-            // Build base layer (level 0) using GPU-accelerated neighbor selection
-            // Brute-force all-pairs on GPU is fast and exact for collections up to ~20K
-            // vectors. Beyond that, we fall back to usearch (which has a proven HNSW
-            // implementation) rather than using a buggy GPU approximation.
-            let base_layer = if n <= 20000 {
-                // Small/medium: brute force all-pairs on GPU — fast and correct
-                build_base_layer_brute_force(backend, &vectors, n, dim, max_edges)?
-            } else {
-                // Large: usearch fallback is more reliable than GPU approximations
-                return Err(GpuError::InvalidArgument(format!(
-                    "GPU HNSW build for {} vectors exceeds 20K brute-force threshold; \
-                             use usearch fallback instead",
-                    n
-                )));
-            };
-
-            // Build upper layers by probabilistic decay
-            let mut layers = vec![base_layer];
-            let mut current_level_nodes: Vec<usize> = (0..n).collect();
-            let mut rng = fastrand::Rng::new();
-
-            while current_level_nodes.len() > 1 {
-                // Each node has probability 1/2 of being promoted to next level
-                let next_level: Vec<usize> = current_level_nodes
-                    .iter()
-                    .copied()
-                    .filter(|_| rng.bool())
-                    .collect();
-
-                if next_level.len() <= 1 {
-                    break;
-                }
-
-                // Build edges for next level using brute force on subset
-                let level_vectors: Vec<f32> = next_level
-                    .iter()
-                    .flat_map(|&idx| vectors[idx * dim..(idx + 1) * dim].iter().copied())
-                    .collect();
-
-                let level_layer = build_level_brute_force(
-                    backend,
-                    &level_vectors,
-                    &next_level,
-                    dim,
-                    max_edges.max(8) / 2, // Fewer edges at higher levels
-                )?;
-
-                layers.push(level_layer);
-                current_level_nodes = next_level;
-            }
-
-            let elapsed = start.elapsed();
-            log::info!(
-                "GPU HNSW: built {} levels for {} vectors in {:.2}s",
-                layers.len(),
-                n,
-                elapsed.as_secs_f64()
-            );
-
-            let memory_bytes = layers
-                .iter()
-                .map(|l| {
-                    l.iter()
-                        .map(|v| v.capacity() * std::mem::size_of::<usize>())
-                        .sum::<usize>()
-                })
-                .sum::<usize>()
-                + vectors.len() * std::mem::size_of::<f32>();
-
-            Ok(CudaAnnIndex {
-                n,
-                dim,
-                memory_bytes,
-                layers,
-                vectors,
-            })
-        }
-
-        /// Build base layer using brute-force all-pairs distance computation on GPU.
-        fn build_base_layer_brute_force(
-            backend: &CudaBackend,
-            vectors: &[f32],
-            n: usize,
-            dim: usize,
-            max_edges: usize,
-        ) -> Result<Vec<Vec<usize>>> {
-            let mut neighbors: Vec<Vec<usize>> = vec![Vec::new(); n];
-
-            // Process in batches to avoid excessive GPU memory usage
-            const BATCH_SIZE: usize = 1024;
-            for batch_start in (0..n).step_by(BATCH_SIZE) {
-                let batch_end = (batch_start + BATCH_SIZE).min(n);
-                let batch_n = batch_end - batch_start;
-
-                // Upload batch vectors to GPU
-                let batch_vectors: Vec<f32> = vectors[batch_start * dim..batch_end * dim].to_vec();
-                let device_buf = backend.upload_vectors(&batch_vectors, dim)?;
-
-                // For each node in the collection, compute distance to batch
-                for i in 0..n {
-                    let query = &vectors[i * dim..(i + 1) * dim];
-                    let scores = backend.batch_cosine_similarity(query, &device_buf)?;
-
-                    // Collect top max_edges neighbors from this batch
-                    let mut heap: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
-                    for (j, score) in scores.iter().enumerate().take(batch_n) {
-                        let global_j = batch_start + j;
-                        if global_j == i {
-                            continue; // Skip self
-                        }
-                        let dist_bits = (1.0 - score).to_bits();
-                        if heap.len() < max_edges {
-                            heap.push(Reverse((dist_bits, global_j)));
-                        } else if let Some(Reverse((min_bits, _))) = heap.peek() {
-                            if dist_bits < *min_bits {
-                                heap.pop();
-                                heap.push(Reverse((dist_bits, global_j)));
-                            }
-                        }
-                    }
-
-                    // Merge into existing neighbors
-                    for Reverse((_, idx)) in heap {
-                        if !neighbors[i].contains(&idx) {
-                            neighbors[i].push(idx);
-                        }
-                    }
-                }
-            }
-
-            // Trim to max_edges and make symmetric
-            for i in 0..n {
-                neighbors[i].sort_by_key(|&j| {
-                    let j_vec = &vectors[j * dim..(j + 1) * dim];
-                    let i_vec = &vectors[i * dim..(i + 1) * dim];
-                    let score = turbomemory_core::cosine_similarity(i_vec, j_vec);
-                    Reverse((1.0 - score).to_bits())
-                });
-                neighbors[i].truncate(max_edges);
-
-                // Make edges symmetric
-                let edges: Vec<usize> = neighbors[i].clone();
-                for &j in &edges {
-                    if !neighbors[j].contains(&i) {
-                        neighbors[j].push(i);
-                    }
-                }
-            }
-
-            // Final trim after symmetry
-            for i in 0..n {
-                neighbors[i].sort_by_key(|&j| {
-                    let j_vec = &vectors[j * dim..(j + 1) * dim];
-                    let i_vec = &vectors[i * dim..(i + 1) * dim];
-                    let score = turbomemory_core::cosine_similarity(i_vec, j_vec);
-                    Reverse((1.0 - score).to_bits())
-                });
-                neighbors[i].truncate(max_edges);
-            }
-
-            Ok(neighbors)
-        }
-
-        /// Build an upper level using brute force on a subset of nodes.
-        fn build_level_brute_force(
-            backend: &CudaBackend,
-            level_vectors: &[f32],
-            node_map: &[usize],
-            dim: usize,
-            max_edges: usize,
-        ) -> Result<Vec<Vec<usize>>> {
-            let n = node_map.len();
-            if n <= 1 {
-                return Ok(vec![Vec::new(); n]);
-            }
-
-            let device_buf = backend.upload_vectors(level_vectors, dim)?;
-            let mut neighbors: Vec<Vec<usize>> = vec![Vec::new(); n];
-
-            for i in 0..n {
-                let query = &level_vectors[i * dim..(i + 1) * dim];
-                let scores = backend.batch_cosine_similarity(query, &device_buf)?;
-
-                let mut top: Vec<(usize, f32)> = scores
-                    .iter()
-                    .enumerate()
-                    .take(n)
-                    .map(|(j, &s)| (j, s))
-                    .filter(|&(j, _)| j != i)
-                    .collect();
-
-                top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                top.truncate(max_edges);
-
-                for (j, _) in top {
-                    if !neighbors[i].contains(&j) {
-                        neighbors[i].push(j);
-                    }
-                    // Make symmetric
-                    if !neighbors[j].contains(&i) {
-                        neighbors[j].push(i);
-                    }
-                }
-            }
-
-            Ok(neighbors)
-        }
-    }
 }
 
 // Stub module when CUDA is not compiled
@@ -1323,14 +938,9 @@ mod cuda {
             ))
         }
     }
-
-    /// Stub GPU ANN index used when the `cuda` feature is disabled.
-    /// Cannot be constructed; exists only so downstream crates can name the
-    /// type unconditionally (e.g. `Option<CudaAnnIndex>`) without a cfg gate.
-    pub struct CudaAnnIndex;
 }
 
-pub use cuda::{CudaAnnIndex, CudaBackend};
+pub use cuda::CudaBackend;
 
 #[cfg(test)]
 mod tests {
