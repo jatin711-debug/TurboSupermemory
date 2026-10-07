@@ -14,6 +14,11 @@
 //!   log and snapshot, truncates the log, and builds any pending index
 //!   segments; without it a store only does those things when a client calls
 //!   `/flush`.
+//! - `TURBO_SYNC_WRITES`: `1` / `true` syncs every write to disk before it is
+//!   acknowledged, so it survives a power loss (a few milliseconds per
+//!   write). Default off: writes survive a crash or kill of the server (they
+//!   are replayed from the write-ahead log) but a power loss can lose those
+//!   since the last flush.
 //! - `RUST_LOG`: standard tracing filter (default `turbomemory_api=info`).
 
 use std::future::IntoFuture;
@@ -94,7 +99,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let service = MemoryService::open(&db_path, dimension)?;
+    let sync_writes = std::env::var("TURBO_SYNC_WRITES")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    if sync_writes {
+        tracing::info!(
+            "every write is synced to disk before it is acknowledged (TURBO_SYNC_WRITES)"
+        );
+    }
+    let service = MemoryService::open_with(&db_path, dimension, sync_writes)?;
     let engine = service.engine().clone();
     let report = engine.recovery_report();
     if !report.is_clean() {

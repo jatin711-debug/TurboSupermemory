@@ -190,10 +190,22 @@ pub struct MemoryService {
 
 impl MemoryService {
     pub fn open(db_path: impl AsRef<Path>, dimension: usize) -> Result<Self, ApiError> {
+        Self::open_with(db_path, dimension, false)
+    }
+
+    /// Like [`open`](Self::open), with `sync_writes` choosing whether every
+    /// write is synced to disk before it is acknowledged (power-loss
+    /// durability) or only made crash-safe through the write-ahead log.
+    pub fn open_with(
+        db_path: impl AsRef<Path>,
+        dimension: usize,
+        sync_writes: bool,
+    ) -> Result<Self, ApiError> {
         let mut config = StoreConfig::default_for_dimension(dimension);
         config.max_edges = 16;
         config.search_list_size = 100;
         config.auto_consolidation_interval = None;
+        config.tier.sync_writes = sync_writes;
         let engine = StorageEngine::open(db_path, config)?;
         Ok(Self { engine })
     }

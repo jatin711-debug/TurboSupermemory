@@ -152,6 +152,39 @@ fn writes_after_a_flush_survive_an_unclean_stop() {
     assert_all_findable(&engine, 0..350);
 }
 
+/// `sync_writes` syncs each vector and log record before the write returns.
+/// Whether the bytes reached the platter cannot be tested without cutting
+/// power; what can be tested is that every write path works with it on and
+/// that recovery sees exactly what was acknowledged.
+#[test]
+fn synced_writes_take_every_path_and_recover() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = config(10_000, 1_000);
+    cfg.tier.sync_writes = true;
+    {
+        let engine = StorageEngine::open(tmp.path(), cfg.clone()).unwrap();
+        fill(&engine, 0..2_500); // grows the vector file past its initial size
+        engine
+            .insert("single", "one at a time", &unit_vec(9_001), 1.0, &[])
+            .unwrap();
+        assert!(engine
+            .update(&id(0), "second version", &unit_vec(9_002), 1.0, &[])
+            .unwrap());
+        assert!(engine.delete_by_id(&id(1)).unwrap());
+        // unclean stop
+    }
+    let engine = StorageEngine::open(tmp.path(), cfg).unwrap();
+    assert_eq!(engine.record_count(), 2_500);
+    assert_eq!(engine.recovery_report().wal_inserts_without_vector, 0);
+    assert_eq!(
+        engine.find_meta_by_id(&id(0)).unwrap().text,
+        "second version"
+    );
+    assert!(!engine.contains_id(&id(1)));
+    assert!(engine.contains_id("single"));
+    assert_all_findable(&engine, 2..2_500);
+}
+
 /// An update is one WAL record: after an unclean stop the id names the new
 /// version, and a delete stays deleted.
 #[test]

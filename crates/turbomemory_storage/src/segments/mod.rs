@@ -224,6 +224,12 @@ pub(crate) fn write_manifest_atomic(dir: &Path, bytes: &[u8]) -> Result<()> {
         file.sync_all()?;
     }
     std::fs::rename(&tmp, dir.join(MANIFEST_FILE))?;
+    // Make the rename (and, one level up, the segment directory itself)
+    // durable.
+    crate::sync_dir(dir);
+    if let Some(parent) = dir.parent() {
+        crate::sync_dir(parent);
+    }
     Ok(())
 }
 

@@ -252,7 +252,8 @@ Single-query time on the GPU grows linearly with the store, and nothing above 10
 
 * Every write is validated before anything changes; a rejected insert, batch or update leaves the store as it was.
 * Writes are logged with a checksum of their vector. If the process dies without `close()`, the next open replays the log and reads each vector back from disk: nothing acknowledged is lost. `engine.recovery_report()` says what an open had to repair.
-* The log is fsynced by `flush()` / `close()`, not per write. After a **power loss**, writes since the last flush can be missing; they are never half-applied.
+* By default the log is fsynced by `flush()` / `close()`, not per write. After a **power loss**, writes since the last flush can be missing; they are never half-applied.
+* `sync_writes=True` (engine and `Memory` keyword; `TURBO_SYNC_WRITES=1` for the server) syncs each write's vectors and log record to disk before it returns, so an acknowledged write survives a power loss too. Measured on an NVMe laptop SSD: a single insert goes from 0.09 ms to 5.5 ms, a batch of 100 from about 2.5 ms to 8 ms, so batch your writes if you turn it on. It relies on the drive honouring flush requests; no power-cut test was run.
 * Index segments are derived data: one that is damaged or incomplete is discarded on open and rebuilt from the vectors.
 * A store whose vector file or metadata file is missing or truncated refuses to open with a clear error instead of opening empty.
 

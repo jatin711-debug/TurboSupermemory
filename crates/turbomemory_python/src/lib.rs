@@ -301,6 +301,7 @@ impl PyMemoryEngine {
         expansion_max_candidates=None,
         concept_expansion=None,
         temporal_recency_weight=None,
+        sync_writes=None,
         gpu_exact_search=None,
         gpu_exact_min_records=None,
         gpu_memory_budget_mb=None
@@ -369,6 +370,7 @@ impl PyMemoryEngine {
         expansion_max_candidates: Option<usize>,
         concept_expansion: Option<bool>,
         temporal_recency_weight: Option<f32>,
+        sync_writes: Option<bool>,
         gpu_exact_search: Option<bool>,
         gpu_exact_min_records: Option<usize>,
         gpu_memory_budget_mb: Option<usize>,
@@ -646,6 +648,10 @@ impl PyMemoryEngine {
         }
         if let Some(trw) = temporal_recency_weight {
             config.tier.temporal_recency_weight = trw.clamp(0.0, 2.0);
+        }
+        // Power-loss durability: sync every write to disk before returning.
+        if let Some(sync) = sync_writes {
+            config.tier.sync_writes = sync;
         }
         // GPU exact search (CUDA builds only): keep the vectors resident on
         // the device and answer a search with one product over all of them.

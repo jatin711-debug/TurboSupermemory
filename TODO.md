@@ -18,10 +18,16 @@ This file is only the short list of open engineering work, grouped by area.
 
 ## Durability and operations
 
-- **Power-loss durability.** The WAL is fsynced by `flush()`, not per write, so
-  a power loss (unlike a process kill) can lose the writes since the last
-  flush. Add a sync policy (per write / every N ms / on flush) if a deployment
-  needs it.
+- **`sync_writes` has never met a real power cut.** It syncs the vector range
+  and then the log record of every write before returning, and a test checks
+  that every write path does so and recovers, but nothing here can cut the
+  power, and a drive that acknowledges a flush it has not performed defeats
+  it. It is off by default: without it a power loss (unlike a process kill)
+  can still lose the writes since the last flush.
+- **`sync_writes` pays one sync pair per write**: about 180 single inserts per
+  second on an NVMe SSD against 11,000 without it; a batch of 100 costs about
+  8 ms instead of 2.5 ms. Batch small writes. A middle policy (sync every N
+  ms, or one sync shared by concurrent writers) is not implemented.
 - **Blocking engine calls run on the async runtime** in every REST and gRPC
   handler. A slow `/flush` or consolidation stalls both transports, including
   `/health`. Move them to `spawn_blocking`.

@@ -91,7 +91,8 @@ search has used it, then a dict with `active`, `rows`, `capacity_rows`,
 `budget_bytes`, `memory_bytes`, `queries` and `device_calls`. Constructor
 keywords: `gpu_exact_search` (default `True`), `gpu_exact_min_records`
 (default 4,097) and `gpu_memory_budget_mb` (default 0: half of the free
-device memory).
+device memory). `sync_writes=True` makes every write durable against power
+loss before it returns.
 
 ### 1.5 Batch Search API (GPU-Ready)
 

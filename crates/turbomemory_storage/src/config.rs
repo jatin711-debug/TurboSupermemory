@@ -383,6 +383,18 @@ pub struct TierConfig {
     /// similar semantic relevance, resolving stale knowledge update conflicts.
     /// Default 0.0 (disabled, pure semantic + graph boost).
     pub temporal_recency_weight: f32,
+    /// Durability of an acknowledged write.
+    ///
+    /// `false` (default): a write survives the process being killed (the next
+    /// open replays it from the write-ahead log), but the log is only synced
+    /// to disk by `flush()`, so after a power loss or an operating-system
+    /// crash the writes since the last flush can be missing.
+    ///
+    /// `true`: before a write returns, its vector and its log record are
+    /// synced to disk, so it also survives a power loss. This costs one sync
+    /// of each file per write (per batch for batch inserts), typically a few
+    /// milliseconds on an SSD.
+    pub sync_writes: bool,
     /// Search with the store's vectors kept resident on the GPU (see
     /// `gpu_exact.rs`). Only has an effect in a build with the `cuda` feature
     /// on a machine with a usable device; otherwise searches take the CPU
@@ -499,6 +511,7 @@ impl TierConfig {
         gist_before_evict: false,
         gist_chunk_facts: 24,
         temporal_recency_weight: 0.0,
+        sync_writes: false,
         gpu_exact_search: true,
         gpu_exact_min_records: 4097,
         gpu_memory_budget_mb: 0,

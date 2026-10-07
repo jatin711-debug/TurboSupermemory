@@ -126,6 +126,7 @@ impl Wal {
             file.seek(SeekFrom::Start(0))?;
             file.write_all(&header_bytes(WAL_VERSION))?;
             file.sync_data()?;
+            crate::sync_dir(dir);
             WAL_VERSION
         } else {
             let mut header = [0u8; WAL_HEADER_SIZE];

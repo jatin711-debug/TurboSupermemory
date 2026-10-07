@@ -103,6 +103,31 @@ impl StorageEngine {
         })
     }
 
+    /// Append operations to the write-ahead log, and sync it to disk when
+    /// `sync_writes` asks for power-loss durability.
+    fn log(&self, ops: &[WalOp]) -> crate::Result<()> {
+        let mut wal = self.wal.lock();
+        wal.append_batch(ops)?;
+        if self.config.tier.sync_writes {
+            wal.flush()?;
+        }
+        Ok(())
+    }
+
+    /// With `sync_writes`, make the vectors just written durable BEFORE their
+    /// log record is: a synced log record whose vector is not on disk would
+    /// be dropped by recovery.
+    fn sync_vectors_if_configured(
+        &self,
+        first: PointOffset,
+        last: PointOffset,
+    ) -> crate::Result<()> {
+        if self.config.tier.sync_writes {
+            self.vectors.sync_range(first, last)?;
+        }
+        Ok(())
+    }
+
     pub fn insert(
         &self,
         id: &str,
@@ -175,15 +200,16 @@ impl StorageEngine {
         //    The vector store is the durable physical source of truth for
         //    embeddings; the WAL only records the metadata operation.
         self.vectors.put(offset, record.embedding_f32())?;
+        self.sync_vectors_if_configured(offset, offset)?;
 
         // 2. WAL metadata entry, with the vector's checksum so recovery can
         //    confirm the vector reached the file.
-        self.wal.lock().append(&WalOp::Insert {
+        self.log(&[WalOp::Insert {
             offset,
             seq: record.insert_seq,
             meta: MetaRecord::from(&record),
             vector_crc: Some(vector_crc(record.embedding_f32())),
-        })?;
+        }])?;
 
         // 3. Submit the index update to the serialized worker.
         self.update_worker.submit_and_wait(vec![(offset, record)])?;
@@ -310,6 +336,8 @@ impl StorageEngine {
         for (offset, record) in &records {
             self.vectors.put(*offset, record.embedding_f32())?;
         }
+        // Offsets were allocated in order under the write lock.
+        self.sync_vectors_if_configured(records[0].0, records[records.len() - 1].0)?;
 
         // 2. WAL metadata entries (batched under a single lock).
         {
@@ -322,7 +350,7 @@ impl StorageEngine {
                     vector_crc: Some(vector_crc(record.embedding_f32())),
                 })
                 .collect();
-            self.wal.lock().append_batch(&ops)?;
+            self.log(&ops)?;
         }
 
         // 3. Submit the index updates to the serialized worker.
@@ -363,7 +391,7 @@ impl StorageEngine {
         };
 
         // 1. WAL delete entry.
-        self.wal.lock().append(&WalOp::Delete { offset })?;
+        self.log(&[WalOp::Delete { offset }])?;
 
         // 2. Remove from the in-memory indexes and the cognitive graph.
         self.remove_from_indexes(id, offset)?;
@@ -470,13 +498,14 @@ impl StorageEngine {
         // Same order as an insert: vector, then one WAL record for the swap,
         // then the in-memory indexes.
         self.vectors.put(offset, record.embedding_f32())?;
-        self.wal.lock().append(&WalOp::Replace {
+        self.sync_vectors_if_configured(offset, offset)?;
+        self.log(&[WalOp::Replace {
             old_offset,
             offset,
             seq: record.insert_seq,
             meta: MetaRecord::from(&record),
             vector_crc: vector_crc(record.embedding_f32()),
-        })?;
+        }])?;
         self.remove_from_indexes(id, old_offset)?;
         self.update_worker.submit_and_wait(vec![(offset, record)])?;
         Ok(true)

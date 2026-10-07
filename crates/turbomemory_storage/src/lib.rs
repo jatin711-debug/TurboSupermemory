@@ -24,6 +24,25 @@ pub use gpu_exact::GpuSearchStats;
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
+/// Sync a directory so that a file just created in it, or renamed into it,
+/// survives a power loss. POSIX keeps a file's name in its directory, and that
+/// entry is only durable once the directory itself is synced. Windows has no
+/// equivalent (and no way to open a directory for it), so this is a no-op
+/// there. Best effort: a failure here must not fail the operation that
+/// already succeeded.
+pub(crate) fn sync_dir(dir: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        if let Ok(handle) = std::fs::File::open(dir) {
+            let _ = handle.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("core error: {0}")]

@@ -145,6 +145,9 @@ impl VectorStore {
             ..header
         };
         write_header(&mut mmap, header);
+        if let Some(parent) = path.parent() {
+            crate::sync_dir(parent);
+        }
 
         Ok(Self {
             inner: RwLock::new(Inner {
@@ -294,6 +297,28 @@ impl VectorStore {
     /// Return the file path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Sync the slots `first..=last` to disk (used when writes must survive a
+    /// power loss). Also syncs the file itself, so a size change made by a
+    /// grow since the last sync is durable too. The header count is not
+    /// touched: recovery reads slots directly.
+    pub fn sync_range(&self, first: PointOffset, last: PointOffset) -> crate::Result<()> {
+        let inner = self.inner.read();
+        let Some(mmap) = inner.mmap.as_ref() else {
+            return Err(StorageError::Io(std::io::Error::other(
+                "vector store is not mapped (an earlier resize failed)",
+            )));
+        };
+        let (first, last) = (first.min(last) as usize, first.max(last) as usize);
+        let row = inner.dim * 4;
+        let start = HEADER_SIZE + first.min(inner.slots) * row;
+        let end = HEADER_SIZE + (last + 1).min(inner.slots) * row;
+        if end > start {
+            mmap.flush_range(start, end - start)?;
+        }
+        inner.file.sync_data()?;
+        Ok(())
     }
 
     /// Sync the mmap to disk and update the persisted header count.

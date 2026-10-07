@@ -76,7 +76,10 @@ message. `extractor="passthrough"` and `extractor="gliner"` keep writes local.
 - Nothing acknowledged is lost if the process dies without `close()`: the
   next open replays the write-ahead log. (`mem.engine.recovery_report()` says
   what an open had to recover.) After a power loss, the writes since the last
-  `flush()` / `close()` may be missing.
+  `flush()` / `close()` may be missing, unless the store was opened with
+  `Memory(db, sync_writes=True)`: each `add()` is then synced to disk before
+  it returns (about 5 ms per call on an NVMe SSD, whatever the number of
+  facts in the call up to a few hundred).
 - In a CUDA build (`make build-python FEATURES=cuda`) vector search runs on
   the GPU once a store holds more than 4,096 records; nothing changes in the
   API. `mem.engine.gpu_search_stats()` shows whether it is active. See
