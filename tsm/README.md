@@ -36,6 +36,10 @@ with Memory("./my_db") as mem:                       # conversational profile
   protocols (`tsm.interfaces`); pass instances to `Memory(...)`.
 - Budget recall: `recall(..., token_budget=N)` returns the best set that fits
   (`tsm.budget.select_under_budget`, greedy MMR with a cross-turn bonus).
+- Each result carries `context`, the text to put in a prompt: the fact with
+  its date in front when the message was added with a `timestamp`
+  (`[2024-03-02] ...`), otherwise its turn (`[turn 12] ...`), so a model can
+  tell which of two facts came first. `time_tags=False` leaves that out.
 - Compress instead of delete: with `max_records` set, pass
   `gist_summarizer=OpenAIGistSummarizer()` (or the model-free
   `ExtractiveGistSummarizer()`, both in `tsm.gist`) and eviction victims are

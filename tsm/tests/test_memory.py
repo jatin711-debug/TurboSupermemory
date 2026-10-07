@@ -33,7 +33,7 @@ import numpy as np
 import tsm
 from tsm import CONVERSATIONAL_PROFILE, Memory
 from tsm.gist import ExtractiveGistSummarizer
-from tsm.memory import STALE_MARK
+from tsm.memory import STALE_MARK, time_tag
 from tsm.verification import LLMVerifier
 
 
@@ -211,8 +211,8 @@ class TestSupersessionFlow(MemoryTestBase):
         self.assertLess(texts.index(new_fact), texts.index(old_fact))
         by_text = {r["text"]: r for r in after}
         self.assertEqual(by_text[old_fact]["superseded_by"], "alice_2")
-        self.assertEqual(by_text[old_fact]["context"], STALE_MARK + old_fact)
-        self.assertEqual(by_text[new_fact]["context"], new_fact)
+        self.assertEqual(by_text[old_fact]["context"], "[turn 1] " + STALE_MARK + old_fact)
+        self.assertEqual(by_text[new_fact]["context"], "[turn 2] " + new_fact)
         self.assertNotIn("superseded_by", by_text[new_fact])
 
     def test_superseded_facts_can_be_excluded_instead(self):
@@ -271,7 +271,7 @@ class TestBeliefResolution(MemoryTestBase):
         self.assertEqual([r["id"] for r in results], [new_id, old_id])
         stale = results[1]
         self.assertEqual(stale["text"], self.OLD_FACT)
-        self.assertEqual(stale["context"], STALE_MARK + self.OLD_FACT)
+        self.assertEqual(stale["context"], "[turn 1] " + STALE_MARK + self.OLD_FACT)
         self.assertEqual(stale["superseded_by"], new_id,
                          "stale result must point at the current belief")
         self.assertEqual(stale["chain"], [old_id, new_id],
@@ -307,7 +307,7 @@ class TestBeliefResolution(MemoryTestBase):
         mem = self._memory_with_correction()
         # A budget with room for one fact: the current belief takes it, even
         # though the query is worded like the stale one.
-        results = mem.recall(self.OLD_FACT, user_id="alice", token_budget=9)
+        results = mem.recall(self.OLD_FACT, user_id="alice", token_budget=11)
         self.assertEqual([r["id"] for r in results], ["alice_2"])
         # With room for more, the stale fact follows, marked. Its marker
         # counts against the budget.
@@ -316,7 +316,7 @@ class TestBeliefResolution(MemoryTestBase):
         stale = results[1]
         self.assertEqual(stale["superseded_by"], "alice_2")
         self.assertEqual(stale["chain"], ["alice_1", "alice_2"])
-        self.assertTrue(stale["context"].startswith(STALE_MARK))
+        self.assertEqual(stale["context"], "[turn 1] " + STALE_MARK + self.OLD_FACT)
         self.assertLessEqual(sum(len(r["context"]) // 4 for r in results), 40)
 
     def test_resolve_beliefs_false_skips_annotation(self):
@@ -843,7 +843,7 @@ class TestLLMVerifiedRevision(MemoryTestBase):
                         "the fact that replaced it must be served first")
         stale = [r for r in mem.recall("user works", user_id="alice", top_k=10)
                  if r["text"] == self.OLD_FACT][0]
-        self.assertEqual(stale["context"], STALE_MARK + self.OLD_FACT)
+        self.assertEqual(stale["context"], "[turn 1] " + STALE_MARK + self.OLD_FACT)
         # A second pass has nothing left to ask: the pair is settled.
         requests = len(judge.requests)
         self.assertEqual(mem.consolidate(), 0)
@@ -906,6 +906,51 @@ class TestLLMVerifiedRevision(MemoryTestBase):
                 os.environ["OPENAI_API_KEY"] = saved
 
 
+class TestTimeTags(MemoryTestBase):
+    """recall() says when each memory is from in the text handed to a model."""
+
+    def test_time_tag(self):
+        self.assertEqual(time_tag("2024-01-15T10:00:00Z", 7), "[2024-01-15] ")
+        self.assertEqual(time_tag("2023/05/20 (Sat) 02:21", None), "[2023-05-20] ")
+        self.assertEqual(time_tag(1705312800, None), "[2024-01-15] ")      # epoch seconds
+        self.assertEqual(time_tag(1705312800000.0, 3), "[2024-01-15] ")   # milliseconds
+        self.assertEqual(time_tag("1705312800", None), "[2024-01-15] ")
+        # No date: the turn orders the memory, nothing more.
+        self.assertEqual(time_tag("", 12), "[turn 12] ")
+        self.assertEqual(time_tag(None, 0), "[turn 0] ")
+        self.assertEqual(time_tag(3.0, 12), "[turn 12] ")  # a small number is not a date
+        self.assertEqual(time_tag("last tuesday", 4), "[turn 4] ")
+        self.assertEqual(time_tag(float("nan"), None), "")
+        self.assertEqual(time_tag("", None), "")
+        self.assertEqual(time_tag(None, True), "")
+
+    def test_context_carries_the_date_or_the_turn(self):
+        mem = self.make_memory()
+        mem.add([{"role": "user", "content": "I joined a volleyball league.",
+                  "timestamp": "2024-03-02T18:00:00Z"}], user_id="alice")
+        mem.add([{"role": "user", "content": "I ran a charity race."}], user_id="alice")
+        by_text = {r["text"]: r for r in mem.recall("volleyball league race", user_id="alice")}
+        league = by_text["I joined a volleyball league"]
+        self.assertEqual(league["context"], "[2024-03-02] I joined a volleyball league")
+        self.assertEqual(league["timestamp"], "2024-03-02T18:00:00Z")
+        self.assertEqual(by_text["I ran a charity race"]["context"],
+                         "[turn 2] I ran a charity race")
+        plain = mem.recall("volleyball league race", user_id="alice", time_tags=False)
+        self.assertEqual([r["context"] for r in plain], [r["text"] for r in plain])
+
+    def test_tags_count_against_the_token_budget(self):
+        mem = self.make_memory()
+        for fact in ("garden has red tulips now", "garden shed needs new paint",
+                     "garden pond froze last week", "garden gate squeaks loudly"):
+            mem.add([{"role": "user", "content": fact + "."}], user_id="alice")
+        # Each fact is 6 tokens bare and 8 or 9 with its "[turn N] ".
+        bare = mem.recall("garden", user_id="alice", token_budget=18, time_tags=False)
+        tagged = mem.recall("garden", user_id="alice", token_budget=18)
+        self.assertEqual(len(bare), 3)
+        self.assertEqual(len(tagged), 2)
+        self.assertLessEqual(sum(len(r["context"]) // 4 for r in tagged), 18)
+
+
 class TestUserBudget(MemoryTestBase):
     """Memory(max_user_tokens=...): a user's memory is kept under a token
     budget by keeping the newest facts and folding the rest into gists."""
@@ -952,9 +997,12 @@ class TestUserBudget(MemoryTestBase):
         # Another user's memory is not touched.
         self.assertEqual(self._tokens(mem, "bob")[0], 21)
 
-        # The gist is an ordinary memory: recall finds it.
-        found = mem.recall(gists[0]["text"].splitlines()[0], user_id="alice", top_k=5)
-        self.assertIn(gists[0]["id"], [r["id"] for r in found])
+        # The gist is an ordinary memory: recall finds it. It covers many
+        # turns, so it is shown without one.
+        found = {r["id"]: r for r in
+                 mem.recall(gists[0]["text"].splitlines()[0], user_id="alice", top_k=5)}
+        self.assertIn(gists[0]["id"], found)
+        self.assertEqual(found[gists[0]["id"]]["context"], gists[0]["text"])
 
     def test_later_passes_fold_the_earlier_gist_again(self):
         mem = self.make_memory(max_user_tokens=self.BUDGET,

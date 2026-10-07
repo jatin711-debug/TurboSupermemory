@@ -15,6 +15,8 @@ preset (``profile="conversational"``):
   - access-aware eviction and importance auto-scoring,
   - concept extraction (bigram ngrams) for the memory graph,
   - MMR best-set recall under a token budget,
+  - results that say when each memory is from (a date or a turn in front of
+    the text handed to a model),
   - optionally, each user's memory kept under a token budget
     (``max_user_tokens``): the newest facts stay as they are and everything
     older is folded into a few short gists.
@@ -26,14 +28,17 @@ OpenAI-backed and read the key from ``OPENAI_API_KEY``.
 
 import json
 import logging
+import math
+import re
 import threading
+from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
 import numpy as np
 
 from ._loader import load_turbomemory
 from .budget import select_under_budget, total_tokens
-from .compaction import plan_compaction
+from .compaction import is_gist, plan_compaction
 from .concepts import extract_concepts
 from .interfaces import Embedder, Extractor, Verifier  # noqa: F401  (re-exported types)
 from .ranking import is_first_person_query, role_prior
@@ -43,6 +48,39 @@ logger = logging.getLogger("tsm.memory")
 # Put in front of a superseded memory's text in a result's "context" when its
 # supersession was verified: it was true, and something newer replaced it.
 STALE_MARK = "[earlier, since changed] "
+
+_DATE = re.compile(r"\s*(\d{4})[-/](\d{2})[-/](\d{2})")
+
+
+def time_tag(timestamp, turn_index) -> str:
+    """When a memory was said, as a prefix for the text shown to a model.
+
+    ``"[2024-01-15] "`` when the message's timestamp carries a date (a string
+    starting ``YYYY-MM-DD``, or epoch seconds or milliseconds); otherwise
+    ``"[turn 12] "`` from the turn index, which only orders memories; ``""``
+    when neither is known. Without one of these a reader cannot tell which of
+    two memories came first.
+    """
+    if isinstance(timestamp, str):
+        match = _DATE.match(timestamp)
+        if match:
+            return "[{}-{}-{}] ".format(*match.groups())
+        try:
+            timestamp = float(timestamp)
+        except ValueError:
+            timestamp = None
+    if (isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool)
+            and math.isfinite(timestamp) and timestamp >= 1e8):
+        seconds = timestamp / 1000.0 if timestamp >= 1e11 else float(timestamp)
+        try:
+            return datetime.fromtimestamp(seconds, timezone.utc).strftime("[%Y-%m-%d] ")
+        except (OverflowError, OSError, ValueError):
+            pass
+    if (isinstance(turn_index, (int, float)) and not isinstance(turn_index, bool)
+            and math.isfinite(turn_index) and turn_index >= 0):
+        return f"[turn {int(turn_index)}] "
+    return ""
+
 
 # Engine methods this SDK cannot work without. The extension and the SDK ship
 # together; this guards against a stale locally-built turbomemory.pyd/.so.
@@ -425,13 +463,15 @@ class Memory:
         rerank: bool = False,
         reranker: Optional[object] = None,
         max_items: Optional[int] = None,
+        time_tags: bool = True,
     ) -> List[Dict]:
         """Search memories under ``user_id``'s scope.
 
         Returns a list of dicts, best first, each with at least ``"id"``,
-        ``"text"``, ``"context"`` (the text to put in a prompt: the same as
-        ``"text"`` unless marked, see below), ``"score"``, ``"role"`` (the
-        stored source role) and ``"turn_index"``. With ``token_budget`` set,
+        ``"text"``, ``"context"`` (the text to put in a prompt: ``"text"``
+        with when it was said and, see below, whether it has since changed
+        in front), ``"score"``, ``"role"`` (the stored source role),
+        ``"turn_index"`` and ``"timestamp"``. With ``token_budget`` set,
         the result is instead the best *set* that fits the budget
         (``tsm.budget.select_under_budget``: greedy MMR over a candidate
         pool), in selection order. The pool is ``pool_k`` candidates or more:
@@ -451,6 +491,13 @@ class Memory:
         have been without its demotion, and added if the search did not find
         it at all (an update is often worded differently from the fact it
         replaces, so a question in the old wording finds only the old fact).
+
+        With ``time_tags`` (default True), ``"context"`` starts with when the
+        memory was said (``time_tag``): its date when the message carried a
+        timestamp, otherwise its turn, as in ``[turn 12] ...``. A model
+        asked which of two things happened first, or what was true before
+        something changed, has nothing else to go on. Gists carry no tag:
+        they cover many turns. The tags count against ``token_budget``.
 
         With ``rerank=True`` or an active ``reranker`` (e.g. ``ColBertReranker``),
         retrieved candidate shortlists from TSM's cognitive graph are reranked
@@ -489,11 +536,18 @@ class Memory:
                 continue
             pool.append({"id": mid, "text": rec["text"], "score": float(score),
                          "role": rec["source_role"] or "",
-                         "turn_index": rec["payload"].get("turn_index")})
+                         "turn_index": rec["payload"].get("turn_index"),
+                         "timestamp": rec["payload"].get("timestamp")})
         if not pool:
             return []
         if resolve_beliefs:
             self._resolve_beliefs(pool, user_id)
+        for p in pool:
+            # Set before packing: what is shown is what the budget counts.
+            shown = p.get("context", p["text"] or "")
+            if time_tags and not is_gist(p["role"]):
+                shown = time_tag(p["timestamp"], p["turn_index"]) + shown
+            p["context"] = shown
 
         first_person = is_first_person_query(query)
         for p in pool:
@@ -519,8 +573,6 @@ class Memory:
         else:
             final = select_under_budget(pool, token_budget, embed=self.embedder.encode,
                                         lam=lam, max_items=max_items)
-        for p in final:
-            p.setdefault("context", p["text"] or "")
         return final
 
     def _resolve_beliefs(self, pool: List[Dict], user_id: Optional[str]) -> None:
@@ -558,7 +610,8 @@ class Memory:
                 continue
             by_id[mid] = {"id": mid, "text": rec["text"], "score": owed[mid],
                           "role": rec["source_role"] or "",
-                          "turn_index": rec["payload"].get("turn_index")}
+                          "turn_index": rec["payload"].get("turn_index"),
+                          "timestamp": rec["payload"].get("timestamp")}
             pool.append(by_id[mid])
         for mid, score in owed.items():
             head = by_id.get(mid)

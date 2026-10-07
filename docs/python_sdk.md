@@ -44,9 +44,21 @@ message. `extractor="passthrough"` and `extractor="gliner"` keep writes local.
 ### Results, budgets, and lifecycle
 
 - `recall()` returns dicts, best first, with `id`, `text`, `context`,
-  `score`, `role` (the stored source role) and `turn_index`. `context` is
-  the text to put in a prompt: the same as `text` unless the fact is marked
-  (next point).
+  `score`, `role` (the stored source role), `turn_index` and `timestamp`.
+  `context` is the text to put in a prompt: `text` with when it was said in
+  front (next point) and, for a fact that has since changed, a marker (the
+  point after).
+- Time tags: `context` starts with the memory's date when its message was
+  added with one (`{"role": "user", "content": ..., "timestamp":
+  "2024-03-02T18:00:00Z"}`; an ISO date or epoch seconds), as in
+  `[2024-03-02] I joined a volleyball league`, and otherwise with its turn,
+  `[turn 12] ...`, which only orders memories. A model asked which of two
+  things came first, or which of two values is the newer one, has nothing
+  else to go on: on 115 judged LongMemEval questions the tags gained 8
+  answers and lost 1, on temporal and knowledge-update questions
+  (`benchmarks/PHASE_PROGRESS.md`, 2026-10-07). Gists carry no tag. The
+  tags count against `token_budget`; `recall(..., time_tags=False)` leaves
+  them out.
 - A fact that a newer one replaced is never removed from recall. It is
   ranked lower and carries `superseded_by` (the id of the current belief)
   and `chain`; a result without `superseded_by` is current. With a verifier
