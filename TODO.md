@@ -17,7 +17,7 @@ This file is only the short list of open engineering work, grouped by area.
 > behaviour": those change what recall returns and need a judged re-run.
 >
 > **2026-10-07.** GPU search over device-resident vectors, `sync_writes`,
-> a CI workflow, and verified belief revision landed (entry of that date in
+> a CI workflow (removed again on 2026-10-21), and verified belief revision landed (entry of that date in
 > `PHASE_PROGRESS.md`). What each of them leaves open is listed under its
 > heading below.
 >
@@ -58,13 +58,12 @@ This file is only the short list of open engineering work, grouped by area.
   graph snapshot are versioned.
 - **A failed insert after the WAL append** (text-index failure) is reported as
   failed although the record is durable.
-- **CI covers less than the local gate.** `.github/workflows/ci.yml` (fmt,
-  clippy, the Rust suite and the SDK suite) passed on its first run on
-  Linux, Windows and macOS on Apple Silicon: 294 Rust and 83 SDK tests on
-  each. It has no GPU, datasets or models, so `make gate` and the CUDA tests
-  stay local. The macOS job is still marked non-blocking; make it required
-  once it has a few green runs. Linux on AArch64 is only linted
-  (`turbomemory_core`, `turbomemory_graph`).
+- **No CI.** The workflow was removed on 2026-10-21. `make gate`, run on
+  this Windows machine, is the only check. Linux and macOS are not built or
+  tested anywhere. The AArch64 NEON kernels in
+  `turbomemory_core/src/metrics.rs` are only type-checked
+  (`cargo clippy --target aarch64-unknown-linux-gnu`), never compiled into a
+  binary or run. The last place they ran was that workflow's macOS job.
 - Request timeouts, body-size configuration and CORS on the REST server.
 - Metrics and tracing: the optimizer reports failures with `eprintln!`, and
   the Python extension initialises no logger, so the engine's warnings
@@ -90,6 +89,40 @@ and an omitted scope searches everything. In the SDK, `user_id=None` on `add`
 or `recall` likewise means "everyone". PLAN Phase C (one engine per tenant) is
 the intended answer; until then, treat a store as single-tenant unless these
 are closed.
+
+## Judged on 2026-10-21 (control, held-out, read-time changes, LongMemEval-S)
+
+The numbers are in `benchmarks/PHASE_PROGRESS.md`. In short:
+
+- **Held out, the reading prompt at 600 tokens holds**: 296 of 355 against
+  259 for the plain prompt at 150 (52 gained, 15 lost).
+- **Graph search ties plain search** on the held-out answers (10 / 10).
+- **The raw evidence sessions, read with the same prompt, score 104 of 115**
+  where memory scores 98. On LongMemEval-S (29 questions) the raw 124k-token
+  sessions score 22 and memory 20.
+- **Not adopted**, all level or worse:
+  - source turns as the read unit (`recall(sources="turn")`);
+  - event dates (`event_dates=True`);
+  - reader tools (`tsm.answering`);
+  - two verifier-prompt rules for repeat occurrences (dev pairs only).
+
+Still open, in this order:
+
+1. **Owed: judge the two built changes that change what a model reads.**
+   The OpenAI credit ran out first. They are on in the working tree:
+   - the `[earlier, changed by DATE]` mark on verified-superseded facts
+     (`sdk_belief_llm`, old against new);
+   - dated gists (`sdk_budget`, `sdk_budget_rolling`, old against new).
+
+   About 900 requests. Run the `stores` step of
+   `.cache/shipped_stack_eval/scripts/run_belief_and_budget.sh`. If either
+   loses answers, put it behind a flag.
+2. **LongMemEval-S on more questions.** The 29 here detect only large
+   differences. The other 85 of the 115 need about 37k extraction requests,
+   about $5, with `.cache/shipped_stack_eval/scripts/extract_s.py`.
+3. **The `sources="turn"` excerpt picks sentences by word overlap** and drops
+   the short sentence that answers. Choose by the facts' embeddings, and
+   measure only at budgets where turns fit (1,500 tokens or more).
 
 ## Judged on 2026-10-09 (the retrieval and input changes)
 
@@ -157,10 +190,9 @@ table is in `benchmarks/PHASE_PROGRESS.md`.
   were cut off at 500 tokens before their answer line (the limit is 800
   now); 2 give the gold answer and were marked wrong by the judge; 1 asks
   about jewelry where the conversation has a chandelier.
-- **Still open, in this order.** (1) A held-out check. The cached extraction
-  covers all 500 conversations of the oracle file, so the other 355 questions
-  can be judged on the first-prompt store for the price of the judge: about
-  710 requests a setting. Nothing was tuned on them. (2) The paired grid on
+- **Still open, in this order.** (1) ~~A held-out check~~ done 2026-10-21:
+  296 of 355 with the reading prompt at 600 tokens, against 259 for the
+  plain prompt at 150. (2) The paired grid on
   the 115 (store x budget x reader), which decides the extractor's defaults:
   about 1,600 requests. (3) The second prompt for the other 380 conversations
   (about 2,700 requests) before the two-pass store can be judged held-out.
@@ -211,11 +243,11 @@ table is in `benchmarks/PHASE_PROGRESS.md`.
   measure: keep earlier gists as they are until the gist share is full and
   only then merge the oldest; or compact only when a user is well over
   budget instead of at every `consolidate()`.
-- **Gists carry no time cue.** `recall()` puts a date or a turn in front of
-  each fact and leaves gists bare, so in a compacted store most of the
-  history has no order. A gist could carry the span it covers
-  (`[turns 3-41]`); `plan_compaction` would have to report which memories
-  each gist was written from.
+- **Gists now carry the dates they cover (built 2026-10-21, not yet judged).**
+  `plan_compaction` reports each gist's span and `recall()` tags it
+  (`[2023-01-05 to 2023-03-02] ...`). A gist written from undated memories
+  is still bare: a span of turns (`[turns 3-41]`) is not stored. Judging it
+  is item 1 of the 2026-10-21 list.
 - **`max_user_tokens` only compacts in `consolidate()`, and only the users
   this process wrote to** (`compact()` covers every user). A store that is
   only ever added to grows until one of them is called.
@@ -405,8 +437,8 @@ recall results:
   would help CPU-only builds.
 - The quantized-scan and SpMV kernels in `turbomemory_gpu` are still unused;
   remove them or find them a caller.
-- The CUDA build is tested by hand (`cargo test --features cuda`); no CI
-  runner has a GPU.
+- The CUDA build is tested by hand (`cargo test --features cuda`); `make
+  gate` does not build it.
 
 ## Evaluation and claims
 

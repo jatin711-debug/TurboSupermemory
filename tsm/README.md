@@ -55,6 +55,13 @@ with Memory("./my_db") as mem:                       # conversational profile
   (`[2024-03-02] ...`), otherwise its turn (`[turn 12] ...`), so a model can
   tell which of two facts came first. `time_tags=False` leaves that out;
   `time_tags="minute"` adds the time of day.
+- Each result also carries `source`, the message the fact was taken from.
+  Two read-time options were measured and left off by default:
+  - `sources="turn"` returns those messages in place of the facts. At a
+    600-token budget it lost judged answers, because fewer turns than facts
+    fit (`tsm.sources`).
+  - `event_dates=True` writes the date after a relative time ("two weeks ago
+    [week of 2023-05-08]"; `tsm.when`). Judged answers came out level.
 - Asking a model to answer from what was recalled: `tsm.reading` has the
   prompt. `answer_prompt(question, results, today=...)` puts the memories in
   the order they were said and tells the model to list what bears on the
@@ -72,10 +79,12 @@ with Memory("./my_db") as mem:                       # conversational profile
   ```
 
   A plain "answer from these snippets" prompt gets totals, changed values
-  and date arithmetic wrong with the facts in front of it. On 115 judged
-  LongMemEval questions with 600-token contexts it answered 92 and this
-  prompt 99; the prompt was written against those questions, so read that as
-  an upper estimate (`benchmarks/PHASE_PROGRESS.md`, 2026-10-12).
+  and date arithmetic wrong with the facts in front of it. On 355 judged
+  LongMemEval questions that none of this was tuned on, this prompt at 600
+  tokens answered 296 where the plain prompt at 150 answered 259
+  (`benchmarks/PHASE_PROGRESS.md`, 2026-10-21).
+  `tsm.answering.answer_with_tools` adds tools for arithmetic, dates and
+  counting. It did not help gpt-4.1-mini: 94 of 115 against 98.
 - `recall()` is a read: it does not change what the next call returns.
   `mem.reinforce(ids)` strengthens the memories that were actually used.
 - Compress instead of delete: with `max_records` set, pass

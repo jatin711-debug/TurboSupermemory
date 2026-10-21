@@ -83,18 +83,48 @@ ago" has no meaning without it. Give the model about 800 reply tokens: a
 reply cut off before its last line has no answer in it.
 
 With the facts in front of it, a plain "answer from these snippets" prompt
-still gets totals, changed values and date arithmetic wrong. On the same
-600-token contexts of 115 judged LongMemEval questions it answered 92 and
-this prompt 99. The prompt was written against those questions, so that is
-an upper estimate until it is checked on others.
+still gets totals, changed values and date arithmetic wrong.
+
+| Questions (LongMemEval) | Plain prompt, 150 tokens | This prompt, 600 tokens | Change |
+|---|---|---|---|
+| 115 the prompt was written on | 87 right | 98 right | |
+| 355 held out (2026-10-21) | 259 (0.730) | 296 (0.834) | 52 gained, 15 lost |
+
+So the gain holds on questions the prompt was not written against.
+
+`tsm.answering.answer_with_tools(client, model, question, results, today)`
+asks the same way and also gives the model four tools: arithmetic, the days
+between two dates, a date some days away, and a count of distinct items.
+It did not help. On the same 115 questions it answered 94 against 98 for the
+plain reading prompt (3 gained, 7 lost). It is there for models that are
+worse at arithmetic than gpt-4.1-mini.
 
 ### Results, budgets, and lifecycle
 
 - `recall()` returns dicts, best first, with `id`, `text`, `context`,
-  `score`, `role` (the stored source role), `turn_index` and `timestamp`.
-  `context` is the text to put in a prompt: `text` with when it was said in
-  front (next point) and, for a fact that has since changed, a marker (the
-  point after).
+  `score`, `role` (the stored source role), `turn_index`, `timestamp` and
+  `source`.
+  - `context` is the text to put in a prompt: `text` with when it was said
+    in front (next point) and, for a fact that has since changed, a marker
+    (the point after).
+  - `source` is the message the memory was extracted from. It is `None` for
+    gists.
+- Source turns are opt-in. `recall(..., sources="turn")` searches on the
+  facts and returns the turns they came from: one result per message, with
+  `facts` and `ids` listing the facts it stands for, and the speaker named
+  in `context`. A long turn is cut to its sentences that share words with
+  those facts and the question (`source_tokens`, 120 by default). At a
+  600-token budget this cost judged answers, 86 of 115 right against 98 for
+  facts (6 gained, 18 lost), because far fewer turns than facts fit. Cut to
+  30 tokens, turns fit as well as facts and scored 67: the cut often dropped
+  the short sentence that held the answer.
+- Event dates are opt-in. With `recall(..., event_dates=True)`, a relative
+  time in what is shown is followed by the date it points to, counted from
+  the day it was said: "two weeks ago [week of 2023-05-08]", "last Saturday
+  [2023-05-20]", "on March 3rd [2023-03-03]". `tsm.when.annotate` does this
+  with rules, no model. Only 2.4% of extracted facts have such a phrase. It
+  was level on judged answers: 100 against 98 of 115, and 298 against 296 of
+  355 held out (8 gained and 4 lost over both).
 - Time tags: `context` starts with the memory's date when its message was
   added with one (`{"role": "user", "content": ..., "timestamp":
   "2024-03-02T18:00:00Z"}`; an ISO date or epoch seconds), as in
@@ -103,8 +133,10 @@ an upper estimate until it is checked on others.
   things came first, or which of two values is the newer one, has nothing
   else to go on: on 115 judged LongMemEval questions the tags gained 8
   answers and lost 1, on temporal and knowledge-update questions
-  (`benchmarks/PHASE_PROGRESS.md`, 2026-10-07). Gists carry no tag. The
-  tags count against `token_budget`; `recall(..., time_tags=False)` leaves
+  (`benchmarks/PHASE_PROGRESS.md`, 2026-10-07). A gist is tagged with the
+  span of what it summarizes when that was dated (`[2023-01-05 to
+  2023-03-02] ...`; added 2026-10-21, not yet judged). The tags count against
+  `token_budget`; `recall(..., time_tags=False)` leaves
   them out, and `time_tags="minute"` adds the time of day when the timestamp
   has one (`[2024-03-02 18:00] ...`), which is what tells two memories of
   one day apart.
@@ -112,7 +144,10 @@ an upper estimate until it is checked on others.
   ranked lower and carries `superseded_by` (the id of the current belief)
   and `chain`; a result without `superseded_by` is current. With a verifier
   installed, two more things happen: its `context` starts with
-  `[earlier, since changed] `, so a model reading it knows what it is, and
+  `[earlier, changed by 2024-06-01] ` (the date its replacement was said,
+  also in the result's `valid_until`; `[earlier, since changed] ` when that
+  is not dated; the dated form was added 2026-10-21 and is not yet judged),
+  so a model reading it knows what it is and when it changed, and
   the fact that replaced it is ranked where the old one would have been and
   brought in if the search missed it (a question in the old wording often
   finds only the old fact). Pass `exclude_superseded=True` to drop
@@ -174,12 +209,17 @@ an upper estimate until it is checked on others.
   | `"llm"` with `gpt-4o-mini`, the default | 49 to 50 of 54 | 4 to 8 of 58 |
   | `"llm"` with a local 4.7B model, `qwen3.5:4b` | 48 to 49 of 54 | 7 to 9 of 58 |
   | `"llm"` with local `Ternary-Bonsai-2-4B-PQ2_0` | 49 / 48 of 54 | 7 / 10 of 58 |
+  | `"llm"` with local `Ternary-Bonsai-2-9B-PQ2_0` (2026-10-19) | 40 / 40 of 54 | 9 / 12 of 58 |
 
   Bonsai's slash-separated figures are isolated / shared scope, measured on
   2026-10-19 with the shipped prompt, non-thinking mode, greedy decoding,
   batches of 8 and a 1,024-token output limit. It remains opt-in: catching
   more updates does not eliminate false supersessions. See the Bonsai follow-up
   in `benchmarks/PHASE_PROGRESS.md` for the runtime and evaluation commands.
+  The 9B model (same settings, MiniLM embeddings) caught fewer updates than
+  the 4B and marked more true facts stale. It also failed the reply format on
+  1 to 6 pairs per run. It needs about 3.2 GB of GPU memory with
+  EmbeddingGemma 2 loaded. Use the 4B.
 
   In each range the first figure is with every pair in its own store and the
   second with all pairs in one store, where statements of different pairs

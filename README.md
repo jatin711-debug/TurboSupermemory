@@ -293,7 +293,7 @@ make wheel
 
 The toolchain is pinned in `rust-toolchain.toml`; Python 3.12 or newer is required (the extension is an `abi3-py312` wheel). `make gate` needs the LongMemEval data (`make download-eval-data`) and a cached `all-MiniLM-L6-v2` model.
 
-`.github/workflows/ci.yml` runs the format check, clippy, the Rust suite and the SDK unit suite on every push and pull request (Linux and Windows, plus a non-blocking macOS/ARM job). It does not run the evaluation part of the gate or the CUDA build; those stay local.
+There is no hosted CI: `make gate` is the check, run locally before merging. It runs the format check, clippy, the Rust suite, the SDK unit suite and the evaluation smoke tests. The CUDA build is tested by hand.
 
 ---
 
