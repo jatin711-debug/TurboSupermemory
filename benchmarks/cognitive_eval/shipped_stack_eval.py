@@ -188,6 +188,13 @@ PAIRS = (
 UNATTRIBUTED = ("naive", "adapter")
 
 
+def default_work_dir():
+    """Where paid results go unless --work-dir says otherwise: $TSM_EVAL_DIR,
+    else ~/.tsm_eval/shipped_stack_eval."""
+    return os.environ.get("TSM_EVAL_DIR") or os.path.join(
+        os.path.expanduser("~"), ".tsm_eval", "shipped_stack_eval")
+
+
 def variants(name):
     """A recall() arm and the diagnostics served from the same store."""
     return (name, name + "_trunc", name + "_untagged", name + "_turns")
@@ -608,8 +615,10 @@ def main():
     ap.add_argument("--judge-model", default="gpt-4.1-mini")
     ap.add_argument("--workers", type=int, default=10)
     ap.add_argument("--work-dir", default=None,
-                    help="where the verdict cache and the embedding overlay are kept "
-                         "(default: .cache/shipped_stack_eval, which is not checked in)")
+                    help="where paid results are kept: verdicts, gists, the embedding overlay "
+                         "and the runs written with --out (default: $TSM_EVAL_DIR, else "
+                         "~/.tsm_eval/shipped_stack_eval; outside the checkout, so cleaning "
+                         "it does not delete what was paid for)")
     ap.add_argument("--out", default=None, help="write per-question results here (JSON)")
     ap.add_argument("--reuse", default=None, metavar="PATHS",
                     help="comma-separated --out files of earlier runs with the same judge: an "
@@ -694,11 +703,18 @@ def main():
 
     # A fixed place by default: the embeddings of texts the shared cache does
     # not hold are kept there, so a later run (an --offline one too) finds
-    # them instead of paying for them again or running without them. Not
-    # under target/, which `cargo clean` removes.
-    work_dir = args.work_dir or os.path.join(os.path.dirname(os.path.dirname(HERE)), ".cache",
-                                             "shipped_stack_eval")
+    # them instead of paying for them again or running without them. Outside
+    # the checkout: target/ went with `cargo clean` once and .cache/ with a
+    # tidy-up once, each taking every saved verdict along.
+    work_dir = args.work_dir or default_work_dir()
     os.makedirs(work_dir, exist_ok=True)
+    readme = os.path.join(work_dir, "README.txt")
+    if not os.path.exists(readme):
+        with open(readme, "w", encoding="utf-8") as fh:
+            fh.write("Paid evaluation results of TurboSuperMemory (shipped_stack_eval.py): judge "
+                     "verdicts, verifier verdicts, gists, embeddings and per-question run files. "
+                     "Deleting this folder deletes what was paid for; paired comparisons need "
+                     "the run files.\n")
 
     from tsm import Memory
     from tsm._retry import QuotaExhausted

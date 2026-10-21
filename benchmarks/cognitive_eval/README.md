@@ -164,7 +164,9 @@ python benchmarks/cognitive_eval/shipped_stack_eval.py --offline --limit 120 --a
 #     with the SDK's prompt (tsm.reading) instead of the plain one. To read saved contexts
 #     another way without building the stores again: --rejudge run.json --reader notes.
 #     Verdicts, gists and embeddings fetched along the way are kept in --work-dir
-#     (default .cache/shipped_stack_eval, not under target/, which `cargo clean` removes).
+#     (default $TSM_EVAL_DIR, else ~/.tsm_eval/shipped_stack_eval: outside the checkout, so
+#     cleaning it does not delete what was paid for). Compare two runs question by question
+#     with pair_runs.py; extract long histories in parallel first with prefetch_extraction.py.
 python benchmarks/cognitive_eval/shipped_stack_eval.py --limit 120 --arms sdk_cognitive --token-budget 600 --reader notes --out notes600.json
 
 # 2. Run the 50-Conversation Head-to-Head Evaluation

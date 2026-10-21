@@ -114,12 +114,13 @@ Still open, in this order:
      (`sdk_belief_llm`, old against new);
    - dated gists (`sdk_budget`, `sdk_budget_rolling`, old against new).
 
-   About 900 requests. Run the `stores` step of
-   `.cache/shipped_stack_eval/scripts/run_belief_and_budget.sh`. If either
-   loses answers, put it behind a flag.
+   About 900 requests. Build each arm from a worktree of the commit before
+   the change and from the branch, then pair them with
+   `benchmarks/cognitive_eval/pair_runs.py`. If either loses answers, put it
+   behind a flag.
 2. **LongMemEval-S on more questions.** The 29 here detect only large
    differences. The other 85 of the 115 need about 37k extraction requests,
-   about $5, with `.cache/shipped_stack_eval/scripts/extract_s.py`.
+   about $5, with `benchmarks/cognitive_eval/prefetch_extraction.py`.
 3. **The `sources="turn"` excerpt picks sentences by word overlap** and drops
    the short sentence that answers. Choose by the facts' embeddings, and
    measure only at budgets where turns fit (1,500 tokens or more).
