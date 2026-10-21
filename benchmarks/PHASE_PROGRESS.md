@@ -2448,3 +2448,721 @@ kept each time.
 embedder; make the head-to-head drive `tsm.Memory`; give gists a time span
 and look at why rolling compaction trails one pass; confirm on the full
 LongMemEval set and on LoCoMo before quoting any of this outside the repo.
+
+---
+
+# Why cognitive search lost, a free retrieval score, and what it fixed (2026-10-07)
+
+The previous entry left one decision open (the conversational profile's
+`cognitive_alpha`) and one question unasked: why would a graph lose to
+plain vector search at all? This entry answers the question, and fixes what
+the answer pointed at. Nothing in it was judged when it was written: every number below is
+free to reproduce. The judged run that followed is at the end.
+
+**1. What the graph term was.** `final = cosine + (1 - alpha) * d / (1 + d)`,
+with `d` made of a BM25 share (at most 0.3), a fixed 0.56 for every query
+word that is one of the memory's concepts, and a spread through shared
+concepts. Measured on 114 questions (cached embeddings, no model): at the
+profile's `alpha = 0.5` the boost averaged 0.24 per candidate where
+neighbouring candidates differ by 0.013 in cosine, and it correlated +0.68
+with the number of query words in the memory (0.17 with none, 0.38 with
+three or more). Concepts are content words, so word overlap was scored twice, the
+second time without IDF, and at eighteen times the weight of the cosine
+gaps it was added to. It changed 1.5 of the top 8.
+
+**2. What the evaluation was missing.**
+- *The data is the benchmark's oracle variant.* The parquet copy the harness
+  downloads holds, per question, only the evidence sessions (1.9 sessions,
+  6.7k tokens). Standard LongMemEval-S has about 48 sessions and 122k tokens
+  for the same questions. Every store judged so far was small and all of it
+  relevant, so numbers published for other systems (LongMemEval-S, large
+  readers) are not comparable with ours, and a mechanism meant to find what
+  similarity misses had little to find.
+- *Dates were dropped.* Every session starts with `[Date: ...]`; the loader
+  skipped the line. Sessions were also ingested in file order, which is not
+  chronological for 34 of the 133 temporal questions (8 of our 28), so their
+  `[turn N]` tags pointed the wrong way.
+- *There was no question date*, so "a month ago" had no anchor.
+
+Fixed: the loader keeps session dates and can read the official files
+(`download.py --official oracle|s|m`); its parse of the official oracle file
+is identical to the parquet copy message for message (10,960 of 10,960), so
+the cached extraction applies. The runner ingests sessions in the order they
+took place, passes each message's session date to `recall()`, and tells the
+reader the question's date.
+
+**3. A retrieval score that costs nothing.** The official files flag the
+turns that hold each question's evidence. `shipped_stack_eval.py` now
+reports, per arm, for how many questions a memory from every evidence turn
+is in the context. Checked against the 3,795 answers already judged in the
+earlier runs:
+
+| evidence in the context | judged right |
+|---|---|
+| all of it | 1071 / 1665 = 0.64 |
+| part of it | 407 / 918 = 0.44 |
+| none of it | 155 / 618 = 0.25 |
+
+| by type, all / not all of the evidence | judged right |
+|---|---|
+| single-session-user | 0.93 / 0.31 |
+| single-session-preference | 0.97 / 0.64 |
+| single-session-assistant | 0.88 / 0.35 |
+| multi-session | 0.76 / 0.29 |
+| knowledge-update | 0.52 / 0.50 |
+| temporal-reasoning | 0.20 / 0.28 |
+
+It tracks the judge where retrieval is the problem, and it reproduces the
+judged finding about cognitive search in two minutes (plain pool 68
+questions with all their evidence, shipped profile 64; judged 0.609 and
+0.574). It also shows where retrieval is *not* the problem: temporal
+questions were answered right 20% of the time with all the evidence
+present, and knowledge-update questions no better with it than without.
+Those need what section 2 adds (dates, order, the question's date), which
+this score cannot see.
+
+To test retrieval among distractors without paying for extraction,
+`--pool N` builds each history from N conversations of the cached data: 20
+conversations give stores of about 2,500 facts, 40 about 5,000, which is
+past the 4,096 records where search stops being an exact scan. (Index
+recall there was checked against an exact scan: 0.996 to 1.000 of the top
+30.)
+
+**4. What the score found, and the fixes.** Questions out of 115 with all
+their evidence in a 150-token context:
+
+| | oracle (125 facts) | 20 pooled (2,500) | 40 pooled (5,000) |
+|---|---|---|---|
+| plain top-20, truncated | 64 | 62 | 61 |
+| shipped before (`cognitive_alpha` 0.5) | 64 | 60 | 57 |
+| plain pool + packer, before | 68 | 67 | 59 |
+| old graph settings, new packer | 68 | 67 | 65 |
+| plain pool + packer, now | 75 | 74 | 68 |
+| **shipped now** | **76** | **74** | **68** |
+
+Old graph settings against the new profile, same packer: 1 / 9 (p=0.02),
+3 / 10 (p=0.09), 5 / 8.
+
+- *The packer threw evidence away.* `select_under_budget` skipped any
+  candidate more similar than 0.72 to one already chosen. With OpenAI
+  embeddings that is not "the same thing said twice": it is two yoga
+  classes in one week, or an egg count before and after it changed, which
+  is what multi-session and knowledge-update questions are made of.
+  Loosening the cutoff helped at every step (0.80, 0.85, 0.90, 0.95) in all
+  three store sizes; at 0.95, which only catches near-identical text, 68
+  becomes 75 on the packer alone (knowledge-update 11 to 15 of 18,
+  multi-session 17 to 20 of 31). `MAX_REDUNDANCY` is now 0.95. This was the
+  largest single effect, and the old cutoff was worse than no MMR at all
+  (relevance order: 69, 68, 66).
+- *The graph step dropped true neighbours in a large store.* It kept its 90
+  best candidates ranked by cosine + delta. Past a few thousand memories,
+  hundreds share a word with the query, each with a delta larger than a
+  seed's cosine, and they crowded ANN hits out before fusion: with cosine
+  ranking the cognitive path covered 55 questions at 5,000 facts where the
+  plain pool covered 59. Every ANN seed is now kept and only discovered
+  candidates compete for the rest; the two are equal again at every size.
+- *The graph weight had no scale.* New engine settings, each off by default
+  so nothing else moves: `graph_weight` (the boost as a share of the cosine
+  spread among the `top_k` nearest: the same weight means the same thing for
+  any embedder), `query_concept_boost` (the per-word bonus; 0 switches it
+  off) and `fan_exponent` (what a concept passes on is divided by the number
+  of memories it points at). The conversational profile now uses 0.5, 0 and
+  1. Of the settings tried it is the only one never below the plain pool
+  (69, 67, 60 against 68, 67, 59 with the old packer). The dose-response of
+  the old form, oracle data: alpha 1.0 68, 0.9 68, 0.8 70, 0.7 66, 0.5 64;
+  without the per-word bonus alpha 0.5 gives 70, and the bonus without the
+  concept spread 62.
+- *A read changed the next read.* A search reinforced every memory it
+  returned, so the same question came back as a different list in 13 of 19
+  checks. `reinforce_on_search` is now off by default and
+  `reinforce(ids)` (engine, Python, `Memory`) is for memories that were
+  used.
+
+**5. What is still out of reach.** For 34 to 37 of the 115 questions an
+evidence turn has no fact among the 30 nearest to the question (60 is no
+better), so about 0.70 is the ceiling for any packer and the stack is at
+0.66. A 600-token context does not lift it (0.70). That gap, and not
+re-ranking, is where an associative step could earn its place.
+
+**What this says about the claims.** The graph term lost because of how it
+was weighted and what it double-counted, not because graphs cannot help;
+calibrated, it is level with plain search, which is still not a gain. The
+larger loss was in the packer. The judged results are at the end.
+
+**Limits.** The evidence score counts a turn as found when any memory from
+it is in the context, not the right one; it is blind to everything a reader
+does. Arms that serve gists are understated (a gist is from no one turn).
+The three store sizes share the same 115 questions, so they are not three
+independent samples, and choosing settings on them is tuning on the test
+set: the judged run decides. Pooled histories mix other users' sessions in,
+which can contradict an answer, so they are for this score only. MiniLM was
+not tried.
+
+**Checks.** `make gate` passed on this tree (8 of 8); 300 Rust tests, 111
+SDK tests, 20 harness tests.
+
+**Cost.** No model was asked: cached extraction and embeddings only.
+
+**Judged, 2026-10-09** (same 115 questions, judge gpt-4.1-mini, 989 judge
+requests, about $0.13 at list prices; the per-question files were under
+`target/bench/e2e` and went when `target/` was removed, so only the counts
+below are left). Each cell is questions right out of 115.
+
+| arm | committed (`shipped6`) | this batch | retrieval only (old inputs) | minute tags |
+|---|---|---|---|---|
+| `sdk_cognitive` | 66 (0.574) | 90 (0.783) | 73 (0.635) | 84 (0.730) |
+| `sdk_pack_tagged` | 71 (0.617) | 87 (0.757) | 72 (0.626) | - |
+| `sdk_cognitive_alpha1` | 70 (0.609) | 87 (0.757) | - | - |
+
+- `sdk_cognitive`, committed to this batch: 26 questions gained, 2 lost, sign
+  test p < 0.001. Of the 26, 12 are explained by the retrieval change alone and
+  14 needed the input fix. The two losses: a question about which of two gifts
+  came first (the day tags on its facts are identical, so they cannot order
+  them; the turn tags gave the reader two numbers to order by), and a charity
+  event a month ago (its fact dropped out of the context).
+- Decomposition: the retrieval change alone gives +7 (13 gained, 6 lost,
+  p = 0.17, not significant). The input fix gives +17 (19 gained, 2 lost,
+  p < 0.001); the run cannot separate its three parts (session dates,
+  time-ordered ingestion, the question's date).
+- By type, committed to this batch: temporal 9 -> 21 of 28, knowledge-update
+  10 -> 15 of 18, multi-session 16 -> 22 of 31; the other three types unchanged.
+- Minute tags are worse than date tags: 84 against 90 (1 gained, 7 lost,
+  p = 0.07). Date tags stay the default.
+- Inside the new run the graph term is 3 questions ahead of cosine-only
+  ranking (3 gained, 0 lost, p = 0.25): not significant.
+
+**Caveats.** The retrieval settings and the packer cut-off were chosen with the
+free score on these same 115 questions, so the +7 from retrieval is optimistic.
+Per-type counts are 9 to 31. One judge, one reader, one run each. The committed
+baseline was measured without dates, so it understated the shipped stack; the
+input fix corrects the harness and was not a tuned setting.
+
+**Next.** A held-out check of the retrieval settings, which needs extraction
+(paid: 13,932 requests for 30 LongMemEval-S questions, 51,562 for all 115); a
+test of tagging with both the date and the turn; then validity intervals on
+facts and the original turn kept next to its facts (sections 3 and 5).
+
+---
+
+# The write path drops a third of what users say (2026-10-09)
+
+After the judged run, 25 of 115 answers are still wrong. Sorting them by
+whether the evidence reached the context (free: saved verdicts and the cached
+extraction, no model asked) points at ingestion, not at ranking.
+
+**1. Where the 25 are lost.** 15 lack some of their evidence in the context
+and 10 have all of it (5 of those are multi-session totals and counts the
+reader got wrong). In 14 of the 15, an evidence turn that is missing produced
+no extracted fact at all: the store never held it.
+
+**2. How much the extractor drops.** Over the 120 conversations of the judged
+runs (`gpt-4.1-nano`, the cached pass every arm shares):
+
+| | messages | no fact extracted |
+|---|---|---|
+| user messages | 1,403 | 470 (33%) |
+| assistant messages | 1,403 | 311 (22%) |
+| evidence turns (`has_answer`) | 229 | 39 (17%) |
+
+34 of the 115 questions have an evidence turn with no fact. `sdk_cognitive`
+is judged right on 20 of those 34 (0.59) and on 70 of the other 81 (0.86).
+
+**3. Why.** 91% of the dropped user messages speak in the first person and
+80% end in a question mark: a statement about the user, then a request ("I
+just got my highest score in Ticket to Ride - 132 points! Anyway, back to
+Scythe..."). The prompt says to ignore questions and to return an empty list
+when there are no facts. `tsm/extractors.py` ships the same prompt, so the SDK
+loses these turns too. Two smaller losses: in about 12% of the messages that
+did yield facts, the facts share more words with the message before than with
+the message itself (the "recent context" is being extracted; a word-overlap
+heuristic, not a count), and the harness extractor reads a reply cut off at
+400 tokens as "no facts" and caches that (the SDK extractor retries and falls
+back to the message; the harness one does not).
+
+**4. This is the 0.70 ceiling.** With the store as it is, the number of
+questions with all their evidence in the context does not move with the
+budget. Keeping the user's own turn as a memory when extraction returned
+nothing removes the ceiling (457 turns; 98% of user turns are already in the
+embedding cache, so the test is free). Questions out of 115 with all their
+evidence, `sdk_cognitive`:
+
+| context | as it is | user turn kept when nothing was extracted |
+|---|---|---|
+| 150 tokens | 76 | 83 |
+| 300 tokens | 81 | 99 |
+| 600 tokens | 81 | 107 |
+| 1,500 tokens | 81 | 109 |
+| 600 tokens, 20 conversations pooled (2,500 records) | 81 | 103 |
+| 600 tokens, 40 pooled (4,900 records) | 81 | 98 |
+
+Storing every user turn next to its facts was no better (80 at 150 tokens,
+108 at 600): a turn costs about 57 tokens where a fact costs 19. At 150
+tokens the gain is small for the same reason, and multi-session questions
+lose 2. What is left at 600 tokens is assistant-side content (7 of 11): long
+assistant turns were not part of this test.
+
+**Limits.** Coverage, not judged answers: a question with all its evidence
+was judged right 0.87 of the time in the 2026-10-09 run, at 150 tokens of
+compact facts, and a reader given longer turns may do better or worse. The
+oracle variant; the pooled rows are the only check among distractors. The
+same 115 questions as everything else here. Nothing is built: the test
+patched the harness inputs in one process (`target/`, not committed).
+
+**Next.** Keep every turn as the record its facts point to and never store
+nothing for a turn with content; fix the extraction prompt (asides inside
+questions, facts taken from the context, long assistant turns in pieces) and
+re-extract (paid); let `recall()` return more when a question needs several
+facts; then judge at 150 and 600 tokens.
+
+---
+
+# Recovering the dropped turns, and how the answer is asked (2026-10-12)
+
+The entry above proposed storing something for every turn. That was built
+and judged on the same 115 questions (`sdk_cognitive`, reader and judge
+gpt-4.1-mini). It raised coverage and did not raise answers; what raised
+answers was the prompt the reader is given.
+
+**1. What was built.**
+
+- *Extraction in two passes* (`tsm/extractors.py`). The first prompt is
+  unchanged. A message of three words or more that it finds nothing in is
+  asked about again with a second prompt, which asks what the speaker
+  reveals, also inside a question (`second_look`). If that finds nothing
+  either, the message's sentences that are not questions are stored as said,
+  in pieces of about 80 tokens (`keep_unextracted`, `statements`). Each
+  prompt's replies are cached under a hash of the prompt.
+- *A reading prompt* (`tsm/reading.py`). `answer_prompt` lists the memories
+  in the order they were said and asks the model to name the notes that bear
+  on the question, settle what they add up to (a later note replaces an
+  earlier one, each item is counted once, a relative time counts from the
+  note's date) and end with one `Answer:` line. `final_answer` takes the
+  answer out.
+- *Harness.* `--extraction shipped|second|first|legacy` (the SDK extractor;
+  without the stored statements; the first prompt alone; the harness's earlier
+  extractor) and `--reader plain|notes`. `first` and `legacy` hold the same
+  facts (125.2 records a conversation, the same contexts). Results and the
+  embedding overlay are kept under `.cache/shipped_stack_eval` by default,
+  not under `target/`.
+
+**2. What the second pass recovers.** Of 2,806 messages the first prompt
+finds nothing in 779 of three words or more. The second prompt finds facts
+in 476 of them (237 user, 239 assistant); the statements of 258 more are
+stored as said (187 user, 71 assistant); 45 are left with nothing. A
+conversation's store grows from 125 records to 151 with the second prompt
+and 155 with the statements. Asking every message with the second prompt
+instead (17,021 facts) still returns nothing for 274 user messages (20%).
+
+**3. Judged.** Questions right out of 115, and questions with every
+evidence turn represented in the context (the free score).
+
+| store | context | reader | right | all evidence |
+|---|---|---|---|---|
+| first prompt only (as committed) | 150 | plain | 90 (0.783) | 76 |
+| second prompt for every message | 150 | plain | 79 (0.687) | 97 |
+| two passes | 150 | plain | 82 (0.713) | 92 |
+| first prompt only | 600 | plain | 86 (0.748) | 81 |
+| second prompt for every message | 600 | plain | 93 (0.809) | 113 |
+| two passes | 600 | plain | 92 (0.800) | 111 |
+| two passes | 600 | reading prompt | 99 (0.861) | 111 |
+
+Question by question (gained, lost, sign test):
+
+| from | to | gained | lost | p |
+|---|---|---|---|---|
+| first, 150 | two passes, 150 | 4 | 12 | 0.08 |
+| first, 150 | second for every message, 150 | 9 | 20 | 0.06 |
+| first, 600 | two passes, 600 | 10 | 4 | 0.18 |
+| first, 600 | second for every message, 600 | 12 | 5 | 0.14 |
+| first, 150 | first, 600 | 4 | 8 | 0.39 |
+| first, 150 | two passes, 600 | 11 | 9 | 0.82 |
+
+The last row of the first table has no paired test: the per-question
+verdicts of the other rows were under `target/`, which was removed before
+that run. Its contexts were rebuilt from the cached extraction and have the
+same coverage (111). By type it is 16 of 18 knowledge-update, 27 of 31
+multi-session, 8 of 11 single-session-assistant, 8 of 9 preference, 17 of 18
+single-session-user and 23 of 28 temporal.
+
+**4. What it says.**
+
+- *Coverage is not answers.* At 150 tokens the second pass puts all the
+  evidence of 16 more questions in the context and 8 fewer are answered. The
+  evidence score counts a turn as found when any memory from it is there,
+  and the memories the second pass adds are often what the user wanted at
+  the time ("The speaker is looking for ...") rather than the fact the
+  question is about. They match a question's wording well and take slots.
+  The retrieval proxy (the gold answer's most distinctive word in the
+  context) does not see the loss either: 80, 80, 81 and 80 for the four
+  stores at 150 tokens.
+- *More context does not help the plain reader.* On the same store it
+  answers 90 at 150 tokens and 86 at 600.
+- *The reader was the bottleneck.* Of the 23 the plain reader got wrong at
+  600 tokens, about 13 had the facts in the context: the older of two
+  values, a total missing an item, a duration computed wrong. The reading
+  prompt answers 99 on the same store and budget.
+- *What is left* (16 wrong): 8 with the facts in the context (two values
+  said on one day, which date tags cannot order; a total and an average
+  whose facts do not say which workshop or degree they are about; a
+  subtraction; a count of flights), 3 missing a fact, 2 replies cut off at
+  500 tokens before the answer line (the harness allows 800 now; a third
+  cut-off reply was still judged right), 2 that give the gold answer and
+  were marked wrong, 1 that asks about jewelry where the conversation has a
+  chandelier.
+
+**5. The retrieval settings of 2026-10-07 on questions they were not chosen
+on (free).** The cached first-prompt extraction turned out to cover all 500
+conversations of the oracle file: 470 questions that are not abstentions,
+of which the settings were chosen on the first 115. Questions with all
+their evidence in a 150-token context, same store in every row:
+
+| | the 115 | the other 355 |
+|---|---|---|
+| shipped (`sdk_cognitive`) | 76 | 256 (0.721) |
+| plain search, same packer (`sdk_pack_tagged`) | 75 | 257 |
+| the fixed boost it replaced (`cognitive_alpha=0.5`, concept bonus 0.75, no fan normalization) | 68 | 248 |
+| shipped, with the packer's earlier cut-off (0.72) | 69 | 246 |
+
+On the 355, question by question: the 0.95 cut-off against 0.72 gains 11
+and loses 1 (p = 0.006; 14 and 2 by the retrieval proxy, p = 0.004); the
+calibrated graph term against the fixed boost gains 11 and loses 3
+(p = 0.06); against plain search it gains 0 and loses 1. The packer change
+and the calibration hold where they were not tuned, and cognitive search is
+level with plain search there too, which is still not a gain. This is
+coverage, and section 4 shows how far coverage can be from answers when the
+store changes; in these rows the store is the same and only the selection
+differs, which is the case the score was checked against judged runs for.
+Seven texts had no cached embedding (the runs were offline) and got a
+stand-in vector, the same in every row.
+
+**Limits.** These are the 115 questions everything here has been tuned on,
+and the reading prompt was written after reading what they got wrong: 0.861
+is an upper estimate. One run of each setting, one judge, and the judge is
+the model that answers. The first prompt alone was not run with the reading
+prompt, so the 99 cannot yet be split between the store and the prompt.
+Two things changed after these runs and are not in the numbers. The harness
+gave the reading prompt the memories as bare strings, so those of one day
+were listed by rank; it now passes each memory's turn, as `recall()` results
+carry it, and they are listed in the order they were said. And a stored
+statement no longer keeps a list number whose question was removed ("1."
+on a line of its own), nor loses the number of the item it starts. The
+extractor's defaults (both recovery steps on) are therefore not settled: at
+150 tokens with the plain reader they score 8 questions lower.
+
+**Cost.** 2,856 extraction requests (gpt-4.1-nano, about $0.64), about
+16,700 embedded texts ($0.01) and 1,308 judge requests (600k tokens in, 42k
+out, about $0.31): about $0.96 at list prices.
+
+**Next.** (1) A held-out check: the cached first-prompt extraction covers
+all 500 conversations of the oracle file, so the 355 questions nothing was
+tuned on can be judged for the price of the judge (about 710 requests a
+setting). (2) The paired grid on the 115 (store, budget, reader) to settle
+the extractor's defaults. (3) The second prompt for the other 380
+conversations (about 2,700 requests), then the two-pass store held-out.
+After that: facts that say what they are about, an order within a day, and
+totals computed in code rather than by the reader.
+
+
+# A local stack: EmbeddingGemma 2 against MiniLM and the OpenAI vectors (2026-10-19)
+
+`Improvements.md` proposes EmbeddingGemma 2 as the embedder, a ternary
+Bonsai model as the local verifier, and consolidation while the memory is
+idle. This entry measures what can be measured on this machine (RTX 3050
+Laptop 4 GB, PyTorch 2.8, sentence-transformers 6.1) before any of it
+becomes a default. The shipped defaults do not change: the embedder is still
+OpenAI's, `embedder="gemma"` and `idle_consolidation_secs` are opt-in. The one
+change that reaches every user is that a database now records which embedder
+wrote it and refuses another (section 7).
+
+**1. Setup.** The free evidence score of `shipped_stack_eval.py` (for how many
+of the 115 non-abstention questions of the first 120 every evidence turn is in
+a 150-token context; no network, no judge), now with `--local-embedder MODEL`
+so the same score runs on a local model. Same cached extraction facts, same
+packer in every row; only the vectors differ. One history is the 120
+conversations separately (about 125 records each); `--pool 20` and `--pool 40`
+put 20 or 40 conversations in one store, so most of it is distractors, and 40
+(about 5,000 records) is past the 4,096-record exact scan. Exact paired tests
+against the OpenAI row. The OpenAI baseline reproduces the documented 75 and
+76 exactly.
+
+```
+python benchmarks/cognitive_eval/shipped_stack_eval.py --offline --limit 120 --arms sdk_pack_tagged,sdk_cognitive --pool N --local-embedder google/embeddinggemma-2
+```
+
+**2. Retrieval (free).** Questions with all their evidence in the context,
+`sdk_pack_tagged` / `sdk_cognitive`:
+
+| embedder | one history | pool 20 | pool 40 |
+|---|---|---|---|
+| OpenAI `text-embedding-3-small`, 1536-d, API | 75 / 76 | 74 / 74 | 68 / 68 |
+| `embeddinggemma-2`, text only, 768-d, local | 76 / 77 | 72 / 72 | 67 / 68 |
+| `embeddinggemma-2`, query prompt `QuestionAnswering` | 76 / 74 | | |
+| `all-MiniLM-L6-v2`, 384-d, local | 73 / 72 | 69 / 71 | 61 / 63 |
+
+Share of the evidence turns present at pool 40: 0.717 / 0.713 (OpenAI),
+0.731 / 0.732 (Gemma), 0.692 / 0.699 (MiniLM). Gemma against OpenAI: a net
+difference of 2 questions or less at every size (up to 5 questions go each
+way), p of 0.62 or more. MiniLM against OpenAI: 2 to 7 questions behind at
+every size, most at pool 40 (`sdk_pack_tagged` 61 against 68, p = 0.07; the
+other rows p of 0.12 to 0.62): suggestive, not settled on 115 questions. The
+`QuestionAnswering` prompt did not help (`sdk_cognitive` 74 against 77 for the
+default query prompt, `sdk_pack_tagged` 76 for both), so the default stays.
+In short, a 270M local text model with 768 dimensions retrieves as well as
+the 1536-dimension API vectors on this score, which is what the blueprint
+needed to be true and had not shown.
+
+**3. Cost.** Same machine, 16 CPU threads. Single text, a 256-text batch and
+GPU memory for the model; then through `Memory` on a 2,000-fact store
+(passthrough extractor):
+
+| | 1 text | 256 batch | texts/s | VRAM |
+|---|---|---|---|---|
+| MiniLM cuda | 10 ms | 118 ms | 2169 | 95 MB |
+| MiniLM cpu | 12 ms | 497 ms | 516 | |
+| Gemma bf16 cuda | 125 ms | 1214 ms | 211 | 519 MB |
+| Gemma fp32 cuda | 94 ms | 1850 ms | 138 | 1036 MB |
+| Gemma fp32 cpu | 115 ms | 10716 ms | 24 | |
+
+| through `Memory` | bulk add of 2,000 | add one message | `recall(top_k=10)` | `recall(token_budget=150)` |
+|---|---|---|---|---|
+| MiniLM | 1.3 s | 10 ms | 15 ms | 34 ms |
+| Gemma bf16 | 9.5 s | 101 ms | 125 ms | 252 ms |
+
+The blueprint's "under 5 ms to embed" is not met: a short text costs 94 to
+125 ms through Gemma on the GPU and 115 ms on the CPU (a 400-token one 138 ms
+and 794 ms), so most of it is a fixed per-call cost; on the GPU the marginal
+text in a batch is 4.7 ms. Two consequences. A
+budgeted `recall()` costs twice a plain one, because the packer embeds the
+whole candidate pool again for its redundancy check although the engine has
+those vectors; the engine has no call that returns stored vectors, and adding
+one would halve this (open). And ingestion has to batch. The 525 MB of GPU
+memory for the text model (644 MB peak) matches the blueprint's 600 MB; the
+card's 740M parameters is the model with its image and audio encoders, which
+the adapter does not load.
+
+**4. A new embedder invalidates the belief thresholds.** The profile's 0.85
+and 0.75 were tuned on other vectors. `belief_pairs_eval.py --split test
+--verifier none` (127 held-out pairs, 54 updates, 58 still-true):
+
+| embedder | updates caught | still-true marked stale |
+|---|---|---|
+| MiniLM (the documented 16 and 8, reproduced) | 16 of 54 | 8 of 58 |
+| Gemma, profile thresholds 0.85 / 0.75 | 30 of 54 | **30 of 58** |
+| Gemma, 0.92 / 0.86 | 18 of 54 | 7 of 58 (9 in one store) |
+
+A sweep on the dev split (0.85/0.75 to 0.96/0.93) only trades recall for
+precision: at 0.92 / 0.86 Gemma behaves like MiniLM at its own thresholds, and
+no setting beats it (the dev and test halves differ, so "similar to", not
+"equal to"), which is the old finding that geometry alone cannot separate an
+update from a second fact. What this costs retrieval, `sdk_belief`
+(detection on, no verifier) against `sdk_cognitive` (detection off), questions
+with all their evidence present:
+
+| | one history | pool 40 |
+|---|---|---|
+| OpenAI, 0.85 / 0.75 | 74 against 76 | 65 against 68 |
+| Gemma, 0.85 / 0.75 | **68 against 77** (loses 10, wins 1, p = 0.012) | 64 against 68 |
+| Gemma, 0.92 / 0.86 | 76 against 77 (p = 1.0) | 70 against 68 |
+
+With another embedder's vectors the profile's detection quietly costs a tenth
+of the questions. An embedder may now declare `engine_defaults`, applied under
+the conversational profile and below any explicit `Memory(...)` argument;
+EmbeddingGemma 2 declares 0.92 / 0.86. Chosen on the dev pairs and the 115
+questions, confirmed on the held-out pairs (row 3 above); the retrieval row
+is therefore an upper estimate. The verified path is unaffected: a
+verifier decides what is committed.
+
+**5. Verifier.** Ternary-Bonsai-2 could not be run: its weights are not on
+this machine (the Hugging Face cache holds the repository's `USAGE.md` only),
+and the compact formats need PrismML's llama.cpp fork. `LLMVerifier(base_url=...)`
+already talks to such a server, and `belief_pairs_eval.py --verifier llm
+--llm-base-url ... --llm-model ... --embed-model google/embeddinggemma-2` is
+the whole evaluation. A stand-in that is cached, `LiquidAI/LFM2.5-1.2B-Instruct`
+(new `--llm-local MODEL`, which runs a causal LM in the process), is not
+usable: on 20 update and 20 still-true dev pairs it scored 19 of 40 with the
+shipped prompt (0 of 20 updates), and 20 to 23 of 40 with a prompt that
+shows the reply format, at any batch size: chance. It also sometimes answers
+with the verdict words instead of numbered lines, which shows up in the
+harness as a verifier that catches almost nothing (2 of 54 in the first full
+run); it now prints how many pair judgments got no readable verdict
+(`LLMVerifier.unresolved_total`).
+This says nothing about a 4B model (`qwen3.5:4b` catches 48 to 49 of 54 on
+the same pairs, `docs/python_sdk.md`), only that the verifier needs one of
+that size.
+
+**6. Idle consolidation.** `Memory(idle_consolidation_secs=N)` runs
+`consolidate()` (verification, supersession, per-user compaction) in a thread
+after N idle seconds with something written since the last pass. Tested with a
+real engine and fake verifiers (13 tests): it runs once idle, stays out while
+`recall()` / `add()` are in use, does nothing when nothing was written,
+consolidates a reopened store, retries a failed pass and a pass a verifier
+could not finish (`LLMVerifier.unresolved`), is stopped by `close()` (which
+waits for a running pass), and leaves memories alone on failure. Not
+measured against a real provider or a live workload.
+
+**7. Changed in the SDK.** `encode_query` / `encode_document` (optional) and
+a `fingerprint`; `Memory` records the embedder in `tsm_embedder.json` and
+refuses another (`EmbedderMismatchError`), because two models of one
+dimension return wrong results with no error (a subprocess test caught the
+first fingerprint, which included the module path and made one embedder look
+like two); `SentenceTransformerEmbedder` handles prompts, Matryoshka
+truncation, text-only loading, a bfloat16/float32 guard, an 8,192-token bound
+(sentence-transformers reports none) and a load-time probe; `tsm[gemma]` and
+`tsm[colbert]` extras (the old extras allowed sentence-transformers 2.2,
+which has neither model). No Rust changed.
+
+**Limits.** One machine, one GPU. The 115 questions are the ones everything
+has been tuned on, and the facts are the OpenAI extractor's, so a local stack
+also needs a local extractor, which is unmeasured (`OpenAIExtractor(client=...)`
+takes any chat client). The score is coverage, not answers, and section 4 of
+the entry of 2026-10-12 shows how far those can be apart; no judged run was
+made. Single runs, no repeats, and 115 questions detect only large
+differences (the one clear result is the belief cost, p = 0.012). The
+thresholds were chosen on the same questions the retrieval row measures.
+
+**Next.** (1) Bonsai: download the weights and PrismML's llama.cpp build, serve
+it, run the command in section 5 on both layouts and with `--embed-model
+google/embeddinggemma-2`. (2) A judged run with the Gemma store
+(`--local-embedder`, `--judge openai`) to see whether the coverage tie holds
+for answers. (3) An engine call that returns stored vectors, so the packer
+stops re-embedding the pool. (4) A local extractor and its extraction score.
+(5) A migration that rebuilds a database under a new embedder (re-ingest in
+insert order; `update()` would reorder history), only if (2) says the switch
+is worth it.
+
+---
+
+# Bonsai 2 4B: local verifier and SDK integration measured (2026-10-19)
+
+Follow-up to the local-stack entry above. With permission to download the
+weights and runtime, `Ternary-Bonsai-2-4B-PQ2_0` now runs locally through the
+existing SDK. No SDK, verifier prompt, harness, or Rust behavior was changed
+for these measurements. Bonsai remains an opt-in verifier: update detection
+improves substantially, but false supersessions remain material.
+
+**Pinned setup.** Windows, Python 3.12.0, RTX 3050 Laptop GPU (4 GB), 16 GB RAM,
+PyTorch 2.8.0+cu126, sentence-transformers 6.1.0. The model is the
+[Prism PQ2 file](https://huggingface.co/prism-ml/Ternary-Bonsai-2-4B-gguf/tree/8d6557168168f91ea6697a4a49ed2ef622b53adb),
+revision `8d6557168168f91ea6697a4a49ed2ef622b53adb`, 1,146,465,120 bytes.
+SHA-256:
+`d406b1e912c0d2a4c124ad10bf38a76ae662fdc4d24b176451403dc7b7f30409`.
+The runtime is Prism release
+[`prism-b10777-e3de715`](https://github.com/PrismML-Eng/llama.cpp/releases/tag/prism-b10777-e3de715),
+`llama-prism-b10777-e3de715-bin-win-cuda-12.4-x64.zip` (313,951,324 bytes;
+SHA-256 `fa5874a1412e251a6efb13f289e97bacbbb4e7fc6714c1836b4fc6c1dc863462`).
+Both hashes matched their published values. The installed CUDA 12.6 runtime
+DLLs worked with this build; no additional CUDA package was needed. No vision
+projector, speculative draft model, or MTP model was loaded.
+
+**Held-out results.** `belief_pairs_eval.py --split test --layout both`, the
+shipped conversational profile and verifier prompt, greedy decoding,
+`enable_thinking=false`, seed 42, batch size 8, output limit 1,024 tokens,
+candidate floor 0.45 and the verifier's normal margin/per-record limits. The
+127 held-out pairs contain 54 updates, 58 coexisting pairs and 15 rewordings;
+the rewordings are not scored.
+
+| Embedder | Verifier | Scope layout | Updates caught / 54 | Coexisting old facts marked stale / 58 | Newer facts marked stale | Precision |
+|---|---|---|---:|---:|---:|---:|
+| MiniLM | none | isolated | 16 | 8 | 0 | 0.667 |
+| MiniLM | none | mixed | 16 | 8 | 0 | 0.667 |
+| MiniLM | Bonsai | isolated | 49 | 7 | 0 | 0.875 |
+| MiniLM | Bonsai | mixed | 48 | 10 | 1 | 0.814 |
+| EmbeddingGemma 2 | none | isolated | 18 | 7 | 0 | 0.720 |
+| EmbeddingGemma 2 | none | mixed | 18 | 9 | 0 | 0.667 |
+| EmbeddingGemma 2 | Bonsai | isolated | 54 | 7 | 0 | 0.885 |
+| EmbeddingGemma 2 | Bonsai | mixed | 50 | 19 | 4 | 0.685 |
+
+Three of MiniLM's ten mixed-layout coexisting supersessions, and eleven of
+Gemma's nineteen, came from another pair's statement. The mixed corpus puts
+independently written first-person histories into one scope; some cross-pair
+conflicts are real and not covered by its pair labels. Report those counts
+separately rather than treating every cross-pair supersession as a proven
+model error. The isolated result still has seven false supersessions out of
+58 coexisting pairs. All older facts remain stored; supersession marks and
+demotes them, and a verified flag changes the context a reader sees.
+
+The same verdict cache was reused across layouts and then from MiniLM to
+Gemma, so identical text pairs retain the same model decision; these are not
+independent fresh-cache repetitions. Calls for isolated/mixed layouts were
+15/10 with MiniLM and 2/27 additional calls with Gemma. Every held-out pair
+judgment returned a readable verdict (zero unresolved in all four runs).
+This measures end-to-end proposal plus verification, not standalone model
+classification or judged answers on LongMemEval.
+
+**Development and output limits.** With MiniLM, `--split dev` caught 46/56
+updates and marked 8/62 coexisting facts stale in isolated scopes; mixed was
+49/56 and 12/62 (plus one newer fact). A preliminary 512-token limit cut two
+replies; it left four mixed-layout judgments without readable verdicts.
+Increasing the limit to 1,024 on dev did not change the outcome counts or
+eliminate those four unreadable judgments. That setting was fixed before the
+final held-out run; an earlier incomplete 512-token test attempt was stopped
+and is not reported as a completed evaluation. No prompt or decision
+threshold was tuned on the held-out results.
+
+**Memory and latency.** Peak sampled GPU usage was 2,201 MiB (about 2.15 GiB)
+with Gemma and Bonsai loaded, within this card's 4 GB. The initial four-pair
+smoke request took 6.86 s, generating 204 tokens at 39.4 tokens/s. Across all
+completed local requests, including setup/dev runs and cache pressure,
+generation ranged from about 13 to 61 tokens/s; this is not a controlled
+latency benchmark. Some requests generated 1,024 tokens despite the prompt
+asking for short verdict lines.
+
+Host RAM is a separate constraint. The runtime's `--cache-ram` default is
+8,192 MiB: during the long run its private memory reached about 11.24 GB
+(working set 5.41 GB), leaving less than 0.8 GB of free physical RAM on this
+16 GB machine. The belief runs above completed with that default. The server
+was then restarted with `--cache-ram 128` for the live SDK smoke check; after
+that check its private memory was about 2.87 GB, working set 1.95 GB. This
+bounded configuration was not rerun through the full belief matrix. Weight
+file size, GPU use, host RAM, and total store size are different quantities;
+these results do not establish the blueprint's complete 2.5 GB budget.
+
+**Live SDK checks.** With Gemma and Bonsai, `idle_consolidation_secs=1`
+committed a Tuesday-to-Wednesday correction in about 2.5 s including idle
+time, kept a different user's Friday meeting unchanged, returned only the
+requested user's memories, marked the old context as earlier, and closed
+and reopened the store with all three records retained. There were no
+unresolved judgments. `OpenAIGistSummarizer` through the same local endpoint
+returned separate first-dog/2016 and second-dog/2021 facts plus the peanut
+allergy, and dropped generic food-journal advice (30 output tokens, about
+0.71 s). These are integration smoke checks, not an evaluation of summary
+fidelity, long-running concurrency, or compaction answer quality.
+
+**Reproduce.** Download the pinned model and release above, then start the
+server (use the full executable/model paths on Windows):
+
+```bash
+llama-server -m Ternary-Bonsai-2-4B-PQ2_0.gguf -ngl 99 -fa on \
+  -c 8192 -np 1 -t 6 --host 127.0.0.1 --port 18080 \
+  --alias bonsai-2-4b-pq2 --jinja --cache-ram 128
+```
+
+`--cache-ram 128` is the bounded SDK setup; omit it only when reproducing
+the original belief runs' runtime configuration. With Python 3.12, run the
+following for MiniLM and then repeat with `--embed-model
+google/embeddinggemma-2`. Reuse the same `--llm-cache` directory for the
+shared-cache protocol above; use a fresh directory when weights, prompt,
+or decoding settings change. Model thinking is disabled explicitly because
+its default thinking mode can spend thousands of tokens before answering.
+
+```bash
+python benchmarks/cognitive_eval/belief_pairs_eval.py \
+  --split test --layout both --verifier llm \
+  --llm-base-url http://127.0.0.1:18080/v1 --llm-model bonsai-2-4b-pq2 \
+  --llm-batch 8 --llm-cache /path/to/bonsai-verdict-cache \
+  --llm-arg max_tokens=1024 \
+  --llm-arg 'extra_body={"chat_template_kwargs":{"enable_thinking":false},"seed":42}' \
+  --show errors --json /path/to/bonsai-test.json
+```
+
+**Artifacts and decision.** Pinned metadata, binaries/model, hashes, exact
+commands, stdout, JSON results, GPU telemetry and `sdk-smoke.json` are retained
+under `D:/personal-projects/.scratch_tsm/bonsai-20261019/`; `report.json` collects
+the measurements. The local test server and telemetry process were stopped
+afterward and GPU usage returned to zero. All inference was local. This
+follow-up changes documentation only, so no extension rebuild or gate was
+run; it does not replace the required gate for SDK/cognitive behavior changes.
+Keep Bonsai and idle consolidation opt-in. Improve/measure precision on
+realistic shared histories and constrain the verdict protocol before making
+verified supersession automatic. Gist quality and judged LongMemEval answers
+remain separate evaluations.

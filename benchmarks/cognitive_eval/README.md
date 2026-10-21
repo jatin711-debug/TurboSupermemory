@@ -144,6 +144,27 @@ python benchmarks/cognitive_eval/shipped_stack_eval.py --offline --limit 5
 #     An interrupted run started again with the same --out continues after the last finished
 #     conversation and keeps the verdicts it already paid for. --reuse a.json,b.json takes
 #     verdicts for identical contexts from earlier runs; --arms picks arms (see the docstring).
+#     A free retrieval score, no network: for how many questions the turns the dataset marks as
+#     evidence are all in the context (needs `benchmark_datasets/download.py --official oracle`).
+#     --config adds an arm with any engine setting; --pool N builds each history from N
+#     conversations, so most of the store is distractors.
+python benchmarks/cognitive_eval/shipped_stack_eval.py --offline --limit 120 --arms sdk_pack_tagged,sdk_cognitive --config gw25:graph_weight=0.25
+python benchmarks/cognitive_eval/shipped_stack_eval.py --offline --limit 120 --pool 20 --arms sdk_pack_tagged,sdk_cognitive
+#     --local-embedder MODEL embeds with a local sentence-transformers model instead of the
+#     cached OpenAI vectors, so the same score needs no network or key (set HF_HUB_OFFLINE=1
+#     once the model is cached). --local-embedder-opt KEY=VALUE passes an argument of
+#     tsm.embedders.SentenceTransformerEmbedder (JSON value). Vectors are cached in
+#     --work-dir/embeddings_local by the embedder's fingerprint; an interrupted run resumes
+#     only with the same embedder.
+python benchmarks/cognitive_eval/shipped_stack_eval.py --offline --limit 120 --arms sdk_pack_tagged,sdk_cognitive --local-embedder google/embeddinggemma-2 --local-embedder-opt 'query_prompt_name="QuestionAnswering"'
+#     --extraction picks whose facts the arms get: the SDK extractor (shipped, the default),
+#     the same without its stored statements (second) or without its second prompt (first),
+#     or the harness's earlier extractor (legacy). --reader notes asks the answering model
+#     with the SDK's prompt (tsm.reading) instead of the plain one. To read saved contexts
+#     another way without building the stores again: --rejudge run.json --reader notes.
+#     Verdicts, gists and embeddings fetched along the way are kept in --work-dir
+#     (default .cache/shipped_stack_eval, not under target/, which `cargo clean` removes).
+python benchmarks/cognitive_eval/shipped_stack_eval.py --limit 120 --arms sdk_cognitive --token-budget 600 --reader notes --out notes600.json
 
 # 2. Run the 50-Conversation Head-to-Head Evaluation
 python benchmarks/cognitive_eval/head_to_head_eval.py --limit 50 --systems tsm,mem0,naive --token-budget 150 --tsm-embedder openai --embed-model text-embedding-3-small --extractor mock --judge openai --judge-model gpt-4o-mini

@@ -107,12 +107,31 @@ class OpenAIJudge:
                 time.sleep(wait)
         raise RuntimeError("OpenAI call failed after retries")
 
-    def answer(self, question, memories):
-        """Answer `question` using only `memories` (list of snippet strings)."""
+    def answer(self, question, memories, today=None, reader="plain", turns=None):
+        """Answer `question` using only `memories` (list of snippet strings).
+
+        `today` is the date the question is asked, when the dataset gives one:
+        "a month ago" or "last week" cannot be resolved without it.
+
+        `reader="notes"` asks with the SDK's own prompt (`tsm.reading`): the
+        memories in the order they were said, and the model lists what
+        matters and works the answer out before giving it. `turns` is the
+        turn each memory is from, which `recall()` results carry: it orders
+        the memories of one day."""
         if not memories:
             return "NO ANSWER"
+        if reader == "notes":
+            from tsm.reading import answer_prompt, final_answer
+
+            if turns and len(turns) == len(memories):
+                memories = [{"context": m, "turn_index": t} for m, t in zip(memories, turns)]
+            system, user = (m["content"] for m in answer_prompt(question, memories, today))
+            # Replies average about 200 tokens; at 500, three of 115 were cut off
+            # before their answer line (a question over many notes).
+            return final_answer(self._chat(system, user, max_tokens=800)) or "NO ANSWER"
         ctx = "\n".join(f"{i + 1}. {m}" for i, m in enumerate(memories) if m)
-        user = f"Memories:\n{ctx}\n\nQuestion: {question}\nAnswer:"
+        when = f"Current date: {today}\n" if today else ""
+        user = f"Memories:\n{ctx}\n\n{when}Question: {question}\nAnswer:"
         return self._chat(_ANSWER_SYS, user, max_tokens=100)
 
     def judge(self, question, gold, prediction):

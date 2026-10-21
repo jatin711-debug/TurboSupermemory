@@ -49,7 +49,9 @@ def download_file(url: str, dest: Path, timeout: int = 120) -> bool:
 def download_longmemeval(force: bool = False) -> Optional[Path]:
     """Download LongMemEval dataset from HuggingFace.
 
-    Uses the official MemoryAsModality/LongMemEval dataset.
+    Uses the MemoryAsModality/LongMemEval parquet copy, which is the
+    benchmark's oracle variant (each question with its evidence sessions
+    only). ``download_longmemeval_official`` fetches the official files.
     """
     data_dir = get_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -77,6 +79,37 @@ def download_longmemeval(force: bool = False) -> Optional[Path]:
             return None
 
     print(f"LongMemEval dataset downloaded to {dataset_dir}")
+    return dataset_dir
+
+
+def download_longmemeval_official(variants=("oracle",), force: bool = False) -> Optional[Path]:
+    """Download official LongMemEval files (xiaowu0162/longmemeval-cleaned).
+
+    ``oracle`` (15 MB) is the parquet copy's questions with what that copy
+    lacks: the question date and a ``has_answer`` flag on every evidence turn.
+    ``s`` (277 MB) has about 40 sessions and 115k tokens of history per
+    question, ``m`` (2.7 GB) about 500 sessions.
+    """
+    try:
+        from .longmemeval import OFFICIAL_DIR, OFFICIAL_FILES
+    except ImportError:  # run as a script
+        from longmemeval import OFFICIAL_DIR, OFFICIAL_FILES
+
+    dataset_dir = get_data_dir() / OFFICIAL_DIR
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    base_url = "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main"
+    for variant in variants:
+        if variant not in OFFICIAL_FILES:
+            print(f"Unknown LongMemEval variant {variant!r} (use {', '.join(OFFICIAL_FILES)})")
+            return None
+        fname = OFFICIAL_FILES[variant]
+        dest = dataset_dir / fname
+        if dest.exists() and not force:
+            print(f"{fname} already exists, skipping.")
+            continue
+        if not download_file(f"{base_url}/{fname}", dest, timeout=600):
+            print(f"Failed to download {fname}")
+            return None
     return dataset_dir
 
 
@@ -114,6 +147,8 @@ def download_all(force: bool = False) -> dict:
     print("Downloading LongMemEval dataset...")
     print("=" * 60)
     results["longmemeval"] = download_longmemeval(force=force)
+    # Small, and it carries the evidence labels and question dates.
+    results["longmemeval_official"] = download_longmemeval_official(("oracle",), force=force)
 
     print("\n" + "=" * 60)
     print("Downloading LoCoMo dataset...")
@@ -136,9 +171,19 @@ if __name__ == "__main__":
         default="all",
         help="Which dataset to download",
     )
+    parser.add_argument(
+        "--official",
+        default=None,
+        metavar="VARIANTS",
+        help="Download official LongMemEval files instead: a comma-separated list of "
+             "oracle (15 MB), s (277 MB), m (2.7 GB)",
+    )
     args = parser.parse_args()
 
-    if args.dataset == "all":
+    if args.official:
+        variants = [v.strip() for v in args.official.split(",") if v.strip()]
+        download_longmemeval_official(variants, force=args.force)
+    elif args.dataset == "all":
         download_all(force=args.force)
     elif args.dataset == "longmemeval":
         download_longmemeval(force=args.force)

@@ -41,6 +41,10 @@ The pairs are split in half by position within each category. Tune on
     # ... or any OpenAI-compatible server, here a local Ollama one
     python benchmarks/cognitive_eval/belief_pairs_eval.py --verifier llm \
         --llm-base-url http://localhost:11434/v1 --llm-model qwen3.5:4b
+    # ... or a causal LM from the Hugging Face cache, run in this process (no
+    # server; see local_chat.py)
+    python benchmarks/cognitive_eval/belief_pairs_eval.py --verifier llm \
+        --llm-local LiquidAI/LFM2.5-1.2B-Instruct
 """
 
 import argparse
@@ -160,6 +164,16 @@ def report(outcomes, title):
             "wrong": wrong, "wrong_by_other_pair": cross}
 
 
+_LOCAL_CLIENTS = {}
+
+
+def local_client(factory, model_name):
+    """One in-process chat model per run: both layouts share it."""
+    if model_name not in _LOCAL_CLIENTS:
+        _LOCAL_CLIENTS[model_name] = factory(model_name)
+    return _LOCAL_CLIENTS[model_name]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--split", choices=("dev", "test", "all"), default="dev")
@@ -167,6 +181,9 @@ def main():
     ap.add_argument("--verifier", choices=("none", "nli", "llm"), default="none")
     ap.add_argument("--llm-model", default="gpt-4o-mini")
     ap.add_argument("--llm-base-url", help="OpenAI-compatible server (default: OpenAI)")
+    ap.add_argument("--llm-local", metavar="MODEL",
+                    help="run this Hugging Face causal LM in-process instead of calling a "
+                         "server (sets --llm-model to its name)")
     ap.add_argument("--llm-batch", type=int, default=8, help="candidate pairs per request")
     ap.add_argument("--llm-cache", help="directory for the verdict cache")
     ap.add_argument("--llm-arg", action="append", metavar="KEY=VALUE",
@@ -186,12 +203,14 @@ def main():
                     help="MemoryEngine option override (JSON value), repeatable")
     ap.add_argument("--show", choices=("none", "errors"), default="none",
                     help="print the pairs that were decided wrongly")
+    ap.add_argument("--embed-model", default="sentence-transformers/all-MiniLM-L6-v2",
+                    help="SentenceTransformer embedding model name")
     ap.add_argument("--json", help="write the summary here")
     args = ap.parse_args()
 
     from tsm.embedders import SentenceTransformerEmbedder
 
-    embedder = SentenceTransformerEmbedder()
+    embedder = SentenceTransformerEmbedder(args.embed_model)
     pairs = load_pairs(args.split)
     overrides = parse_overrides(args.set)
     summary = {}
@@ -204,7 +223,14 @@ def main():
         elif args.verifier == "llm":
             from tsm.verification import LLMVerifier
 
-            if not args.llm_base_url:
+            local = None
+            if args.llm_local:
+                sys.path.insert(0, HERE)
+                from local_chat import LocalChatClient
+
+                local = local_client(LocalChatClient, args.llm_local)
+                args.llm_model = args.llm_local
+            elif not args.llm_base_url:
                 # OpenAI itself: the key comes from the environment or the
                 # gitignored key file, never from the command line.
                 sys.path.insert(0, HERE)
@@ -220,12 +246,15 @@ def main():
             if args.margin is not None:
                 options["candidate_margin"] = None if args.margin < 0 else args.margin
             verifier = LLMVerifier(model=args.llm_model, base_url=args.llm_base_url,
-                                   batch_size=args.llm_batch, cache_dir=args.llm_cache,
+                                   client=local, batch_size=args.llm_batch, cache_dir=args.llm_cache,
                                    request_timeout=600.0,
                                    request_kwargs=parse_overrides(args.llm_arg), **options)
         outcomes, committed = run(pairs, layout, verifier, overrides, embedder, args.rounds)
         if args.verifier == "llm":
-            print(f"\n  [{verifier.calls} requests to {args.llm_model} so far]")
+            lost = verifier.unresolved_total
+            print(f"\n  [{verifier.calls} requests to {args.llm_model} so far; {lost} pair "
+                  f"judgments got no readable verdict"
+                  f"{' - the model is not following the reply format' if lost else ''}]")
         summary[layout] = report(
             outcomes,
             f"split={args.split} layout={layout} verifier={args.verifier} "
