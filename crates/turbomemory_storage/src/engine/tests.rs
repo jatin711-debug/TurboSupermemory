@@ -10,6 +10,7 @@ fn small_config(dim: usize) -> StoreConfig {
         ef_construction: 100,
         search_list_size: 5,
         cognitive_alpha: 1.0,
+        graph_weight: None,
         outlier_count: 0,
         initial_capacity: 16,
         tier: TierConfig {
@@ -70,6 +71,7 @@ fn hnsw_test_config(dim: usize) -> StoreConfig {
         ef_construction: 100,
         search_list_size: 10,
         cognitive_alpha: 1.0,
+        graph_weight: None,
         outlier_count: 0,
         initial_capacity: 4096,
         tier: TierConfig {
@@ -516,6 +518,102 @@ fn graph_state_survives_restart_via_binary_snapshot() {
         .iter()
         .any(|e| e.last_reinforced_at == 1234);
     assert!(reinforced, "reinforcement timestamp should survive restart");
+}
+
+/// With `graph_weight` the graph boost is a share of the cosine spread among
+/// the candidates, so it reorders close calls and cannot outvote the
+/// embedding; the fixed `cognitive_alpha` boost can.
+#[test]
+fn graph_weight_scales_the_boost_to_the_cosine_spread() {
+    let order = |alpha: f32, graph_weight: Option<f32>| {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = small_config(8);
+        config.cognitive_alpha = alpha;
+        config.graph_weight = graph_weight;
+        let engine = StorageEngine::open(tmp.path(), config).unwrap();
+        let put = |id: &str, text: &str, x: f32, concepts: &[String]| {
+            let v = [x, (1.0 - x * x).sqrt(), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+            engine.insert(id, text, &v, 1.0, concepts).unwrap();
+        };
+        put("near", "alpha", 1.0, &[]);
+        put("mid", "beta", 0.9, &[]);
+        // Farthest by cosine, but it repeats the query's word.
+        put("far", "garden garden shed", 0.8, &["garden".to_string()]);
+        let query = [1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        engine.search("garden", &query, 3).unwrap().unwrap()
+    };
+    let ids = |hits: &[(String, f32)]| hits.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+
+    // Fixed boost of up to 0.5: the word match outvotes a 0.2 cosine lead.
+    assert_eq!(ids(&order(0.5, None))[0], "far");
+    // A weight of zero is cosine ranking, whatever alpha says.
+    let cosine = order(0.5, Some(0.0));
+    assert_eq!(ids(&cosine), ["near", "mid", "far"]);
+    assert!((cosine[2].1 - 0.8).abs() < 1e-4);
+    // Half the spread (0.2) at most: "far" gains less than 0.1 and stays last.
+    let scaled = order(0.5, Some(0.5));
+    assert_eq!(ids(&scaled), ["near", "mid", "far"]);
+    assert!(scaled[2].1 > 0.8 + 1e-3 && scaled[2].1 < 0.9);
+    // The whole spread: it can now pass "mid" (0.9) but a saturating signal
+    // never quite adds the full 0.2, so "near" (1.0) keeps its place.
+    let full = order(0.5, Some(1.0));
+    assert_eq!(ids(&full)[0], "near");
+    assert!(full.iter().find(|(id, _)| id == "far").unwrap().1 < 1.0);
+}
+
+/// A search does not change what the next search returns unless rehearsal is
+/// switched on; `reinforce` does it for the memories a caller names.
+#[test]
+fn search_reinforces_only_when_asked_to() {
+    let reinforced = |engine: &StorageEngine, id: &str| {
+        let graph = engine.graph.read();
+        graph
+            .graph()
+            .neighbors(&turbomemory_graph::NodeId::memory(id).as_str())
+            .iter()
+            .any(|e| e.last_reinforced_at != 0)
+    };
+    let fill = |engine: &StorageEngine| {
+        let rust = ["rust".to_string()];
+        engine
+            .insert(
+                "a",
+                "rust memory safety",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &rust,
+            )
+            .unwrap();
+        engine
+            .insert(
+                "b",
+                "rust borrow checker",
+                &[0.9f32, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1.0,
+                &rust,
+            )
+            .unwrap();
+    };
+    let query = [1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+    fill(&engine);
+    let first = engine.search("rust safety", &query, 2).unwrap();
+    let second = engine.search("rust safety", &query, 2).unwrap();
+    assert!(first.is_some());
+    assert_eq!(first, second);
+    assert!(!reinforced(&engine, "a") && !reinforced(&engine, "b"));
+    assert_eq!(engine.reinforce(&["a", "missing"]), 1);
+    assert!(reinforced(&engine, "a") && !reinforced(&engine, "b"));
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = small_config(8);
+    config.tier.reinforce_on_search = true;
+    let engine = StorageEngine::open(tmp.path(), config).unwrap();
+    fill(&engine);
+    assert!(engine.search("rust safety", &query, 2).unwrap().is_some());
+    assert!(reinforced(&engine, "a") && reinforced(&engine, "b"));
 }
 
 #[test]

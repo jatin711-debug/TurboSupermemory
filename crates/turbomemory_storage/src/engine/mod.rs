@@ -703,11 +703,28 @@ impl StorageEngine {
         }
     }
 
-    /// Reinforce the cognitive-graph edges of a retrieved memory (rehearsal).
-    /// Called alongside `bump_access_by_id` on every cognitive-search result
+    /// Reinforce the graph edges of the given memories (rehearsal): each gets
+    /// stronger links to its concepts and neighbours, as a search does for
+    /// its results when `reinforce_on_search` is on. For a caller that knows
+    /// which memories were actually used, which is a better signal than
+    /// having been retrieved. Ids that do not exist are ignored; returns how
+    /// many were reinforced.
+    pub fn reinforce(&self, ids: &[&str]) -> usize {
+        let known: Vec<&str> = {
+            let index = self.id_index.read();
+            ids.iter()
+                .copied()
+                .filter(|id| index.contains_key(*id))
+                .collect()
+        };
+        self.reinforce_graph_ids(&known);
+        known.len()
+    }
+
+    /// Reinforce the cognitive-graph edges of retrieved memories (rehearsal),
     /// so that frequently-recalled memories get stronger graph links over
-    /// time. This is the "retain what matters" learning loop: retrieval
-    /// itself is the signal that a memory was useful.
+    /// time. A cognitive search calls this for its results when
+    /// `reinforce_on_search` is on.
     fn reinforce_graph_ids(&self, ids: &[&str]) {
         if ids.is_empty() {
             return;

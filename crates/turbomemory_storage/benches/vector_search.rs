@@ -11,6 +11,7 @@ fn bench_config(dim: usize, hot_capacity: usize, warm_capacity: usize) -> StoreC
         ef_construction: 100,
         search_list_size: 100,
         cognitive_alpha: 1.0,
+        graph_weight: None,
         outlier_count: 0,
         initial_capacity: 1024,
         tier: TierConfig {

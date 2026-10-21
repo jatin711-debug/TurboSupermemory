@@ -34,6 +34,20 @@ pub struct SpreadingConfig {
     /// abstraction expansion (the W4 OFF arm). Belief (`Refines`/`Contradicts`)
     /// and `Temporal` traversal are unaffected either way.
     pub concept_expansion: bool,
+    /// Weight of the direct query-concept seeding: a memory tagged with a
+    /// concept that is also a word of the query gets `query_concept_boost *
+    /// edge weight` for each such word. `0.75` is the original behaviour, in
+    /// which three shared words outweigh any cosine difference between two
+    /// candidates; `0.0` switches the seeding off (BM25 already scores word
+    /// overlap, with IDF and length normalization).
+    pub query_concept_boost: f32,
+    /// Fan normalization. A signal that reaches a memory through a concept
+    /// is divided by `fan ^ fan_exponent`, where `fan` is the number of
+    /// memories the concept is attached to. `0.0` (the original behaviour)
+    /// does not normalize, so a word half the store shares links as strongly
+    /// as a name two memories share. `1.0` divides by the fan: what a
+    /// concept passes on is split among everything it points at.
+    pub fan_exponent: f32,
 }
 
 impl Default for SpreadingConfig {
@@ -46,6 +60,8 @@ impl Default for SpreadingConfig {
             seed_hops_from: 10,           // Expand from top-10 ANN seeds
             expansion_max_candidates: 50, // Cap added candidates at 50
             concept_expansion: true,      // Concept + abstraction graph expansion on
+            query_concept_boost: 0.75,    // Direct query-concept seeding at full strength
+            fan_exponent: 0.0,            // No fan normalization
         }
     }
 }
@@ -158,6 +174,27 @@ impl SpreadingActivation {
     ) -> bool {
         self.graph
             .add_contradiction(old_id, new_id, weight, weaken_factor)
+    }
+
+    /// What a signal passing through a concept is divided by: the number of
+    /// memories the concept is attached to, raised to `fan_exponent`. `1.0`
+    /// when fan normalization is off.
+    fn fan_divisor(&self, concept_nid: u32) -> f32 {
+        if self.config.fan_exponent <= 0.0 {
+            return 1.0;
+        }
+        let fan = self.graph.neighbor_indices(concept_nid).map_or(0, |edges| {
+            edges
+                .iter()
+                .filter(|&&idx| {
+                    self.graph.get_edge(idx).is_some_and(|edge| {
+                        edge.kind == EdgeKind::Association
+                            && matches!(self.graph.node_kind(edge.target), Some(NodeKind::Memory))
+                    })
+                })
+                .count()
+        });
+        (fan.max(1) as f32).powf(self.config.fan_exponent)
     }
 
     /// Bounded augmenter search: ANN candidates + 1-hop graph expansion.
@@ -305,7 +342,10 @@ impl SpreadingActivation {
                 let token_lower = token.to_lowercase();
                 let ckey = format!("concept:{token_lower}");
                 if let Some(cnid) = self.graph.get_node_id(&ckey) {
-                    if !self.graph.is_concept_suppressed(&token_lower) {
+                    if !self.graph.is_concept_suppressed(&token_lower)
+                        && self.config.query_concept_boost > 0.0
+                    {
+                        let seed_weight = self.config.query_concept_boost / self.fan_divisor(cnid);
                         if let Some(cedges) = self.graph.neighbor_indices(cnid) {
                             for &cidx in cedges {
                                 if let Some(cedge) = self.graph.get_edge(cidx) {
@@ -322,7 +362,7 @@ impl SpreadingActivation {
                                         {
                                             let key = format!("mem:{mid}");
                                             *normal.entry(key).or_insert(0.0) +=
-                                                0.75 * cedge.weight;
+                                                seed_weight * cedge.weight;
                                         }
                                     }
                                 }
@@ -387,7 +427,8 @@ impl SpreadingActivation {
                             if self.graph.is_concept_suppressed(concept_name) {
                                 continue;
                             }
-                            let concept_w = edge.weight;
+                            // What this concept passes on, split by its fan.
+                            let concept_w = edge.weight / self.fan_divisor(concept_nid);
                             let Some(concept_edges) = self.graph.neighbor_indices(concept_nid)
                             else {
                                 continue;
@@ -467,7 +508,8 @@ impl SpreadingActivation {
                                                     * cedge.weight
                                                     * pedge.weight
                                                     * sedge.weight
-                                                    * decay;
+                                                    * decay
+                                                    / self.fan_divisor(sib_nid);
                                                 *abstraction.entry(key).or_insert(0.0) += signal;
                                             }
                                         }
@@ -521,33 +563,39 @@ impl SpreadingActivation {
         }
 
         // Step 4: Build the candidate list. The returned value is the PURE
-        // graph delta (>= 0); the engine fuses it with exact cosine. For
-        // truncation we rank by (seed cosine activation + delta) so the ANN
-        // floor is preserved even when a floor candidate has zero graph delta
-        // and would otherwise be dropped below a graph-discovered candidate.
-        let mut memories: Vec<(String, f32, f32)> = delta
-            .into_iter()
-            .filter(|(k, _)| k.starts_with("mem:"))
-            .map(|(k, d)| {
-                let rank_key = seed_scores.get(&k).copied().unwrap_or(0.0) + d;
-                (
-                    k.strip_prefix("mem:").unwrap_or(&k).to_string(),
-                    d,
-                    rank_key,
-                )
-            })
-            .collect();
-
+        // graph delta (>= 0); the engine fuses it with exact cosine. Every ANN
+        // seed is returned whatever its delta: that is the floor. What is left
+        // of `top_k` goes to the graph-discovered candidates with the largest
+        // delta. (Ranking both kinds together by cosine + delta, as this once
+        // did, let lexical matches crowd seeds out: in a store of a few
+        // thousand memories hundreds share a word with the query, each with a
+        // delta larger than a seed's cosine.)
+        let mut floor: Vec<(String, f32)> = Vec::with_capacity(seed_scores.len());
+        let mut discovered: Vec<(String, f32)> = Vec::new();
+        for (key, d) in delta {
+            let Some(id) = key.strip_prefix("mem:") else {
+                continue;
+            };
+            if seed_scores.contains_key(&key) {
+                floor.push((id.to_string(), d));
+            } else {
+                discovered.push((id.to_string(), d));
+            }
+        }
         // Ties broken by id: `delta` is a hash map, so without this the
         // candidates that survive the cut would differ from call to call.
-        memories
-            .sort_by(|a, b| turbomemory_core::cmp_score_desc(a.2, b.2).then_with(|| a.0.cmp(&b.0)));
-        memories.truncate(top_k);
+        let by_delta = |a: &(String, f32), b: &(String, f32)| {
+            turbomemory_core::cmp_score_desc(a.1, b.1).then_with(|| a.0.cmp(&b.0))
+        };
+        discovered.sort_by(by_delta);
+        discovered.truncate(top_k.saturating_sub(floor.len()));
+        floor.sort_by(by_delta);
+        floor.extend(discovered);
 
-        if memories.is_empty() {
+        if floor.is_empty() {
             None
         } else {
-            Some(memories.into_iter().map(|(id, d, _)| (id, d)).collect())
+            Some(floor)
         }
     }
 
@@ -604,6 +652,106 @@ mod tests {
         assert!(results.is_some());
         let r = results.unwrap();
         assert_eq!(r[0].0, "m1");
+    }
+
+    /// Six memories share the word "garden"; two of them also share the name
+    /// "rex". Unnormalized, the common word links as strongly as the name;
+    /// with fan normalization the name links more strongly.
+    fn hub_and_name() -> MemoryGraph {
+        let mut graph = MemoryGraph::new();
+        // Only the memory added right after a seed is its temporal neighbour;
+        // the tests compare memories that are not.
+        graph.add_memory(
+            "seed",
+            "rex digs in the garden",
+            &["rex".into(), "garden".into()],
+        );
+        for id in ["hub0", "hub1", "named", "hub2", "hub3", "hub4"] {
+            if id == "named" {
+                graph.add_memory(id, "rex was at the vet", &["rex".into()]);
+            } else {
+                graph.add_memory(id, "the garden needs water", &["garden".into()]);
+            }
+        }
+        graph
+    }
+
+    fn delta_of(results: &[(String, f32)], id: &str) -> f32 {
+        results
+            .iter()
+            .find(|(r, _)| r == id)
+            .map_or(0.0, |(_, d)| *d)
+    }
+
+    #[test]
+    fn fan_normalization_favours_the_rare_concept() {
+        let seeds = [("seed".to_string(), 0.9f32)];
+        // "walk" is in no memory: no lexical or query-concept signal.
+        let plain = SpreadingActivation::new(hub_and_name(), SpreadingConfig::default());
+        let results = plain.search("walk", &seeds, 10).unwrap();
+        assert!(delta_of(&results, "named") > 0.0);
+        assert!((delta_of(&results, "named") - delta_of(&results, "hub3")).abs() < 1e-6);
+
+        let config = SpreadingConfig {
+            fan_exponent: 1.0,
+            ..SpreadingConfig::default()
+        };
+        let normalized = SpreadingActivation::new(hub_and_name(), config);
+        let results = normalized.search("walk", &seeds, 10).unwrap();
+        // "rex" has a fan of 2, "garden" of 6.
+        assert!(delta_of(&results, "named") > 2.5 * delta_of(&results, "hub3"));
+        let unnormalized = plain.search("walk", &seeds, 10).unwrap();
+        assert!(delta_of(&results, "named") < delta_of(&unnormalized, "named"));
+    }
+
+    #[test]
+    fn lexical_matches_never_crowd_out_an_ann_seed() {
+        // Forty memories repeat the query's word; the two seeds do not.
+        let mut graph = MemoryGraph::new();
+        graph.add_memory("seed_a", "the cat sat on the mat", &["cat".into()]);
+        graph.add_memory("seed_b", "a dog barked at night", &["dog".into()]);
+        for i in 0..40 {
+            graph.add_memory(
+                &format!("word{i:02}"),
+                "garden garden garden",
+                &["garden".into()],
+            );
+        }
+        let sa = SpreadingActivation::new(graph, SpreadingConfig::default());
+        let seeds = [
+            ("seed_a".to_string(), 0.4f32),
+            ("seed_b".to_string(), 0.35f32),
+        ];
+        let results = sa.search("garden", &seeds, 10).unwrap();
+        assert_eq!(results.len(), 10);
+        let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(
+            ids.contains(&"seed_a") && ids.contains(&"seed_b"),
+            "seeds are the floor"
+        );
+        assert_eq!(delta_of(&results, "seed_a"), 0.0);
+        // The other eight places go to the strongest graph candidates.
+        assert_eq!(ids.iter().filter(|id| id.starts_with("word")).count(), 8);
+        // More seeds than places: every seed is still returned.
+        let results = sa.search("garden", &seeds, 1).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn query_concept_seeding_can_be_switched_off() {
+        let seeds = [("named".to_string(), 0.9f32)];
+        let on = SpreadingActivation::new(hub_and_name(), SpreadingConfig::default());
+        let config = SpreadingConfig {
+            query_concept_boost: 0.0,
+            ..SpreadingConfig::default()
+        };
+        let off = SpreadingActivation::new(hub_and_name(), config);
+        // "garden" is a concept of hub0 and a word of the query. hub0 shares
+        // no concept with the seed, so only the lexical boost is left.
+        let with_seeding = delta_of(&on.search("garden", &seeds, 10).unwrap(), "hub0");
+        let without = delta_of(&off.search("garden", &seeds, 10).unwrap(), "hub0");
+        assert!(with_seeding > without + 0.5);
+        assert!(without > 0.0 && without <= 0.3 + 1e-6);
     }
 
     #[test]

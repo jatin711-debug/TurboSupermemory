@@ -16,6 +16,7 @@ fn test_config(dim: usize, hot_capacity: usize, warm_capacity: usize) -> StoreCo
         ef_construction: 100,
         search_list_size: 32,
         cognitive_alpha: 1.0,
+        graph_weight: None,
         outlier_count: 0,
         initial_capacity: 1024,
         tier: TierConfig {

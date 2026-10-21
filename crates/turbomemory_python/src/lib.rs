@@ -271,6 +271,7 @@ impl PyMemoryEngine {
         refinement_cosine_threshold=None,
         refinement_max_pairs_per_cycle=None,
         cognitive_alpha=None,
+        graph_weight=None,
         contradiction_cosine_threshold=None,
         contradiction_text_threshold=None,
         refinement_text_threshold=None,
@@ -290,6 +291,7 @@ impl PyMemoryEngine {
         belief_source_roles=None,
         defer_supersession_commit=None,
         exclude_superseded=None,
+        reinforce_on_search=None,
         access_aware_eviction=None,
         actr_activation=None,
         actr_decay=None,
@@ -300,6 +302,9 @@ impl PyMemoryEngine {
         seed_hops_from=None,
         expansion_max_candidates=None,
         concept_expansion=None,
+        query_concept_boost=None,
+        fan_exponent=None,
+        lexical_alpha=None,
         temporal_recency_weight=None,
         sync_writes=None,
         gpu_exact_search=None,
@@ -340,6 +345,7 @@ impl PyMemoryEngine {
         refinement_cosine_threshold: Option<f32>,
         refinement_max_pairs_per_cycle: Option<usize>,
         cognitive_alpha: Option<f32>,
+        graph_weight: Option<f32>,
         contradiction_cosine_threshold: Option<f32>,
         contradiction_text_threshold: Option<f32>,
         refinement_text_threshold: Option<f32>,
@@ -359,6 +365,7 @@ impl PyMemoryEngine {
         belief_source_roles: Option<Vec<String>>,
         defer_supersession_commit: Option<bool>,
         exclude_superseded: Option<bool>,
+        reinforce_on_search: Option<bool>,
         access_aware_eviction: Option<bool>,
         actr_activation: Option<bool>,
         actr_decay: Option<f64>,
@@ -369,6 +376,9 @@ impl PyMemoryEngine {
         seed_hops_from: Option<usize>,
         expansion_max_candidates: Option<usize>,
         concept_expansion: Option<bool>,
+        query_concept_boost: Option<f32>,
+        fan_exponent: Option<f32>,
+        lexical_alpha: Option<f32>,
         temporal_recency_weight: Option<f32>,
         sync_writes: Option<bool>,
         gpu_exact_search: Option<bool>,
@@ -468,6 +478,22 @@ impl PyMemoryEngine {
         if let Some(ce) = concept_expansion {
             config.spreading.concept_expansion = ce;
         }
+        // - query_concept_boost: weight of the bonus a memory gets for each
+        //   query word that is one of its concepts (default 0.75; 0 = off).
+        // - fan_exponent: a signal passing through a concept is divided by
+        //   (number of memories the concept is attached to) ^ fan_exponent
+        //   (default 0 = no normalization; 1 = split evenly).
+        // - lexical_alpha: weight of the BM25 boost, whose best match gets
+        //   exactly this much (default 0.3).
+        if let Some(qcb) = query_concept_boost {
+            config.spreading.query_concept_boost = qcb.max(0.0);
+        }
+        if let Some(fe) = fan_exponent {
+            config.spreading.fan_exponent = fe.clamp(0.0, 2.0);
+        }
+        if let Some(la) = lexical_alpha {
+            config.spreading.lexical_alpha = la.max(0.0);
+        }
         if let Some(th) = abstraction_co_occurrence_threshold {
             config.tier.abstraction_co_occurrence_threshold = th;
         }
@@ -507,6 +533,15 @@ impl PyMemoryEngine {
         //   allow reinforcement/refinement/abstraction to add a bounded boost.
         if let Some(ca) = cognitive_alpha {
             config.cognitive_alpha = ca;
+        }
+        // - graph_weight: scale the graph boost to the query instead:
+        //   final_score = cosine + graph_weight * spread * normalized_graph_delta,
+        //   spread being the cosine difference between the nearest candidate
+        //   and the top_k-th. 0 = cosine ranking, 1 = a saturated graph signal
+        //   can lift a memory from the cut to the top. Unset keeps the fixed
+        //   `1 - cognitive_alpha` boost.
+        if let Some(gw) = graph_weight {
+            config.graph_weight = Some(gw.clamp(0.0, 4.0));
         }
         // - contradiction_cosine_threshold: enable belief revision. When a
         //   newer memory contradicts an older one (cosine >= threshold AND
@@ -609,6 +644,14 @@ impl PyMemoryEngine {
         //   false.
         if let Some(ex) = exclude_superseded {
             config.tier.exclude_superseded = ex;
+        }
+        // - reinforce_on_search: when true, every memory a cognitive search
+        //   returns gets its graph edges reinforced (rehearsal), so asking a
+        //   question changes what the next one returns. Default false: a
+        //   search leaves the ranking state alone. `reinforce(ids)` does it
+        //   for the memories a caller names.
+        if let Some(ros) = reinforce_on_search {
+            config.tier.reinforce_on_search = ros;
         }
         if let Some(aae) = access_aware_eviction {
             config.tier.access_aware_eviction = aae;
@@ -1210,6 +1253,18 @@ impl PyMemoryEngine {
         Ok(py.allow_threads(|| {
             let guard = engine.read_graph();
             guard.graph().contradicted_by(&id)
+        }))
+    }
+
+    /// Reinforce the graph edges of the given memories (rehearsal), as a
+    /// search does for its results when `reinforce_on_search` is on. For a
+    /// caller that knows which memories were actually used. Unknown ids are
+    /// ignored; returns how many were reinforced.
+    fn reinforce(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<usize> {
+        let engine = self.engine()?;
+        Ok(py.allow_threads(|| {
+            let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+            engine.reinforce(&refs)
         }))
     }
 

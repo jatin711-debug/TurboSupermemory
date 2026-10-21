@@ -325,6 +325,15 @@ pub struct TierConfig {
     /// eval at adapter level. No-op unless belief revision has created
     /// supersession edges (empty superseded set = zero behavior change).
     pub exclude_superseded: bool,
+    /// Reinforce the graph edges of every memory a cognitive search returns
+    /// (rehearsal: what is retrieved gets stronger links and ranks higher
+    /// next time). Off by default, so a read leaves the ranking state as it
+    /// was and the same query returns the same result twice. With it on,
+    /// asking a question changes the answer to the next one: measured on
+    /// LongMemEval, a repeated question came back as a different list in 13
+    /// of 19 cases. A caller that knows which memories were actually used
+    /// can reinforce those with `StorageEngine::reinforce` instead.
+    pub reinforce_on_search: bool,
     /// Whether eviction ranks records by cognitive salience (retrieval-driven
     /// `access_score` = access_count × recency, with a grace window for
     /// recently-accessed records) or by pure insertion order. `true` (default)
@@ -494,6 +503,8 @@ impl TierConfig {
         // Superseded facts are rank-demoted but still returned by default.
         // Set true to exclude them from results entirely (B1 ghost-memory fix).
         exclude_superseded: false,
+        // A search does not change what the next search returns.
+        reinforce_on_search: false,
         // Cognitive retain-what-is-used eviction by default. Set false for the
         // naive FIFO baseline (W5 isolation).
         access_aware_eviction: true,
@@ -626,6 +637,17 @@ pub struct StoreConfig {
     /// while still preserving the ANN recall floor. Range `[0.0, 1.0]`;
     /// clamped at runtime.
     pub cognitive_alpha: f32,
+    /// Scale the graph boost to the query instead of using the fixed
+    /// `1 - cognitive_alpha`: `final_score = cosine + graph_weight * spread *
+    /// normalized_graph_signal`, where `spread` is the difference in cosine
+    /// between the nearest candidate and the `top_k`-th. At `0.0` the ranking
+    /// is pure cosine; at `1.0` a memory with a saturated graph signal can
+    /// rise from the cut to the top; in between the graph reorders memories
+    /// that the embedding scores about alike and leaves clear differences
+    /// alone. `None` (default) keeps the fixed `cognitive_alpha` boost, which
+    /// at 0.5 is about eighteen times the cosine gap between neighbouring
+    /// candidates on OpenAI embeddings and lost judged answers.
+    pub graph_weight: Option<f32>,
     pub outlier_count: usize,
     pub initial_capacity: usize,
     pub tier: TierConfig,
@@ -732,6 +754,7 @@ impl Default for StoreConfig {
             ef_construction: 200,
             search_list_size: 100,
             cognitive_alpha: 0.7,
+            graph_weight: None,
             outlier_count: 0,
             initial_capacity: 1024,
             tier: TierConfig::default(),

@@ -607,34 +607,59 @@ impl StorageEngine {
             1
         };
 
-        let mut hydrated: Vec<(String, f32)> = results
+        // (id, offset, cosine, graph delta) of every candidate in scope.
+        let candidates: Vec<(String, PointOffset, f32, f32)> = results
             .into_iter()
             .filter_map(|(id, act)| {
                 let offset = self.id_index.read().get(id.as_str()).copied()?;
                 if allowed.is_some_and(|bitmap| !bitmap.contains(offset as u32)) {
                     return None;
                 }
-                self.get_record(offset).map(|rec| {
-                    let cos = cosine_similarity(query_embedding, rec.embedding_f32());
-                    // Absolute, saturating graph boost: `act / (1 + act)` depends
-                    // on the candidate's OWN graph signal, not the result-set
-                    // maximum.
-                    let graph_boost = (1.0 - alpha) * (act / (1.0 + act));
-                    let base_fused = cos + graph_boost;
+                let cos =
+                    cosine_similarity(query_embedding, self.get_record(offset)?.embedding_f32());
+                Some((id, offset, cos, act))
+            })
+            .collect();
 
-                    let recency_boost = if temporal_recency_weight > 0.0 && max_seq > 0 {
-                        let seq = self.find_meta_by_id(&id).map(|m| m.insert_seq).unwrap_or(0);
-                        1.0 + temporal_recency_weight * (seq as f32 / max_seq as f32)
-                    } else {
-                        1.0
-                    };
-                    let fused = base_fused * recency_boost;
+        // How much a saturated graph signal adds to a cosine. Either a fixed
+        // amount (`1 - cognitive_alpha`), or, with `graph_weight`, a share of
+        // the spread of cosine among the `top_k` nearest candidates: the same
+        // weight then means the same thing whatever the embedder's scale, and
+        // the graph can move a memory within the set the query would return
+        // but cannot outvote the embedding.
+        let boost_scale = match self.config.graph_weight {
+            Some(weight) => {
+                let mut cosines: Vec<f32> = candidates.iter().map(|c| c.2).collect();
+                cosines.sort_by(|a, b| turbomemory_core::cmp_score_desc(*a, *b));
+                cosines.truncate(top_k.max(1));
+                let spread = match (cosines.first(), cosines.last()) {
+                    (Some(top), Some(cut)) => (top - cut).max(0.0),
+                    _ => 0.0,
+                };
+                weight.clamp(0.0, 4.0) * spread
+            }
+            None => 1.0 - alpha,
+        };
 
-                    // Supersession demotion: a memory superseded by a newer one
-                    // carries a persisted factor < 1.0.
-                    let demotion = self.meta.demotion_factor(offset);
-                    (id, fused * demotion)
-                })
+        let mut hydrated: Vec<(String, f32)> = candidates
+            .into_iter()
+            .map(|(id, offset, cos, act)| {
+                // Absolute, saturating graph boost: `act / (1 + act)` depends on
+                // the candidate's OWN graph signal, not the result-set maximum.
+                let base_fused = cos + boost_scale * (act / (1.0 + act));
+
+                let recency_boost = if temporal_recency_weight > 0.0 && max_seq > 0 {
+                    let seq = self.find_meta_by_id(&id).map(|m| m.insert_seq).unwrap_or(0);
+                    1.0 + temporal_recency_weight * (seq as f32 / max_seq as f32)
+                } else {
+                    1.0
+                };
+                let fused = base_fused * recency_boost;
+
+                // Supersession demotion: a memory superseded by a newer one
+                // carries a persisted factor < 1.0.
+                let demotion = self.meta.demotion_factor(offset);
+                (id, fused * demotion)
             })
             .collect();
         // B1: drop superseded memories entirely rather than merely demoting
@@ -789,10 +814,13 @@ impl StorageEngine {
         for (id, _) in &hydrated {
             self.bump_access_by_id(id);
         }
-        // One graph write lock for the whole batch of hits (rehearsal),
-        // not one per hit.
-        let hit_ids: Vec<&str> = hydrated.iter().map(|(id, _)| id.as_str()).collect();
-        self.reinforce_graph_ids(&hit_ids);
+        // Rehearsal is opt-in: by default a search does not change what the
+        // next search returns.
+        if self.config.tier.reinforce_on_search {
+            // One graph write lock for the whole batch of hits, not one per hit.
+            let hit_ids: Vec<&str> = hydrated.iter().map(|(id, _)| id.as_str()).collect();
+            self.reinforce_graph_ids(&hit_ids);
+        }
         Ok(Some(hydrated))
     }
 
