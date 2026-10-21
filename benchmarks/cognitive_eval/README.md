@@ -157,9 +157,10 @@ python benchmarks/cognitive_eval/shipped_stack_eval.py --offline --limit 120 --p
 #     --work-dir/embeddings_local by the embedder's fingerprint; an interrupted run resumes
 #     only with the same embedder.
 python benchmarks/cognitive_eval/shipped_stack_eval.py --offline --limit 120 --arms sdk_pack_tagged,sdk_cognitive --local-embedder google/embeddinggemma-2 --local-embedder-opt 'query_prompt_name="QuestionAnswering"'
-#     --extraction picks whose facts the arms get: the SDK extractor (shipped, the default),
-#     the same without its stored statements (second) or without its second prompt (first),
-#     or the harness's earlier extractor (legacy). --reader notes asks the answering model
+#     --extraction picks whose facts the arms get: the SDK extractor as it ships, its first
+#     prompt alone (shipped, the default); with its second prompt for a message the first
+#     finds nothing in (second); with that and the stored statements of a message both find
+#     nothing in (all); or the harness's earlier extractor, the same facts as shipped (legacy). --reader notes asks the answering model
 #     with the SDK's prompt (tsm.reading) instead of the plain one. To read saved contexts
 #     another way without building the stores again: --rejudge run.json --reader notes.
 #     Verdicts, gists and embeddings fetched along the way are kept in --work-dir

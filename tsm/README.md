@@ -120,20 +120,22 @@ with Memory("./my_db") as mem:                       # conversational profile
 - The OpenAI extractor never drops a message because a request went wrong. A
   reply that is cut off or is not valid JSON is requested again with a
   larger budget, and if that fails the message itself is stored.
-- Nor does it drop one because the model found nothing in it. People say
+- A message the model found nothing in is another matter. People say
   things about themselves while asking for something else ("any collar for a
   Golden Retriever like Max?"), and the extraction prompt returned no fact
-  for a third of the user messages it was measured on. A message of three
-  words or more that comes back empty is asked about again with a second
-  prompt (what the speaker reveals, also inside a question); if that finds
-  nothing either, its sentences that are not questions are stored as they
-  were said, in pieces of about 80 tokens (`tsm.extractors.statements`).
-  `OpenAIExtractor(second_look=False)` and `keep_unextracted=False` switch
-  the two steps off. What this buys depends on how much you recall: with a
-  600-token context it answered more questions (92 of 115 against 86), with
-  a 150-token one fewer (82 against 90), because the recovered memories
-  compete for the same few slots. Neither difference is statistically
-  settled (`benchmarks/PHASE_PROGRESS.md`, 2026-10-12).
+  for a third of the user messages it was measured on. Two steps recover
+  such a message, both off by default: with
+  `OpenAIExtractor(second_look=True)` a message of three words or more that
+  comes back empty is asked about again with a second prompt (what the
+  speaker reveals, also inside a question); with `keep_unextracted=True`, if
+  that finds nothing either, its sentences that are not questions are stored
+  as they were said, in pieces of about 80 tokens
+  (`tsm.extractors.statements`). What this buys depends on how much you
+  recall: with a 600-token context it answered more questions (92 of 115
+  against 86), with a 150-token one fewer (82 against 90), because the
+  recovered memories compete for the same few slots. Neither difference is
+  statistically settled (`benchmarks/PHASE_PROGRESS.md`, 2026-10-12), which
+  is why the default stores only the first prompt's facts.
 - Only well-formed replies are cached, under a key that includes the prompt.
 - `OpenAIEmbedder(dim=512)` asks the API for 512-dimensional vectors
   (text-embedding-3 models); a vector of an unexpected size is an error at

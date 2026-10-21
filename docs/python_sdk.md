@@ -44,16 +44,19 @@ message. `extractor="passthrough"` and `extractor="gliner"` keep writes local.
 The OpenAI extractor asks the model for the facts a message asserts. That
 prompt returns nothing for about a third of what users write, mostly a
 statement about themselves followed by a request ("any collar for a Golden
-Retriever like Max?"). So a message of three words or more that comes back
-empty is asked about again with a second prompt (what the speaker reveals,
-also inside a question), and if that finds nothing either, its sentences
-that are not questions are stored as they were said, in pieces of about 80
-tokens. `OpenAIExtractor(second_look=False)` and
-`OpenAIExtractor(keep_unextracted=False)` switch the two steps off. The
-recovered memories help when recall has room for them and compete with the
-others when it does not: on 115 judged questions, 92 right against 86 with
-a 600-token context, 82 against 90 with a 150-token one, neither difference
-statistically settled (`benchmarks/PHASE_PROGRESS.md`, 2026-10-12).
+Retriever like Max?"). Two steps recover such a message, and both are off
+by default. With `OpenAIExtractor(second_look=True)` a message of three
+words or more that comes back empty is asked about again with a second
+prompt (what the speaker reveals, also inside a question); with
+`keep_unextracted=True`, if that finds nothing either, its sentences that
+are not questions are stored as they were said, in pieces of about 80
+tokens. They are off because they did not pay when judged: the recovered
+memories help when recall has room for them and compete with the others
+when it does not. On 115 judged questions, 92 right against 86 with a
+600-token context, 82 against 90 with a 150-token one, neither difference
+statistically settled (`benchmarks/PHASE_PROGRESS.md`, 2026-10-12). Turn
+them on when recall has room and nothing a user said may go unstored:
+`Memory(extractor=OpenAIExtractor(second_look=True, keep_unextracted=True))`.
 
 ### Answering from memories
 

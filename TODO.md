@@ -185,8 +185,10 @@ table is in `benchmarks/PHASE_PROGRESS.md`.
   p = 0.08); at 600 tokens answers went from 86 to 92 (10 gained, 4 lost,
   p = 0.18). The recovered memories are mostly what the user wanted at the
   time; they match a question's wording and, in a small context, take the
-  place of the fact that answers it. Both steps are on by default in the
-  working tree, and that default is not settled (next section). Still open
+  place of the fact that answers it. Both steps are off by default
+  (`OpenAIExtractor(second_look=True, keep_unextracted=True)` turns them
+  on); whether to ship them on waits for the paired grid, item (2) of the
+  2026-10-12 list above. Still open
   from the diagnosis: facts taken from the recent context instead of the
   message, facts that do not say what they are about ("The workshop was
   free"), and the same fact stored several times in different words.
