@@ -50,9 +50,11 @@ ANSWER_SYSTEM = (
     f"answer, finish with \"{ANSWER_MARK} NO ANSWER\"."
 )
 
-# What recall() puts in front of a memory: "[2024-01-15] ", "[2024-01-15 10:00] "
-# or "[turn 12] ".
-_TAG = re.compile(r"^\[(?:(\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?)|turn (\d+))\] ")
+# What recall() puts in front of a memory: "[2024-01-15] ", "[2024-01-15 10:00] ",
+# "[turn 12] ", or for a gist the span it covers, "[2024-01-05 to 2024-03-02] "
+# (ordered by where it starts).
+_TAG = re.compile(
+    r"^\[(?:(\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?)(?: to \d{4}-\d{2}-\d{2})?|turn (\d+))\] ")
 
 Memory = Union[str, Dict]
 

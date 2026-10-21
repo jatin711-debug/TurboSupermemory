@@ -14,8 +14,8 @@ say. It touches no store; ``tsm.Memory`` applies the plan
 (``Memory(max_user_tokens=...)``).
 """
 
-from dataclasses import dataclass
-from typing import Callable, Collection, List, Optional, Sequence
+from dataclasses import dataclass, field
+from typing import Callable, Collection, List, Optional, Sequence, Tuple
 
 from .budget import (
     fit_complete_facts_to_budget,
@@ -38,12 +38,26 @@ class CompactionPlan:
     ``keep`` and ``fold`` are indexes into the memories that were passed in:
     the ones that stay untouched and the ones the gists replace. ``gists``
     are the new gist texts and ``gist_roles`` the role to store each under.
+    ``gist_spans`` gives, per gist, the first and last date of what it was
+    written from (``None`` when none of it was dated).
     """
 
     keep: List[int]
     fold: List[int]
     gists: List[str]
     gist_roles: List[str]
+    gist_spans: List[Optional[Tuple[str, str]]] = field(default_factory=list)
+
+
+Span = Optional[Tuple[str, str]]
+
+
+def _join(spans: Sequence[Span]) -> Span:
+    """The span covering ``spans`` (ISO dates compare as strings)."""
+    dated = [s for s in spans if s]
+    if not dated:
+        return None
+    return (min(s[0] for s in dated), max(s[1] for s in dated))
 
 
 def is_gist(role: Optional[str]) -> bool:
@@ -71,6 +85,7 @@ def plan_compaction(
     gist_chunk_tokens: int = 32,
     max_gist_chunks: int = 4,
     fold_first: Collection[int] = (),
+    spans: Optional[Sequence[Span]] = None,
 ) -> Optional[CompactionPlan]:
     """Plan one compaction of a user's memories, given oldest first.
 
@@ -90,11 +105,20 @@ def plan_compaction(
     ``fold_first`` lists memories that must not survive as they are, such as
     facts a newer one has replaced: they are folded before anything else.
 
+    ``spans`` gives each memory's first and last date (``("2023-05-22",
+    "2023-05-22")`` for a fact said that day, an earlier gist's own span) or
+    ``None``; each gist's span is then the span of what it was written from.
+    Without dates a gist is undated, and a reader cannot place what it says
+    in time.
+
     A summarizer that raises aborts the plan: nothing is planned, so nothing
     is removed.
     """
     if len(texts) != len(roles):
         raise ValueError("texts and roles must have the same length")
+    if spans is not None and len(spans) != len(texts):
+        raise ValueError("spans and texts must have the same length")
+    spans = list(spans) if spans is not None else [None] * len(texts)
     if token_budget < 2:
         raise ValueError("token budget must be at least 2")
     if not 0.0 < gist_share < 1.0:
@@ -121,16 +145,27 @@ def plan_compaction(
     # for history older than any fact still stored, so its lines lead.
     user_tail: List[str] = []
     other_tail: List[str] = []
+    user_spans: List[Span] = []  # the span of each entry of the tails
+    other_spans: List[Span] = []
     for i in fold:
         if roles[i] == GIST_ROLE:
-            user_tail.extend(f"[user] {line}" for line in _gist_lines(texts[i]))
+            lines = [f"[user] {line}" for line in _gist_lines(texts[i])]
+            user_tail.extend(lines)
+            user_spans.extend([spans[i]] * len(lines))
         elif roles[i] == GIST_OTHER_ROLE:
-            other_tail.extend(f"[assistant] {line}" for line in _gist_lines(texts[i]))
+            lines = [f"[assistant] {line}" for line in _gist_lines(texts[i])]
+            other_tail.extend(lines)
+            other_spans.extend([spans[i]] * len(lines))
     for i in fold:
         if is_gist(roles[i]):
             continue
         entry = f"[{roles[i]}] {texts[i]}"
-        (user_tail if roles[i] == "user" else other_tail).append(entry)
+        if roles[i] == "user":
+            user_tail.append(entry)
+            user_spans.append(spans[i])
+        else:
+            other_tail.append(entry)
+            other_spans.append(spans[i])
 
     chunk_count = min(max_gist_chunks, max(1, gist_limit // gist_chunk_tokens))
     # Tight budgets are reserved for user history. At four or more chunks, one
@@ -139,20 +174,31 @@ def plan_compaction(
     user_chunks = chunk_count - other_chunks if user_tail else 0
     if not user_chunks and other_tail:
         other_chunks = chunk_count
-    chunks = [(GIST_ROLE, chunk) for chunk in (
-        partition_by_token_weight(user_tail, user_chunks) if user_chunks else [])]
+    def with_spans(parts, entry_spans):
+        """Each chunk with the span of its entries (chunks are contiguous)."""
+        out, start = [], 0
+        for part in parts:
+            out.append((part, _join(entry_spans[start:start + len(part)])))
+            start += len(part)
+        return out
+
+    chunks = [(GIST_ROLE, chunk, span) for chunk, span in with_spans(
+        partition_by_token_weight(user_tail, user_chunks) if user_chunks else [], user_spans)]
     if other_chunks:
-        chunks.extend((GIST_OTHER_ROLE, chunk)
-                      for chunk in partition_by_token_weight(other_tail, other_chunks))
+        chunks.extend((GIST_OTHER_ROLE, chunk, span) for chunk, span in with_spans(
+            partition_by_token_weight(other_tail, other_chunks), other_spans))
 
     gists: List[str] = []
     gist_roles: List[str] = []
+    gist_spans: List[Span] = []
     if chunks:
         base, extra = divmod(gist_limit, len(chunks))
-        for position, (role, chunk) in enumerate(chunks):
+        for position, (role, chunk, span) in enumerate(chunks):
             limit = base + (1 if position < extra else 0)
             gist = fit_complete_facts_to_budget(summarize(chunk, limit), limit)
             if gist:
                 gists.append(gist)
                 gist_roles.append(role)
-    return CompactionPlan(keep=keep, fold=fold, gists=gists, gist_roles=gist_roles)
+                gist_spans.append(span)
+    return CompactionPlan(keep=keep, fold=fold, gists=gists, gist_roles=gist_roles,
+                          gist_spans=gist_spans)

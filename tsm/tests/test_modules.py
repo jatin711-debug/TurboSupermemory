@@ -28,6 +28,10 @@ from tsm.gist import ExtractiveGistSummarizer, OpenAIGistSummarizer, single_fact
 from tsm.ranking import (ASSISTANT_ROLE_DAMP, USER_ROLE_BOOST, is_first_person_query,
                          role_prior)
 from tsm.reading import ANSWER_SYSTEM, answer_prompt, final_answer, in_order
+from tsm.answering import (add_days, answer_with_tools, calculate, count_distinct,
+                           days_between, run_tool)
+from tsm.sources import excerpt, turn_units
+from tsm.when import annotate, said_on
 
 
 def _item(text, score, vec, turn_index=None):
@@ -259,6 +263,9 @@ class TestReading(unittest.TestCase):
         # Strings work too (the "context" of each result), and turns order undated ones.
         self.assertEqual(in_order(["[turn 12] later", "[turn 3] earlier"]),
                          ["[turn 3] earlier", "[turn 12] later"])
+        # A dated gist goes where what it summarizes starts.
+        self.assertEqual(in_order(["[2023-03-01] a fact", "[2023-01-05 to 2023-02-20] a gist"]),
+                         ["[2023-01-05 to 2023-02-20] a gist", "[2023-03-01] a fact"])
         # Without tags in the text, the result's own fields are used.
         untagged = [{"text": "second", "timestamp": "2024/02/01 (Thu) 10:00", "turn_index": 2},
                     {"text": "first", "timestamp": "2024-01-15", "turn_index": 9}]
@@ -301,6 +308,21 @@ class TestCompactionPlan(unittest.TestCase):
 
     def test_nothing_to_do_when_everything_fits(self):
         self.assertIsNone(plan_compaction(["a" * 40, "b" * 40], ["user", "user"], 20, None))
+
+    def test_each_gist_spans_the_dates_of_what_it_was_written_from(self):
+        texts = ["- old summary line"] + [f"u{i} " + "x" * 36 for i in range(9)]
+        roles = [GIST_ROLE] + ["user"] * 9
+        spans = [("2023-01-01", "2023-01-20")] + [(f"2023-02-{i + 1:02d}",) * 2 for i in range(8)]
+        spans.append(None)  # an undated fact
+        _, summarize = self._capture()
+        plan = plan_compaction(texts, roles, 60, summarize, spans=spans)
+        self.assertEqual(plan.keep, [7, 8, 9])
+        # One gist from the earlier gist and facts 0-5 (Feb 1-6).
+        self.assertEqual(plan.gist_spans, [("2023-01-01", "2023-02-06")])
+        undated = plan_compaction(texts, roles, 60, summarize)
+        self.assertEqual(undated.gist_spans, [None])
+        with self.assertRaises(ValueError):
+            plan_compaction(texts, roles, 60, summarize, spans=spans[:3])
 
     def test_newest_user_facts_survive_and_the_rest_is_summarized(self):
         texts = [f"{'u' if i % 2 == 0 else 'a'}{i} " + "x" * 36 for i in range(10)]  # 10 tokens each
@@ -360,6 +382,169 @@ class TestCompactionPlan(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             plan_compaction(["u " + "x" * 80] * 3, ["user"] * 3, 30, broken)
+
+
+class TestSourceUnits(unittest.TestCase):
+    def test_a_short_message_is_kept_whole(self):
+        self.assertEqual(excerpt("  I moved to Lisbon.  ", ["moved"], 20), "I moved to Lisbon.")
+
+    def test_a_long_message_keeps_the_sentences_its_facts_share_words_with(self):
+        message = ("We talked about many things. The weather was grey all week. "
+                   "My sister Ana moved to Porto in May. We also cooked pasta. "
+                   "Ana now teaches chemistry there.")
+        cut = excerpt(message, ["Ana moved to Porto", "Ana teaches chemistry"], 20)
+        self.assertEqual(cut, "My sister Ana moved to Porto in May. ... "
+                              "Ana now teaches chemistry there.")
+
+    def test_one_overlong_sentence_is_cut_not_dropped(self):
+        cut = excerpt("word " * 200, ["word"], 10)
+        self.assertTrue(cut)
+        self.assertLessEqual(len(cut) // 4, 10)
+
+    def test_facts_of_one_turn_become_one_unit(self):
+        pool = [
+            {"id": "a", "text": "Ana moved to Porto", "score": 0.9, "turn_index": 3,
+             "source": "Ana moved to Porto and teaches there.", "scope": "u"},
+            {"id": "b", "text": "Ana teaches", "score": 0.5, "turn_index": 3,
+             "source": "Ana moved to Porto and teaches there.", "scope": "u"},
+            {"id": "c", "text": "a gist", "score": 0.7, "turn_index": None, "source": None},
+            {"id": "d", "text": "I like tea", "score": 0.6, "turn_index": 4,
+             "source": "I like tea.", "scope": "u", "superseded_by": "x", "chain": ["d", "x"]},
+        ]
+        units = turn_units(pool, "where does Ana live")
+        self.assertEqual([u["id"] for u in units], ["a", "c", "d"])
+        self.assertEqual(units[0]["ids"], ["a", "b"])
+        self.assertEqual(units[0]["facts"], ["Ana moved to Porto", "Ana teaches"])
+        self.assertEqual(units[0]["text"], "Ana moved to Porto and teaches there.")
+        self.assertNotIn("source", units[0])
+        self.assertEqual(units[1]["text"], "a gist")  # no source: as it was
+        self.assertEqual(units[2]["superseded_by"], "x")  # every fact of it is stale
+
+    def test_a_turn_is_stale_only_when_all_its_facts_are(self):
+        pool = [
+            {"id": "a", "text": "I live in Rome", "score": 0.9, "turn_index": 1,
+             "source": "I live in Rome and work at a bakery.", "superseded_by": "z"},
+            {"id": "b", "text": "I work at a bakery", "score": 0.4, "turn_index": 1,
+             "source": "I live in Rome and work at a bakery."},
+        ]
+        [unit] = turn_units(pool)
+        self.assertNotIn("superseded_by", unit)
+
+
+class TestEventDates(unittest.TestCase):
+    SAID = said_on("2023/05/22 (Mon) 14:05")  # a Monday
+
+    def check(self, text, expected):
+        self.assertEqual(annotate(text, self.SAID), expected)
+
+    def test_the_date_a_message_was_said(self):
+        self.assertEqual(str(self.SAID), "2023-05-22")
+        self.assertEqual(str(said_on("2023-05-22T10:00:00Z")), "2023-05-22")
+        self.assertEqual(str(said_on(1684749600)), "2023-05-22")
+        self.assertIsNone(said_on("last week"))
+        self.assertIsNone(said_on(None))
+
+    def test_relative_times_get_the_date_they_point_to(self):
+        self.check("I saw the dentist two weeks ago.",
+                   "I saw the dentist two weeks ago [week of 2023-05-08].")
+        self.check("We moved 3 days ago", "We moved 3 days ago [2023-05-19]")
+        self.check("I started a month ago", "I started a month ago [2023-04]")
+        self.check("I quit two years ago", "I quit two years ago [2021]")
+        self.check("I ran last Saturday", "I ran last Saturday [2023-05-20]")
+        self.check("I ran last Monday", "I ran last Monday [2023-05-15]")
+        self.check("Party next Friday", "Party next Friday [2023-05-26]")
+        self.check("I flew yesterday", "I flew yesterday [2023-05-21]")
+        self.check("I went last weekend", "I went last weekend [weekend of 2023-05-20]")
+        self.check("It was busy last month", "It was busy last month [2023-04]")
+        self.check("It started this year", "It started this year [2023]")
+        self.check("I got it on the 15th of last month",
+                   "I got it on the 15th of last month [2023-04-15]")
+
+    def test_a_date_without_a_year_gets_the_nearest_year(self):
+        self.check("I saw Dr. Smith on March 3rd.", "I saw Dr. Smith on March 3rd [2023-03-03].")
+        self.check("My birthday is on the 15th of December",
+                   "My birthday is on the 15th of December [2022-12-15]")
+        self.check("Symptoms started in late January", "Symptoms started in late January [2023-01]")
+        self.check("We go in August", "We go in August [2023-08]")
+        self.check("It snowed in December", "It snowed in December [2022-12]")
+        self.check("It rained in May", "It rained in May [2023-05]")
+        self.assertEqual(annotate("in February", said_on("2023-11-20")), "in February [2024-02]")
+        self.assertEqual(annotate("in May", said_on("2023-11-20")), "in May [2023-05]")
+
+    def test_what_is_already_a_date_or_cannot_be_placed_is_left_alone(self):
+        for text in ("I earned it in May 2016.", "On 2023-02-10 we met.", "I did it today.",
+                     "I learned it in two weeks.", "a few weeks ago", "March 3, 2021",
+                     "I may go there", "back in 2019"):
+            self.check(text, text)
+        self.assertEqual(annotate("two weeks ago", None), "two weeks ago")
+
+
+class _Call:
+    def __init__(self, call_id, name, arguments):
+        self.id = call_id
+        self.function = type("F", (), {"name": name, "arguments": arguments})()
+
+
+class _ToolClient:
+    """Asks for one calculation, then answers with its result."""
+
+    def __init__(self):
+        self.requests = []
+        self.chat = type("C", (), {"completions": self})()
+
+    def create(self, **kwargs):
+        self.requests.append(kwargs)
+        if len(self.requests) == 1:
+            message = type("M", (), {"content": "", "tool_calls": [
+                _Call("c1", "calculate", '{"expression": "120 + 85 + 1,200"}')]})()
+        else:
+            result = kwargs["messages"][-1]["content"]
+            message = type("M", (), {"content": f"1. ...\nAnswer: ${result}",
+                                     "tool_calls": None})()
+        usage = type("U", (), {"prompt_tokens": 10, "completion_tokens": 3})()
+        return type("R", (), {"choices": [type("Ch", (), {"message": message})()],
+                              "usage": usage})()
+
+
+class TestAnsweringTools(unittest.TestCase):
+    def test_calculate(self):
+        self.assertEqual(calculate("(120 + 85) * 2"), "410")
+        self.assertEqual(calculate("1,200 + 300"), "1500")
+        self.assertEqual(calculate("max(3, 5) + round(2.456, 1)"), "7.5")
+        self.assertEqual(calculate("sum([10, 20, 30]) / 3"), "20")
+        self.assertEqual(calculate("10 / 4"), "2.5")
+        self.assertEqual(calculate("$45 * 3"), "135")
+        self.assertTrue(calculate("1 / 0").startswith("error"))
+        self.assertTrue(calculate("__import__('os')").startswith("error"))
+        self.assertTrue(calculate("2 ** 1000").startswith("error"))
+        self.assertTrue(calculate("x + 1").startswith("error"))
+
+    def test_dates_and_counts(self):
+        self.assertEqual(days_between("2023-03-01", "2023-05-22"),
+                         "82 days (11 weeks and 5 days; 2 whole months; 0.22 years)")
+        self.assertTrue(days_between("2023-05-22", "2023-03-01").startswith("-82 days"))
+        self.assertTrue(days_between("soon", "2023-03-01").startswith("error"))
+        self.assertEqual(add_days("2023-05-22", -14), "2023-05-08 (Monday)")
+        self.assertEqual(count_distinct(["Yoga", "yoga!", "Pilates", " spin "]),
+                         "3 distinct: Yoga; Pilates; spin")
+        self.assertEqual(run_tool("calculate", '{"expression": "2+2"}'), "4")
+        self.assertTrue(run_tool("calculate", "not json").startswith("error"))
+        self.assertTrue(run_tool("delete_everything", "{}").startswith("error"))
+
+    def test_the_model_calls_a_tool_then_answers(self):
+        client = _ToolClient()
+        out = answer_with_tools(client, "m", "How much did I spend?",
+                                ["[2023-05-01] I paid $120", "[2023-05-02] I paid $85"])
+        self.assertEqual(out["answer"], "$1405")
+        self.assertEqual(out["requests"], 2)
+        self.assertEqual(out["tool_calls"],
+                         [("calculate", '{"expression": "120 + 85 + 1,200"}', "1405")])
+        self.assertEqual(out["input_tokens"], 20)
+        first, second = client.requests
+        self.assertEqual(first["tool_choice"], "auto")
+        self.assertIn("calculate", first["messages"][0]["content"])
+        self.assertEqual(second["messages"][-1], {"role": "tool", "tool_call_id": "c1",
+                                                  "content": "1405"})
 
 
 if __name__ == "__main__":

@@ -230,6 +230,21 @@ class TestSupersessionFlow(MemoryTestBase):
         self.assertEqual(by_text[new_fact]["context"], "[turn 2] " + new_fact)
         self.assertNotIn("superseded_by", by_text[new_fact])
 
+    def test_a_superseded_fact_says_by_when_it_changed(self):
+        mem = self.make_memory(verifier=AcceptAllVerifier())
+        old_fact = "user user user user lives in paris"
+        new_fact = "user user user user lives in london"
+        mem.add([{"role": "user", "content": old_fact + ".", "timestamp": "2024/01/05 (Fri) 10:00"}],
+                user_id="alice")
+        mem.add([{"role": "user", "content": new_fact + ".", "timestamp": "2024-06-01"}],
+                user_id="alice")
+        mem.consolidate()
+        by_text = {r["text"]: r for r in mem.recall("user lives", user_id="alice", top_k=10)}
+        self.assertEqual(by_text[old_fact]["context"],
+                         "[2024-01-05] [earlier, changed by 2024-06-01] " + old_fact)
+        self.assertEqual(by_text[old_fact]["valid_until"], "2024-06-01")
+        self.assertEqual(by_text[new_fact]["context"], "[2024-06-01] " + new_fact)
+
     def test_superseded_facts_can_be_excluded_instead(self):
         mem = self.make_memory(verifier=AcceptAllVerifier(), exclude_superseded=True)
         old_fact = "user user user user lives in paris"
@@ -993,6 +1008,57 @@ class TestTimeTags(MemoryTestBase):
         self.assertLessEqual(sum(len(r["context"]) // 4 for r in tagged), 18)
 
 
+class TestSourceTurns(MemoryTestBase):
+    """Each fact knows the message it came from; sources="turn" returns that."""
+
+    MESSAGE = "I adopted a beagle named Rex. He is three years old."
+
+    def test_results_carry_their_source_message(self):
+        mem = self.make_memory()
+        mem.add([{"role": "user", "content": self.MESSAGE}], user_id="alice")
+        results = mem.recall("beagle Rex years", user_id="alice")
+        self.assertEqual({r["text"] for r in results},
+                         {"I adopted a beagle named Rex", "He is three years old"})
+        self.assertEqual({r["source"] for r in results}, {self.MESSAGE})
+
+    def test_facts_of_one_message_come_back_as_that_message(self):
+        mem = self.make_memory()
+        mem.add([{"role": "user", "content": self.MESSAGE, "timestamp": "2024-03-02"}],
+                user_id="alice")
+        mem.add([{"role": "assistant", "content": "Beagles need long walks."}], user_id="alice")
+        units = mem.recall("beagle Rex years walks", user_id="alice", sources="turn")
+        self.assertEqual(len(units), 2)
+        by_role = {u["role"]: u for u in units}
+        rex = by_role["user"]
+        self.assertEqual(rex["text"], self.MESSAGE)
+        self.assertEqual(rex["context"], "[2024-03-02] user: " + self.MESSAGE)
+        self.assertEqual(sorted(rex["facts"]),
+                         ["He is three years old", "I adopted a beagle named Rex"])
+        self.assertEqual(len(rex["ids"]), 2)
+        self.assertEqual(by_role["assistant"]["context"],
+                         "[turn 3] assistant: Beagles need long walks.")
+        with self.assertRaises(ValueError):
+            mem.recall("beagle", user_id="alice", sources="session")
+
+    def test_a_turn_counts_against_the_budget_as_shown(self):
+        mem = self.make_memory()
+        mem.add([{"role": "user", "content": self.MESSAGE}], user_id="alice")
+        units = mem.recall("beagle Rex years", user_id="alice", sources="turn", token_budget=10)
+        self.assertEqual(units, [])  # the turn is longer than 10 tokens
+        units = mem.recall("beagle Rex years", user_id="alice", sources="turn", token_budget=40)
+        self.assertEqual([u["text"] for u in units], [self.MESSAGE])
+
+    def test_a_long_turn_is_cut_to_what_bears_on_the_question(self):
+        mem = self.make_memory()
+        filler = " ".join(f"Sentence {i} talks about the weather in general." for i in range(30))
+        message = filler + " I adopted a beagle named Rex. " + filler
+        mem.add([{"role": "user", "content": message}], user_id="alice")
+        [unit] = mem.recall("beagle named Rex", user_id="alice", sources="turn", top_k=1,
+                            source_tokens=30)
+        self.assertIn("I adopted a beagle named Rex.", unit["text"])
+        self.assertLessEqual(len(unit["text"]) // 4, 31)
+
+
 class TestReinforcement(MemoryTestBase):
     """recall() is a read: asking does not change what the next call returns."""
 
@@ -1085,6 +1151,31 @@ class TestUserBudget(MemoryTestBase):
                  mem.recall(gists[0]["text"].splitlines()[0], user_id="alice", top_k=5)}
         self.assertIn(gists[0]["id"], found)
         self.assertEqual(found[gists[0]["id"]]["context"], gists[0]["text"])
+
+    def test_a_gist_says_when_what_it_summarizes_was_said(self):
+        mem = self.make_memory(max_user_tokens=self.BUDGET,
+                               gist_summarizer=ExtractiveGistSummarizer())
+        for i in range(12):
+            mem.add([{"role": "user", "content": f"user fact number {i:03d} is here.",
+                      "timestamp": f"2024-01-{i + 1:02d}"}], user_id="alice")
+        mem.consolidate()
+        _, records = self._tokens(mem, "alice")
+        [gist] = [r for r in records if r["source_role"] == "summary"]
+        # Facts 8-11 stay; the gist is written from facts 0-7, said Jan 1-8.
+        self.assertEqual(json.loads(gist["payload"])["span"], ["2024-01-01", "2024-01-08"])
+        found = {r["id"]: r for r in
+                 mem.recall(gist["text"].splitlines()[0], user_id="alice", top_k=5)}
+        self.assertEqual(found[gist["id"]]["context"],
+                         "[2024-01-01 to 2024-01-08] " + gist["text"])
+        # Folded again with what ages out next, the span grows.
+        for i in range(12, 16):
+            mem.add([{"role": "user", "content": f"user fact number {i:03d} is here.",
+                      "timestamp": f"2024-02-{i:02d}"}], user_id="alice")
+        mem.consolidate()
+        _, records = self._tokens(mem, "alice")
+        spans = [json.loads(r["payload"])["span"] for r in records
+                 if r["source_role"] == "summary"]
+        self.assertEqual(spans, [["2024-01-01", "2024-01-12"]])
 
     def test_later_passes_fold_the_earlier_gist_again(self):
         mem = self.make_memory(max_user_tokens=self.BUDGET,

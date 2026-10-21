@@ -35,7 +35,7 @@ import re
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Callable, Dict, Iterable, List, Optional, Union
+from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -47,12 +47,53 @@ from .identity import bind_embedder
 from .interfaces import (  # noqa: F401  (Embedder, Extractor, Verifier: re-exported types)
     Embedder, Extractor, Verifier, embed_documents, embed_query, embedder_fingerprint)
 from .ranking import is_first_person_query, role_prior
+from .sources import SOURCE_TOKENS, speaker, turn_units
+from .when import annotate, said_on
 
 logger = logging.getLogger("tsm.memory")
 
 # Put in front of a superseded memory's text in a result's "context" when its
 # supersession was verified: it was true, and something newer replaced it.
 STALE_MARK = "[earlier, since changed] "
+# The same when the date of the memory that replaced it is known: the change
+# happened by then (it may have happened earlier and been mentioned then).
+STALE_BY = "[earlier, changed by {date}] "
+
+
+def stale_mark(valid_until) -> str:
+    """What goes in front of a verified-superseded memory: ``STALE_BY`` with
+    the date its replacement was said, or ``STALE_MARK`` without one."""
+    until = said_on(valid_until)
+    return STALE_BY.format(date=f"{until:%Y-%m-%d}") if until else STALE_MARK
+
+
+def span_tag(span) -> str:
+    """When the memories a gist summarizes were said: ``"[2023-01-05 to
+    2023-03-02] "``, one date when they were all said on one day, ``""``
+    without a span."""
+    if not span or len(span) != 2:
+        return ""
+    first, last = said_on(span[0]), said_on(span[1])
+    if first is None or last is None:
+        return ""
+    return f"[{first:%Y-%m-%d}] " if first == last else f"[{first:%Y-%m-%d} to {last:%Y-%m-%d}] "
+
+
+def _span_of(payload) -> Optional[Tuple[str, str]]:
+    """A stored memory's span for compaction: a gist's own, or the day a fact
+    was said."""
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload) if payload else {}
+        except ValueError:
+            payload = {}
+    if not isinstance(payload, dict):
+        return None
+    span = payload.get("span")
+    if isinstance(span, (list, tuple)) and len(span) == 2 and all(said_on(s) for s in span):
+        return (f"{said_on(span[0]):%Y-%m-%d}", f"{said_on(span[1]):%Y-%m-%d}")
+    day = said_on(payload.get("timestamp"))
+    return (f"{day:%Y-%m-%d}",) * 2 if day else None
 
 # A date, then optionally a weekday in brackets and a time of day:
 # "2024-01-15", "2024-01-15T10:00:00Z", "2023/05/20 (Sat) 02:21".
@@ -566,6 +607,9 @@ class Memory:
         reranker: Optional[object] = None,
         max_items: Optional[int] = None,
         time_tags: Union[bool, str] = True,
+        sources: Optional[str] = None,
+        source_tokens: int = SOURCE_TOKENS,
+        event_dates: bool = False,
     ) -> List[Dict]:
         """Search memories under ``user_id``'s scope.
 
@@ -598,11 +642,33 @@ class Memory:
         memory was said (``time_tag``): its date when the message carried a
         timestamp, otherwise its turn, as in ``[turn 12] ...``. A model
         asked which of two things happened first, or what was true before
-        something changed, has nothing else to go on. Gists carry no tag:
-        they cover many turns. The tags count against ``token_budget``.
+        something changed, has nothing else to go on. A gist is tagged with
+        the span of what it summarizes (``[2023-01-05 to 2023-03-02] ...``)
+        when that was dated, and carries no tag otherwise. The tags count
+        against ``token_budget``.
         ``time_tags="minute"`` adds the time of day when the timestamp has
         one (``[2024-01-15 10:00] ...``), so two memories of one day can be
         ordered; ``"date"`` is the same as True.
+
+        Every result carries ``"source"``, the message it was taken from
+        (``None`` for gists and for records stored before messages were
+        kept). With ``sources="turn"`` the facts are the keys and the turns
+        are what is returned (``tsm.sources.turn_units``): the facts found
+        for one message become one result whose ``"text"`` is that message
+        as it was said, cut to its sentences that bear on the facts and the
+        question when it is longer than ``source_tokens``, with ``"facts"``
+        and ``"ids"`` listing the facts it stands for. Its ``"context"``
+        names the speaker after the time tag (``[2024-01-15] user: ...``).
+        A fact does not always say what it is about ("The workshop was
+        free"); the message it came from does.
+
+        With ``event_dates``, a relative time in what is shown is followed by
+        the date it points to, counted from the date the memory was said
+        (``tsm.when.annotate``): "two weeks ago [week of 2023-05-08]". When
+        something happened is then written out instead of left to the
+        reader's arithmetic. A verified-superseded memory says by when it
+        changed (``STALE_BY``: the date its replacement was said) whenever
+        that date is known.
 
         ``recall()`` is a read: asking does not change what the next call
         returns. Use ``reinforce()`` to tell the memory which results were
@@ -616,6 +682,8 @@ class Memory:
         self._activity = time.monotonic()
         if time_tags not in (True, False, "date", "minute"):
             raise ValueError("time_tags must be True, False, 'date' or 'minute'")
+        if sources not in (None, "turn"):
+            raise ValueError("sources must be None or 'turn'")
         query_embedding = np.asarray(embed_query(self.embedder, query), dtype=np.float32)
 
         active_reranker = reranker or (self.reranker if rerank else None)
@@ -646,20 +714,27 @@ class Memory:
             # Scope guard: only this user's memories and global (unscoped) ones.
             if user_id is not None and rec["scope"] not in (None, user_id):
                 continue
-            pool.append({"id": mid, "text": rec["text"], "score": float(score),
-                         "role": rec["source_role"] or "",
-                         "turn_index": rec["payload"].get("turn_index"),
-                         "timestamp": rec["payload"].get("timestamp")})
+            pool.append(self._pool_item(mid, rec, float(score)))
         if not pool:
             return []
         if resolve_beliefs:
             self._resolve_beliefs(pool, user_id)
+        if sources == "turn":
+            pool = turn_units(pool, query, source_tokens)
         for p in pool:
             # Set before packing: what is shown is what the budget counts.
-            shown = p.get("context", p["text"] or "")
+            shown = p["text"] or ""
+            if event_dates and not is_gist(p["role"]):
+                shown = annotate(shown, said_on(p["timestamp"]))
+            if sources == "turn" and p.get("facts"):
+                shown = speaker(p["role"]) + shown
+            if self._verified and p.get("superseded_by"):
+                shown = stale_mark(p.get("valid_until")) + shown
             if time_tags and not is_gist(p["role"]):
                 shown = time_tag(p["timestamp"], p["turn_index"],
                                  minutes=time_tags == "minute") + shown
+            elif time_tags:
+                shown = span_tag(p.get("span")) + shown
             p["context"] = shown
 
         first_person = is_first_person_query(query)
@@ -689,6 +764,18 @@ class Memory:
                 lam=lam, max_items=max_items)
         return final
 
+    @staticmethod
+    def _pool_item(mid: str, rec: Dict, score: float) -> Dict:
+        """A search candidate as ``recall()`` hands it on: the stored record
+        with what its payload says about where and when it was said."""
+        payload = rec["payload"]
+        return {"id": mid, "text": rec["text"], "score": score,
+                "role": rec["source_role"] or "", "scope": rec["scope"],
+                "turn_index": payload.get("turn_index"),
+                "timestamp": payload.get("timestamp"),
+                "source": payload.get("original_message"),
+                "span": payload.get("span")}
+
     def _resolve_beliefs(self, pool: List[Dict], user_id: Optional[str]) -> None:
         """Mark the superseded memories in ``pool`` and, when supersessions are
         verified, add the current belief of each one that is missing.
@@ -706,6 +793,7 @@ class Memory:
         # had before its demotion: the place the current belief is owed when
         # the query is worded like the old fact.
         owed: Dict[str, float] = {}
+        successor: Dict[str, str] = {}  # stale memory -> the one that replaced it
         for res in resolve(list(by_id)):
             current = res["current_id"]
             if current == res["id"]:
@@ -715,17 +803,25 @@ class Memory:
             stale["chain"] = list(res["chain"])
             if not self._verified:
                 continue
-            stale["context"] = STALE_MARK + (stale["text"] or "")
+            chain = stale["chain"]
+            position = chain.index(res["id"]) if res["id"] in chain else -1
+            successor[res["id"]] = (chain[position + 1] if 0 <= position < len(chain) - 1
+                                    else current)
             before = stale["score"] / max(float(res.get("demotion") or 1.0), 1e-6)
             owed[current] = max(owed.get(current, 0.0), before)
+        if successor:
+            # When each was replaced: the date its replacement was said.
+            unknown = [mid for mid in set(successor.values()) if mid not in by_id]
+            said = {mid: rec["payload"].get("timestamp")
+                    for mid, rec in (self._records(unknown).items() if unknown else ())}
+            said.update({mid: p.get("timestamp") for mid, p in by_id.items()})
+            for mid, after in successor.items():
+                by_id[mid]["valid_until"] = said.get(after)
         missing = [mid for mid in owed if mid not in by_id]
         for mid, rec in (self._records(missing).items() if missing else ()):
             if user_id is not None and rec["scope"] not in (None, user_id):
                 continue
-            by_id[mid] = {"id": mid, "text": rec["text"], "score": owed[mid],
-                          "role": rec["source_role"] or "",
-                          "turn_index": rec["payload"].get("turn_index"),
-                          "timestamp": rec["payload"].get("timestamp")}
+            by_id[mid] = self._pool_item(mid, rec, owed[mid])
             pool.append(by_id[mid])
         for mid, score in owed.items():
             head = by_id.get(mid)
@@ -879,6 +975,7 @@ class Memory:
             self.max_user_tokens,
             self._summarize_chunk if self._gist_summarizer is not None else None,
             fold_first=[i for i, r in enumerate(records) if r["id"] in superseded],
+            spans=[_span_of(r.get("payload")) for r in records],
         )
         if plan is None:
             self._touched.discard(user)
@@ -900,13 +997,17 @@ class Memory:
                 return 0
             if plan.gists:
                 gist_ids, payloads = [], []
-                for _ in plan.gists:
+                spans = plan.gist_spans or [None] * len(plan.gists)
+                for span in spans:
                     gist_ids.append(self._next_id(user))
                     # Each gist is a turn of its own, so budget recall spreads
-                    # its selection over gists as it does over turns.
-                    payloads.append(json.dumps({"kind": "gist", "user_id": user,
-                                                "folded": len(folded),
-                                                "turn_index": self._insert_counter}))
+                    # its selection over gists as it does over turns. Its span
+                    # says when what it summarizes was said.
+                    payload = {"kind": "gist", "user_id": user, "folded": len(folded),
+                               "turn_index": self._insert_counter}
+                    if span:
+                        payload["span"] = list(span)
+                    payloads.append(json.dumps(payload))
                 self.engine.insert_batch(
                     gist_ids,
                     plan.gists,
