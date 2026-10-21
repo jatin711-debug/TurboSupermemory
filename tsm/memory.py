@@ -41,7 +41,7 @@ import numpy as np
 
 from ._loader import load_turbomemory
 from .budget import select_under_budget, total_tokens
-from .compaction import is_gist, plan_compaction
+from .compaction import POLICIES, is_gist, plan_compaction
 from .concepts import extract_concepts
 from .identity import bind_embedder
 from .interfaces import (  # noqa: F401  (Embedder, Extractor, Verifier: re-exported types)
@@ -94,6 +94,17 @@ def _span_of(payload) -> Optional[Tuple[str, str]]:
         return (f"{said_on(span[0]):%Y-%m-%d}", f"{said_on(span[1]):%Y-%m-%d}")
     day = said_on(payload.get("timestamp"))
     return (f"{day:%Y-%m-%d}",) * 2 if day else None
+
+
+def _level_of(payload) -> int:
+    """A stored gist's merge level (0 for anything else)."""
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload) if payload else {}
+        except ValueError:
+            return 0
+    level = payload.get("level") if isinstance(payload, dict) else 0
+    return int(level) if isinstance(level, int) and level >= 0 else 0
 
 # A date, then optionally a weekday in brackets and a time of day:
 # "2024-01-15", "2024-01-15T10:00:00Z", "2023/05/20 (Sat) 02:21".
@@ -215,6 +226,7 @@ class Memory:
         gist_summarizer: Optional[Callable[[List[str]], str]] = None,
         reranker: Optional[object] = None,
         max_user_tokens: Optional[int] = None,
+        compaction: str = "refold",
         allow_embedder_change: bool = False,
         idle_consolidation_secs: Optional[float] = None,
         **engine_kwargs,
@@ -259,6 +271,10 @@ class Memory:
                 ``gist_summarizer``, earlier gists included, so the store
                 stays within the budget however long the history grows.
                 Without a summarizer the older facts are simply removed.
+                ``compaction="merge_oldest"`` keeps earlier gists as they are
+                and merges only the two oldest when the gists outgrow their
+                share (``tsm.compaction.plan_compaction``); the default
+                ``"refold"`` summarizes every earlier gist again on each pass.
                 This is per user and by tokens; the engine's ``max_records``
                 is one count for the whole store and keeps whatever is
                 newest.
@@ -376,6 +392,9 @@ class Memory:
         if max_user_tokens is not None and int(max_user_tokens) < 16:
             raise ValueError("max_user_tokens must be at least 16")
         self.max_user_tokens = None if max_user_tokens is None else int(max_user_tokens)
+        if compaction not in POLICIES:
+            raise ValueError(f"compaction must be one of {POLICIES}")
+        self.compaction = compaction
         if idle_consolidation_secs is not None and not float(idle_consolidation_secs) > 0:
             raise ValueError("idle_consolidation_secs must be positive")
         self._idle_secs = (None if idle_consolidation_secs is None
@@ -976,6 +995,8 @@ class Memory:
             self._summarize_chunk if self._gist_summarizer is not None else None,
             fold_first=[i for i, r in enumerate(records) if r["id"] in superseded],
             spans=[_span_of(r.get("payload")) for r in records],
+            levels=[_level_of(r.get("payload")) for r in records],
+            policy=self.compaction,
         )
         if plan is None:
             self._touched.discard(user)
@@ -998,13 +1019,15 @@ class Memory:
             if plan.gists:
                 gist_ids, payloads = [], []
                 spans = plan.gist_spans or [None] * len(plan.gists)
-                for span in spans:
+                levels = plan.gist_levels or [0] * len(plan.gists)
+                for span, level in zip(spans, levels):
                     gist_ids.append(self._next_id(user))
                     # Each gist is a turn of its own, so budget recall spreads
                     # its selection over gists as it does over turns. Its span
-                    # says when what it summarizes was said.
+                    # says when what it summarizes was said; its level, how
+                    # many merges it is the result of.
                     payload = {"kind": "gist", "user_id": user, "folded": len(folded),
-                               "turn_index": self._insert_counter}
+                               "turn_index": self._insert_counter, "level": int(level)}
                     if span:
                         payload["span"] = list(span)
                     payloads.append(json.dumps(payload))

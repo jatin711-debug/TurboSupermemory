@@ -29,7 +29,9 @@ GIST_SYSTEM_PROMPT = (
     "user, especially names, numbers, dates, purchases, preferences, locations, "
     "changes, and counts. Drop generic assistant advice unless the user explicitly "
     "adopted it. Output only terse bullet facts, one complete fact per line. Never "
-    "merge separate countable events and never end with an incomplete fact."
+    "merge separate countable events and never end with an incomplete fact. When "
+    "an input fact starts with a date in brackets, keep that date at the start of "
+    "its line; when a value changed, write the latest value with its date."
 )
 
 _ROLE_PREFIXES = ("[user] ", "[assistant] ", "[system] ")

@@ -28,6 +28,9 @@ neighbouring arms belongs to one mechanism:
     sdk_budget_rolling  the same store compacted --rolling-passes times as
                     the conversation arrives, each pass folding the last
                     one's gists again: what a live deployment does
+    sdk_budget_rolling_merge  the same with compaction="merge_oldest": earlier
+                    gists stay as written; only the two oldest are merged
+                    when the gists outgrow their share
 
   any engine setting, as an arm of its own
     --config NAME:KEY=VALUE,...   adds the arm cfg_NAME: sdk_cognitive (the
@@ -140,10 +143,11 @@ BOUNDED = ("sdk_evict", "sdk_evict_gist", "sdk_budget", "sdk_budget_rolling")
 # Arms served by recall() as it ships; each also has an _untagged twin.
 RECALL_ARMS = ("sdk_cognitive", "sdk_cognitive_alpha1", "sdk_belief", "sdk_belief_llm",
                "sdk_belief_llm_exclude", "sdk_belief_llm_nodemote", "sdk_evict",
-               "sdk_evict_gist", "sdk_budget", "sdk_budget_rolling", "sdk_budget_delete")
+               "sdk_evict_gist", "sdk_budget", "sdk_budget_rolling", "sdk_budget_rolling_merge",
+               "sdk_budget_delete")
 DIAGNOSTIC = (("sdk_cognitive_trunc", "sdk_cognitive_alpha1", "sdk_pack_capped", "sdk_pack_tagged",
                "sdk_belief_llm_exclude", "sdk_belief_llm_nodemote", "sdk_budget_delete",
-               "full_context")
+               "sdk_budget_rolling_merge", "full_context")
               + tuple(a + "_untagged" for a in RECALL_ARMS)
               + tuple(a + "_turns" for a in RECALL_ARMS))
 DEFAULT_ARMS = UNBOUNDED + BOUNDED
@@ -165,6 +169,8 @@ PAIRS = (
     ("sdk_budget", "sdk_cognitive"),
     ("sdk_budget", "sdk_budget_untagged"),
     ("sdk_budget_rolling", "sdk_budget"),
+    ("sdk_budget_rolling_merge", "sdk_budget_rolling"),
+    ("sdk_budget_rolling_merge", "sdk_budget"),
     ("sdk_budget", "sdk_budget_delete"),
     ("sdk_budget_untagged", "sdk_budget_delete_untagged"),
     ("sdk_cognitive_trunc", "sdk_plain"),
@@ -754,7 +760,7 @@ def main():
                                client=KeepsClient() if args.offline else None,
                                cache_dir=None if args.offline else os.path.join(work_dir, "verdicts"))
     summarizer = None
-    if asked("sdk_evict_gist", "sdk_budget", "sdk_budget_rolling"):
+    if asked("sdk_evict_gist", "sdk_budget", "sdk_budget_rolling", "sdk_budget_rolling_merge"):
         summarizer = CachedGists(
             ExtractiveGistSummarizer() if args.offline else OpenAIGistSummarizer(
                 model=args.gist_model),
@@ -1014,6 +1020,8 @@ def main():
                        gist_summarizer=summarizer)
             recall_arm("sdk_budget_rolling", feed=rolling, max_user_tokens=args.user_tokens,
                        gist_summarizer=summarizer)
+            recall_arm("sdk_budget_rolling_merge", feed=rolling, max_user_tokens=args.user_tokens,
+                       gist_summarizer=summarizer, compaction="merge_oldest")
             recall_arm("sdk_budget_delete", max_user_tokens=args.user_tokens)
 
             for asked_of, q in questions:

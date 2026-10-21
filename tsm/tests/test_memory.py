@@ -1177,6 +1177,24 @@ class TestUserBudget(MemoryTestBase):
                  if r["source_role"] == "summary"]
         self.assertEqual(spans, [["2024-01-01", "2024-01-12"]])
 
+    def test_merge_oldest_leaves_an_earlier_gist_as_written(self):
+        mem = self.make_memory(max_user_tokens=self.BUDGET, compaction="merge_oldest",
+                               gist_summarizer=lambda texts: "- " + str(len(texts)) + " facts")
+        self._fill(mem, "alice", 0, 12)
+        mem.consolidate()
+        _, records = self._tokens(mem, "alice")
+        [first] = [r for r in records if r["source_role"] == "summary"]
+        self.assertEqual(json.loads(first["payload"])["level"], 0)
+        self._fill(mem, "alice", 12, 8)  # over the budget again
+        mem.consolidate()
+        _, records = self._tokens(mem, "alice")
+        gists = [r for r in records if r["source_role"] == "summary"]
+        self.assertIn(first["id"], [g["id"] for g in gists], "kept, not refolded")
+        self.assertEqual(len(gists), 2)
+        with self.assertRaises(ValueError):
+            Memory(self.db_path + "_x", embedder=FakeEmbedder(), extractor=FakeExtractor(),
+                   compaction="forget")
+
     def test_later_passes_fold_the_earlier_gist_again(self):
         mem = self.make_memory(max_user_tokens=self.BUDGET,
                                gist_summarizer=ExtractiveGistSummarizer())

@@ -309,6 +309,53 @@ class TestCompactionPlan(unittest.TestCase):
     def test_nothing_to_do_when_everything_fits(self):
         self.assertIsNone(plan_compaction(["a" * 40, "b" * 40], ["user", "user"], 20, None))
 
+    def test_merge_oldest_keeps_earlier_gists_while_they_fit(self):
+        # One earlier gist (8 tokens) and ten facts of 10 tokens; budget 60:
+        # 30 for gists, 30 for the three newest facts.
+        texts = ["- adopted a dog\n- moved to Porto"] + [f"u{i} " + "x" * 36 for i in range(10)]
+        roles = [GIST_ROLE] + ["user"] * 10
+        spans = [("2023-01-01", "2023-01-09")] + [(f"2023-02-{i + 1:02d}",) * 2 for i in range(10)]
+        seen = []
+
+        def summarize(lines, max_tokens):
+            seen.append((list(lines), max_tokens))
+            return "- seven facts in short"  # 5 tokens: 8 + 5 fit the 30 of gists
+
+        plan = plan_compaction(texts, roles, 60, summarize, spans=spans, levels=[0] * 11,
+                               policy="merge_oldest")
+        self.assertIn(0, plan.keep, "the earlier gist stays as it is")
+        self.assertNotIn(0, plan.fold)
+        self.assertEqual(plan.keep, [0, 8, 9, 10])
+        self.assertEqual(len(seen), 1, "one new gist from what aged out, nothing refolded")
+        self.assertEqual(seen[0][0][0], f"[user] [2023-02-01] {texts[1]}")
+        self.assertEqual(plan.gist_levels, [0])
+        self.assertEqual(plan.gist_spans, [("2023-02-01", "2023-02-07")])
+
+    def test_merge_oldest_merges_the_two_oldest_gists_of_one_level(self):
+        gist = "- " + "y" * 54  # 14 tokens
+        texts = [gist, gist, gist] + [f"u{i} " + "x" * 36 for i in range(6)]
+        roles = [GIST_ROLE] * 3 + ["user"] * 6
+        spans = [("2023-01-01",) * 2, ("2023-01-05",) * 2, ("2023-01-09",) * 2] + [None] * 6
+        merges = []
+
+        def summarize(lines, max_tokens):
+            merges.append(list(lines))
+            # The new gist is 10 tokens, a merge 4.
+            return "- " + "z" * (40 if len(merges) == 1 else 14)
+
+        plan = plan_compaction(texts, roles, 60, summarize, spans=spans, levels=[0, 0, 1] + [0] * 6,
+                               policy="merge_oldest")
+        # Three earlier gists (42 tokens) and a new one (10) exceed the 30 of
+        # gists: the two oldest at level 0 are merged (not the level-1 one),
+        # and the 28 tokens left fit.
+        self.assertEqual(sorted(i for i in plan.fold if i < 3), [0, 1])
+        self.assertIn(2, plan.keep)
+        self.assertEqual(sorted(plan.gist_levels), [0, 1])
+        self.assertIn(("2023-01-01", "2023-01-05"), plan.gist_spans)
+        self.assertEqual(len(merges), 2)  # the new gist, then one merge
+        with self.assertRaises(ValueError):
+            plan_compaction(texts, roles, 60, summarize, policy="forget")
+
     def test_each_gist_spans_the_dates_of_what_it_was_written_from(self):
         texts = ["- old summary line"] + [f"u{i} " + "x" * 36 for i in range(9)]
         roles = [GIST_ROLE] + ["user"] * 9

@@ -15,7 +15,7 @@ say. It touches no store; ``tsm.Memory`` applies the plan
 """
 
 from dataclasses import dataclass, field
-from typing import Callable, Collection, List, Optional, Sequence, Tuple
+from typing import Callable, Collection, Dict, List, Optional, Sequence, Tuple
 
 from .budget import (
     fit_complete_facts_to_budget,
@@ -47,6 +47,9 @@ class CompactionPlan:
     gists: List[str]
     gist_roles: List[str]
     gist_spans: List[Optional[Tuple[str, str]]] = field(default_factory=list)
+    # How many merges each gist is the result of: 0 for a gist written from
+    # facts, one more than its inputs for a merge (``policy="merge_oldest"``).
+    gist_levels: List[int] = field(default_factory=list)
 
 
 Span = Optional[Tuple[str, str]]
@@ -60,8 +63,19 @@ def _join(spans: Sequence[Span]) -> Span:
     return (min(s[0] for s in dated), max(s[1] for s in dated))
 
 
+POLICIES = ("refold", "merge_oldest")
+
+
 def is_gist(role: Optional[str]) -> bool:
     return role in (GIST_ROLE, GIST_OTHER_ROLE)
+
+
+def _entry(role: str, text: str, span: Span) -> str:
+    """A fact as the summarizer reads it: its role, and its date when it was
+    said on one day (``[user] [2023-05-22] ...``), so the gist can keep it."""
+    if span and span[0] == span[1]:
+        return f"[{role}] [{span[0]}] {text}"
+    return f"[{role}] {text}"
 
 
 def _gist_lines(text: str) -> List[str]:
@@ -86,6 +100,8 @@ def plan_compaction(
     max_gist_chunks: int = 4,
     fold_first: Collection[int] = (),
     spans: Optional[Sequence[Span]] = None,
+    levels: Optional[Sequence[int]] = None,
+    policy: str = "refold",
 ) -> Optional[CompactionPlan]:
     """Plan one compaction of a user's memories, given oldest first.
 
@@ -109,7 +125,21 @@ def plan_compaction(
     "2023-05-22")`` for a fact said that day, an earlier gist's own span) or
     ``None``; each gist's span is then the span of what it was written from.
     Without dates a gist is undated, and a reader cannot place what it says
-    in time.
+    in time. A fact said on one day reaches the summarizer with its date
+    (``[user] [2023-05-22] ...``), so a gist can keep it on the line.
+
+    ``policy`` decides what happens to earlier gists:
+
+    - ``"refold"`` (default): every earlier gist is summarized again with
+      what ages out, on every pass. A fact is rewritten once per pass, and
+      compacting four times as a conversation arrived scored 0.411 where
+      compacting once scored 0.464 (``benchmarks/PHASE_PROGRESS.md``).
+    - ``"merge_oldest"``: earlier gists stay as they are. What ages out
+      becomes new gists, and only while the gists exceed their share are the
+      two oldest gists of one role and of the lowest level merged into one
+      a level up, as a log-structured store compacts. A fact is then
+      rewritten about log2(passes) times. ``levels`` gives each memory's
+      level (an earlier gist's, from its payload; 0 otherwise).
 
     A summarizer that raises aborts the plan: nothing is planned, so nothing
     is removed.
@@ -118,7 +148,12 @@ def plan_compaction(
         raise ValueError("texts and roles must have the same length")
     if spans is not None and len(spans) != len(texts):
         raise ValueError("spans and texts must have the same length")
+    if levels is not None and len(levels) != len(texts):
+        raise ValueError("levels and texts must have the same length")
+    if policy not in POLICIES:
+        raise ValueError(f"policy must be one of {POLICIES}")
     spans = list(spans) if spans is not None else [None] * len(texts)
+    levels = [int(level or 0) for level in levels] if levels is not None else [0] * len(texts)
     if token_budget < 2:
         raise ValueError("token budget must be at least 2")
     if not 0.0 < gist_share < 1.0:
@@ -140,6 +175,9 @@ def plan_compaction(
     fold = [i for i in range(len(texts)) if i not in surviving]
     if summarize is None:
         return CompactionPlan(keep=keep, fold=fold, gists=[], gist_roles=[])
+    if policy == "merge_oldest":
+        return _merge_oldest(texts, roles, spans, levels, keep, fold, summarize, gist_limit,
+                             gist_chunk_tokens)
 
     # What the gists are written from, oldest first. An earlier gist stands
     # for history older than any fact still stored, so its lines lead.
@@ -159,7 +197,7 @@ def plan_compaction(
     for i in fold:
         if is_gist(roles[i]):
             continue
-        entry = f"[{roles[i]}] {texts[i]}"
+        entry = _entry(roles[i], texts[i], spans[i])
         if roles[i] == "user":
             user_tail.append(entry)
             user_spans.append(spans[i])
@@ -201,4 +239,66 @@ def plan_compaction(
                 gist_roles.append(role)
                 gist_spans.append(span)
     return CompactionPlan(keep=keep, fold=fold, gists=gists, gist_roles=gist_roles,
-                          gist_spans=gist_spans)
+                          gist_spans=gist_spans, gist_levels=[0] * len(gists))
+
+
+def _merge_oldest(texts, roles, spans, levels, keep, fold, summarize, gist_limit,
+                  chunk_tokens) -> CompactionPlan:
+    """``policy="merge_oldest"``: see ``plan_compaction``."""
+    earlier = [i for i in range(len(texts)) if is_gist(roles[i])]
+    aged_out = [i for i in fold if not is_gist(roles[i])]
+    # Every gist in play: the earlier ones as they are, then the new ones.
+    pool = [{"role": roles[i], "text": texts[i], "span": spans[i], "level": levels[i],
+             "index": i} for i in earlier]
+    for gist_role, ours in ((GIST_ROLE, lambda role: role == "user"),
+                            (GIST_OTHER_ROLE, lambda role: role != "user")):
+        sources = [i for i in aged_out if ours(roles[i])]
+        if not sources:
+            continue
+        lines = [_entry(roles[i], texts[i], spans[i]) for i in sources]
+        gist = fit_complete_facts_to_budget(summarize(lines, chunk_tokens), chunk_tokens)
+        if gist:
+            pool.append({"role": gist_role, "text": gist, "level": 0, "index": None,
+                         "span": _join([spans[i] for i in sources])})
+
+    def age(gist):
+        """Older first: by the start of its span, then by store order."""
+        start = gist["span"][0] if gist["span"] else "9999-99-99"
+        return (start, gist["index"] if gist["index"] is not None else len(texts))
+
+    def oldest_pair():
+        """The two oldest gists of one role at its lowest level holding two
+        or more; across roles, the pair whose older gist is older."""
+        best = None
+        for role in (GIST_ROLE, GIST_OTHER_ROLE):
+            ours = sorted((g for g in pool if g["role"] == role), key=age)
+            by_level: Dict[int, List[dict]] = {}
+            for gist in ours:
+                by_level.setdefault(gist["level"], []).append(gist)
+            paired = [group[:2] for _, group in sorted(by_level.items()) if len(group) >= 2]
+            pair = paired[0] if paired else (ours[:2] if len(ours) >= 2 else None)
+            if pair and (best is None or age(pair[0]) < age(best[0])):
+                best = pair
+        return best
+
+    while total_tokens([g["text"] for g in pool]) > gist_limit:
+        pair = oldest_pair()
+        if pair is None:
+            break  # one gist per role left: nothing more to merge
+        label = "[user] " if pair[0]["role"] == GIST_ROLE else "[assistant] "
+        lines = [label + line for gist in pair for line in _gist_lines(gist["text"])]
+        merged = fit_complete_facts_to_budget(summarize(lines, chunk_tokens), chunk_tokens)
+        for gist in pair:
+            pool.remove(gist)
+        if merged:
+            pool.append({"role": pair[0]["role"], "text": merged,
+                         "span": _join([g["span"] for g in pair]),
+                         "level": max(g["level"] for g in pair) + 1, "index": None})
+
+    still = {g["index"] for g in pool if g["index"] is not None}
+    new = [g for g in pool if g["index"] is None]
+    return CompactionPlan(
+        keep=sorted(set(keep) | still),
+        fold=sorted(set(aged_out) | {i for i in earlier if i not in still}),
+        gists=[g["text"] for g in new], gist_roles=[g["role"] for g in new],
+        gist_spans=[g["span"] for g in new], gist_levels=[g["level"] for g in new])
