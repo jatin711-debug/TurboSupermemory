@@ -27,6 +27,8 @@ import json
 import logging
 import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from ._retry import QuotaExhausted, call_with_retries
@@ -228,6 +230,7 @@ class LLMVerifier:
         candidate_margin: Optional[float] = 0.1,
         request_kwargs: Optional[dict] = None,
         system_prompt: Optional[str] = None,
+        workers: int = 4,
     ):
         """
         Args:
@@ -238,6 +241,10 @@ class LLMVerifier:
                 also retire the older wording of a repeated fact; a wrong
                 "same" then costs a fact, so it is off by default.
             batch_size: candidate pairs per request.
+            workers: requests in flight at once. A long history proposes
+                thousands of pairs (a LongMemEval-S history holds about 2,400
+                memories), and one request after another took hours. A local
+                server that serves one request at a time simply queues them.
             cache_dir: directory for the verdict cache (one JSON file per model).
             candidate_min_cosine / candidates_per_record: how widely
                 ``Memory.consolidate`` asks the engine for candidates.
@@ -271,6 +278,8 @@ class LLMVerifier:
         self.model = model
         self.accept = {v.lower() for v in accept}
         self.batch_size = max(1, int(batch_size))
+        self.workers = max(1, int(workers))
+        self._calls_lock = threading.Lock()
         self.max_retries = max_retries
         self.candidate_min_cosine = float(candidate_min_cosine)
         self.candidates_per_record = int(candidates_per_record)
@@ -313,7 +322,8 @@ class LLMVerifier:
             for i, (older, newer) in enumerate(batch))
 
         def request():
-            self.calls += 1
+            with self._calls_lock:
+                self.calls += 1
             resp = self._client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "system", "content": self._system},
@@ -326,26 +336,46 @@ class LLMVerifier:
         reply = call_with_retries(request, "supersession verification", self.max_retries, logger)
         return _read_verdicts(reply, len(batch))
 
+    def _outcome(self, pairs, chunk):
+        """The verdicts of one batch, or the error that stopped it."""
+        try:
+            return self._ask([pairs[i] for i in chunk])
+        except RuntimeError as e:  # QuotaExhausted included: judge() decides
+            return e
+
     def judge(self, pairs: Sequence[Tuple[str, str]]) -> List[Optional[str]]:
         """One verdict per ``(older, newer)`` text pair: ``"replaces"``,
         ``"same"``, ``"keeps"``, or ``None`` when the model could not be
         asked or did not answer for that pair."""
         out: List[Optional[str]] = [self._cache.get(self._key(o, n)) for o, n in pairs]
         todo = [i for i, verdict in enumerate(out) if verdict is None]
-        for start in range(0, len(todo), self.batch_size):
-            chunk = todo[start:start + self.batch_size]
-            try:
-                verdicts = self._ask([pairs[i] for i in chunk])
-            except QuotaExhausted:
-                raise  # no later batch can succeed either
-            except RuntimeError as e:
-                logger.warning("%s; %d pairs left unverified (not committed)", e, len(chunk))
-                continue
-            for position, verdict in verdicts.items():
-                index = chunk[position]
-                out[index] = verdict
-                self._cache[self._key(*pairs[index])] = verdict
-                self._dirty = True
+        chunks = [todo[start:start + self.batch_size]
+                  for start in range(0, len(todo), self.batch_size)]
+        if not chunks:
+            replies = []
+        elif self.workers == 1 or len(chunks) == 1:
+            replies = ((chunk, self._outcome(pairs, chunk)) for chunk in chunks)
+        else:
+            pool = ThreadPoolExecutor(max_workers=min(self.workers, len(chunks)))
+            futures = [(chunk, pool.submit(self._outcome, pairs, chunk)) for chunk in chunks]
+            replies = ((chunk, future.result()) for chunk, future in futures)
+        try:
+            # The cache is only written here, on this thread, in batch order.
+            for chunk, verdicts in replies:
+                if isinstance(verdicts, QuotaExhausted):
+                    raise verdicts  # no later batch can succeed either
+                if isinstance(verdicts, RuntimeError):
+                    logger.warning("%s; %d pairs left unverified (not committed)",
+                                   verdicts, len(chunk))
+                    continue
+                for position, verdict in verdicts.items():
+                    index = chunk[position]
+                    out[index] = verdict
+                    self._cache[self._key(*pairs[index])] = verdict
+                    self._dirty = True
+        finally:
+            if len(chunks) > 1 and self.workers > 1:
+                pool.shutdown(wait=True, cancel_futures=True)
         self.unresolved = sum(verdict is None for verdict in out)
         self.unresolved_total += self.unresolved
         return out

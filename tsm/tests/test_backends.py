@@ -145,6 +145,26 @@ class TestRetryPolicy(unittest.TestCase):
             verifier.judge([("I live in Lisbon.", "I live in Porto."),
                             ("I like tea.", "I like coffee.")])
 
+    def test_verifier_batches_run_in_parallel_and_land_in_order(self):
+        import threading
+
+        lock, seen = threading.Lock(), []
+
+        def create(**kwargs):
+            with lock:
+                seen.append(kwargs["messages"][1]["content"])
+            return chat_reply("1: moved REPLACES\n2: second item KEEPS")
+
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        verifier = LLMVerifier(client=client, batch_size=2, workers=4)
+        pairs = [(f"old {i}", f"new {i}") for i in range(10)]
+        self.assertEqual(verifier.judge(pairs), ["replaces", "keeps"] * 5)
+        self.assertEqual(verifier.calls, 5)
+        self.assertEqual(len(seen), 5)
+        # A second ask is served from the cache, in parallel or not.
+        self.assertEqual(verifier.judge(pairs), ["replaces", "keeps"] * 5)
+        self.assertEqual(verifier.calls, 5)
+
     def test_gives_up_after_the_last_attempt_without_a_trailing_sleep(self):
         with self.assertRaises(RuntimeError) as ctx:
             self.run_with(ApiError(500), ApiError(500), ApiError(500), max_retries=3)
