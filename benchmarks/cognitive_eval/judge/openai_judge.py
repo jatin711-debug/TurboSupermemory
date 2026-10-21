@@ -120,6 +120,20 @@ class OpenAIJudge:
         the memories of one day."""
         if not memories:
             return "NO ANSWER"
+        if reader == "tools":
+            # The same prompt as "notes", with tools for arithmetic, dates
+            # and counting (tsm.answering).
+            from tsm.answering import answer_with_tools
+
+            if turns and len(turns) == len(memories):
+                memories = [{"context": m, "turn_index": t} for m, t in zip(memories, turns)]
+            out = answer_with_tools(self._client, self.model, question, memories, today,
+                                    max_retries=self.max_retries)
+            with self._calls_lock:
+                self.calls += out["requests"]
+                self.input_tokens += out["input_tokens"]
+                self.output_tokens += out["output_tokens"]
+            return out["answer"]
         if reader == "notes":
             from tsm.reading import answer_prompt, final_answer
 

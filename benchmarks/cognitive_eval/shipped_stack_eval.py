@@ -35,9 +35,17 @@ neighbouring arms belongs to one mechanism:
                             these MemoryEngine settings, e.g.
                             --config a90:cognitive_alpha=0.9
 
+  any recall() argument, as an arm of its own
+    --recall NAME:KEY=VALUE,...   adds the arm rcl_NAME: the sdk_cognitive
+                            store read with these recall() arguments, e.g.
+                            --recall dates:event_dates=true
+
   diagnostics (not run by default)
     <recall arm>_untagged   the same store, recall(time_tags=False): the
                             facts without their turn or date
+    <recall arm>_turns      the same store, recall(sources="turn"): the facts
+                            are the keys and the reader gets the turns they
+                            were taken from (--source-tokens caps a long one)
     sdk_cognitive_trunc     cognitive search results, untagged and truncated
                             like sdk_plain (cognitive search without the packer)
     sdk_cognitive_alpha1    sdk_cognitive with cognitive_alpha=1.0: the graph
@@ -49,6 +57,9 @@ neighbouring arms belongs to one mechanism:
     sdk_belief_llm_nodemote sdk_belief_llm with supersession_demotion_factor=1.0:
                             a superseded fact keeps its rank and is only marked
     sdk_budget_delete       sdk_budget without a summarizer
+    full_context            no memory: every message of the history, dated and
+                            in the order said, with no token budget. The control
+                            for what extracting and selecting costs the reader
 
 Every arm gets the facts of one cached extraction pass and the same cached
 embeddings; only the memory system differs. Per-question results are written
@@ -131,8 +142,10 @@ RECALL_ARMS = ("sdk_cognitive", "sdk_cognitive_alpha1", "sdk_belief", "sdk_belie
                "sdk_belief_llm_exclude", "sdk_belief_llm_nodemote", "sdk_evict",
                "sdk_evict_gist", "sdk_budget", "sdk_budget_rolling", "sdk_budget_delete")
 DIAGNOSTIC = (("sdk_cognitive_trunc", "sdk_cognitive_alpha1", "sdk_pack_capped", "sdk_pack_tagged",
-               "sdk_belief_llm_exclude", "sdk_belief_llm_nodemote", "sdk_budget_delete")
-              + tuple(a + "_untagged" for a in RECALL_ARMS))
+               "sdk_belief_llm_exclude", "sdk_belief_llm_nodemote", "sdk_budget_delete",
+               "full_context")
+              + tuple(a + "_untagged" for a in RECALL_ARMS)
+              + tuple(a + "_turns" for a in RECALL_ARMS))
 DEFAULT_ARMS = UNBOUNDED + BOUNDED
 ARMS = DEFAULT_ARMS + DIAGNOSTIC
 # (arm, baseline): each pair differs in one mechanism.
@@ -164,6 +177,10 @@ PAIRS = (
     ("sdk_belief_llm", "sdk_belief_llm_exclude"),
     ("sdk_belief_llm_nodemote", "sdk_belief_llm"),
     ("sdk_belief_llm_nodemote", "sdk_cognitive"),
+    ("sdk_cognitive", "full_context"),
+    ("sdk_pack_tagged", "full_context"),
+    ("sdk_cognitive_turns", "sdk_cognitive"),
+    ("sdk_cognitive_turns", "full_context"),
 )
 
 
@@ -173,7 +190,7 @@ UNATTRIBUTED = ("naive", "adapter")
 
 def variants(name):
     """A recall() arm and the diagnostics served from the same store."""
-    return (name, name + "_trunc", name + "_untagged")
+    return (name, name + "_trunc", name + "_untagged", name + "_turns")
 
 
 class Embeddings:
@@ -558,9 +575,16 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--data-dir", default=None)
     ap.add_argument("--limit", type=int, default=120)
+    ap.add_argument("--skip", type=int, default=0, metavar="N",
+                    help="leave out the first N conversations: --skip 120 --limit 500 runs the "
+                         "380 whose questions no setting was chosen on")
     ap.add_argument("--arms", default=",".join(DEFAULT_ARMS))
     ap.add_argument("--token-budget", type=int, default=150, help="answer-context token cap")
     ap.add_argument("--pool-k", type=int, default=20)
+    ap.add_argument("--source-tokens", type=int, default=None,
+                    help="the _turns arms and any --recall arm with sources=\"turn\": cut a "
+                         "turn longer than this to its sentences that bear on the question "
+                         "(default: tsm.sources.SOURCE_TOKENS)")
     ap.add_argument("--user-tokens", type=int, default=256,
                     help="storage budget of the sdk_budget arms (tokens per conversation)")
     ap.add_argument("--rolling-passes", type=int, default=4,
@@ -599,6 +623,10 @@ def main():
     ap.add_argument("--config", action="append", default=[], metavar="NAME:KEY=VALUE[,...]",
                     help="an extra arm cfg_NAME: sdk_cognitive with these engine settings "
                          "(values are read as JSON); may be given several times")
+    ap.add_argument("--recall", action="append", default=[], metavar="NAME:KEY=VALUE[,...]",
+                    help="an extra arm rcl_NAME: the sdk_cognitive store read with these "
+                         "recall() arguments (values are read as JSON); may be given several "
+                         "times")
     ap.add_argument("--variant", choices=["oracle", "s", "m"], default=None,
                     help="read the official file of this variant for the same questions "
                          "(default: the parquet copy, which is the oracle variant)")
@@ -613,10 +641,11 @@ def main():
                          "they took place")
     ap.add_argument("--no-question-date", dest="question_date", action="store_false",
                     help="do not tell the reader when the question is asked")
-    ap.add_argument("--reader", choices=["plain", "notes"], default="plain",
-                    help="how the answering model is asked: the harness's plain prompt, or the "
+    ap.add_argument("--reader", choices=["plain", "notes", "tools"], default="plain",
+                    help="how the answering model is asked: the harness's plain prompt, the "
                          "SDK's (tsm.reading: memories in the order they were said, and the "
-                         "model works the answer out before giving it)")
+                         "model works the answer out before giving it), or the SDK's with "
+                         "tools for arithmetic, dates and counting (tsm.answering)")
     ap.add_argument("--extraction", choices=["shipped", "second", "all", "legacy"],
                     default="shipped",
                     help="whose facts every arm is given: the SDK's extractor as it ships "
@@ -628,9 +657,8 @@ def main():
     args = ap.parse_args()
 
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
-    configs = {}
-    for spec in args.config:
-        name, _, rest = spec.partition(":")
+
+    def settings_of(rest):
         settings = {}
         for pair in filter(None, (x.strip() for x in rest.split(","))):
             key, _, value = pair.partition("=")
@@ -638,9 +666,18 @@ def main():
                 settings[key.strip()] = json.loads(value)
             except ValueError:
                 settings[key.strip()] = value
-        configs["cfg_" + name.strip()] = settings
-    arms += [name for name in configs if name not in arms]
-    known = set(ARMS) | {v for name in configs for v in variants(name)}
+        return settings
+
+    configs = {}
+    for spec in args.config:
+        name, _, rest = spec.partition(":")
+        configs["cfg_" + name.strip()] = settings_of(rest)
+    readings = {}
+    for spec in args.recall:
+        name, _, rest = spec.partition(":")
+        readings["rcl_" + name.strip()] = settings_of(rest)
+    arms += [name for name in list(configs) + list(readings) if name not in arms]
+    known = (set(ARMS) | {v for name in configs for v in variants(name)} | set(readings))
     unknown = [a for a in arms if a not in known]
     if unknown:
         ap.error(f"unknown arms: {unknown}")
@@ -708,7 +745,7 @@ def main():
                 work_dir, f"gists_{args.gist_model.replace('/', '_')}.json"))
     nli = None
 
-    convs = load_longmemeval(args.data_dir)[:args.limit]
+    convs = load_longmemeval(args.data_dir)[args.skip:args.limit]
     if args.variant:
         convs = load_longmemeval(args.data_dir, variant=args.variant,
                                  question_ids=[c.queries[0].query_id for c in convs if c.queries])
@@ -759,7 +796,8 @@ def main():
              "verifier_model": args.verifier_model, "offline": args.offline,
              "variant": args.variant, "pool": size, "time_tags": args.time_tags,
              "file_order": args.file_order, "question_date": args.question_date,
-             "configs": configs, "reader": args.reader}
+             "configs": configs, "reader": args.reader, "skip": args.skip,
+             "source_tokens": args.source_tokens, "readings": readings}
     done = set()
     if checkpoint and os.path.exists(checkpoint):
         with open(checkpoint, encoding="utf-8") as fh:
@@ -834,6 +872,13 @@ def main():
                     (text, None) for text in ad.recall_under_budget(
                         q, user_id=user, token_budget=args.token_budget, method="mmr")]
 
+            if "full_context" in arms:
+                # Everything that was said, as said: what the reader gets
+                # without a memory system.
+                said = [(time_tag(m["timestamp"], m["turn_index"], minutes=tag_mode == "minute")
+                         + f"{m['role']}: {m['content']}", m["turn_index"]) for m in messages]
+                retrieve["full_context"] = lambda q, said=said: said
+
             plain_arms = [a for a in ("sdk_plain", "sdk_pack", "sdk_pack_capped",
                                       "sdk_pack_tagged") if a in arms]
             if plain_arms:
@@ -879,12 +924,14 @@ def main():
                          None if is_gist(r.get("role")) else r.get("turn_index"))
                         for r in results]
 
-            def recall_arm(name, feed=None, **kwargs):
+            def recall_arm(name, feed=None, extra=(), **kwargs):
                 """One Memory serving `name` through recall() as shipped,
                 `name`_untagged (the same without time tags) and `name`_trunc,
-                which truncates the same search results."""
+                which truncates the same search results; `extra` are the
+                --recall arms read from the same store."""
                 wanted = [a for a in variants(name) if a in arms]
-                if not wanted:
+                extra = [a for a in extra if a in arms]
+                if not wanted and not extra:
                     return
                 mem, db = sdk_memory(**kwargs)
                 opened.append((mem.close, db))
@@ -894,7 +941,7 @@ def main():
                     stored, committed = feed(mem)
                 store = [r["text"] or "" for r in
                          mem.engine.get_records(mem.engine.scope_ids(user)) if r]
-                for arm in wanted:
+                for arm in wanted + extra:
                     conv_stats[arm]["stored"] += stored
                     conv_stats[arm]["committed"] += committed
                     conv_stats[arm]["superseded"] += len(mem.engine.superseded_ids())
@@ -907,6 +954,17 @@ def main():
                 retrieve[name + "_untagged"] = lambda q, mem=mem: shown(
                     mem.recall(q, user_id=user, token_budget=args.token_budget,
                                pool_k=args.pool_k, time_tags=False))
+                turn_options = {} if args.source_tokens is None else {
+                    "source_tokens": args.source_tokens}
+                for arm in extra:
+                    retrieve[arm] = lambda q, mem=mem, how=readings[arm]: shown(
+                        mem.recall(q, user_id=user, **{
+                            "token_budget": args.token_budget, "pool_k": args.pool_k,
+                            "time_tags": tag_mode, **turn_options, **how}))
+                retrieve[name + "_turns"] = lambda q, mem=mem: shown(
+                    mem.recall(q, user_id=user, token_budget=args.token_budget,
+                               pool_k=args.pool_k, time_tags=tag_mode, sources="turn",
+                               **turn_options))
                 retrieve[name + "_trunc"] = lambda q, mem=mem: truncated(
                     shown(mem.recall(q, user_id=user, top_k=args.pool_k, time_tags=False)),
                     args.token_budget)
@@ -921,7 +979,7 @@ def main():
                 return stored, committed
 
             recall_arm("sdk_cognitive", refinement_cosine_threshold=None,
-                       contradiction_cosine_threshold=None)
+                       contradiction_cosine_threshold=None, extra=list(readings))
             recall_arm("sdk_cognitive_alpha1", refinement_cosine_threshold=None,
                        contradiction_cosine_threshold=None, cognitive_alpha=1.0)
             for name, settings in configs.items():
@@ -1132,6 +1190,8 @@ def main():
     # Every --config arm against the arms it is a variation of.
     pairs = list(PAIRS) + [(name, base) for name in configs
                            for base in ("sdk_cognitive", "sdk_cognitive_alpha1", "sdk_pack_tagged")]
+    pairs += [(name, base) for name in readings
+              for base in ("sdk_cognitive", "sdk_cognitive_turns", "full_context")]
     evidence_by_arm = evidence_scores(tasks, arms)
     evidence_pairs = {}
     if evidence_by_arm:
@@ -1175,6 +1235,7 @@ def main():
 
     summary = {
         "token_budget": args.token_budget, "pool_k": args.pool_k, "limit": args.limit,
+        "skip": args.skip,
         "max_records": args.max_records, "user_tokens": args.user_tokens,
         "rolling_passes": args.rolling_passes, "questions": n_questions, "arms": arms,
         "overall": {a: round(v, 4) for a, v in overall.items()},
@@ -1185,7 +1246,8 @@ def main():
         "evidence_paired": evidence_pairs,
         "variant": args.variant, "pool": size, "time_tags": args.time_tags,
         "file_order": args.file_order, "question_date": args.question_date,
-        "configs": configs, "extraction": args.extraction, "reader": args.reader,
+        "configs": configs, "readings": readings, "extraction": args.extraction,
+        "reader": args.reader,
         "judge_model": getattr(judge, "model", "?"), "judge_calls": getattr(judge, "calls", 0),
         "judge_input_tokens": getattr(judge, "input_tokens", 0),
         "judge_output_tokens": getattr(judge, "output_tokens", 0),

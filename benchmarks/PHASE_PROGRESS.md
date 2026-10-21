@@ -1,7 +1,8 @@
 # Cognitive MVP — Phase Progress
 
 Living record of the four-mechanism cognitive MVP effort (belief revision + reinforcement +
-abstraction + forgetting/importance). Baseline: [PHASE0_GROUND_TRUTH.md](PHASE0_GROUND_TRUTH.md).
+abstraction + forgetting/importance). Baseline: `PHASE0_GROUND_TRUTH.md`, removed
+2026-10-21 (`git show 98a17e7:benchmarks/PHASE0_GROUND_TRUTH.md`).
 Ship rule: a change ships only if it improves (or holds) cognition's marginal lift over plain
 ANN **without** regressing recall@10.
 
@@ -3166,3 +3167,251 @@ Keep Bonsai and idle consolidation opt-in. Improve/measure precision on
 realistic shared histories and constrain the verdict protocol before making
 verified supersession automatic. Gist quality and judged LongMemEval answers
 remain separate evaluations.
+
+---
+
+# The raw-sessions control, the held-out check, and six read-time changes (2026-10-21)
+
+The audit of 2026-10-21 (Hy-Memory, Bonsai 2, EmbeddingGemma 2 and the
+agent-memory literature to October 2026) ended with an order of work: two
+cheap measurements first, then source turns, event time, verifier rules,
+reader tools, dated gists, and LongMemEval-S. This entry records all of it.
+Reader and judge gpt-4.1-mini throughout, LongMemEval oracle file unless
+stated. The per-question verdicts of earlier batches were under
+`.cache/shipped_stack_eval`, which had been removed before this one, so every
+comparison here was re-run inside this batch.
+
+**1. The control: what extracting and selecting costs a reader.** New arm
+`full_context`: every message of the evidence sessions, dated and in order,
+no budget (7,270 tokens a question on average). Same 115 questions, same
+judge, same reader prompts.
+
+| context | plain reader, 150 tokens | reading prompt, 600 tokens |
+|---|---|---|
+| the raw sessions (`full_context`) | 90 (0.783) | **104 (0.904)** |
+| `tsm.Memory`, shipped (`sdk_cognitive`) | 87 (0.757) | 98 (0.852) |
+| memory against raw, question by question | 11 / 14, p = 0.69 | 6 / 12, p = 0.24 |
+
+- On the oracle file the memory layer costs about six questions against
+  reading everything (not significant). It loses single-session-assistant
+  (8 against 11 of 11) and knowledge-update (16 against 18) and wins
+  temporal (25 against 22 of 28).
+- The reading prompt helps the raw sessions as much as it helps memory
+  (90 -> 104, 18 gained / 4 lost, p = 0.004; memory 87 -> 98, 15 / 4,
+  p = 0.02).
+- The oracle file holds only the evidence sessions, so raw reading here is
+  an upper bound that LongMemEval-S (about 115k tokens a question) takes
+  away; section 7 measures that.
+- Run-to-run: `sdk_cognitive` at 150 tokens with the plain reader scored 90
+  on 2026-10-09 and 87 here, with the same facts and contexts. Treat a
+  difference of three on 115 as noise.
+
+**2. The held-out check.** The 355 questions of conversations 120-499,
+which no setting was chosen on (`--skip 120 --limit 500`; the extraction
+cache covers them, so only the judge was paid).
+
+| setup | right of 355 | KU /54 | multi-session /90 | temporal /99 | ss-assistant /45 |
+|---|---|---|---|---|---|
+| shipped, 150 tokens, plain reader | 259 (0.730) | 47 | 56 | 68 | 30 |
+| plain vector search + packer, same | 259 (0.730) | 46 | 55 | 68 | 31 |
+| shipped, 600 tokens, reading prompt | **296 (0.834)** | **54** | **70** | **77** | **37** |
+
+- The reading prompt at 600 tokens holds where it was not written: 52
+  gained, 15 lost (p < 0.0001), against +11 on the 115 it was written on.
+- Graph search and plain vector search tie exactly on held-out answers
+  (10 / 10), as the free score said (256 against 257).
+- Cost of sections 1-2: 2,764 judge-model requests, 2.47M tokens in, 128k
+  out: about $1.20 at list prices.
+
+**3. Source turns (`recall(sources="turn")`, `tsm/sources.py`).** Every
+fact's payload has always held the message it was extracted from
+(`original_message`); nothing read it back. Now every result carries it as
+`source`. With `sources="turn"`, the facts are the keys and the reader gets
+the turns: LongMemEval's own fact-augmented key expansion. Facts from one
+message become one result: the message, cut to its sentences that share
+words with those facts and the question when it is longer than
+`source_tokens`. Same store, 115 questions, reading prompt, 600 tokens:
+
+| what the reader gets | right | against facts | items / tokens a context |
+|---|---|---|---|
+| facts (shipped) | 98 | | 26.2 / 580 |
+| turns cut at 30 tokens | 67 | 3 / 34 | 11.1 / 506 |
+| turns cut at 120 tokens, + event dates | 86 | 6 / 18 (p = 0.02) | 6.3 / 545 |
+
+- On the free score, 30-token turns cover as much evidence as facts do (80
+  against 81 questions). They still lose 31 answers: the cut keeps the
+  sentences with the most words in common with the facts, which favours long
+  sentences. It dropped "over a year" from the asylum question and kept the
+  sentence about the application. Assistant turns collapse to "1. ... 2. ...".
+- With whole turns, far fewer fit in 600 tokens (6 against 26).
+- LongMemEval's gain was measured with much larger contexts. At the budgets
+  `recall()` is used with, the extracted fact is the better thing to read.
+  `sources="turn"` stays opt-in, and `source` is there for a caller that
+  wants the message itself.
+
+**4. Event time (`recall(event_dates=True)`, `tsm/when.py`).** A rule-based
+resolver writes the date a relative time points to after it, counted from
+the date the message was said: "two weeks ago [week of 2023-05-08]", "last
+Saturday [2023-05-20]", "on March 3rd [2023-03-03]", "the 15th of last month
+[2023-04-15]". It leaves alone what it cannot place: "in two weeks" (often a
+duration), "a few weeks ago", today.
+
+| | dev, 115 | held out, 355 |
+|---|---|---|
+| facts | 98 | 296 |
+| facts with event dates | 100 (3 / 1) | 298 (5 / 3, p = 0.73) |
+| the same with the tools reader | 98 against 94 (4 / 0) | |
+
+- Of 71,973 cached facts, 1,694 (2.4%) contain a phrase it resolves, so most
+  contexts do not change.
+- Temporal questions did not move on held-out data (77 against 77 of 99).
+  The net +2 there was on multi-session questions.
+- Level overall, so it stays opt-in. The extractor mostly writes dates out
+  already ("on March 3rd"); relative phrases survive in only a few facts.
+
+**5. Verifier rules for repeat occurrences and different subjects (not
+adopted).** Hy-Memory's reconcile rules are that a repeat occurrence is a new
+memory, never a supersession, and that a fact never supersedes one about
+another subject. Two versions of the `LLMVerifier` prompt were scored
+against the shipped one on `belief_pairs_eval.py --split dev` with
+gpt-4o-mini:
+
+| prompt | isolated stores: updates / still-true marked stale | one shared store |
+|---|---|---|
+| shipped | 52 of 56 / 0 of 62 | 53 / 3 |
+| two new rules, each with an example | 51 / 2 | 52 / 4 |
+| one clause added to the "both stay true" list | 52 / 1 | 53 / 4 |
+
+- The shipped prompt already names "different people, pets, things or
+  occasions" and "different periods of the past".
+- The errors moved between pairs from one wording to the next (Slack/Jira,
+  the two loans, the two allergies), which is the model reacting to the
+  wording, not to a rule.
+- The case that motivated this, repeated dated events, appears only in the
+  held-out half. Writing the prompt against it would be tuning on the test
+  set, so the held-out half was not run.
+- The prompt is unchanged. About 80 gpt-4o-mini requests were used.
+
+**6. Reader tools (`tsm/answering.py`, `--reader tools`).** These are the
+reading prompt plus four deterministic tools, called through the chat API:
+`calculate` (safe arithmetic), `days_between`, `add_days` and
+`count_distinct`. On 115 questions at 600 tokens they scored 94 against 98
+for the reading prompt alone (3 gained, 7 lost, p = 0.34), one or none fewer
+on every question type. Why was not examined: the run keeps the answers, not
+the tool calls. The module stays for weaker models; it is not a default.
+
+**7. "Changed by" on a verified-superseded fact (built, not judged).** With a
+verifier, a replaced fact used to be shown as `[earlier, since changed] ...`.
+When the date of the memory that replaced it is known, `recall()` now shows
+`[earlier, changed by 2024-06-01] ...` (`STALE_BY`). The date is the one its
+replacement was said, read at recall time from the chain
+(`valid_until` on the result), so nothing new is stored. Without that date
+the old mark is used. The judged comparison (old code against new,
+`sdk_belief_llm`, 115 questions) stopped at 60 of 120 histories when the
+OpenAI account's credit ran out (HTTP 429, `insufficient_quota`). Its
+partial results are discarded: the failed verifier requests had left pairs
+unverified. Owed.
+
+**8. Dated gists (built, not judged).** `plan_compaction(..., spans=...)` now
+reports, per gist, the first and last date of what it was written from
+(`CompactionPlan.gist_spans`). `Memory` stores the span in the gist's payload
+and `recall()` tags the gist with it: `[2023-01-05 to 2023-03-02] - ...`.
+The reading prompt orders a gist by where its span starts. A rolling pass
+folds earlier gists with their spans, so a span only widens. This was the
+"gists carry no time cue" item of `TODO.md`. The judged comparison
+(`sdk_budget`, `sdk_budget_rolling`, old against new) did not run, for the
+same reason. Owed.
+
+**9. LongMemEval-S, first 30 conversations' questions (29 not abstentions).**
+The standard histories (about 48 sessions, 124k tokens a question) were
+extracted for the first time. `extract_s.py`, a parallel pre-pass into the
+runner's cache, sent 14,128 gpt-4.1-nano requests for 13,886 messages, with
+no failures, in 18 minutes. A history then holds 2,380 memories (48.6k
+tokens) where the oracle one holds 125. Reading prompt, 600 tokens:
+
+| context | right of 29 | tokens a question | same questions on the oracle file |
+|---|---|---|---|
+| raw sessions (`full_context`) | 22 (0.759) | 124,110 | 25 |
+| shipped (`sdk_cognitive`) | 20 (0.690) | 596 | 22 |
+| plain vector search + packer | 19 (0.655) | 594 | |
+| shipped + event dates | 19 (0.655) | 597 | |
+
+- The distractor sessions cost raw reading 3 questions and memory 2 on these
+  29.
+- Memory reads 0.5% of the tokens and is 2 behind (1 / 3, p = 0.62).
+  gpt-4.1-mini with the reading prompt reads a 124k-token context well.
+  Published full-context baselines on S are 55-60 with gpt-4o-mini and
+  gpt-4o and a plain prompt, so the reading prompt is part of why the raw
+  arm is strong here.
+- Twenty-nine questions detect only large differences. These are the
+  numbers to quote next to any LongMemEval-S result, with the reader and
+  judge (both gpt-4.1-mini) named, not the oracle 0.85.
+- The 2,380-record stores are below the 4,096-record line, so search was the
+  exact scan.
+
+**10. Bonsai-2-9B as the local verifier (run 2026-10-19, not recorded
+until now).** Files are in `.scratch_tsm/bonsai-9b-20261019/`:
+`Ternary-Bonsai-2-9B-PQ2_0.gguf`, 2,416,851,840 bytes; the same server
+flags as the 4B; `-c 8192`. Held-out pairs, isolated / shared store:
+
+| verifier | embedder | updates caught / 54 | still-true marked stale / 58 |
+|---|---|---|---|
+| Bonsai 4B | MiniLM | 49 / 48 | 7 / 10 |
+| Bonsai 9B | MiniLM | 40 / 40 | 9 / 12 |
+| Bonsai 4B | Gemma | 54 / 50 | 7 / 19 |
+| Bonsai 9B | Gemma | 45 / 42 | 9 / 20 |
+
+- The 9B was worse on both counts, in every setting.
+- It failed the reply format on 1 to 6 pair judgments per run, which
+  accounts for part of the missed updates.
+- GPU use with EmbeddingGemma 2 loaded: 3,227-3,241 MiB of 4,096.
+- Use the 4B.
+
+**What this says.**
+
+- The two largest measured effects are the reader prompt and the budget.
+  They hold on held-out data (+37 of 355). On the oracle file, memory now
+  sits about six questions below reading every evidence session. On
+  LongMemEval-S it is two below reading 124k tokens, with 0.5% of the
+  tokens.
+- None of the read-time changes built here improved judged answers:
+  - source turns lost;
+  - event dates were level;
+  - reader tools were level to slightly worse;
+  - the verifier rules were not adopted.
+
+  The remaining errors are where the store has the fact and the reader
+  still errs (same-day order, totals), or where the extractor stored nothing.
+- Graph search ties plain vector search on held-out answers (10 / 10).
+  Describe it as neutral.
+
+**Checks.**
+
+- `make gate` on this tree: 8 of 8 passed. The LongMemEval smoke test's edge
+  count was 247, as on the four runs before. ANN recall was 100%.
+- SDK unit suite: 188 tests, +19 for the new modules and behaviour.
+- No Rust changed.
+
+**Cost.**
+
+| item | requests | about |
+|---|---|---|
+| judging | 4,184 gpt-4.1-mini (6.4M tokens in, 255k out) | $3.00 |
+| extracting LongMemEval-S | 14,128 gpt-4.1-nano | $2.10 |
+| embeddings | about 66k texts | $0.05 |
+| verifier, including the stopped run | about 400 gpt-4o-mini | $0.05 |
+| **total** | | **about $5.20 at list prices** |
+
+The account's credit ran out during the last comparison.
+
+**Next.**
+
+1. With credit: judge sections 7 and 8 (about 900 requests, $0.50).
+2. A LongMemEval-S run on more questions: the other 85 of the 115 need about
+   37k extraction requests, about $5.
+3. The excerpt rule of `sources="turn"` picks sentences by word overlap and
+   loses the short sentence that answers. Choosing by the facts' embeddings
+   would fix the case seen here. Measure it only at budgets where turns fit
+   (1,500 tokens or more).
+4. The rolling-compaction loss (0.411 against 0.464) is untouched. "Merge the
+   oldest gist only when the gist share is full" is the next thing to try.
