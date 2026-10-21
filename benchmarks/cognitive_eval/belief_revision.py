@@ -5,7 +5,8 @@ TurboSuperMemory — Belief-Revision Evaluation Harness (Phase 1).
 WHY THIS EXISTS
 ---------------
 The existing `cognitive_benchmark.py` is a *wiring test*: 4 hand-built scenarios
-that prove the cognitive path is connected. The frozen baseline (benchmarks/BASELINE.md)
+that prove the cognitive path is connected. The frozen baseline (benchmarks/BASELINE.md, removed 2026-10-21;
+`git show 98a17e7:benchmarks/BASELINE.md`)
 exposed its blind spot — at realistic scale it reports "3/4 won", but in every win the
 **CogOFF arm wins too**. The targets are surfaced by generic BM25 lexical + concept
 expansion, NOT by the specific belief-revision edge under test. So the benchmark cannot
@@ -39,7 +40,8 @@ THREE SCALING AXES
                        correction is more distinct => ANN buries it deeper => harder.
                        Replaces the old randn --subtlety, which was dimension-dependent
                        and made corrections near-orthogonal at 768-dim (cos ~0.11 at
-                       subtlety 0.25); see benchmarks/PHASE0_GROUND_TRUTH.md.
+                       subtlety 0.25); see benchmarks/PHASE0_GROUND_TRUTH.md
+                       (`git show 98a17e7:benchmarks/PHASE0_GROUND_TRUTH.md`).
 
 Usage:
     python benchmarks/cognitive_eval/belief_revision.py                 # default sweep

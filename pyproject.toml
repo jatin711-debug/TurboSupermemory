@@ -90,6 +90,6 @@ features = ["pyo3/extension-module"]
 
 [tool.pytest.ini_options]
 # The SDK unit suite: fake embedder/extractor, real engine, no keys or model
-# downloads. The `test_*.py` files under benchmarks/ and tests/ are live
+# downloads. The `test_*.py` files under benchmarks/ are live
 # evaluation scripts that need models and API keys; run those explicitly.
 testpaths = ["tsm/tests"]
