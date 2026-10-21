@@ -29,7 +29,7 @@ import os
 import re
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from ._retry import call_with_retries
+from ._retry import QuotaExhausted, call_with_retries
 from .interfaces import CommitTriple, ProposedPair
 
 logger = logging.getLogger("tsm.verification")
@@ -336,6 +336,8 @@ class LLMVerifier:
             chunk = todo[start:start + self.batch_size]
             try:
                 verdicts = self._ask([pairs[i] for i in chunk])
+            except QuotaExhausted:
+                raise  # no later batch can succeed either
             except RuntimeError as e:
                 logger.warning("%s; %d pairs left unverified (not committed)", e, len(chunk))
                 continue

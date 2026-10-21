@@ -24,7 +24,7 @@ if _ROOT not in sys.path:
 
 import numpy as np
 
-from tsm._retry import call_with_retries, is_permanent
+from tsm._retry import QuotaExhausted, call_with_retries, is_permanent, is_quota_exhausted
 from tsm.budget import estimate_tokens
 from tsm.embedders import OpenAIEmbedder
 from tsm.extractors import OpenAIExtractor, message_pieces, statements
@@ -121,6 +121,29 @@ class TestRetryPolicy(unittest.TestCase):
         self.assertTrue(is_permanent(ApiError(401)))
         self.assertFalse(is_permanent(ApiError(429)))
         self.assertFalse(is_permanent(ValueError("no status")))
+
+    def test_an_account_out_of_credit_fails_at_once(self):
+        empty = ApiError(429)
+        empty.code = "credit_balance_exhausted"
+        empty.body = {"code": "credit_balance_exhausted", "type": "insufficient_quota"}
+        self.assertTrue(is_quota_exhausted(empty))
+        with self.assertRaises(QuotaExhausted) as ctx:
+            self.run_with(empty, "never reached")
+        self.assertEqual(self.slept, [], "an empty account is not a rate limit")
+        self.assertIn("out of credit", str(ctx.exception))
+        self.assertNotIn("details that must not be echoed", str(ctx.exception))
+        nested = ApiError(429)
+        nested.body = {"error": {"type": "insufficient_quota"}}
+        self.assertTrue(is_quota_exhausted(nested))
+        self.assertFalse(is_quota_exhausted(ApiError(429)))  # a plain rate limit
+
+    def test_the_verifier_stops_instead_of_leaving_pairs_unverified(self):
+        empty = ApiError(429)
+        empty.code = "insufficient_quota"
+        verifier = LLMVerifier(client=ScriptedChat(empty), batch_size=1)
+        with self.assertRaises(QuotaExhausted):
+            verifier.judge([("I live in Lisbon.", "I live in Porto."),
+                            ("I like tea.", "I like coffee.")])
 
     def test_gives_up_after_the_last_attempt_without_a_trailing_sleep(self):
         with self.assertRaises(RuntimeError) as ctx:

@@ -701,6 +701,7 @@ def main():
     os.makedirs(work_dir, exist_ok=True)
 
     from tsm import Memory
+    from tsm._retry import QuotaExhausted
     from tsm.budget import select_under_budget
     from tsm.compaction import is_gist
     from tsm.gist import ExtractiveGistSummarizer, OpenAIGistSummarizer
@@ -1023,6 +1024,11 @@ def main():
                              + "\n")
             if summarizer is not None:
                 summarizer.flush()
+        except QuotaExhausted as e:
+            # Every later history would fail the same way, and a run that went
+            # on would compare arms built with and without their model calls.
+            sys.exit(f"stopped: {e}. Histories finished so far are in the checkpoint; "
+                     "rerun with the same --out once the account has credit.")
         except Exception as e:  # noqa: BLE001 — one bad history must not sink the run
             logger.warning("history %s skipped for every arm: %s: %s", unit_id,
                            type(e).__name__, e)
@@ -1125,18 +1131,26 @@ def main():
                     how["turns"] = task["turns"]
             prediction = judge.answer(task["query"], task["retrieved"], **how)
             return prediction, bool(judge.judge(task["query"], task["gold"], prediction))
+        except QuotaExhausted:
+            raise
         except Exception as e:  # noqa: BLE001 — left unjudged, reported below
             logger.warning("judging failed for one answer: %s", type(e).__name__)
             return None, None
 
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        for count, (task, (prediction, correct)) in enumerate(
-                zip(pending, pool.map(score, pending)), 1):
-            if correct is not None:
-                known[what(task)] = (prediction, correct)
-            if count % 100 == 0:
-                settle()
-                save()
+    try:
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            for count, (task, (prediction, correct)) in enumerate(
+                    zip(pending, pool.map(score, pending)), 1):
+                if correct is not None:
+                    known[what(task)] = (prediction, correct)
+                if count % 100 == 0:
+                    settle()
+                    save()
+    except QuotaExhausted as e:
+        settle()
+        save()
+        sys.exit(f"stopped: {e}. The verdicts so far are saved; once the account has credit, "
+                 f"rerun with --rejudge {args.out}")
     settle()
     unjudged = sum(t.get("correct") is None for t in tasks)
     if unjudged:

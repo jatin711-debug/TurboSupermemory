@@ -101,6 +101,11 @@ class OpenAIJudge:
                         self.output_tokens += resp.usage.completion_tokens or 0
                 return (resp.choices[0].message.content or "").strip()
             except Exception as e:  # noqa: BLE001 — transient API errors: backoff + retry
+                from tsm._retry import QuotaExhausted, is_quota_exhausted
+
+                if is_quota_exhausted(e):
+                    raise QuotaExhausted("judge request failed: the OpenAI account is out of "
+                                         "credit") from e
                 wait = _retry_wait(e, attempt)
                 logger.warning("OpenAI call failed (attempt %d/%d): %s; retrying in %.1fs",
                                attempt + 1, self.max_retries, e, wait)

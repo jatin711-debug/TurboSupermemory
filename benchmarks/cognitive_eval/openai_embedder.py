@@ -91,6 +91,11 @@ class OpenAIEmbedder:
                 r = self._client.embeddings.create(model=self.model, input=chunk)
                 return [np.asarray(d.embedding, dtype=np.float32) for d in r.data]
             except Exception as e:  # noqa: BLE001
+                from tsm._retry import QuotaExhausted, is_quota_exhausted
+
+                if is_quota_exhausted(e):
+                    raise QuotaExhausted("embedding failed: the OpenAI account is out of "
+                                         "credit") from e
                 wait = min(5.0 * (2 ** attempt), 120.0)
                 logger.warning("embed failed (attempt %d/%d): %s; retry %.0fs",
                                attempt + 1, self.max_retries, e, wait)

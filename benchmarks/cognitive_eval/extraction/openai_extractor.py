@@ -94,6 +94,11 @@ class OpenAIExtractor:
                 )
                 return resp.choices[0].message.content or "{}"
             except Exception as e:  # noqa: BLE001 — transient API errors: backoff + retry
+                from tsm._retry import QuotaExhausted, is_quota_exhausted
+
+                if is_quota_exhausted(e):
+                    raise QuotaExhausted("extraction failed: the OpenAI account is out of "
+                                         "credit") from e
                 # 429s can be per-minute windows; back off long enough to outlast them.
                 wait = min(5.0 * (2 ** attempt), 120.0)
                 logger.warning("OpenAI extract failed (attempt %d/%d): %s; retry in %.0fs",
