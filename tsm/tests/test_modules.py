@@ -27,6 +27,7 @@ from tsm.concepts import extract_concepts
 from tsm.gist import ExtractiveGistSummarizer, OpenAIGistSummarizer, single_fact, strip_role
 from tsm.ranking import (ASSISTANT_ROLE_DAMP, USER_ROLE_BOOST, is_first_person_query,
                          role_prior)
+from tsm.reading import ANSWER_SYSTEM, answer_prompt, final_answer, in_order
 
 
 def _item(text, score, vec, turn_index=None):
@@ -59,6 +60,18 @@ class TestSelectUnderBudget(unittest.TestCase):
                 _item("other", 0.2, _B)]
         chosen = select_under_budget(pool, 1000, embed=_embedder(pool))
         self.assertEqual([p["text"] for p in chosen], ["first", "other"])
+
+    def test_memories_that_read_alike_are_kept_together(self):
+        # Two instances of one kind of event: cosine 0.87, well short of the
+        # same text twice. A question that counts them needs both.
+        alike = [0.87, 0.493, 0.0]
+        pool = [_item("yoga class on tuesday", 0.9, _A), _item("yoga class on thursday", 0.88, alike),
+                _item("bought a kettle", 0.3, _C)]
+        chosen = select_under_budget(pool, 1000, embed=_embedder(pool))
+        # The second one is penalized (the unrelated memory is taken before
+        # it) but not thrown away.
+        self.assertEqual([p["text"] for p in chosen],
+                         ["yoga class on tuesday", "bought a kettle", "yoga class on thursday"])
 
     def test_a_memory_and_the_one_it_replaced_are_not_duplicates(self):
         # They read alike, but one is the current value and one the earlier.
@@ -226,6 +239,52 @@ class TestGistRanking(unittest.TestCase):
         self.assertEqual(role_prior(True, GIST_ROLE), role_prior(True, "user"))
         self.assertEqual(role_prior(True, GIST_OTHER_ROLE), ASSISTANT_ROLE_DAMP)
         self.assertEqual(role_prior(False, GIST_ROLE), 1.0)
+
+
+class TestReading(unittest.TestCase):
+    """answer_prompt / final_answer: what a model is asked, and what it said."""
+
+    def test_memories_are_shown_in_the_order_they_were_said(self):
+        recalled = [
+            {"context": "[2023-05-20] Bought the necklace.", "turn_index": 9},
+            {"context": "[2023-03-02] Ordered the photo album.", "turn_index": 4},
+            {"context": "[2023-05-20 08:15] Had breakfast.", "turn_index": 7},
+            {"context": "A summary of older conversations.", "role": "summary"},
+            {"context": "[2023-05-20] Wrapped the necklace.", "turn_index": 11},
+        ]
+        self.assertEqual([m["context"] for m in in_order(recalled)],
+                         ["[2023-03-02] Ordered the photo album.", "[2023-05-20] Bought the necklace.",
+                          "[2023-05-20] Wrapped the necklace.", "[2023-05-20 08:15] Had breakfast.",
+                          "A summary of older conversations."])
+        # Strings work too (the "context" of each result), and turns order undated ones.
+        self.assertEqual(in_order(["[turn 12] later", "[turn 3] earlier"]),
+                         ["[turn 3] earlier", "[turn 12] later"])
+        # Without tags in the text, the result's own fields are used.
+        untagged = [{"text": "second", "timestamp": "2024/02/01 (Thu) 10:00", "turn_index": 2},
+                    {"text": "first", "timestamp": "2024-01-15", "turn_index": 9}]
+        self.assertEqual([m["text"] for m in in_order(untagged)], ["first", "second"])
+
+    def test_the_prompt_carries_the_notes_the_question_and_its_date(self):
+        messages = answer_prompt("Which did I buy first?",
+                                 [{"context": "[2023-05-20] Bought the necklace."},
+                                  {"context": "[2023-03-02] Ordered the photo album."}],
+                                 today="2023/05/22 (Mon) 12:21")
+        self.assertEqual([m["role"] for m in messages], ["system", "user"])
+        self.assertEqual(messages[0]["content"], ANSWER_SYSTEM)
+        self.assertEqual(messages[1]["content"],
+                         "Notes:\n1. [2023-03-02] Ordered the photo album.\n"
+                         "2. [2023-05-20] Bought the necklace.\n\n"
+                         "Current date: 2023/05/22 (Mon) 12:21\nQuestion: Which did I buy first?")
+        self.assertNotIn("Current date", answer_prompt("q", ["a note"])[1]["content"])
+        self.assertIn("(none)", answer_prompt("q", [])[1]["content"])
+
+    def test_the_answer_is_what_follows_the_last_answer_mark(self):
+        reply = ("1. Relevant notes: ...\n2. Reasoning: the album came first.\n"
+                 "Answer: the photo album for your mom")
+        self.assertEqual(final_answer(reply), "the photo album for your mom")
+        self.assertEqual(final_answer("Answer: 3\n\nanswer: 4 plants"), "4 plants")
+        self.assertEqual(final_answer("It was the album."), "It was the album.")
+        self.assertEqual(final_answer(None), "")
 
 
 class TestCompactionPlan(unittest.TestCase):

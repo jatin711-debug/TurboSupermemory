@@ -8,6 +8,7 @@ hang::
     python -m unittest tsm.tests.test_backends -v
 """
 
+import json
 import logging
 import os
 import pickle
@@ -24,8 +25,9 @@ if _ROOT not in sys.path:
 import numpy as np
 
 from tsm._retry import call_with_retries, is_permanent
+from tsm.budget import estimate_tokens
 from tsm.embedders import OpenAIEmbedder
-from tsm.extractors import OpenAIExtractor
+from tsm.extractors import OpenAIExtractor, message_pieces, statements
 from tsm.gist import OpenAIGistSummarizer
 from tsm.verification import LLMVerifier
 
@@ -169,6 +171,105 @@ class TestExtractor(TempDirTest):
             # Not cached: a later run gets another chance.
             self.client.script.append(chat_reply('{"facts": ["recovered"]}'))
             self.assertEqual(ex.extract_facts(message), ["recovered"], name)
+
+    def test_by_default_only_the_first_prompt_is_asked(self):
+        # The two recovery steps are opt-in: they did not pay when judged.
+        message = "Any tips for a half marathon? I ran my first 10K in 58 minutes last month."
+        ex = self.extractor(chat_reply('{"facts": []}'))
+        self.assertEqual(ex.extract_facts(message), [])
+        self.assertEqual(ex.extract_facts(message), [])
+        self.assertEqual(len(self.client.requests), 1)
+        self.assertTrue(ex.is_cached(message))
+
+    def test_a_message_the_first_prompt_finds_nothing_in_gets_a_second_look(self):
+        # A statement made while asking for something else: a model told to
+        # extract asserted facts often returns none, and the memory was lost.
+        message = "Any tips for a half marathon? I ran my first 10K in 58 minutes last month."
+        ex = self.extractor(chat_reply('{"facts": []}'),
+                            chat_reply('{"facts": ["The speaker ran a 10K in 58 minutes."]}'),
+                            second_look=True)
+        self.assertEqual(ex.extract_facts(message), ["The speaker ran a 10K in 58 minutes."])
+        self.assertEqual(ex.extract_facts(message), ["The speaker ran a 10K in 58 minutes."])
+        self.assertEqual(len(self.client.requests), 2, "both replies are cached")
+        first, second = (r["messages"][0]["content"] for r in self.client.requests)
+        self.assertNotEqual(first, second, "the second request uses the other prompt")
+        self.assertTrue(ex.is_cached(message))
+        self.assertFalse(ex.is_cached("Another message that was never extracted."))
+        # A message with facts is asked about once.
+        ex.client = None
+        once = self.extractor(chat_reply('{"facts": ["The speaker lives in Lisbon."]}'))
+        self.assertEqual(once.extract_facts("I live in Lisbon."), ["The speaker lives in Lisbon."])
+        self.assertEqual(len(self.client.requests), 1)
+
+    def test_what_a_message_states_is_kept_when_both_prompts_find_nothing(self):
+        message = "Any tips for a half marathon? I ran my first 10K in 58 minutes last month."
+        ex = self.extractor(chat_reply('{"facts": []}'), chat_reply('{"facts": []}'),
+                            second_look=True, keep_unextracted=True)
+        self.assertEqual(ex.extract_facts(message),
+                         ["I ran my first 10K in 58 minutes last month."],
+                         "what was said, without what was asked")
+        self.assertEqual(ex.extract_facts(message),
+                         ["I ran my first 10K in 58 minutes last month."])
+        self.assertEqual(len(self.client.requests), 2, "the empty replies are cached")
+        ex.flush_cache()
+        # The same cache, no request: each step is a switch of its own.
+        for switches, stored in (({"second_look": True}, []),
+                                 ({"keep_unextracted": True},
+                                  ["I ran my first 10K in 58 minutes last month."]),
+                                 ({}, [])):
+            self.assertEqual(self.extractor(**switches).extract_facts(message), stored, switches)
+            self.assertEqual(self.client.requests, [], switches)
+        # A message that only asks states nothing, so nothing is stored for it.
+        asks = self.extractor(chat_reply('{"facts": []}'), chat_reply('{"facts": []}'),
+                              second_look=True, keep_unextracted=True)
+        self.assertEqual(asks.extract_facts("What is the capital of France?"), [])
+        self.assertEqual(statements("Good to know. Can you say more?\nI use a Yamaha P-125."),
+                         ["Good to know.\nI use a Yamaha P-125."])
+        self.assertEqual(statements("Is it far? How long?"), [])
+        # A numbered question goes with its number: no "1." is left behind.
+        self.assertEqual(
+            statements("I can help with that. A few details first:\n"
+                       "1. Which city do you fly from?\n2. Which dates?\n"
+                       "I will look for deals after that."),
+            ["I can help with that. A few details first:\nI will look for deals after that."])
+
+    def test_a_long_message_is_kept_in_pieces_that_fit(self):
+        lines = [f"{n}. Parameter {n} sets one aspect of the reply, with an example of its use"
+                 for n in range(1, 41)]
+        message = "Sure, here are the parameters:\n" + "\n".join(lines)
+        pieces = message_pieces(message, max_tokens=60)
+        self.assertGreater(len(pieces), 5)
+        self.assertTrue(all(estimate_tokens(piece) <= 60 for piece in pieces))
+        self.assertEqual("\n".join(pieces).split(), message.split(),
+                         "nothing left out, nothing reworded, in order")
+        for line in lines:  # a line that fits is never cut in two
+            self.assertEqual(sum(line in piece for piece in pieces), 1, line)
+        # One sentence longer than a piece is cut between words.
+        endless = " ".join(f"word{n}" for n in range(300))
+        cut = message_pieces(endless, max_tokens=40)
+        self.assertTrue(all(estimate_tokens(piece) <= 40 for piece in cut))
+        self.assertEqual(" ".join(cut), endless)
+        # A list number is not cut off from the item it numbers.
+        item = "3. Regular training: " + " ".join(f"word{n}" for n in range(30)) + ". It helps."
+        numbered = message_pieces("Some examples:\n" + item, max_tokens=40)
+        self.assertTrue(all(estimate_tokens(piece) <= 40 for piece in numbered))
+        self.assertEqual(numbered[0], "Some examples:")
+        self.assertTrue(numbered[1].startswith("3. Regular training: word0"), numbered[1])
+        self.assertEqual("\n".join(numbered).split(), ("Some examples:\n" + item).split())
+        self.assertEqual(message_pieces("  short enough  "), ["short enough"])
+        self.assertEqual(message_pieces("   "), [])
+
+    def test_a_reply_to_another_prompt_is_not_served(self):
+        # Caches written before the prompt changed were keyed by the message
+        # alone; what that prompt found (here: nothing) must not be reused.
+        message = "I moved to Lisbon last week, can you suggest a dentist?"
+        with open(os.path.join(self.dir, "extract_gpt-4o-mini.json"), "w", encoding="utf-8") as f:
+            json.dump({message: []}, f)
+        ex = self.extractor(chat_reply('{"facts": ["The speaker moved to Lisbon last week."]}'))
+        self.assertEqual(ex.extract_facts(message), ["The speaker moved to Lisbon last week."])
+        self.assertEqual(len(self.client.requests), 1)
+        self.assertNotEqual(ex.cache_key(message), message)
+        self.assertNotEqual(ex.cache_key(message), ex.cache_key(message, ["earlier message"]))
 
     def test_cache_survives_a_reload_and_flush_is_idempotent(self):
         ex = self.extractor(chat_reply('{"facts": ["kept"]}'))

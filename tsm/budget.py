@@ -11,9 +11,13 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-# A candidate more similar than this to something already selected is a
-# near-duplicate paraphrase: it is skipped rather than merely penalized.
-MAX_REDUNDANCY = 0.72
+# A candidate this similar to something already selected says the same thing
+# again and is skipped. Anything less alike is only penalized: memories that
+# read alike are often different instances that a question needs together
+# (two classes in one week, a count before and after it changed). The cutoff
+# was 0.72 once, which with OpenAI embeddings threw such memories away; it is
+# now only for near-identical text.
+MAX_REDUNDANCY = 0.95
 # Marginal-gain bonus for the first memory taken from a not-yet-covered turn
 # (cross-turn / cross-session coverage).
 NEW_TURN_BONUS = 0.20

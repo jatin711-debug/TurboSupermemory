@@ -25,7 +25,13 @@ class ColBertReranker:
         trust_remote_code: bool = True,
     ):
         import torch
-        from sentence_transformers import MultiVectorEncoder
+
+        try:
+            from sentence_transformers import MultiVectorEncoder
+        except ImportError as e:
+            raise ImportError(
+                "ColBertReranker needs sentence-transformers 6.0 or newer "
+                "(MultiVectorEncoder); install it with: pip install 'tsm[colbert]'") from e
 
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"

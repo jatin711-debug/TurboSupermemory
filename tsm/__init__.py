@@ -7,7 +7,8 @@ conversational memory with verified belief revision and budget-aware recall.
 from .embedders import OpenAIEmbedder, SentenceTransformerEmbedder
 from .extractors import GlinerExtractor, OpenAIExtractor
 from .gist import ExtractiveGistSummarizer, OpenAIGistSummarizer
-from .interfaces import Embedder, Extractor, Reranker, Verifier
+from .identity import EmbedderMismatchError
+from .interfaces import AsymmetricEmbedder, Embedder, Extractor, Reranker, Verifier
 from .memory import CONVERSATIONAL_PROFILE, Memory
 from .rerankers import ColBertReranker
 
@@ -21,6 +22,8 @@ __all__ = [
     "Memory",
     "MemoryConfig",
     "Embedder",
+    "AsymmetricEmbedder",
+    "EmbedderMismatchError",
     "Extractor",
     "Verifier",
     "Reranker",

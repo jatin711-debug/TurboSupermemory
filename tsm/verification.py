@@ -280,6 +280,10 @@ class LLMVerifier:
         # Verdicts are only reused for the instructions that produced them.
         self._prompt_id = hashlib.sha256(self._system.encode("utf-8")).hexdigest()[:12]
         self.calls = 0
+        # Pairs the last judge() could not get a verdict for (request failed,
+        # reply unreadable). Memory's idle worker asks again while it is > 0.
+        self.unresolved = 0
+        self.unresolved_total = 0  # the same, summed over every judge() call
         self._cache: Dict[str, str] = {}
         self._cache_path = None
         self._dirty = False
@@ -340,6 +344,8 @@ class LLMVerifier:
                 out[index] = verdict
                 self._cache[self._key(*pairs[index])] = verdict
                 self._dirty = True
+        self.unresolved = sum(verdict is None for verdict in out)
+        self.unresolved_total += self.unresolved
         return out
 
     def flush_cache(self) -> None:

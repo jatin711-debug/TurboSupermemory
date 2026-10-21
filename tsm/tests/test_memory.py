@@ -162,7 +162,11 @@ class TestProfileConfig(MemoryTestBase):
     def test_profile_contents_match_proven_preset(self):
         self.assertEqual(CONVERSATIONAL_PROFILE["refinement_cosine_threshold"], 0.85)
         self.assertEqual(CONVERSATIONAL_PROFILE["contradiction_cosine_threshold"], 0.75)
-        self.assertEqual(CONVERSATIONAL_PROFILE["cognitive_alpha"], 0.5)
+        # Cognitive search is scaled to the query, not a fixed boost.
+        self.assertEqual(CONVERSATIONAL_PROFILE["graph_weight"], 0.5)
+        self.assertEqual(CONVERSATIONAL_PROFILE["query_concept_boost"], 0.0)
+        self.assertEqual(CONVERSATIONAL_PROFILE["fan_exponent"], 1.0)
+        self.assertNotIn("cognitive_alpha", CONVERSATIONAL_PROFILE)
         # Superseded facts stay in recall unless a caller asks otherwise.
         self.assertNotIn("exclude_superseded", CONVERSATIONAL_PROFILE)
         self.assertIs(CONVERSATIONAL_PROFILE["access_aware_eviction"], True)
@@ -176,10 +180,21 @@ class TestProfileConfig(MemoryTestBase):
         self.assertEqual(mem.engine.record_count(), 1)
 
     def test_explicit_engine_kwarg_overrides_profile(self):
-        mem = self.make_memory(cognitive_alpha=0.9)
+        mem = self.make_memory(fan_exponent=0.5)
         self.assertEqual(mem.profile, "conversational")
         # Engine accepted the override (construction would raise otherwise).
         self.assertEqual(mem.engine.record_count(), 0)
+        self.assertEqual(mem.engine_config["fan_exponent"], 0.5)
+        self.assertEqual(mem.engine_config["graph_weight"], 0.5)
+
+    def test_a_fixed_boost_replaces_the_scaled_one(self):
+        # cognitive_alpha would be ignored next to the profile's graph_weight.
+        mem = self.make_memory(cognitive_alpha=0.9)
+        self.assertEqual(mem.engine_config["cognitive_alpha"], 0.9)
+        self.assertNotIn("graph_weight", mem.engine_config)
+        mem.close()
+        both = self.make_memory(cognitive_alpha=0.9, graph_weight=0.25)
+        self.assertEqual(both.engine_config["graph_weight"], 0.25)
 
 
 class TestSupersessionFlow(MemoryTestBase):
@@ -923,6 +938,14 @@ class TestTimeTags(MemoryTestBase):
         self.assertEqual(time_tag(float("nan"), None), "")
         self.assertEqual(time_tag("", None), "")
         self.assertEqual(time_tag(None, True), "")
+        # With minutes: the time of day too, when the timestamp has one.
+        self.assertEqual(time_tag("2023/05/20 (Sat) 02:21", None, minutes=True),
+                         "[2023-05-20 02:21] ")
+        self.assertEqual(time_tag("2024-01-15T10:00:00Z", 7, minutes=True), "[2024-01-15 10:00] ")
+        self.assertEqual(time_tag("2024-01-15 9:05", 7, minutes=True), "[2024-01-15 09:05] ")
+        self.assertEqual(time_tag("2024-01-15", 7, minutes=True), "[2024-01-15] ")
+        self.assertEqual(time_tag(1705312800, None, minutes=True), "[2024-01-15 10:00] ")
+        self.assertEqual(time_tag("", 12, minutes=True), "[turn 12] ")
 
     def test_context_carries_the_date_or_the_turn(self):
         mem = self.make_memory()
@@ -938,6 +961,25 @@ class TestTimeTags(MemoryTestBase):
         plain = mem.recall("volleyball league race", user_id="alice", time_tags=False)
         self.assertEqual([r["context"] for r in plain], [r["text"] for r in plain])
 
+    def test_minute_tags_tell_two_memories_of_one_day_apart(self):
+        mem = self.make_memory()
+        mem.add([{"role": "user", "content": "I joined a volleyball league.",
+                  "timestamp": "2024/03/02 (Sat) 18:05"}], user_id="alice")
+        mem.add([{"role": "user", "content": "I ran a charity race.",
+                  "timestamp": "2024/03/02 (Sat) 09:30"}], user_id="alice")
+
+        def contexts(**kwargs):
+            return {r["text"]: r["context"] for r in
+                    mem.recall("volleyball league race", user_id="alice", **kwargs)}
+
+        self.assertEqual(contexts(time_tags="minute"), {
+            "I joined a volleyball league": "[2024-03-02 18:05] I joined a volleyball league",
+            "I ran a charity race": "[2024-03-02 09:30] I ran a charity race"})
+        self.assertEqual(contexts(time_tags="date"), contexts())
+        self.assertEqual(contexts()["I ran a charity race"], "[2024-03-02] I ran a charity race")
+        with self.assertRaises(ValueError):
+            mem.recall("race", user_id="alice", time_tags="hour")
+
     def test_tags_count_against_the_token_budget(self):
         mem = self.make_memory()
         for fact in ("garden has red tulips now", "garden shed needs new paint",
@@ -949,6 +991,46 @@ class TestTimeTags(MemoryTestBase):
         self.assertEqual(len(bare), 3)
         self.assertEqual(len(tagged), 2)
         self.assertLessEqual(sum(len(r["context"]) // 4 for r in tagged), 18)
+
+
+class TestReinforcement(MemoryTestBase):
+    """recall() is a read: asking does not change what the next call returns."""
+
+    FACTS = ("garden has red tulips now", "garden shed needs new paint",
+             "garden pond froze last week", "garden gate squeaks loudly",
+             "kitchen tap drips at night", "kitchen shelf holds the good plates")
+
+    def _filled(self, **kwargs):
+        mem = self.make_memory(**kwargs)
+        for fact in self.FACTS:
+            mem.add([{"role": "user", "content": fact + "."}], user_id="alice")
+        return mem
+
+    @staticmethod
+    def _ask(mem):
+        return [(r["id"], r["score"]) for r in mem.recall("garden", user_id="alice", top_k=6)]
+
+    def test_asking_twice_gives_the_same_answer(self):
+        mem = self._filled()
+        first = self._ask(mem)
+        self.assertEqual(len(first), 6)
+        for _ in range(3):
+            self.assertEqual(self._ask(mem), first)
+
+    def test_reinforce_names_the_memories_that_were_used(self):
+        mem = self._filled()
+        before = dict(self._ask(mem))
+        self.assertEqual(mem.reinforce(["alice_1", "alice_2", "nobody_9"]), 2)
+        after = dict(self._ask(mem))
+        self.assertGreater(after["alice_1"], before["alice_1"])
+        self.assertGreater(after["alice_2"], before["alice_2"])
+        self.assertEqual(after["alice_5"], before["alice_5"])
+
+    def test_rehearsal_on_every_read_is_opt_in(self):
+        mem = self._filled(reinforce_on_search=True)
+        first = dict(self._ask(mem))
+        second = dict(self._ask(mem))
+        self.assertGreater(second["alice_1"], first["alice_1"])
 
 
 class TestUserBudget(MemoryTestBase):

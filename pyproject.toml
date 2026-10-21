@@ -52,6 +52,17 @@ cuda = [
     "sentence-transformers>=2.2.0",
     "torch>=2.0.0",
 ]
+# EmbeddingGemma 2 (embedder="gemma") needs sentence-transformers 6.1 or newer;
+# the LFM2.5 ColBERT reranker (reranker="colbert") needs 6.0 or newer. The
+# `cpu`/`cuda` extras keep the 2.2 floor, which is enough for MiniLM.
+gemma = [
+    "sentence-transformers>=6.1.0",
+    "torch>=2.0.0",
+]
+colbert = [
+    "sentence-transformers>=6.0.0",
+    "torch>=2.0.0",
+]
 eval = [
     "openai>=1.0.0",
     "scikit-learn>=1.3.0",
@@ -59,7 +70,7 @@ eval = [
     "pytest>=7.0.0",
 ]
 all = [
-    "sentence-transformers>=2.2.0",
+    "sentence-transformers>=6.1.0",
     "torch>=2.0.0",
     "openai>=1.0.0",
     "scikit-learn>=1.3.0",

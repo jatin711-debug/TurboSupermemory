@@ -6,7 +6,9 @@ preset (``profile="conversational"``):
 
   - role-tagged, scope-filtered fact storage (user-scoped memories),
   - belief revision with refinement/contradiction thresholds 0.85 / 0.75,
-  - cognitive search (``cognitive_alpha = 0.5``),
+  - cognitive search, calibrated: the concept graph may move a memory by up
+    to half the spread of similarity among the candidates, enough to settle
+    close calls and never enough to outvote the embedding,
   - belief revision that keeps history: a superseded fact is ranked lower
     and flagged, never removed. With a ``Verifier`` (consolidation proposes,
     the verifier vets, only accepted pairs are committed) recall also marks
@@ -31,8 +33,9 @@ import logging
 import math
 import re
 import threading
+import time
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Union
 
 import numpy as np
 
@@ -40,7 +43,9 @@ from ._loader import load_turbomemory
 from .budget import select_under_budget, total_tokens
 from .compaction import is_gist, plan_compaction
 from .concepts import extract_concepts
-from .interfaces import Embedder, Extractor, Verifier  # noqa: F401  (re-exported types)
+from .identity import bind_embedder
+from .interfaces import (  # noqa: F401  (Embedder, Extractor, Verifier: re-exported types)
+    Embedder, Extractor, Verifier, embed_documents, embed_query, embedder_fingerprint)
 from .ranking import is_first_person_query, role_prior
 
 logger = logging.getLogger("tsm.memory")
@@ -49,10 +54,13 @@ logger = logging.getLogger("tsm.memory")
 # supersession was verified: it was true, and something newer replaced it.
 STALE_MARK = "[earlier, since changed] "
 
-_DATE = re.compile(r"\s*(\d{4})[-/](\d{2})[-/](\d{2})")
+# A date, then optionally a weekday in brackets and a time of day:
+# "2024-01-15", "2024-01-15T10:00:00Z", "2023/05/20 (Sat) 02:21".
+_DATE = re.compile(
+    r"\s*(\d{4})[-/](\d{2})[-/](\d{2})(?:\s*\(\w+\))?(?:[T\s]\s*(\d{1,2}):(\d{2}))?")
 
 
-def time_tag(timestamp, turn_index) -> str:
+def time_tag(timestamp, turn_index, minutes: bool = False) -> str:
     """When a memory was said, as a prefix for the text shown to a model.
 
     ``"[2024-01-15] "`` when the message's timestamp carries a date (a string
@@ -60,11 +68,18 @@ def time_tag(timestamp, turn_index) -> str:
     ``"[turn 12] "`` from the turn index, which only orders memories; ``""``
     when neither is known. Without one of these a reader cannot tell which of
     two memories came first.
+
+    With ``minutes`` the time of day is added when the timestamp has one
+    (``"[2024-01-15 10:00] "``, UTC for an epoch timestamp), which tells two
+    memories of one day apart for two more tokens each.
     """
     if isinstance(timestamp, str):
         match = _DATE.match(timestamp)
         if match:
-            return "[{}-{}-{}] ".format(*match.groups())
+            year, month, day, hour, minute = match.groups()
+            if minutes and hour is not None:
+                return f"[{year}-{month}-{day} {int(hour):02d}:{minute}] "
+            return f"[{year}-{month}-{day}] "
         try:
             timestamp = float(timestamp)
         except ValueError:
@@ -73,7 +88,8 @@ def time_tag(timestamp, turn_index) -> str:
             and math.isfinite(timestamp) and timestamp >= 1e8):
         seconds = timestamp / 1000.0 if timestamp >= 1e11 else float(timestamp)
         try:
-            return datetime.fromtimestamp(seconds, timezone.utc).strftime("[%Y-%m-%d] ")
+            return datetime.fromtimestamp(seconds, timezone.utc).strftime(
+                "[%Y-%m-%d %H:%M] " if minutes else "[%Y-%m-%d] ")
         except (OverflowError, OSError, ValueError):
             pass
     if (isinstance(turn_index, (int, float)) and not isinstance(turn_index, bool)
@@ -81,6 +97,12 @@ def time_tag(timestamp, turn_index) -> str:
         return f"[turn {int(turn_index)}] "
     return ""
 
+
+# How long close() waits for an idle consolidation pass that is still running
+# (a verifier request can take a minute) before it releases the engine anyway.
+IDLE_CLOSE_TIMEOUT_SECS = 30.0
+# The least an idle pass waits before trying again after it failed.
+IDLE_RETRY_FLOOR_SECS = 1.0
 
 # Engine methods this SDK cannot work without. The extension and the SDK ship
 # together; this guards against a stale locally-built turbomemory.pyd/.so.
@@ -92,10 +114,21 @@ _REQUIRED_ENGINE_METHODS = ("get_records", "next_insert_seq", "recovery_report")
 # verifier is installed. Superseded facts stay in recall (pass
 # `exclude_superseded=True` to drop them): a question about what was true
 # earlier needs them, and removing them lost more judged answers than it won.
+#
+# Cognitive search is weighted against the query's own spread of cosine
+# (`graph_weight`), without the per-word concept bonus (`query_concept_boost`:
+# BM25 already scores word overlap) and with what a concept passes on split
+# among the memories it points at (`fan_exponent`). The profile used a fixed
+# boost before (`cognitive_alpha=0.5`, up to 0.5 on top of a cosine, where
+# neighbouring candidates differ by about 0.01): that ranked by word overlap
+# and lost questions against plain vector search. Passing `cognitive_alpha`
+# to Memory() brings the fixed boost back.
 CONVERSATIONAL_PROFILE = {
     "refinement_cosine_threshold": 0.85,
     "contradiction_cosine_threshold": 0.75,
-    "cognitive_alpha": 0.5,
+    "graph_weight": 0.5,
+    "query_concept_boost": 0.0,
+    "fan_exponent": 1.0,
     "importance_auto_scoring": True,
     "concept_max_ngram_len": 2,
     "max_concepts": 10,
@@ -141,6 +174,8 @@ class Memory:
         gist_summarizer: Optional[Callable[[List[str]], str]] = None,
         reranker: Optional[object] = None,
         max_user_tokens: Optional[int] = None,
+        allow_embedder_change: bool = False,
+        idle_consolidation_secs: Optional[float] = None,
         **engine_kwargs,
     ):
         """
@@ -152,6 +187,14 @@ class Memory:
                 ``None`` leaves engine defaults (plain vector store).
                 Explicit ``engine_kwargs`` override the profile.
             embedder: ``Embedder`` implementation. Default: ``OpenAIEmbedder``.
+                ``"gemma"`` is EmbeddingGemma 2 run locally (text model,
+                768 dimensions, no API key); ``"local"`` / ``"minilm"`` is
+                all-MiniLM-L6-v2. An embedder with ``encode_query`` /
+                ``encode_document`` is asked for the right one of the two
+                (``tsm.interfaces.AsymmetricEmbedder``). The database
+                remembers which embedder wrote it (``tsm_embedder.json``)
+                and refuses another: two models of one dimension are not
+                comparable and search would return wrong results silently.
             extractor: ``Extractor`` implementation. Default: ``OpenAIExtractor``.
             verifier: ``Verifier`` implementation, or ``"nli"`` /``"llm"``
                 for the two in ``tsm.verification`` (``NLIVerifier``: a small
@@ -181,12 +224,28 @@ class Memory:
             reranker: optional ``Reranker`` implementation or ``"colbert"``
                 to enable Stage-2 MultiVector late-interaction MaxSim precision
                 reranking (e.g. ``LFM2.5-ColBERT-350M``).
+            allow_embedder_change: open a database with an embedder other
+                than the one that wrote it (``EmbedderMismatchError``
+                otherwise). Only for an embedder that produces the same
+                vectors as the recorded one; the record is then replaced.
+            idle_consolidation_secs: run ``consolidate()`` in a background
+                thread once nothing has called ``add()`` or ``recall()`` for
+                this many seconds and something was written since the last
+                pass (also once after opening a store that already holds
+                memories). Verification, supersession commits and
+                ``max_user_tokens`` compaction then happen away from the
+                request path. A pass is not interrupted when a call arrives:
+                the engine serves it meanwhile, and only a manual
+                ``consolidate()`` waits for the pass. A failed pass, or one
+                a verifier could not finish (``verifier.unresolved``), is
+                tried again after another idle period. ``close()`` stops the
+                thread first. Default ``None``: consolidate when you call it.
             **engine_kwargs: forwarded to ``turbomemory.MemoryEngine``.
         """
         # Backend names are resolved here; anything else that is a string is a
         # typo, and is reported now rather than at the first add().
         for kind, value, known in (
-            ("embedder", embedder, ("openai", "sentence_transformer", "local", "minilm")),
+            ("embedder", embedder, ("openai", "sentence_transformer", "local", "minilm", "gemma")),
             ("extractor", extractor, ("openai", "gliner", "passthrough")),
             ("reranker", reranker, ("colbert",)),
             ("verifier", verifier, ("nli", "llm")),
@@ -210,6 +269,10 @@ class Memory:
             from .embedders import SentenceTransformerEmbedder
 
             embedder = SentenceTransformerEmbedder()
+        elif embedder == "gemma":
+            from .embedders import SentenceTransformerEmbedder
+
+            embedder = SentenceTransformerEmbedder("google/embeddinggemma-2")
         if extractor is None or extractor == "openai":
             from .extractors import OpenAIExtractor
 
@@ -251,6 +314,9 @@ class Memory:
         config: Dict = {}
         if profile == "conversational":
             config.update(CONVERSATIONAL_PROFILE)
+            # Cosine thresholds depend on the embedder's geometry (see
+            # tsm.interfaces.Embedder); explicit engine_kwargs still win.
+            config.update(getattr(embedder, "engine_defaults", None) or {})
         elif profile is not None:
             raise ValueError(f"unknown profile: {profile!r} (use 'conversational' or None)")
         # A verifier only gets to vet supersessions if the engine does not
@@ -258,12 +324,30 @@ class Memory:
         config["defer_supersession_commit"] = verifier is not None
         if gist_summarizer is not None:
             config["gist_before_evict"] = True
+        if "cognitive_alpha" in engine_kwargs and "graph_weight" not in engine_kwargs:
+            # A caller who sets the fixed boost means it: the profile's
+            # spread-scaled weight would otherwise take its place.
+            config.pop("graph_weight", None)
         config.update(engine_kwargs)  # explicit kwargs win over the profile
         self.profile = profile
+        self.engine_config = dict(config)  # what the engine was opened with
         self._gist_summarizer = gist_summarizer
         if max_user_tokens is not None and int(max_user_tokens) < 16:
             raise ValueError("max_user_tokens must be at least 16")
         self.max_user_tokens = None if max_user_tokens is None else int(max_user_tokens)
+        if idle_consolidation_secs is not None and not float(idle_consolidation_secs) > 0:
+            raise ValueError("idle_consolidation_secs must be positive")
+        self._idle_secs = (None if idle_consolidation_secs is None
+                           else float(idle_consolidation_secs))
+        # Idle consolidation: one pass at a time (also against a manual
+        # consolidate()), and what decides whether the worker has work.
+        self._maintenance_lock = threading.Lock()
+        self._activity = time.monotonic()
+        self._pending = False       # written to since the last pass
+        self._retry = False         # the last pass left something to try again
+        self._retry_after = 0.0
+        self._stop_worker = threading.Event()
+        self._worker: Optional[threading.Thread] = None
         # Users written to since their last compaction (this process only;
         # compact() with no argument covers every user in the store).
         self._touched: set = set()
@@ -285,6 +369,13 @@ class Memory:
                 "the compiled turbomemory extension is older than this tsm SDK "
                 f"(missing: {', '.join(missing)}); rebuild it with 'make build-python'"
             )
+        try:
+            bind_embedder(db_path, embedder_fingerprint(embedder, self.dim), self.dim,
+                          records=int(self.engine.record_count()),
+                          allow_change=allow_embedder_change)
+        except BaseException:
+            self.close()  # do not leave the database locked behind the error
+            raise
         if gist_summarizer is not None:
             set_compressor = getattr(self.engine, "set_gist_compressor", None)
             if set_compressor is None:
@@ -299,6 +390,14 @@ class Memory:
         # sequence (which starts at 1 and is never reused) keeps ids unique
         # when an existing database is reopened.
         self._insert_counter = max(0, int(self.engine.next_insert_seq()) - 1)
+
+        if self._idle_secs is not None:
+            # A store written by an earlier session may never have been
+            # consolidated: the first idle period does it.
+            self._pending = int(self.engine.record_count()) > 0
+            self._worker = threading.Thread(target=self._idle_loop,
+                                            name="tsm-idle-consolidation", daemon=True)
+            self._worker.start()
 
     # writes ----------------------------------------------------------------------
     def add(self, messages: List[Dict], user_id: str) -> int:
@@ -322,6 +421,7 @@ class Memory:
         facts or raises having stored none. Safe to call from several threads.
         """
         self._require_open()
+        self._activity = time.monotonic()
         if isinstance(messages, str):
             messages = [{"role": "user", "content": messages}]
         elif isinstance(messages, dict):
@@ -354,7 +454,7 @@ class Memory:
         if not facts:
             return 0
 
-        embeddings = np.ascontiguousarray(self.embedder.encode(facts), dtype=np.float32)
+        embeddings = np.ascontiguousarray(embed_documents(self.embedder, facts), dtype=np.float32)
         if embeddings.ndim != 2 or embeddings.shape != (len(facts), self.dim):
             raise ValueError(
                 f"embedder returned shape {embeddings.shape} for {len(facts)} facts; "
@@ -391,6 +491,8 @@ class Memory:
             )
             if self.max_user_tokens is not None and user_id is not None:
                 self._touched.add(user_id)
+            self._pending = True
+        self._activity = time.monotonic()
         return len(facts)
 
     def _compress_gist(self, texts: List[str]):
@@ -411,7 +513,7 @@ class Memory:
             gist = (self._gist_summarizer(texts) or "").strip()
             if not gist:
                 return None
-            emb = np.asarray(self.embedder.encode([gist]), dtype=np.float32)[0]
+            emb = np.asarray(embed_documents(self.embedder, [gist]), dtype=np.float32)[0]
             return gist, emb.tolist()
         except Exception as e:  # noqa: BLE001 — logged here, handled by the engine
             logger.warning("gist summarizer failed for %d texts (kept, will retry): %s",
@@ -463,7 +565,7 @@ class Memory:
         rerank: bool = False,
         reranker: Optional[object] = None,
         max_items: Optional[int] = None,
-        time_tags: bool = True,
+        time_tags: Union[bool, str] = True,
     ) -> List[Dict]:
         """Search memories under ``user_id``'s scope.
 
@@ -498,13 +600,23 @@ class Memory:
         asked which of two things happened first, or what was true before
         something changed, has nothing else to go on. Gists carry no tag:
         they cover many turns. The tags count against ``token_budget``.
+        ``time_tags="minute"`` adds the time of day when the timestamp has
+        one (``[2024-01-15 10:00] ...``), so two memories of one day can be
+        ordered; ``"date"`` is the same as True.
+
+        ``recall()`` is a read: asking does not change what the next call
+        returns. Use ``reinforce()`` to tell the memory which results were
+        actually used.
 
         With ``rerank=True`` or an active ``reranker`` (e.g. ``ColBertReranker``),
         retrieved candidate shortlists from TSM's cognitive graph are reranked
         using token-level MaxSim late interaction.
         """
         self._require_open()
-        query_embedding = np.asarray(self.embedder.encode(query), dtype=np.float32)
+        self._activity = time.monotonic()
+        if time_tags not in (True, False, "date", "minute"):
+            raise ValueError("time_tags must be True, False, 'date' or 'minute'")
+        query_embedding = np.asarray(embed_query(self.embedder, query), dtype=np.float32)
 
         active_reranker = reranker or (self.reranker if rerank else None)
         if rerank and active_reranker is None:
@@ -546,7 +658,8 @@ class Memory:
             # Set before packing: what is shown is what the budget counts.
             shown = p.get("context", p["text"] or "")
             if time_tags and not is_gist(p["role"]):
-                shown = time_tag(p["timestamp"], p["turn_index"]) + shown
+                shown = time_tag(p["timestamp"], p["turn_index"],
+                                 minutes=time_tags == "minute") + shown
             p["context"] = shown
 
         first_person = is_first_person_query(query)
@@ -571,8 +684,9 @@ class Memory:
         if token_budget is None:
             final = pool[:top_k]
         else:
-            final = select_under_budget(pool, token_budget, embed=self.embedder.encode,
-                                        lam=lam, max_items=max_items)
+            final = select_under_budget(
+                pool, token_budget, embed=lambda texts: embed_documents(self.embedder, texts),
+                lam=lam, max_items=max_items)
         return final
 
     def _resolve_beliefs(self, pool: List[Dict], user_id: Optional[str]) -> None:
@@ -645,16 +759,58 @@ class Memory:
             The number of supersession edges committed (0 without a verifier).
         """
         self._require_open()
-        self.engine.trigger_consolidation()
-        committed = self._verify_supersessions()
-        if self.max_user_tokens is not None:
-            for user in sorted(self._touched):
-                try:
-                    self._compact_user(user)
-                except Exception as e:  # noqa: BLE001 — nothing was removed; retried later
-                    logger.warning("memory of %r not compacted (kept as it is, will retry): %s",
-                                   user, type(e).__name__)
+        with self._maintenance_lock:
+            self._require_open()  # closed while this call waited for a running pass
+            # Writes that arrive during the pass set these again.
+            self._pending = False
+            self._retry = False
+            try:
+                self.engine.trigger_consolidation()
+                committed = self._verify_supersessions()
+                if self.max_user_tokens is not None:
+                    for user in sorted(self._touched):
+                        try:
+                            self._compact_user(user)
+                        except Exception as e:  # noqa: BLE001 — nothing was removed; retried later
+                            self._retry = True
+                            logger.warning(
+                                "memory of %r not compacted (kept as it is, will retry): %s",
+                                user, type(e).__name__)
+            except BaseException:
+                self._pending = True
+                raise
         return committed
+
+    def _idle_loop(self) -> None:
+        """Background thread of ``idle_consolidation_secs``: consolidate when
+        there is something to do and nobody has been using the memory."""
+        idle = self._idle_secs
+        poll = min(max(idle / 4.0, 0.05), 5.0)
+        while not self._stop_worker.wait(poll):
+            if not (self._pending or self._retry):
+                continue
+            now = time.monotonic()
+            if now - self._activity < idle or now < self._retry_after:
+                continue
+            try:
+                self.consolidate()
+            except Exception as e:  # noqa: BLE001 — the worker must outlive one bad pass
+                if self._closed or self._stop_worker.is_set():
+                    return  # the engine was closed under this pass
+                self._retry_after = time.monotonic() + max(idle, IDLE_RETRY_FLOOR_SECS)
+                logger.warning("idle consolidation failed (memories are kept, will retry): %s: %s",
+                               type(e).__name__, e)
+
+    def _stop_idle_worker(self) -> None:
+        worker = self._worker
+        if worker is None:
+            return
+        self._stop_worker.set()
+        if worker is not threading.current_thread():
+            worker.join(IDLE_CLOSE_TIMEOUT_SECS)
+            if worker.is_alive():
+                logger.warning("an idle consolidation pass is still running after %.0f s; "
+                               "closing anyway", IDLE_CLOSE_TIMEOUT_SECS)
 
     def _verify_supersessions(self) -> int:
         """Propose, vet and commit supersessions; 0 without a verifier."""
@@ -673,6 +829,9 @@ class Memory:
         pair_ids = sorted({mid for old, new, *_ in proposed for mid in (old, new)})
         id_to_text = {mid: rec["text"] for mid, rec in self._records(pair_ids).items()}
         accepted = self.verifier.verify(proposed, id_to_text)
+        # A verifier that could not judge some pairs (a failed request) says
+        # so; the idle worker then asks again later.
+        self._retry = self._retry or bool(getattr(self.verifier, "unresolved", 0))
         if not accepted:
             return 0
         committed = self.engine.commit_supersessions(accepted)
@@ -726,7 +885,8 @@ class Memory:
             return 0
         embeddings = None
         if plan.gists:
-            embeddings = np.ascontiguousarray(self.embedder.encode(plan.gists), dtype=np.float32)
+            embeddings = np.ascontiguousarray(embed_documents(self.embedder, plan.gists),
+                                              dtype=np.float32)
             if embeddings.shape != (len(plan.gists), self.dim):
                 raise ValueError(
                     f"embedder returned shape {embeddings.shape} for {len(plan.gists)} gists; "
@@ -764,6 +924,27 @@ class Memory:
                     len(plan.gists))
         return len(folded)
 
+    def reinforce(self, memory_ids: Iterable[str]) -> int:
+        """Tell the memory which memories were actually used.
+
+        Their links in the concept graph get stronger, so cognitive search
+        ranks them, and what is connected to them, higher from then on.
+        ``recall()`` itself reinforces nothing (unless the engine is opened
+        with ``reinforce_on_search=True``): having been retrieved is a weak
+        signal, and reinforcing on every read made the same question return
+        a different list the second time it was asked.
+
+        Returns:
+            How many of the ids exist and were reinforced.
+        """
+        self._require_open()
+        reinforce = getattr(self.engine, "reinforce", None)
+        if reinforce is None:
+            raise RuntimeError(
+                "the compiled turbomemory extension is older than this tsm SDK "
+                "(missing: reinforce); rebuild it with 'make build-python'")
+        return int(reinforce([str(mid) for mid in memory_ids]))
+
     def flush(self) -> None:
         """Durably persist all pending writes."""
         self._require_open()
@@ -777,6 +958,7 @@ class Memory:
         ``RuntimeError``.
         """
         if not self._closed:
+            self._stop_idle_worker()
             try:
                 self.engine.close()
             finally:
