@@ -91,8 +91,114 @@ or `recall` likewise means "everyone". PLAN Phase C (one engine per tenant) is
 the intended answer; until then, treat a store as single-tenant unless these
 are closed.
 
+## Judged on 2026-10-09 (the retrieval and input changes)
+
+The same 115 questions, judged by gpt-4.1-mini: 989 judge requests, about
+$0.13 at list prices. The arms and the table are in `benchmarks/PHASE_PROGRESS.md`.
+
+- **Shipped default: 0.574 -> 0.783** (`sdk_cognitive`, 66 -> 90 of 115; 26
+  questions gained, 2 lost, sign test p < 0.001). Most of it is the input fix,
+  not retrieval. The retrieval change alone, on the old inputs, gives 0.635
+  (13 gained, 6 lost, p = 0.17). The input fix (session dates, time-ordered
+  ingestion and the question's date; this run cannot separate the three) adds
+  17 more (19 gained, 2 lost, p < 0.001). Temporal questions 9 -> 21 of 28,
+  knowledge updates 10 -> 15 of 18, multi-session 16 -> 22 of 31.
+- **Minute tags lose.** `--time-tags minute` scored 84 against 90 with date
+  tags (1 gained, 7 lost, p = 0.07). Date tags stay the default.
+- **The graph term adds little on OpenAI embeddings.** Inside the new run it is
+  3 questions ahead of cosine-only ranking (3 gained, 0 lost, p = 0.25).
+- **Caveats.** The retrieval settings were chosen with the free score on these
+  same 115 questions, so the retrieval share is optimistic. Per-type counts are
+  9 to 31. One judge, one reader, one run each.
+- **Held-out, coverage only (2026-10-12, free).** The cached extraction
+  covers all 500 oracle conversations, so the settings were checked on the 355
+  questions they were not chosen on. Questions with all their evidence at 150
+  tokens: the 0.95 packer cut-off against 0.72 gains 11 and loses 1
+  (p = 0.006); the calibrated graph term against the old fixed boost gains 11
+  and loses 3 (p = 0.06); against plain search it is level (0 and 1). Judged
+  answers on those 355 are still owed.
+- **Still open.** A check on full histories needs more extraction (paid:
+  about 14k requests for 30 LongMemEval-S questions, 51k for all 115). Date tags cannot order two sessions of one day (118 of the 500
+  questions have such a pair); one regression from the input fix is such a
+  pair. Tagging with both the date and the turn is untested. Validity intervals
+  on facts and keeping the original turn beside its facts (item 3 of the plan)
+  are not started.
+
+## Judged on 2026-10-12 (the write path and the reading prompt)
+
+The same 115 questions, `sdk_cognitive`, reader and judge gpt-4.1-mini: 2,856
+extraction requests and 1,308 judge requests, about $0.96 at list prices. The
+table is in `benchmarks/PHASE_PROGRESS.md`.
+
+- **Best so far: 0.861** (99 of 115) with the two-pass store, a 600-token
+  context and the `tsm.reading` prompt. The committed setup (first prompt
+  only, 150 tokens, the harness's plain prompt) is 0.783 (90).
+- **How the model is asked is the larger part.** On the same 600-token
+  contexts the plain prompt answered 92 and the reading prompt 99. The plain
+  prompt gets worse with more context on the same store (90 at 150 tokens,
+  86 at 600), so a larger budget alone buys nothing.
+- **Recovering the dropped turns is not settled**: 6 more answers at 600
+  tokens, 8 fewer at 150, neither significant (SDK section below).
+- **The evidence score misled here.** It counts a turn as found when any
+  memory from it is in the context; the recovered memories are often not the
+  one that answers. Do not tune extraction on it.
+- **Caveats.** The reading prompt was written after reading what these 115
+  questions got wrong, so 0.861 is an upper estimate. The 92 -> 99 step has
+  no paired test: the per-question verdicts of the earlier runs were under
+  `target/`, which was removed before the last run (results are now kept
+  under `.cache/shipped_stack_eval`). One judge, one run each. Not in the
+  numbers: the harness now lists one day's memories in the order they were
+  said (it passed the reading prompt bare strings before, so they came by
+  rank), and `statements` keeps a list number with its item.
+- **Of the 16 still wrong**: 8 have the facts in the context and the reader
+  still errs (two values said on one day, which date tags cannot order; a
+  total and an average whose facts do not say which workshop or degree they
+  are about; a subtraction; a count of flights); 3 miss a fact; 2 replies
+  were cut off at 500 tokens before their answer line (the limit is 800
+  now); 2 give the gold answer and were marked wrong by the judge; 1 asks
+  about jewelry where the conversation has a chandelier.
+- **Still open, in this order.** (1) A held-out check. The cached extraction
+  covers all 500 conversations of the oracle file, so the other 355 questions
+  can be judged on the first-prompt store for the price of the judge: about
+  710 requests a setting. Nothing was tuned on them. (2) The paired grid on
+  the 115 (store x budget x reader), which decides the extractor's defaults:
+  about 1,600 requests. (3) The second prompt for the other 380 conversations
+  (about 2,700 requests) before the two-pass store can be judged held-out.
+
 ## SDK (`tsm/`)
 
+- **The extraction pass stores nothing for a third of what users say**
+  (measured 2026-10-09, free; `benchmarks/PHASE_PROGRESS.md`). The extractor
+  returned no fact for 470 of 1,403 user messages and 311 of 1,403 assistant
+  messages. Most are a statement about the user followed by a question, which
+  the prompt (the same one in `tsm/extractors.py`) tells it to ignore. 39 of
+  229 evidence turns are lost this way, 34 of the 115 questions have one, and
+  judged accuracy is 0.59 on those against 0.86 on the rest. This is the 0.70
+  ceiling: 81 questions have all their evidence in the context at 300, 600
+  and 1,500 tokens alike. Storing the user's own turn when extraction returns
+  nothing lifts that to 99, 107 and 109 (103 and 98 at 600 tokens with 20 and
+  40 conversations pooled). Built on 2026-10-12 as a second prompt for a
+  message the first one finds nothing in, plus its statements stored as said
+  (`tsm/extractors.py`), and judged: it does not pay the way coverage
+  predicted. Questions with all their evidence in a 150-token context went
+  from 76 to 92 and judged answers from 90 to 82 (4 gained, 12 lost,
+  p = 0.08); at 600 tokens answers went from 86 to 92 (10 gained, 4 lost,
+  p = 0.18). The recovered memories are mostly what the user wanted at the
+  time; they match a question's wording and, in a small context, take the
+  place of the fact that answers it. Both steps are on by default in the
+  working tree, and that default is not settled (next section). Still open
+  from the diagnosis: facts taken from the recent context instead of the
+  message, facts that do not say what they are about ("The workshop was
+  free"), and the same fact stored several times in different words.
+- **Readers cannot tell which of two values is current.** With all the
+  evidence in the context, knowledge-update questions were answered right
+  52% of the time (50% without it). Dates may help; a validity interval on
+  the fact itself (true from, true until) is the direct fix.
+- **The packer's weights are fixed amounts.** The new-turn bonus (0.20) and
+  the redundancy penalty are added to relevance differences of about 0.01
+  between neighbouring candidates. Normalizing relevance to the pool's
+  spread was within one or two questions of not doing so on the free score,
+  so it was left; it is the same scale problem the graph term had.
 - **Compacting as the conversation arrives scores lower than compacting
   once.** `Memory(max_user_tokens=256)` answers 0.464 of 112 judged
   questions when the store is compacted once after ingestion (the
@@ -123,11 +229,11 @@ are closed.
   with everything on 0.591), so the published head-to-head and bounded
   tables can be re-run through `tsm.Memory` (`shipped_stack_eval.py` shows
   how) and the adapter retired.
-- **`recall()` is not read-only.** A query reinforces what it returned, so
-  the same question asked twice of one store comes back in a different
-  order more often than not (13 of 19 questions checked, different members
-  in 3). An evaluation has to build one store per arm, and a caller cannot
-  rely on a repeated query. A read that does not reinforce is missing.
+- **Nothing calls `reinforce()` yet.** `recall()` no longer reinforces what
+  it returns (the same question came back as a different list the second
+  time in 13 of 19 checks); `Memory.reinforce(ids)` is there for memories
+  that were used, and no example or integration uses it. Access counters
+  are still bumped by every read.
 - **Extraction results cached before 2026-10-06 may be wrong.** The OpenAI
   extractor used to cache "no facts" for a reply that was cut off at 400
   tokens. It no longer does, but an existing `extract_<model>.json` cache can
@@ -137,10 +243,6 @@ are closed.
   (`<db_path>/tsm_cache/`) and are never pruned, including after eviction.
   The embedding cache is still a pickle file, now read with an arrays-only
   loader; a plain format (npz) would be simpler.
-- **`recall()` applies the role prior without re-sorting** unless a reranker or
-  a budget is used, so on the default path the prior does not change the
-  order and results are not sorted by the returned score. (The eval adapter
-  does re-sort.)
 - **Role prior is very broad.** `tsm/ranking.py` treats a query as first-person
   when it contains words like "what", "how", "have" or "did", so the user-fact
   boost applies to nearly every question. It is the cue set the evaluations
@@ -148,31 +250,30 @@ are closed.
 - **Budget recall re-embeds its candidate pool on every call** (a paid API
   call with the OpenAI embedder). Have the engine return the stored vectors
   for the pool, or cache them.
-- **Time tags were judged with turn numbers only.** LongMemEval messages
-  carry no dates in this loader, so `[turn N]` is what gained 5 to 8
-  questions of 115. `[YYYY-MM-DD]` is covered by unit tests, not by a judged
-  run (LoCoMo has dated sessions). A tag costs about 3 tokens, one item of a
-  150-token context; whether a shorter form does as well is not known.
+- **Time tags have been judged with turn numbers only** (5 to 8 questions
+  of 115). Dated tags are wired through the eval now and wait for the
+  judged run above. A tag costs about 3 tokens, one item of a 150-token
+  context; whether a shorter form does as well is not known.
 
 ## Cognitive behaviour (needs a judged re-run before changing)
 
 Found by the audit, deliberately left as they are because fixing them changes
 recall results:
 
-- **Decide `cognitive_alpha` for a strong embedder (owner's call).** The
-  conversational profile ranks by cosine plus a graph boost of up to 0.5
-  (`cognitive_alpha=0.5`). On 115 judged LongMemEval questions with OpenAI
-  embeddings, the default embedder, that scores 0.574; the same profile with
-  `cognitive_alpha=1.0` (the graph still proposes candidates, ranking is by
-  cosine) scores 0.609 and returns the plain vector pool in 114 of 115
-  questions (7 gained, 3 lost, p=0.34; three other comparisons of cognitive
-  search against the plain pool went 3/7, 2/8 and 3/8). No single
-  comparison is significant; all point the same way. The 0.5 came from
-  earlier runs, most on MiniLM embeddings, where the graph helped. Options:
-  leave it; set 1.0 in the profile; choose by embedder. Whatever is chosen,
+- **Cognitive search no longer costs answers; it has not been shown to add
+  any.** The profile's fixed boost (`cognitive_alpha=0.5`) ranked by word
+  overlap and scored 0.574 judged where cosine ranking scored 0.609. The
+  profile now weights the graph against the query's cosine spread
+  (`graph_weight=0.5`), drops the per-word concept bonus and normalizes by
+  fan. On the free evidence score that is level with the plain vector pool
+  at three store sizes (76, 74, 68 against 75, 74, 68) where the old
+  settings, with the same packer, were 3 to 7 questions behind. Until something shows a gain,
   describe graph expansion and belief revision as neutral for answer
-  accuracy on strong embeddings, and lead with what was measured: packing
-  to the budget, time tags, bounded compression.
+  accuracy and lead with what was measured: packing to the budget, time
+  tags, bounded compression. Not measured: MiniLM, where the graph used to
+  help and the new weights were not tried; the engine's own default
+  (`cognitive_alpha=0.7`, the old seeding) is unchanged and is what the
+  evaluation adapter and the gate use.
 - **Marking a superseded fact or demoting it.** Superseded facts are kept
   now, and a verifier's are marked for the reader, but the 0.4 score
   demotion keeps the marked fact out of a 150-token context almost always
@@ -229,9 +330,10 @@ recall results:
 - **Gist records are not counted against `max_records`**, start with a score
   of zero (first in line next cycle), and superseded victims are gisted like
   any other.
-- **The expansion can drop an ANN hit** when more graph candidates than the
-  cut have a large delta, contrary to the "never drops an ANN hit" docs; the
-  query-token concept seeding is uncapped.
+- **The graph step's costs grow with the store.** BM25 scores every document
+  of every scope on each query, and the expansion stops at the first 50
+  candidates it meets rather than the 50 strongest. (The ANN hits it used to
+  drop at its cut are now always kept.)
 - **Vocabulary evolution merges concepts that co-occur once** (no minimum
   support) and never lifts a hub suppression.
 - **Demotion is not reverted** when the superseding record is deleted, and the

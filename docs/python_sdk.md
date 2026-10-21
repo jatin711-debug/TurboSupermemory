@@ -41,6 +41,50 @@ With no `embedder` / `extractor` arguments, `Memory` uses OpenAI for both
 (`pip install "tsm[openai]"`, `OPENAI_API_KEY`): one extraction call per added
 message. `extractor="passthrough"` and `extractor="gliner"` keep writes local.
 
+The OpenAI extractor asks the model for the facts a message asserts. That
+prompt returns nothing for about a third of what users write, mostly a
+statement about themselves followed by a request ("any collar for a Golden
+Retriever like Max?"). So a message of three words or more that comes back
+empty is asked about again with a second prompt (what the speaker reveals,
+also inside a question), and if that finds nothing either, its sentences
+that are not questions are stored as they were said, in pieces of about 80
+tokens. `OpenAIExtractor(second_look=False)` and
+`OpenAIExtractor(keep_unextracted=False)` switch the two steps off. The
+recovered memories help when recall has room for them and compete with the
+others when it does not: on 115 judged questions, 92 right against 86 with
+a 600-token context, 82 against 90 with a 150-token one, neither difference
+statistically settled (`benchmarks/PHASE_PROGRESS.md`, 2026-10-12).
+
+### Answering from memories
+
+`tsm.reading` holds the prompt for the model that answers from what
+`recall()` returned:
+
+```python
+from tsm.reading import answer_prompt, final_answer
+
+results = memory.recall(question, user_id="alice", token_budget=600)
+reply = client.chat.completions.create(
+    model="gpt-4.1-mini", max_tokens=800, temperature=0,
+    messages=answer_prompt(question, results, today="2024-03-09"))
+print(final_answer(reply.choices[0].message.content))
+```
+
+`answer_prompt` lists the memories in the order they were said (each with
+its date), and asks the model to name the ones that bear on the question,
+to settle what they add up to (a later note replaces an earlier one, a
+total counts each item once, "last week" counts from the note's date) and
+to end with one line that starts with `Answer:`. `final_answer` returns
+what follows that line. `today` is the date the question is asked; "a month
+ago" has no meaning without it. Give the model about 800 reply tokens: a
+reply cut off before its last line has no answer in it.
+
+With the facts in front of it, a plain "answer from these snippets" prompt
+still gets totals, changed values and date arithmetic wrong. On the same
+600-token contexts of 115 judged LongMemEval questions it answered 92 and
+this prompt 99. The prompt was written against those questions, so that is
+an upper estimate until it is checked on others.
+
 ### Results, budgets, and lifecycle
 
 - `recall()` returns dicts, best first, with `id`, `text`, `context`,
@@ -58,7 +102,9 @@ message. `extractor="passthrough"` and `extractor="gliner"` keep writes local.
   answers and lost 1, on temporal and knowledge-update questions
   (`benchmarks/PHASE_PROGRESS.md`, 2026-10-07). Gists carry no tag. The
   tags count against `token_budget`; `recall(..., time_tags=False)` leaves
-  them out.
+  them out, and `time_tags="minute"` adds the time of day when the timestamp
+  has one (`[2024-03-02 18:00] ...`), which is what tells two memories of
+  one day apart.
 - A fact that a newer one replaced is never removed from recall. It is
   ranked lower and carries `superseded_by` (the id of the current belief)
   and `chain`; a result without `superseded_by` is current. With a verifier
@@ -74,10 +120,27 @@ message. `extractor="passthrough"` and `extractor="gliner"` keep writes local.
   where it ranks, marked, next to the fact that replaced it. Judged answers
   came out level between the two.
 - `recall(..., token_budget=N)` returns the best *set* that fits `N` tokens
-  instead of the top-k: greedy MMR over a candidate pool with a redundancy
-  cutoff and a cross-turn coverage bonus (`tsm.budget.select_under_budget`).
-  The budget is filled; pass `max_items=` to also limit the number of
-  results.
+  instead of the top-k: greedy MMR over a candidate pool, with a penalty for
+  saying what is already there and a bonus for a turn not yet covered
+  (`tsm.budget.select_under_budget`). Only a memory nearly identical to one
+  already chosen is skipped outright: memories that merely read alike are
+  often separate instances a question needs together (two classes in one
+  week, a count before and after it changed). The budget is filled; pass
+  `max_items=` to also limit the number of results.
+- `recall()` is a read: asking does not change what the next call returns.
+  `reinforce(memory_ids)` tells the memory which results were actually
+  used, and their links in the concept graph get stronger. (Pass
+  `reinforce_on_search=True` to reinforce everything every search returns,
+  as older versions did; the same question then comes back differently the
+  second time.)
+- Ranking. The conversational profile ranks by embedding similarity plus a
+  bounded vote from the concept graph and BM25: the vote can move a memory
+  by at most half the spread of similarity among the candidates
+  (`graph_weight=0.5`), so it settles close calls and cannot outvote the
+  embedding. `graph_weight=0` is pure similarity ranking. The older fixed
+  boost is still there (`Memory(db, cognitive_alpha=0.5)`); on OpenAI
+  embeddings it ranked by word overlap and lost answers
+  (`docs/cognitive_graph.md`, section 3).
 - `consolidate()` runs the engine's consolidation cycle, including belief
   revision. What a superseded fact turns into depends on the verifier:
   - `verifier="llm"` (`tsm.verification.LLMVerifier`): every new fact is
@@ -107,6 +170,13 @@ message. `extractor="passthrough"` and `extractor="gliner"` keep writes local.
   | `"nli"` | 16 of 54 | 6 of 58 |
   | `"llm"` with `gpt-4o-mini`, the default | 49 to 50 of 54 | 4 to 8 of 58 |
   | `"llm"` with a local 4.7B model, `qwen3.5:4b` | 48 to 49 of 54 | 7 to 9 of 58 |
+  | `"llm"` with local `Ternary-Bonsai-2-4B-PQ2_0` | 49 / 48 of 54 | 7 / 10 of 58 |
+
+  Bonsai's slash-separated figures are isolated / shared scope, measured on
+  2026-10-19 with the shipped prompt, non-thinking mode, greedy decoding,
+  batches of 8 and a 1,024-token output limit. It remains opt-in: catching
+  more updates does not eliminate false supersessions. See the Bonsai follow-up
+  in `benchmarks/PHASE_PROGRESS.md` for the runtime and evaluation commands.
 
   In each range the first figure is with every pair in its own store and the
   second with all pairs in one store, where statements of different pairs
@@ -185,7 +255,96 @@ memory = Memory(
     embedder=SentenceTransformerEmbedder(model_name="sentence-transformers/all-MiniLM-L6-v2", device="cuda"),
     reranker=ColBertReranker(model_name="LiquidAI/LFM2.5-ColBERT-350M", device="cuda"),
 )
+
+# EmbeddingGemma 2, local and offline once cached (pip install "tsm[gemma]")
+memory = Memory("./my_db", embedder="gemma", extractor="passthrough")
 ```
+
+**Local Bonsai verifier.** Serve the PQ2 model with the
+[PrismML runtime](https://github.com/PrismML-Eng/llama.cpp/releases/tag/prism-b10777-e3de715)
+and the alias `bonsai-2-4b-pq2` on `127.0.0.1:18080`. The live SDK smoke check
+used `-ngl 99 -fa on -c 8192 -np 1 --jinja --cache-ram 128`. The cache bound
+matters: the default is 8,192 MiB of host prompt cache, which grew the server's
+private memory to about 11 GB in the longer evaluation. Then:
+
+```python
+from tsm import Memory
+from tsm.verification import LLMVerifier
+
+verifier = LLMVerifier(
+    model="bonsai-2-4b-pq2",
+    base_url="http://127.0.0.1:18080/v1",
+    api_key="local",
+    cache_dir="./gemma_db/tsm_cache",
+    request_timeout=600.0,
+    request_kwargs={
+        "max_tokens": 1024,
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}, "seed": 42},
+    },
+)
+with Memory("./gemma_db", embedder="gemma", extractor="passthrough",
+            verifier=verifier, idle_consolidation_secs=60) as memory:
+    memory.add("My meeting is on Tuesday.", user_id="alice")
+    memory.add("Correction: my meeting is on Wednesday.", user_id="alice")
+    memory.consolidate()  # Explicit pass; otherwise the worker waits for idle time.
+```
+
+Compact PQ2/PTQ packs need the Prism fork. Non-thinking mode is explicit:
+otherwise the model may spend thousands of tokens reasoning before returning
+the verdict lines. Even with thinking disabled some batches are verbose or
+unparseable; unresolved pairs are left uncommitted and retried later. Use a fresh
+verdict cache when changing weights or decoding settings.
+
+**Local embedders.** `SentenceTransformerEmbedder` follows each model's own card.
+`encode` / `encode_document` embed stored text and `encode_query` embeds a
+question, each with the model's task prompt (`title: none | text: ` and
+`task: search result | query: ` for EmbeddingGemma 2); `Memory` asks for the right
+one (`tsm.interfaces.AsymmetricEmbedder`), and an embedder with only `encode` works
+unchanged. Per-model settings from the card are applied by name
+(`tsm.embedders._MODEL_DEFAULTS`): for EmbeddingGemma 2 only the text model is
+loaded (271M parameters, about 0.5 GB on the GPU in bfloat16, against 740M with
+its image and audio encoders), the input is bounded at its 8,192-token context,
+and float16 is refused because its activations overflow it (NaN, no error). A
+load-time probe checks the model returns finite vectors of the declared size.
+The cosine thresholds of belief detection are tuned on OpenAI vectors and do not
+carry over: with EmbeddingGemma 2's vectors the profile's 0.85 / 0.75 marks 30 of 58
+still-true facts stale (8 of 58 on MiniLM) and cost 10 of 77 questions their
+evidence at one history (p = 0.012). An embedder can declare `engine_defaults`, which
+`Memory` applies under the conversational profile and below anything passed to
+`Memory(...)`; EmbeddingGemma 2 declares 0.92 / 0.86, which on the held-out pairs
+marks 7 of 58 stale and costs 1 question (`benchmarks/PHASE_PROGRESS.md`,
+2026-10-19). Give any other new embedder the same check
+(`benchmarks/cognitive_eval/belief_pairs_eval.py --embed-model ...`) before trusting
+the profile with it.
+`truncate_dim=512` (also 256, 128) keeps the leading dimensions of a Matryoshka
+model and re-normalizes; `query_prompt_name="QuestionAnswering"` picks another of
+the model's prompts. Vectors are unit length, and the model is called under a lock
+(HF tokenizers are not safe to share across threads).
+
+**One embedder per database.** Two models of one dimension look the same to the
+engine, and searching one's vectors with the other's queries returns plausible,
+wrong results without an error. `Memory` therefore records the embedder's
+`fingerprint` (model, commit, dimension, task prompts; for any other embedder its
+class name and dimension: give it a `fingerprint` attribute if one class serves
+several models) in `tsm_embedder.json` next to the engine's files and refuses to
+open the database with a different one (`tsm.EmbedderMismatchError`, a
+`ValueError`). An empty database takes any embedder; one written before this record
+existed adopts the first embedder that opens it. `allow_embedder_change=True` is for
+an embedder that produces the same vectors. Changing models means re-ingesting:
+`update()` allocates a fresh insert sequence, which belief revision uses to order
+old against new, so re-embedding in place would scramble the history.
+
+**Idle consolidation.** `Memory(..., idle_consolidation_secs=60)` runs
+`consolidate()` in a background thread once nothing has called `add()` or
+`recall()` for that long and something was written since the last pass (and once
+after opening a store that already holds memories): verification, supersession
+commits and `max_user_tokens` compaction then happen off the request path. A pass
+is not interrupted by a call (the engine serves it meanwhile; a manual
+`consolidate()` waits for the pass), a failed pass or one a verifier could not
+finish (`LLMVerifier.unresolved`) is tried again after another idle period, nothing
+is deleted on failure, and `close()` stops the thread before it releases the
+engine. It is separate from the engine's own `auto_consolidation_secs` timer,
+which has no verifier and which the conversational profile leaves at 0.
 
 ---
 

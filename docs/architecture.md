@@ -47,7 +47,7 @@ This keeps write latency low while optimizing search speeds for old/cold memorie
 ### 2.3 Adaptive Prompt Budget Saliency (Submodular MMR)
 For agent prompt generation under tight token limits (150, 300, 1000+ tokens):
 * **The token budget bounds the set**: selection continues until the budget is full, from a candidate pool that grows with the budget. An optional `max_items` limits the count as well. (An earlier fixed cap, `min(10, max(4, token_budget // 35))`, used about half of the budget with short memories and cost judged accuracy; see `benchmarks/PHASE_PROGRESS.md`, 2026-10-07.)
-* **Semantic Redundancy Gate (`red > 0.72`)**: Rejects near-duplicate rephrasings of the same event to guarantee cross-session diversity.
+* **Semantic Redundancy Gate (`red > 0.95`)**: Skips a memory that says the same thing as one already chosen; anything less alike is only penalized. (The gate was `0.72` once. Memories that read alike are often different instances a question needs together, and that cutoff dropped them; see `benchmarks/PHASE_PROGRESS.md`.)
 * **Cross-Turn Coverage Bonus (`+0.20`)**: Rewards facts from distinct temporal sessions to excel at multi-session reasoning.
 
 ### 2.4 The Split-Persistence Model (WAL + redb)

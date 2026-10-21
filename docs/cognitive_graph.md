@@ -53,12 +53,13 @@ Cosine seed scores *are* used internally — to pick which seeds to expand from 
 
 ### 2.2 Candidate Floor and Lexical Seeding
 
-1. **ANN floor**: every ANN candidate is inserted with \(\Delta_{\text{graph}} = 0\), so it always appears in the result set and is ranked by exact cosine unless the graph adds a boost. Its cosine seed activation is recorded separately as \(E_{\text{seed}}(M) = \alpha_{\text{semantic}} \cdot \text{score}(M)\) for use in expansion (`semantic_alpha` default `1.0`).
+1. **ANN floor**: every ANN candidate is inserted with \(\Delta_{\text{graph}} = 0\), so it always appears in the result set and is ranked by exact cosine unless the graph adds a boost. Its cosine seed activation is recorded separately as \(E_{\text{seed}}(M) = \alpha_{\text{semantic}} \cdot \text{score}(M)\) for use in expansion (`semantic_alpha` default `1.0`). The floor holds at the cut too: when there are more candidates than the engine asked for, every ANN seed is kept and the remaining places go to the graph-discovered candidates with the largest delta. (Seeds and discovered candidates were once ranked together by cosine + delta. In a store of a few thousand memories hundreds share a word with the query, each with a delta larger than a seed's cosine, and they pushed true nearest neighbours out before fusion.)
 2. **Lexical boost**: BM25 keyword scores, normalized against the top BM25 score, contribute to the delta:
    \[
    \Delta_{\text{graph}}(M) \mathrel{+}= \alpha_{\text{lexical}} \cdot \frac{\text{BM25}(Q, M)}{\max \text{BM25}}
    \]
    (`lexical_alpha` default `0.3`.)
+3. **Query-concept seeding**: a memory tagged with a concept that is also a word of the query gets `query_concept_boost × edge weight` for each such word (`query_concept_boost` default `0.75`; `0` switches it off). Concepts are mostly content words, so this scores word overlap a second time, without IDF or length normalization: three shared words outweigh any cosine difference. The `tsm` conversational profile sets it to `0`.
 
 ### 2.3 Single 1-Hop Expansion
 
@@ -68,13 +69,13 @@ If `iterations > 0` (default `1`), the augmenter expands from the top-`seed_hops
 \]
 (`decay` default `0.5`.)
 
-| Pool | Edge kinds | Re-ranks ANN hits? | Boost factor |
-|---|---|---|---|
-| **Strong** | `Refines`, `Contradicts` | Yes — always traversed, even to existing ANN candidates (this is what lets a correction outrank its cosine-nearest older memory) | `1.0` |
-| **Temporal** | `Temporal` | Yes — surfaces nearby conversation turns | `0.5` |
-| **Normal** | `Association` (weight ≥ `0.5`) | No — only *adds* candidates not already in the ANN floor (prevents flooding) | `0.3` |
+| Pool | Path | Boost factor |
+|---|---|---|
+| **Strong** | `Refines` / `Contradicts` edge to another memory. This is what lets a correction outrank its cosine-nearest older memory. | `1.0` |
+| **Temporal** | `Temporal` edge to the memory stored next | `0.5` |
+| **Concept** | memory → shared concept → sibling memory (2 hops), and with an abstraction parent memory → concept → parent → sibling concept → memory (4 hops); both need `concept_expansion` (default on) | `0.75` |
 
-`Abstraction` edges are not traversed on the read path; they are used during consolidation to shape `Association` weights. Suppressed hub concepts (see §5) do not propagate energy.
+**Fan normalization** (`fan_exponent`, default `0` = off): a signal that passes through a concept is divided by `fan ^ fan_exponent`, where `fan` is the number of memories the concept is attached to. Without it a word half the store shares links two memories as strongly as a name only they share. With `1.0` (the `tsm` conversational profile) what a concept passes on is split among everything it points at. Suppressed hub concepts (see §5) do not propagate at all.
 
 #### Concrete Numerical Example
 
@@ -98,25 +99,31 @@ flowchart TD
     EmptyCheck -- "Yes" --> Floor["Seed candidates: graph delta = 0"]
     Floor --> BM25["+ BM25 lexical boost into delta"]
     BM25 --> Expand["1-hop expand from top-M seeds (iterations=1)"]
-    Expand --> Pools["Strong x1.0 / Temporal x0.5 / Normal x0.3"]
-    Pools --> Cap["Cap new candidates at expansion_max_candidates"]
+    Expand --> Pools["Strong x1.0 / Temporal x0.5 / Concept x0.75"]
+    Pools --> Cap["Keep every ANN seed; fill the rest with the largest deltas"]
     Cap --> Return["Return PURE graph delta per candidate"]
-    Return --> Fuse["Engine fuses: cosine + (1-alpha) * normalized_delta"]
+    Return --> Fuse["Engine fuses: cosine + scale * delta / (1 + delta)"]
 ```
 
 ---
 
 ## 3. Retrieval Score Fusion
 
-The augmenter returns only the pure graph delta; the storage engine ([`StorageEngine::hydrate_and_fuse`](file:///d:/personal-projects/TurboSuperMemory/crates/turbomemory_storage/src/engine/search.rs)) re-hydrates each candidate's exact FP32 embedding, computes the authoritative cosine, normalizes the delta to `[0, 1]`, and produces the final ranking:
+The augmenter returns only the pure graph delta; the storage engine ([`StorageEngine::hydrate_and_fuse`](file:///d:/personal-projects/TurboSuperMemory/crates/turbomemory_storage/src/engine/search.rs)) re-hydrates each candidate's exact FP32 embedding, computes the authoritative cosine, squashes the delta into `[0, 1)` with a saturating transform of the candidate's own signal (not a share of the result set's maximum), and produces the final ranking:
 \[
-\text{Final Score}(M) = \text{CosineSimilarity}(Q, M) + (1 - \alpha_{\text{cognitive}}) \cdot \frac{\Delta_{\text{graph}}(M)}{\max_j \Delta_{\text{graph}}(j)}
+\text{Final Score}(M) = \text{CosineSimilarity}(Q, M) + s \cdot \frac{\Delta_{\text{graph}}(M)}{1 + \Delta_{\text{graph}}(M)}
 \]
-* **\(\alpha_{\text{cognitive}} = 1.0\)**: pure cosine — the graph only decides which candidates exist, never their order.
-* **\(\alpha_{\text{cognitive}} = 0.7\)**: the default — cognition ON, graph gets a bounded vote.
-* **\(\alpha_{\text{cognitive}} = 0.5\)**: balanced blend giving the graph more influence.
+
+The scale \(s\) is one of two things.
+
+* **A fixed amount, \(s = 1 - \alpha_{\text{cognitive}}\)** (the engine default, `cognitive_alpha = 0.7`). At `1.0` the ranking is pure cosine and the graph only decides which candidates exist; at `0.5` a saturated signal adds half a point of cosine.
+* **A share of the query's own spread, \(s = w \cdot (\cos_{1} - \cos_{k})\)** when `graph_weight = w` is set: the difference in cosine between the nearest candidate and the `top_k`-th. At `w = 0` the ranking is pure cosine, at `w = 1` a saturated signal can lift a memory from the cut to the top, and in between the graph settles close calls and leaves clear differences alone. The weight means the same thing whatever the embedder's similarity scale.
+
+Why the second form exists: with OpenAI embeddings the 30 nearest memories of a question span about 0.35 of cosine and neighbours differ by about 0.013. A fixed boost of up to 0.5 (`cognitive_alpha = 0.5`, the old `tsm` profile) averaged 0.24 per candidate, eighteen times that gap, so the ranking was decided by word overlap. On 115 LongMemEval questions it put the full evidence in a 150-token context for 64 questions where plain cosine ranking did for 68, and lost judged answers. The `tsm` conversational profile now uses `graph_weight = 0.5` (69, and never below plain ranking in the three store sizes tried); see `benchmarks/PHASE_PROGRESS.md`.
 
 Because the boost is additive and non-negative, it can reorder candidates and surface graph-discovered ones, but it can never push a candidate below cosine-only ranking — the ANN recall floor is preserved.
+
+**Reads do not reinforce by default.** A cognitive search used to reinforce the edges of every memory it returned, so the same question came back as a different list the second time (13 of 19 questions checked). That is now opt-in (`reinforce_on_search`); `StorageEngine::reinforce` (Python: `reinforce(ids)`, SDK: `Memory.reinforce`) does it for the memories a caller says were actually used.
 
 ---
 
@@ -255,7 +262,7 @@ The cognitive graph exposes a read-only introspection API for debugging and "wha
 ```mermaid
 stateDiagram-v2
     [*] --> Inserted: "add_memory_with_importance"
-    Inserted --> Reinforced: "reinforce() on retrieval"
+    Inserted --> Reinforced: "reinforce(ids), or on retrieval with reinforce_on_search"
     Reinforced --> Decayed: "decay_edges() over time"
     Decayed --> Evicted: "importance < floor"
     Inserted --> Refined: "check_refinements()"
