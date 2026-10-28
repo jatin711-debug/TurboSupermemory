@@ -3415,3 +3415,103 @@ The account's credit ran out during the last comparison.
    (1,500 tokens or more).
 4. The rolling-compaction loss (0.411 against 0.464) is untouched. "Merge the
    oldest gist only when the gist share is full" is the next thing to try.
+
+---
+
+# Graph expansion walks every seed; hub pruning; where evidence is lost (2026-10-21, finished 2026-10-28)
+
+Two changes to the expansion in `SpreadingActivation::search_restricted`, and a
+report on where a question's evidence goes missing. Everything here is the free
+evidence score (questions with all of their evidence in the context, no model
+asked). Nothing was judged.
+
+**1. Every seed is expanded.** The walk stopped as soon as it had collected
+`expansion_max_candidates` graph candidates. Later seeds were never expanded,
+and which candidates survived depended on the order edges were met in, not on
+how strong they were. Now every seed is expanded. The pools are merged with
+the same edge-kind factors as before, and the `expansion_max_candidates`
+strongest are kept (ties broken by id). This changes the default path.
+
+**2. `max_concept_share`**, opt-in. The default 1.0 prunes nothing; Python takes
+`MemoryEngine(max_concept_share=...)`. A concept attached to more than that
+share of all memories is not walked through, whether the query names it or a
+seed reaches it. Taken from TAGGRAPH (2026), which reports that dropping query
+terms present in more than 15% of notes raised MRR.
+
+How these were run:
+- Arm: `sdk_cognitive`, shipped profile.
+- Old: the snapshot of 98a17e7 (`.cache/eval_tree`).
+- New: this tree.
+- Logs: `$TSM_EVAL_DIR/runs/free_graph/`. Dev ran on 2026-10-21, the rest on
+  2026-10-28.
+
+| slice | budget | old | new | hub 0.15 / 0.30 | plain search (new run) |
+|---|---|---|---|---|---|
+| dev, 115 | 150 | 76 | 76 | 76 / 76 | 75 |
+| dev | 600 | 81 | 81 | 81 / 81 | 81 |
+| held-out, 355 | 150 | 256 | **258** | 258 / 258 | 257 |
+| held-out | 600 | 275 | 275 | 275 / 275 | 275 |
+| `--pool 20`, 115 | 150 | 74 | 74 | 74 / 74 | 74 |
+| `--pool 20` | 600 | 81 | 81 | 81 / 81 | 81 |
+| `--pool 40`, 115 | 150 | 68 | **70** | 70 / 70 | 68 |
+| `--pool 40` | 600 | 81 | 81 | 81 / 81 | 80 |
+
+- **Walking every seed loses nothing on any slice and gains 2 on two of them.**
+  Old and new are separate runs, so these are totals, not question-by-question
+  pairs. Within the new runs, graph search against plain search on `--pool 40`
+  at 150 tokens is 2 / 0 (p = 0.50).
+- **Hub pruning changed no context anywhere**: 0 / 0 against `sdk_cognitive` on
+  every slice, at both shares. It stays off.
+
+**3. Where evidence is lost.** `evidence_rank_report.py` files each question
+under its worst evidence turn:
+- no fact was extracted from it ("not stored");
+- otherwise, the dense rank of the turn's best fact among all of the history's
+  facts.
+
+It was read against the judged 600-token runs with the reading prompt
+(`sdk_cognitive`):
+- Dev was read against `ctl_notes600`.
+- Held-out was read against `ho_notes600`. The message of commit 577ad37 names
+  `ctl_notes600` for both; the counts do not depend on the run file.
+
+| worst evidence turn | dev: questions | in context | judged right | held-out: questions | in context | judged right |
+|---|---|---|---|---|---|---|
+| not stored | 34 | 0 | 23 | 80 | 0 | 48 |
+| rank > 60 | 0 | | | 1 | 1 | 0 |
+| rank 31-60 | 1 | 1 | 1 | 8 | 8 | 6 |
+| rank <= 30 | 80 | 80 | 74 | 266 | 266 | 242 |
+
+- At 600 tokens, every question whose evidence turns all yielded a fact had
+  all of that evidence in the context: dev 81 of 81, held-out 275 of 275.
+  `--pool 40` also reached 81 of 115 at 600 tokens.
+- Every question that misses evidence has a turn the extractor stored nothing
+  from. On the oracle file at this budget, retrieval and graph changes have
+  nothing left to win. The room is on the write path, where the two recovery
+  steps exist but are off (`second_look`, `keep_unextracted`; see the
+  2026-10-12 entry).
+- The reader still answers many of those questions from other facts: 23 of 34
+  on dev, 48 of 80 held out.
+
+**The judged runs of sections 7 and 8 of the previous entry did not finish
+on 2026-10-21.**
+- The old belief arm stopped partway.
+- The new belief arm ingested all 120 histories, but the verifier was
+  rate-limited (HTTP 429) and left pairs uncommitted. It then failed on a
+  missing old-run path.
+- The old budget arm stopped at 60 of 120 histories.
+
+None of these numbers can be used, so item 1 of that entry's "Next" stands.
+
+**Checks.**
+
+- `make gate` on this tree: 8 of 8 passed. The LongMemEval smoke test's edge
+  count was 247, as before. ANN recall was 100%.
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`,
+  `cargo test --workspace --exclude turbomemory_python`: clean.
+- Two new `turbomemory_graph` tests:
+  - a second seed is expanded, and its strong candidate beats the first seed's
+    many weak ones under the cap;
+  - a hub concept is not walked through, while a rarer concept is.
+
+**Cost.** None (cached extraction and embeddings, offline).
