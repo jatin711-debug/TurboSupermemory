@@ -109,7 +109,10 @@ The numbers are in `benchmarks/PHASE_PROGRESS.md`. In short:
 Still open, in this order:
 
 1. **Owed: judge the two built changes that change what a model reads.**
-   The OpenAI credit ran out first. They are on in the working tree:
+   The OpenAI credit ran out first, and the attempt of 2026-10-21 did not
+   finish (the verifier was rate-limited, a run failed on a missing file, the
+   budget arm stopped halfway), so none of its numbers count. Both are on by
+   default on the branch:
    - the `[earlier, changed by DATE]` mark on verified-superseded facts
      (`sdk_belief_llm`, old against new);
    - dated gists (`sdk_budget`, `sdk_budget_rolling`, old against new).
@@ -124,6 +127,13 @@ Still open, in this order:
 3. **The `sources="turn"` excerpt picks sentences by word overlap** and drops
    the short sentence that answers. Choose by the facts' embeddings, and
    measure only at budgets where turns fit (1,500 tokens or more).
+4. **Evidence is lost on the write path, not in ranking**
+   (`benchmarks/cognitive_eval/evidence_rank_report.py`, 2026-10-28 entry in
+   `PHASE_PROGRESS.md`). At 600 tokens every question whose evidence turns
+   all yielded a fact had all of it in the context. Every miss has a turn
+   the extractor stored nothing from (34 of 115 dev questions, 80 of 355
+   held out). Retrieval and graph work has little left to win on the oracle
+   file; extraction coverage does.
 
 ## Judged on 2026-10-09 (the retrieval and input changes)
 
