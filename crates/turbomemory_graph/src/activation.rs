@@ -48,6 +48,12 @@ pub struct SpreadingConfig {
     /// as a name two memories share. `1.0` divides by the fan: what a
     /// concept passes on is split among everything it points at.
     pub fan_exponent: f32,
+    /// Hub pruning. A concept attached to more than this share of all
+    /// memories is not expanded through: a word most memories contain links
+    /// everything to everything, and walking it costs the most. `1.0` (the
+    /// default) prunes nothing. TAGGRAPH (2026) found that dropping query
+    /// terms present in more than 15% of notes raised MRR by 36-59%.
+    pub max_concept_share: f32,
 }
 
 impl Default for SpreadingConfig {
@@ -62,6 +68,7 @@ impl Default for SpreadingConfig {
             concept_expansion: true,      // Concept + abstraction graph expansion on
             query_concept_boost: 0.75,    // Direct query-concept seeding at full strength
             fan_exponent: 0.0,            // No fan normalization
+            max_concept_share: 1.0,       // No hub pruning
         }
     }
 }
@@ -183,7 +190,12 @@ impl SpreadingActivation {
         if self.config.fan_exponent <= 0.0 {
             return 1.0;
         }
-        let fan = self.graph.neighbor_indices(concept_nid).map_or(0, |edges| {
+        (self.concept_fan(concept_nid).max(1) as f32).powf(self.config.fan_exponent)
+    }
+
+    /// How many memories a concept is attached to.
+    fn concept_fan(&self, concept_nid: u32) -> usize {
+        self.graph.neighbor_indices(concept_nid).map_or(0, |edges| {
             edges
                 .iter()
                 .filter(|&&idx| {
@@ -193,8 +205,12 @@ impl SpreadingActivation {
                     })
                 })
                 .count()
-        });
-        (fan.max(1) as f32).powf(self.config.fan_exponent)
+        })
+    }
+
+    /// Whether a concept is a hub to skip (`max_concept_share`).
+    fn is_hub(&self, concept_nid: u32, hub_fan: usize) -> bool {
+        hub_fan < usize::MAX && self.concept_fan(concept_nid) > hub_fan
     }
 
     /// Bounded augmenter search: ANN candidates + 1-hop graph expansion.
@@ -332,6 +348,14 @@ impl SpreadingActivation {
             let mut abstraction: HashMap<String, f32> = HashMap::new();
             let max_candidates = self.config.expansion_max_candidates.clamp(10, 200);
             let decay = self.config.decay;
+            // A concept attached to more memories than this is a hub and is
+            // not walked through (`max_concept_share`; usize::MAX = off).
+            let hub_fan = if self.config.max_concept_share < 1.0 {
+                let share = self.config.max_concept_share.max(0.0);
+                ((self.graph.memory_count() as f32 * share).ceil() as usize).max(2)
+            } else {
+                usize::MAX
+            };
 
             // Direct query concept seeding: bridge abstract queries directly to concept hubs
             let q_tokens: Vec<&str> = query_text
@@ -344,6 +368,7 @@ impl SpreadingActivation {
                 if let Some(cnid) = self.graph.get_node_id(&ckey) {
                     if !self.graph.is_concept_suppressed(&token_lower)
                         && self.config.query_concept_boost > 0.0
+                        && !self.is_hub(cnid, hub_fan)
                     {
                         let seed_weight = self.config.query_concept_boost / self.fan_divisor(cnid);
                         if let Some(cedges) = self.graph.neighbor_indices(cnid) {
@@ -372,7 +397,11 @@ impl SpreadingActivation {
                 }
             }
 
-            'seeds: for (seed_key, seed_score) in seed_list {
+            // Every chosen seed is expanded; the strongest candidates are kept
+            // afterwards. (The walk used to stop as soon as `max_candidates`
+            // were collected, so later seeds were never expanded and what was
+            // kept depended on the order edges were met in, not on strength.)
+            for (seed_key, seed_score) in seed_list {
                 let seed_id = seed_key.strip_prefix("mem:").unwrap_or(&seed_key);
                 let Some(seed_nid) = self.graph.memory_node_id(seed_id) else {
                     continue;
@@ -424,7 +453,9 @@ impl SpreadingActivation {
                             let concept_nid = edge.target;
                             let concept_name =
                                 self.graph.node_external_id(concept_nid).unwrap_or("");
-                            if self.graph.is_concept_suppressed(concept_name) {
+                            if self.graph.is_concept_suppressed(concept_name)
+                                || self.is_hub(concept_nid, hub_fan)
+                            {
                                 continue;
                             }
                             // What this concept passes on, split by its fan.
@@ -478,7 +509,9 @@ impl SpreadingActivation {
                                         let sib_nid = pedge.target;
                                         let sib_name =
                                             self.graph.node_external_id(sib_nid).unwrap_or("");
-                                        if self.graph.is_concept_suppressed(sib_name) {
+                                        if self.graph.is_concept_suppressed(sib_name)
+                                            || self.is_hub(sib_nid, hub_fan)
+                                        {
                                             continue;
                                         }
                                         let Some(sib_edges) = self.graph.neighbor_indices(sib_nid)
@@ -515,50 +548,40 @@ impl SpreadingActivation {
                                         }
                                     }
                                 }
-                                if strong.len() + temporal.len() + normal.len() + abstraction.len()
-                                    >= max_candidates
-                                {
-                                    break 'seeds;
-                                }
                             }
                         }
                         _ => {}
                     }
-                    if strong.len() + temporal.len() + normal.len() + abstraction.len()
-                        >= max_candidates
-                    {
-                        break 'seeds;
-                    }
                 }
             }
 
-            // Merge the pools into the graph delta with edge-kind-aware boost
-            // factors. Strong (Refines/Contradicts) full strength; Temporal 0.5;
+            // Merge the pools with edge-kind-aware boost factors. Strong
+            // (Refines/Contradicts) full strength; Temporal 0.5;
             // Association-mediated 2-hop concept spread 0.75; Abstraction (4-hop,
-            // through the parent) 0.75 so a sibling-concept memory the query cannot
-            // reach by cosine can still surface.
-            for (key, signal) in strong {
-                if signal > 0.01 {
-                    *delta.entry(key).or_insert(0.0) += signal;
+            // through the parent) 0.75 so a sibling-concept memory the query
+            // cannot reach by cosine can still surface. Then keep the
+            // `max_candidates` strongest (ties by id, so the cut is stable).
+            let mut expanded: HashMap<String, f32> = HashMap::new();
+            for (pool, factor) in [
+                (strong, 1.0f32),
+                (temporal, 0.5),
+                (normal, 0.75),
+                (abstraction, 0.75),
+            ] {
+                for (key, signal) in pool {
+                    let boosted = signal * factor;
+                    if boosted > 0.01 {
+                        *expanded.entry(key).or_insert(0.0) += boosted;
+                    }
                 }
             }
-            for (key, signal) in temporal {
-                let boosted = signal * 0.5;
-                if boosted > 0.01 {
-                    *delta.entry(key).or_insert(0.0) += boosted;
-                }
-            }
-            for (key, signal) in normal {
-                let boosted = signal * 0.75;
-                if boosted > 0.01 {
-                    *delta.entry(key).or_insert(0.0) += boosted;
-                }
-            }
-            for (key, signal) in abstraction {
-                let boosted = signal * 0.75;
-                if boosted > 0.01 {
-                    *delta.entry(key).or_insert(0.0) += boosted;
-                }
+            let mut expanded: Vec<(String, f32)> = expanded.into_iter().collect();
+            expanded.sort_by(|a, b| {
+                turbomemory_core::cmp_score_desc(a.1, b.1).then_with(|| a.0.cmp(&b.0))
+            });
+            expanded.truncate(max_candidates);
+            for (key, boosted) in expanded {
+                *delta.entry(key).or_insert(0.0) += boosted;
             }
         }
 
@@ -752,6 +775,88 @@ mod tests {
         let without = delta_of(&off.search("garden", &seeds, 10).unwrap(), "hub0");
         assert!(with_seeding > without + 0.5);
         assert!(without > 0.0 && without <= 0.3 + 1e-6);
+    }
+
+    /// The first seed reaches 30 memories through one concept; the second
+    /// reaches one memory through two concepts, more strongly. The walk used
+    /// to stop once the cap was reached, before the second seed was expanded.
+    #[test]
+    fn every_seed_is_expanded_and_the_strongest_candidates_are_kept() {
+        let mut graph = MemoryGraph::new();
+        graph.add_memory("seed_a", "the garden needs work", &["garden".into()]);
+        graph.add_memory("pad_a", "nothing much", &["pad".into()]);
+        for i in 0..30 {
+            graph.add_memory(&format!("g{i:02}"), "a garden note", &["garden".into()]);
+        }
+        graph.add_memory(
+            "seed_b",
+            "rex went to the vet",
+            &["rex".into(), "vet".into()],
+        );
+        graph.add_memory("pad_b", "nothing else", &["pad2".into()]);
+        graph.add_memory(
+            "named",
+            "rex at the vet again",
+            &["rex".into(), "vet".into()],
+        );
+        let config = SpreadingConfig {
+            expansion_max_candidates: 10,
+            ..SpreadingConfig::default()
+        };
+        let sa = SpreadingActivation::new(graph, config);
+        let seeds = [
+            ("seed_a".to_string(), 0.9f32),
+            ("seed_b".to_string(), 0.8f32),
+        ];
+        let results = sa.search("walk", &seeds, 40).unwrap();
+        assert!(
+            delta_of(&results, "named") > 0.0,
+            "the second seed is expanded"
+        );
+        let garden = results.iter().filter(|(id, _)| id.starts_with('g')).count();
+        assert!(garden <= 10, "at most the cap: {garden}");
+        let weakest_garden = results
+            .iter()
+            .filter(|(id, _)| id.starts_with('g'))
+            .map(|(_, d)| *d)
+            .fold(f32::INFINITY, f32::min);
+        assert!(delta_of(&results, "named") > weakest_garden);
+    }
+
+    #[test]
+    fn hub_concepts_are_not_walked_through() {
+        let build = || {
+            let mut graph = MemoryGraph::new();
+            graph.add_memory(
+                "seed",
+                "rex in the garden",
+                &["garden".into(), "rex".into()],
+            );
+            graph.add_memory("pad", "nothing much", &["pad".into()]);
+            for i in 0..10 {
+                graph.add_memory(&format!("g{i}"), "a garden note", &["garden".into()]);
+            }
+            graph.add_memory("named", "rex at the vet", &["rex".into()]);
+            graph
+        };
+        let seeds = [("seed".to_string(), 0.9f32)];
+        // 13 memories; "garden" is attached to 11 of them, "rex" to 2.
+        let pruned = SpreadingActivation::new(
+            build(),
+            SpreadingConfig {
+                max_concept_share: 0.5,
+                ..SpreadingConfig::default()
+            },
+        );
+        let results = pruned.search("walk", &seeds, 20).unwrap();
+        assert!(delta_of(&results, "named") > 0.0);
+        assert_eq!(
+            delta_of(&results, "g3"),
+            0.0,
+            "the hub is not walked through"
+        );
+        let plain = SpreadingActivation::new(build(), SpreadingConfig::default());
+        assert!(delta_of(&plain.search("walk", &seeds, 20).unwrap(), "g3") > 0.0);
     }
 
     #[test]

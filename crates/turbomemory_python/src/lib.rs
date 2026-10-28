@@ -304,6 +304,7 @@ impl PyMemoryEngine {
         concept_expansion=None,
         query_concept_boost=None,
         fan_exponent=None,
+        max_concept_share=None,
         lexical_alpha=None,
         temporal_recency_weight=None,
         sync_writes=None,
@@ -378,6 +379,7 @@ impl PyMemoryEngine {
         concept_expansion: Option<bool>,
         query_concept_boost: Option<f32>,
         fan_exponent: Option<f32>,
+        max_concept_share: Option<f32>,
         lexical_alpha: Option<f32>,
         temporal_recency_weight: Option<f32>,
         sync_writes: Option<bool>,
@@ -490,6 +492,11 @@ impl PyMemoryEngine {
         }
         if let Some(fe) = fan_exponent {
             config.spreading.fan_exponent = fe.clamp(0.0, 2.0);
+        }
+        // - max_concept_share: a concept attached to more than this share of all
+        //   memories is not walked through (default 1.0 = no pruning).
+        if let Some(share) = max_concept_share {
+            config.spreading.max_concept_share = share.clamp(0.0, 1.0);
         }
         if let Some(la) = lexical_alpha {
             config.spreading.lexical_alpha = la.max(0.0);
