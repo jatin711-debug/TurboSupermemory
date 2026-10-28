@@ -3515,3 +3515,88 @@ None of these numbers can be used, so item 1 of that entry's "Next" stands.
   - a hub concept is not walked through, while a rarer concept is.
 
 **Cost.** None (cached extraction and embeddings, offline).
+
+---
+
+# The owed judged runs: dated stale mark, dated gists, merge-oldest compaction (2026-10-28)
+
+This entry judges sections 7 and 8 of the 2026-10-21 entry, which were built
+then but never judged, plus `compaction="merge_oldest"` (commit c361b48).
+
+Setup:
+- 115 dev questions (`--limit 120`), reading prompt (`--reader notes`) at
+  600 tokens, reader and judge gpt-4.1-mini.
+- Old: the snapshot of 98a17e7. New: the branch at 0109fe5, which also has
+  the every-seed graph walk.
+- The attempt of 2026-10-21 is kept in `runs/abandoned_2026-10-21/` and not
+  used.
+
+Two things changed in how the runs were made:
+
+- **gpt-4.1-nano now returns 404 (`model_not_found`) for this account,
+  although it is still listed.** Gists were therefore written by gpt-4o-mini
+  on both sides. The budget numbers below are comparable with each other but
+  not with the earlier nano-gist numbers. Extraction was unaffected: the dev
+  extraction cache is complete (0 misses).
+- **Parallel slices.** Each budget run was split into three slices of 40
+  conversations, run at once. Each slice had its own work dir, because the
+  gist cache writes one temp file. The slices' tasks were concatenated
+  (`dev_budget_{old,new}.json`).
+  - Belief old then new took 5 minutes. They shared the verifier's verdict
+    cache, so both stores were identical (3.4 superseded facts a
+    conversation), and new reused old's verdicts for identical contexts.
+  - The six budget slices took 20 minutes.
+  - There were no rate limits, no unverified pairs and no skipped histories.
+
+**Stale mark `[earlier, changed by DATE]` (`sdk_belief_llm`).**
+
+| | old | new | only old / only new | p |
+|---|---|---|---|---|
+| judged right of 115 | 98 | 97 | 4 / 3 | 1.00 |
+
+- 20 new contexts carry the dated mark. On those, 0 were gained and 1 was lost.
+- 76 of 115 contexts differ in their memories, not only in the mark, because
+  the new side also has the graph walk and the other changes since 98a17e7.
+- So this shows that the branch loses nothing on this arm. It does not
+  isolate the mark. Level: the mark stays on.
+
+**Dated gists, and merge-oldest compaction (`max_user_tokens=256`).**
+
+| arm | old | new | only old / only new | p |
+|---|---|---|---|---|
+| `sdk_budget` (compacted once) | 51 | 48 | 13 / 10 | 0.68 |
+| `sdk_budget_rolling` (four passes) | 45 | 50 | 12 / 17 | 0.46 |
+| `sdk_budget_rolling_merge` (new only) | | **57** | | |
+
+- **Dated gists are level overall**, 96 against 98 across the two arms, so
+  they stay on.
+  - Compacting once lost 4 on multi-session and gained 2 on temporal.
+  - Rolling gained 6 on temporal (8 -> 14 of 28), where the dates the
+    summarizer now receives and keeps matter most.
+- **The old gap reproduces with gpt-4o-mini gists.** Compacting once beats
+  rolling 51 to 45 (14 / 8, p = 0.29); it was 0.464 against 0.411 with nano.
+- **`merge_oldest` is the first rolling policy to beat compacting once.**
+  - Against rolling: 57 to 50 (16 / 9, p = 0.23); multi-session 10 against
+    4, knowledge-update 11 against 9.
+  - Against compacting once: 57 to 48 (17 / 8, p = 0.11).
+  - Neither is significant. The default stays `"refold"`.
+  - The 355 held-out questions would settle it, for about three times this
+    gist cost.
+
+**Cost.**
+- 1,372 reader and judge requests (gpt-4.1-mini, 654k tokens in, 124k out):
+  $0.46.
+- 4,558 gist requests (gpt-4o-mini): about $0.80, estimated; their tokens are
+  not logged.
+- 25 verifier requests.
+- **Total about $1.30.**
+
+**Next.**
+
+1. `merge_oldest` on the held-out questions, then decide the default.
+2. Extraction coverage (2026-10-28 entry above): every question that misses
+   evidence has a turn the extractor stored nothing from.
+3. Any new extraction (LongMemEval-S, more held-out data) needs a model this
+   account still has. `OpenAIGistSummarizer` defaults to gpt-4.1-nano, so
+   its gists fail here. A failed gist removes nothing, so `max_user_tokens`
+   then bounds nothing.
