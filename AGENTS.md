@@ -118,7 +118,7 @@ make api-server
   - With a verifier, `stale_mark`: `[earlier, changed by DATE]`, where DATE is when its replacement was said (`valid_until`), else `STALE_MARK`.
   - The text.
 
-  The dated stale mark and gist spans were added 2026-10-21 and are not yet judged (`TODO.md`).
+  The dated stale mark and gist spans were added 2026-10-21 and judged level on 2026-10-28 (98 / 97 and 96 / 98 of 115), so both stay on. `Memory(compaction="merge_oldest")` scored 57 against 50 for the default rolling compaction (p = 0.23, `benchmarks/PHASE_PROGRESS.md`); the default stays `"refold"` until a held-out run decides it.
 
   Every result also carries `source`, the message it was extracted from. Two read-time options are opt-in and were measured on 2026-10-21:
   - `sources="turn"` (`tsm/sources.py`): turns lost at 600 tokens, 86 against 98.

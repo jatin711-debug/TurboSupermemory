@@ -135,7 +135,7 @@ worse at arithmetic than gpt-4.1-mini.
   answers and lost 1, on temporal and knowledge-update questions
   (`benchmarks/PHASE_PROGRESS.md`, 2026-10-07). A gist is tagged with the
   span of what it summarizes when that was dated (`[2023-01-05 to
-  2023-03-02] ...`; added 2026-10-21, not yet judged). The tags count against
+  2023-03-02] ...`; added 2026-10-21, judged level 2026-10-28). The tags count against
   `token_budget`; `recall(..., time_tags=False)` leaves
   them out, and `time_tags="minute"` adds the time of day when the timestamp
   has one (`[2024-03-02 18:00] ...`), which is what tells two memories of
@@ -146,7 +146,7 @@ worse at arithmetic than gpt-4.1-mini.
   installed, two more things happen: its `context` starts with
   `[earlier, changed by 2024-06-01] ` (the date its replacement was said,
   also in the result's `valid_until`; `[earlier, since changed] ` when that
-  is not dated; the dated form was added 2026-10-21 and is not yet judged),
+  is not dated; the dated form was judged level on 2026-10-28),
   so a model reading it knows what it is and when it changed, and
   the fact that replaced it is ranked where the old one would have been and
   brought in if the search missed it (a question in the old wording often

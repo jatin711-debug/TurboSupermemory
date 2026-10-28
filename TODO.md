@@ -108,19 +108,12 @@ The numbers are in `benchmarks/PHASE_PROGRESS.md`. In short:
 
 Still open, in this order:
 
-1. **Owed: judge the two built changes that change what a model reads.**
-   The OpenAI credit ran out first, and the attempt of 2026-10-21 did not
-   finish (the verifier was rate-limited, a run failed on a missing file, the
-   budget arm stopped halfway), so none of its numbers count. Both are on by
-   default on the branch:
-   - the `[earlier, changed by DATE]` mark on verified-superseded facts
-     (`sdk_belief_llm`, old against new);
-   - dated gists (`sdk_budget`, `sdk_budget_rolling`, old against new).
-
-   About 900 requests. Build each arm from a worktree of the commit before
-   the change and from the branch, then pair them with
-   `benchmarks/cognitive_eval/pair_runs.py`. If either loses answers, put it
-   behind a flag.
+1. **Decide `compaction="merge_oldest"` on the held-out questions.** Judged
+   2026-10-28 on the 115 dev questions (`PHASE_PROGRESS.md`): 57 against 50
+   for rolling compaction (p = 0.23) and 48 for compacting once (p = 0.11),
+   the first rolling policy to beat compacting once. Not significant; the
+   default stays `"refold"`. The same run found the dated stale mark (98 / 97)
+   and dated gists (96 / 98 over two arms) level, so both stay on.
 2. **LongMemEval-S on more questions.** The 29 here detect only large
    differences. The other 85 of the 115 need about 37k extraction requests,
    about $5, with `benchmarks/cognitive_eval/prefetch_extraction.py`.
@@ -254,11 +247,17 @@ table is in `benchmarks/PHASE_PROGRESS.md`.
   measure: keep earlier gists as they are until the gist share is full and
   only then merge the oldest; or compact only when a user is well over
   budget instead of at every `consolidate()`.
-- **Gists now carry the dates they cover (built 2026-10-21, not yet judged).**
+  The first is `compaction="merge_oldest"`: 57 against 50 judged
+  (2026-10-28, not significant; item 1 of the open list).
+- **Gists carry the dates they cover** (judged level 2026-10-28).
   `plan_compaction` reports each gist's span and `recall()` tags it
   (`[2023-01-05 to 2023-03-02] ...`). A gist written from undated memories
-  is still bare: a span of turns (`[turns 3-41]`) is not stored. Judging it
-  is item 1 of the 2026-10-21 list.
+  is still bare: a span of turns (`[turns 3-41]`) is not stored.
+- **`OpenAIGistSummarizer` defaults to gpt-4.1-nano, which returns 404 for
+  the owner's account as of 2026-10-28** (it worked on 2026-10-21; still
+  listed, not callable). Every
+  gist then fails, nothing is removed, and `max_user_tokens` bounds nothing.
+  Pick a default that is callable (the 2026-10-28 run used gpt-4o-mini).
 - **`max_user_tokens` only compacts in `consolidate()`, and only the users
   this process wrote to** (`compact()` covers every user). A store that is
   only ever added to grows until one of them is called.
