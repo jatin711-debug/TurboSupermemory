@@ -119,6 +119,17 @@ Open, in this order:
    (the assistant's echo of a stated fact). All were in the candidate pool.
    Next candidates are a count over a typed list of events (User as Code)
    and a judged run to see what the reader does with what it now gets.
+   Judged 2026-10-29: 85 of 95 right. The assistant-question misses were
+   partial replies, now fixed by `_whole_reply` (11 of 11). Of the six
+   left, three were right when asked again (reader variance), two hinge on
+   how the gold answer reads the notes, and one contradicts the history's
+   dates. Measure the reader's variance on the full slice (ask twice)
+   before reading small judged differences, and consider a majority of
+   three replies as a reader option.
+5. **The reader's variance.** The same 96 contexts judged twice scored 90 and
+   85 (2026-10-29). Before reading a judged difference of a few questions,
+   judge both arms in one run, or take more than one draw. A majority of
+   three replies is the candidate fix on the reader's side.
 4. **Exact search on larger stores.** On the S30 run the CUDA build's exact
    device search and the CPU's tiered path chose identical contexts in all 8
    stores past 4,096 records (2026-10-29). Repeat on `--pool 20` stores with
