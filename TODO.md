@@ -90,6 +90,38 @@ or `recall` likewise means "everyone". PLAN Phase C (one engine per tenant) is
 the intended answer; until then, treat a store as single-tenant unless these
 are closed.
 
+## Judged on 2026-10-29 (the messages as said, the packer in the engine)
+
+`Memory` now keeps every message, in passages, next to its facts
+(`keep_messages`, on by default unless `max_user_tokens` is set). On 29
+LongMemEval-S questions at 2,000 tokens the facts alone answered 19, facts
+plus messages 27 (8 / 0, p = 0.01) and the messages alone 26; reading the
+whole 124k-token history had answered 22. The budget packer runs in the
+engine on stored vectors. Numbers in `benchmarks/PHASE_PROGRESS.md`.
+
+Open, in this order:
+
+1. **More LongMemEval-S questions without paying for extraction.** The
+   messages-only store needs no extraction, so it can be scored and judged on
+   all 500 S questions for about $0.002 a question at 2,000 tokens. Pair it
+   with `sdk_raw_plain` (the same passages without cognitive search; harness
+   arm added 2026-10-29, not run yet) to see whether graph and keyword search
+   earn their place on passages.
+2. **`keep_messages` with `max_user_tokens`.** Compaction folds facts by
+   speaker and does not know passages, so the two are refused together. A
+   bounded store with messages needs a policy for folding passages (oldest
+   first, into dated gists, as facts are).
+3. **The six misses at 600 tokens.** Four are questions with four to six
+   evidence turns that do not fit; two were misread with the evidence
+   present. A budget chosen per question (agentmemory budgets by question
+   type) or a count over a typed list of events (User as Code) are the
+   candidates.
+4. **Exact search on larger stores.** On the S30 run the CUDA build's exact
+   device search and the CPU's tiered path chose identical contexts in all 8
+   stores past 4,096 records (2026-10-29). Repeat on `--pool 20` stores with
+   messages kept (tens of thousands of records), where the approximate path
+   has room to differ.
+
 ## Judged on 2026-10-21 (control, held-out, read-time changes, LongMemEval-S)
 
 The numbers are in `benchmarks/PHASE_PROGRESS.md`. In short:
@@ -120,7 +152,8 @@ Still open, in this order:
 3. **The `sources="turn"` excerpt picks sentences by word overlap** and drops
    the short sentence that answers. Choose by the facts' embeddings, and
    measure only at budgets where turns fit (1,500 tokens or more).
-4. **Evidence is lost on the write path, not in ranking**
+4. **Evidence is lost on the write path, not in ranking** (addressed
+   2026-10-29 by keeping the messages, above)
    (`benchmarks/cognitive_eval/evidence_rank_report.py`, 2026-10-28 entry in
    `PHASE_PROGRESS.md`). At 600 tokens every question whose evidence turns
    all yielded a fact had all of it in the context. Every miss has a turn
