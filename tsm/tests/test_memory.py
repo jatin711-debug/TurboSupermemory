@@ -1127,6 +1127,15 @@ class TestKeepMessages(MemoryTestBase):
         self.assertEqual(len(results), 2)
         self.assertFalse(any("superseded_by" in r for r in results))
 
+    def test_the_same_words_on_two_days_are_both_recalled(self):
+        mem = self.make_memory(keep_messages=True, extractor="none")
+        said = "I am having issues with the nitrite levels in my tank."
+        for day in ("2023-05-01", "2023-05-01", "2023-06-01"):
+            mem.add([{"role": "user", "content": said, "timestamp": day}], user_id="alice")
+        results = mem.recall("nitrite levels tank", user_id="alice", token_budget=200)
+        # Twice on one day says it again; another day is another occurrence.
+        self.assertEqual(sorted(r["timestamp"] for r in results), ["2023-05-01", "2023-06-01"])
+
     def test_not_combined_with_a_storage_budget(self):
         with self.assertRaises(ValueError):
             self.make_memory(keep_messages=True, max_user_tokens=500)

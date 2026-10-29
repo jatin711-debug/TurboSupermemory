@@ -23,6 +23,7 @@ import re
 from typing import List, Optional
 
 from .budget import estimate_tokens
+from .when import said_on
 
 # About two sentences of an assistant reply; a typical user message (57
 # tokens on average) stays one passage.
@@ -51,6 +52,17 @@ def spoken_by(role: Optional[str]) -> str:
     if role == MESSAGE_ROLE:
         return "user"
     return role[len(MESSAGE_ROLE) + 1:] if is_message(role) else (role or "")
+
+
+def occasion(role: Optional[str], timestamp) -> Optional[int]:
+    """The day a passage of a message was said (a date ordinal), for the
+    packer: two passages said on different days are two occurrences and are
+    never dropped as duplicates of each other. ``None`` for anything that is
+    not a passage or has no date."""
+    if not is_message(role):
+        return None
+    day = said_on(timestamp)
+    return day.toordinal() if day else None
 
 
 def passages(text: str, max_tokens: int = PASSAGE_TOKENS) -> List[str]:

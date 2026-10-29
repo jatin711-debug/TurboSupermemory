@@ -54,8 +54,12 @@ def select_under_budget(
     still measured on ``"text"``. A memory and the one it replaced (an item
     whose ``"superseded_by"`` is the other's ``"id"``) are never redundant
     with each other, however alike they read: one holds the current value
-    and the other the earlier one. Returns the chosen items in selection
-    order.
+    and the other the earlier one. Two items whose ``"occasion"`` (the day
+    a message was said, ``tsm.chunks.occasion``) are both set and differ are
+    never skipped as near-duplicates of each other: the same words said on
+    two days are two occurrences, which a count or a date question needs
+    both of. They still weigh as redundant. Returns the chosen items in
+    selection order.
 
     ``method="mmr"`` (default): greedy submodular Maximal Marginal Relevance —
     each step adds the candidate maximizing
@@ -104,6 +108,11 @@ def select_under_budget(
             second.get("superseded_by") is not None
             and second.get("superseded_by") == first.get("id"))
 
+    days = [p.get("occasion") for p in pool]
+
+    def same_occasion(a: int, b: int) -> bool:
+        return days[a] is None or days[b] is None or days[a] == days[b]
+
     selected, used, remaining = [], 0, list(range(len(pool)))
     selected_turns = set()
     while remaining and len(selected) < cap:
@@ -111,9 +120,12 @@ def select_under_budget(
         for i in remaining:
             if used + int(toks[i]) > token_budget:
                 continue
-            red = max((float(sim[i, j]) for j in selected if not replaces(i, j)), default=0.0)
-            if red > MAX_REDUNDANCY:
+            counted = [j for j in selected if not replaces(i, j)]
+            duplicate = max((float(sim[i, j]) for j in counted if same_occasion(i, j)),
+                            default=0.0)
+            if duplicate > MAX_REDUNDANCY:
                 continue
+            red = max((float(sim[i, j]) for j in counted), default=0.0)
             t_idx = pool[i].get("turn_index")
             bonus = NEW_TURN_BONUS if (t_idx is not None and t_idx not in selected_turns) else 0.0
             gain = lam * float(rel[i]) - (1.0 - lam) * red + bonus

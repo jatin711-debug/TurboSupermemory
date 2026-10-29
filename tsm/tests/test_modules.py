@@ -22,12 +22,13 @@ from tsm.budget import (
     pack_recent,
     select_under_budget,
 )
-from tsm.chunks import MESSAGE_ROLE, is_message, message_role, passages, spoken_by
+from tsm.chunks import MESSAGE_ROLE, is_message, message_role, occasion, passages, spoken_by
 from tsm.compaction import GIST_OTHER_ROLE, GIST_ROLE, plan_compaction
 from tsm.concepts import extract_concepts
 from tsm.gist import ExtractiveGistSummarizer, OpenAIGistSummarizer, single_fact, strip_role
-from tsm.ranking import (ASSISTANT_ROLE_DAMP, USER_ROLE_BOOST, is_first_person_query,
-                         role_prior)
+from tsm.ranking import (ASSISTANT_ROLE_DAMP, COUNTING_LAM, PRIOR_SPARES_TOP, RECALL_LAM,
+                         USER_ROLE_BOOST, apply_role_prior, asks_what_assistant_said,
+                         is_counting_query, is_first_person_query, packing_lam, role_prior)
 from tsm.reading import ANSWER_SYSTEM, answer_prompt, final_answer, in_order
 from tsm.answering import (add_days, answer_with_tools, calculate, count_distinct,
                            days_between, run_tool)
@@ -65,6 +66,17 @@ class TestSelectUnderBudget(unittest.TestCase):
         pool = [_item("a" * 40, 0.5, _A), _item("b" * 40, 0.5 + 1e-7, _B)]
         chosen = select_under_budget(pool, 10, embed=_embedder(pool))
         self.assertEqual([p["text"][0] for p in chosen], ["a"])
+
+    def test_the_same_words_on_another_day_are_another_occurrence(self):
+        pool = [_item("first", 0.9, _A), _item("paraphrase", 0.89, _A_DUP),
+                _item("other", 0.2, _B)]
+        pool[0]["occasion"], pool[1]["occasion"] = 738000, 738000
+        chosen = select_under_budget(pool, 1000, embed=_embedder(pool))
+        self.assertEqual([p["text"] for p in chosen], ["first", "other"])
+        pool[1]["occasion"] = 738001  # said a day later: a second occurrence
+        chosen = select_under_budget(pool, 1000, embed=_embedder(pool))
+        # Kept, though still weighed as redundant: after the unrelated one.
+        self.assertEqual([p["text"] for p in chosen], ["first", "other", "paraphrase"])
 
     def test_near_duplicate_is_skipped_not_just_penalized(self):
         pool = [_item("first", 0.9, _A), _item("paraphrase", 0.89, _A_DUP),
@@ -243,6 +255,45 @@ class TestConceptsAndRanking(unittest.TestCase):
         self.assertEqual(role_prior(True, "gist"), 1.0)
         self.assertEqual(role_prior(False, "user"), 1.0)
 
+    def test_a_question_about_what_the_assistant_said_has_no_role_prior(self):
+        for q in ("I remember you told me about the refineries. Which processes?",
+                  "How many eggs did you say we need for the omelette?",
+                  "Can you remind me of the deli near the Vatican?",
+                  "What did we finally decide to name it?",
+                  "what we finally decided to name the zombie",
+                  "I was going through our previous chat about binaural beats.",
+                  "the two companies you mentioned that prioritize safety"):
+            self.assertTrue(asks_what_assistant_said(q), q)
+        for q in ("Can you suggest a hotel for my upcoming trip to Miami?",
+                  "Can you recommend a show for me to watch tonight?",
+                  "What did I buy for my sister's birthday?",
+                  "How many model kits have I worked on?", ""):
+            self.assertFalse(asks_what_assistant_said(q), q)
+        for role in ("assistant", "message-assistant", "user", "message", "summary"):
+            self.assertEqual(role_prior(True, role, True), 1.0, role)
+
+    def test_a_counting_question_packs_for_relevance(self):
+        for q in ("How many tanks do I have?", "How much did I spend on workshops?",
+                  "What is the total I paid?", "How many in all?"):
+            self.assertTrue(is_counting_query(q), q)
+            self.assertEqual(packing_lam(q), COUNTING_LAM)
+        for q in ("I totally forgot", "What degree did I get?", ""):
+            self.assertFalse(is_counting_query(q), q)
+            self.assertEqual(packing_lam(q), RECALL_LAM)
+        self.assertEqual(packing_lam("How many?", lam=0.3), 0.3)
+
+    def test_the_best_matches_are_never_damped(self):
+        pool = [{"score": 0.9 - k / 100, "role": "assistant"} for k in range(5)]
+        apply_role_prior(pool, "what is on my jumpsuit")  # first person, not about replies
+        kept = [round(p["score"], 4) for p in pool]
+        self.assertEqual(kept[:PRIOR_SPARES_TOP], [0.9, 0.89, 0.88][:PRIOR_SPARES_TOP])
+        self.assertEqual(kept[PRIOR_SPARES_TOP:],
+                         [round((0.9 - k / 100) * ASSISTANT_ROLE_DAMP, 4)
+                          for k in range(PRIOR_SPARES_TOP, 5)])
+        pool = [{"score": 0.5, "role": "user"}]
+        apply_role_prior(pool, "what did I buy")
+        self.assertAlmostEqual(pool[0]["score"], 0.5 * USER_ROLE_BOOST)  # boosts still apply
+
 
 class TestGistRanking(unittest.TestCase):
     def test_a_gist_is_ranked_like_the_facts_it_was_written_from(self):
@@ -277,6 +328,13 @@ class TestPassages(unittest.TestCase):
         parts = passages(text, max_tokens=40)
         self.assertGreater(len(parts), 1)
         self.assertEqual(" ".join(parts).split(), text.split())
+
+    def test_a_passage_knows_the_day_it_was_said(self):
+        self.assertEqual(occasion("message", "2023/05/29 (Mon) 08:33"),
+                         occasion("message-assistant", "2023-05-29"))
+        self.assertNotEqual(occasion("message", "2023-05-29"), occasion("message", "2023-05-30"))
+        self.assertIsNone(occasion("user", "2023-05-29"))  # a fact: no occasion
+        self.assertIsNone(occasion("message", ""))
 
     def test_roles(self):
         self.assertEqual(message_role("user"), MESSAGE_ROLE)

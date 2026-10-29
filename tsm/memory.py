@@ -43,13 +43,13 @@ import numpy as np
 
 from ._loader import load_turbomemory
 from .budget import MAX_REDUNDANCY, NEW_TURN_BONUS, select_under_budget, total_tokens
-from .chunks import is_message, message_role, passages, spoken_by
+from .chunks import is_message, message_role, occasion, passages, spoken_by
 from .compaction import POLICIES, is_gist, plan_compaction
 from .concepts import extract_concepts
 from .identity import bind_embedder
 from .interfaces import (  # noqa: F401  (Embedder, Extractor, Verifier: re-exported types)
     Embedder, Extractor, Verifier, embed_documents, embed_query, embedder_fingerprint)
-from .ranking import is_first_person_query, role_prior
+from .ranking import apply_role_prior, packing_lam
 from .sources import SOURCE_TOKENS, speaker, turn_units
 from .when import annotate, said_on
 
@@ -665,7 +665,7 @@ class Memory:
         token_budget: Optional[int] = None,
         top_k: int = 10,
         pool_k: int = 20,
-        lam: float = 0.7,
+        lam: Optional[float] = None,
         resolve_beliefs: bool = True,
         rerank: bool = False,
         reranker: Optional[object] = None,
@@ -687,7 +687,10 @@ class Memory:
         pool), in selection order. The pool is ``pool_k`` candidates or more:
         it grows with the budget so a large budget can be filled.
         ``max_items`` limits the number of results as well; by default only
-        the token budget does.
+        the token budget does. ``lam`` weighs relevance against variety in
+        that choice. By default it is 0.7, and 0.9 for a question that counts
+        or adds up ("how many", "in total"), whose answer needs every mention
+        of the thing, however alike they read (``tsm.ranking.packing_lam``).
 
         With ``resolve_beliefs`` (default True), a memory that has been
         superseded stays in the results, ranked lower, with
@@ -803,9 +806,7 @@ class Memory:
                 shown = span_tag(p.get("span")) + shown
             p["context"] = shown
 
-        first_person = is_first_person_query(query)
-        for p in pool:
-            p["score"] = p["score"] * role_prior(first_person, p["role"])
+        apply_role_prior(pool, query)
 
         # Stage-2 MultiVector / ColBERT Late-Interaction Precision Reranking
         if active_reranker is not None and len(pool) > 1:
@@ -824,7 +825,8 @@ class Memory:
         pool.sort(key=lambda p: (-p["score"], "superseded_by" in p))
         if token_budget is None:
             return pool[:top_k]
-        return self._pack(pool, token_budget, lam, max_items, stored=sources is None)
+        return self._pack(pool, token_budget, packing_lam(query, lam), max_items,
+                          stored=sources is None)
 
     def _pack(self, pool: List[Dict], token_budget: int, lam: float,
               max_items: Optional[int], stored: bool) -> List[Dict]:
@@ -845,7 +847,8 @@ class Memory:
             chosen = pack(ids, [float(p["score"]) for p in pool], tokens, turns,
                           int(token_budget), lam=float(lam), max_items=max_items or None,
                           never_redundant=pairs, max_redundancy=MAX_REDUNDANCY,
-                          new_turn_bonus=NEW_TURN_BONUS)
+                          new_turn_bonus=NEW_TURN_BONUS,
+                          occasions=[p.get("occasion") for p in pool])
             return [pool[i] for i in chosen]
         return select_under_budget(
             pool, token_budget, embed=lambda texts: embed_documents(self.embedder, texts),
@@ -861,7 +864,8 @@ class Memory:
                 "turn_index": payload.get("turn_index"),
                 "timestamp": payload.get("timestamp"),
                 "source": payload.get("original_message"),
-                "span": payload.get("span")}
+                "span": payload.get("span"),
+                "occasion": occasion(rec["source_role"], payload.get("timestamp"))}
 
     def _resolve_beliefs(self, pool: List[Dict], user_id: Optional[str]) -> None:
         """Mark the superseded memories in ``pool`` and, when supersessions are
