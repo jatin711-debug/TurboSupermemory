@@ -103,19 +103,22 @@ Open, in this order:
 
 1. **More LongMemEval-S questions without paying for extraction.** The
    messages-only store needs no extraction, so it can be scored and judged on
-   all 500 S questions for about $0.002 a question at 2,000 tokens. Pair it
-   with `sdk_raw_plain` (the same passages without cognitive search; harness
-   arm added 2026-10-29, not run yet) to see whether graph and keyword search
-   earn their place on passages.
+   all 500 S questions for about $0.002 a question at 2,000 tokens. Done for
+   questions 31-130 (free score): cognitive search 84 against plain search
+   80 (4 / 0), and the assistant-question fix (3 -> 10 of 11). The rest of
+   the 500, and a judged run of both, are still to do (needs the GPU for
+   embedding, about 7 minutes per 20 new histories).
 2. **`keep_messages` with `max_user_tokens`.** Compaction folds facts by
    speaker and does not know passages, so the two are refused together. A
    bounded store with messages needs a policy for folding passages (oldest
    first, into dated gists, as facts are).
-3. **The six misses at 600 tokens.** Four are questions with four to six
-   evidence turns that do not fit; two were misread with the evidence
-   present. A budget chosen per question (agentmemory budgets by question
-   type) or a count over a typed list of events (User as Code) are the
-   candidates.
+3. **What still misses at 2,000 tokens.** After the packer fixes of
+   2026-10-29 (near-duplicates only within one day, relevance first for
+   counting questions, the prior never damping the top 3), 5 of 97 S
+   questions lack evidence: 2 multi-session counts, 2 temporal, and 1 benign
+   (the assistant's echo of a stated fact). All were in the candidate pool.
+   Next candidates are a count over a typed list of events (User as Code)
+   and a judged run to see what the reader does with what it now gets.
 4. **Exact search on larger stores.** On the S30 run the CUDA build's exact
    device search and the CPU's tiered path chose identical contexts in all 8
    stores past 4,096 records (2026-10-29). Repeat on `--pool 20` stores with
