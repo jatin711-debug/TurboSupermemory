@@ -3726,3 +3726,99 @@ so earlier arms keep their meaning.
   answer, so the judged numbers are the ones to quote.
 
 **Cost.** 517 reader and judge requests (485k tokens in, 52k out): $0.28.
+
+## Addendum: the graph on messages, and questions about what the assistant said (2026-10-29)
+
+Free evidence score on LongMemEval-S questions 31 to 130. The messages
+were stored alone (`sdk_raw`), recalled at 2,000 tokens, embedded with
+EmbeddingGemma 2. The run was stopped at 100 of the planned 200, because
+the GPU was needed elsewhere. Scored from its checkpoint,
+`runs/free_messages/s200_2000.json.partial.jsonl`.
+
+**Cognitive search against plain vector search** (`sdk_raw_plain`: the same
+passages, a plain vector pool, then recall()'s role prior, packer and
+tags): 84 against 80 of 100 with all of their evidence, 4 / 0 (p = 0.12).
+The graph stays.
+
+**Questions about what the assistant said** found their evidence 3 times
+in 12. Every other type found it 85 to 100% of the time.
+- Cause: the role prior. `FIRST_PERSON_CUES` includes "i", "me", "what" and
+  "how", so it fires on nearly every question. Assistant memories were
+  scaled 0.85 and the user's 1.30.
+- Effect: the contexts of these twelve questions held 529 user passages and
+  4 of the assistant's.
+
+**Fix: `tsm.ranking.asks_what_assistant_said`.** It looks for past-tense
+cues: "you told / said / suggested ...", "did you say", "remind me", "we
+decided", "our previous chat".
+- On the 500 LongMemEval questions it matches 54 of the 56
+  single-session-assistant questions and none of any other type. So every
+  other question's context is unchanged by construction.
+- Present tense ("can you suggest a hotel") is left out: it asks for
+  something new.
+- For such a question `role_prior` applies no prior. Variants tried on the
+  eleven of these questions the type filter keeps:
+
+| prior on those questions | all evidence, of 11 |
+|---|---|
+| shipped (user 1.30, assistant 0.85) | 3 |
+| swapped (assistant 1.30, user 0.85) | 8 |
+| assistant 1.30, user 1.0 | 9 |
+| **none** | **10** |
+
+- Swapping lost two questions whose answer is in what the user said in
+  reply ("the script you wrote" was the user's; "what we decided to name
+  it"). With no prior both come back.
+- On the oracle file's 56 such questions, read from the fact store at 600
+  tokens, 47 contexts changed and evidence stayed at 46. Those stores hold
+  only the evidence sessions, so nothing crowds a reply out.
+- Not judged yet. The questions are few, but the cause is mechanical and
+  the change only reaches questions the detector matches.
+
+**The rest of the misses.** After that fix, 8 of the 97 questions with
+evidence still lacked some of it. Every missing turn was in the
+250-candidate pool. All of them were lost in the packer, for three reasons:
+- **Near-duplicates from different days** (Yosemite trip, fish tanks). The
+  user opened two sessions with nearly the same words. The `MAX_REDUNDANCY`
+  skip dropped the second, though it is a second occurrence that a count or
+  a date question needs.
+- **The role prior on the best match** (the jumpsuit, an assistant reply).
+  It was the closest record in the store and was ranked 95th after the
+  prior.
+- **Counting questions** (instruments, hobbies, charity events). The
+  mentions read alike, so the variety term counted them against each
+  other.
+
+Variants, scored on the same stores (`.cache/scratch/pack_variants.py`).
+Questions with all of their evidence:
+
+| variant | S 31-130 (97) | S 1-30 (30), not tuned on |
+|---|---|---|
+| as committed | 89 | 29 |
+| no role prior on message passages | 85 (2 / 6) | |
+| near-duplicate skip within one day only | 90 (1 / 0) | |
+| `lam` 0.9 for counting questions | 90 (1 / 0) | |
+| both | 91 (2 / 0) | 29 |
+| both, and the prior never damps the top 3 | **92 (3 / 0)** | **29** |
+| both, top 5 | 92 (3 / 0) | 29 |
+
+- **Dropping the prior on passages loses 5 multi-session questions.** It
+  keeps the user's own mentions ahead of long generic replies.
+- **All three are shipped together:**
+  - `tsm.chunks.occasion`, used by both packers; the Rust packer takes a
+    `Candidate` with tokens, turn and occasion;
+  - `tsm.ranking.packing_lam`;
+  - `PRIOR_SPARES_TOP` = 3 in `apply_role_prior`.
+- Remaining misses on the 97: 2 multi-session, 2 temporal, and 1 whose
+  missing turn is the assistant's echo of a fact the kept user turn already
+  states (the degree).
+- Confirmed with the harness on the shipped code: the Rust packer, CPU
+  only, `runs/free_messages/s100_fixed_2000.json`. On the 95 questions
+  both runs scored:
+  - messages alone: 80 before the three fixes and the assistant-question
+    fix, 90 after (10 / 0, p = 0.002). Assistant questions went 3 -> 11 of
+    11, multi-session 22 -> 23, temporal 20 -> 21;
+  - plain vector search: 77 -> 88 (11 / 0).
+  - With cognitive search against plain search: 91 against 88 of the
+    harness's 96 (3 / 0).
+- Free score only; not judged.

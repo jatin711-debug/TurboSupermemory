@@ -582,6 +582,8 @@ def evidence_scores(tasks, arms):
 
 def sdk_pool(mem, embedder, query, user_id, k):
     """The plain-vector pool recall() would rank: nearest records of the scope."""
+    from tsm.chunks import occasion
+
     embed_query = getattr(embedder, "encode_query", None) or embedder.encode
     hits = mem.engine.search_ann(np.asarray(embed_query(query), dtype=np.float32), k,
                                  scope=user_id)
@@ -597,9 +599,11 @@ def sdk_pool(mem, embedder, query, user_id, k):
                 payload = json.loads(payload)
             except ValueError:
                 payload = {}
+        role = rec.get("source_role") or ""
         pool.append({"id": mid, "text": rec["text"], "score": float(score),
-                     "role": rec.get("source_role") or "", "turn_index": payload.get("turn_index"),
-                     "timestamp": payload.get("timestamp")})
+                     "role": role, "turn_index": payload.get("turn_index"),
+                     "timestamp": payload.get("timestamp"),
+                     "occasion": occasion(role, payload.get("timestamp"))})
     return pool
 
 
@@ -654,6 +658,9 @@ def main():
                          "run whose judging did not finish)")
     ap.add_argument("--offline", action="store_true",
                     help="no network: cached texts only, proxy judge, fake verdicts, extractive gists")
+    ap.add_argument("--types", default=None, metavar="TYPE[,TYPE]",
+                    help="only the questions of these types (e.g. single-session-assistant), "
+                         "taken from the --skip/--limit range")
     ap.add_argument("--extraction-cache-only", action="store_true",
                     help="extract nothing: a message the extraction cache does not hold gives no "
                          "facts (counted, as with --offline) while the judge and reader are real. "
@@ -753,7 +760,7 @@ def main():
     from tsm.compaction import is_gist
     from tsm.gist import ExtractiveGistSummarizer, OpenAIGistSummarizer
     from tsm.memory import time_tag
-    from tsm.ranking import is_first_person_query, role_prior
+    from tsm.ranking import apply_role_prior, packing_lam
     from tsm.sources import speaker
     from tsm.verification import LLMVerifier
 
@@ -796,6 +803,9 @@ def main():
     nli = None
 
     convs = load_longmemeval(args.data_dir)[args.skip:args.limit]
+    if args.types:
+        wanted = set(args.types.split(","))
+        convs = [c for c in convs if c.queries and c.queries[0].question_type in wanted]
     if args.variant:
         convs = load_longmemeval(args.data_dir, variant=args.variant,
                                  question_ids=[c.queries[0].query_id for c in convs if c.queries])
@@ -938,9 +948,8 @@ def main():
                 # recall()'s packing on a plain-vector pool of recall()'s size.
                 pool = sdk_pool(mem, embedder, q, user,
                                 max(args.pool_k, 30, args.token_budget // 8))
-                first_person = is_first_person_query(q)
+                apply_role_prior(pool, q)
                 for p in pool:
-                    p["score"] *= role_prior(first_person, p["role"])
                     if tags:
                         said = (speaker(spoken_by(p["role"])) if is_message(p["role"])
                                 else "")
@@ -951,7 +960,7 @@ def main():
                 chosen = select_under_budget(
                     pool, args.token_budget,
                     embed=getattr(embedder, "encode_document", None) or embedder.encode,
-                    lam=0.7, max_items=cap)
+                    lam=packing_lam(q), max_items=cap)
                 return [(p.get("context") or p["text"] or "", p["turn_index"]) for p in chosen]
 
             plain_arms = [a for a in ("sdk_plain", "sdk_pack", "sdk_pack_capped",
