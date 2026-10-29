@@ -3832,3 +3832,72 @@ Questions with all of their evidence:
     the reader still misses 4: a list position, a chord progression, and
     two longer replies. That is the reader's share of what is left.
   - Cost: 381 requests, $0.25.
+
+**The reader's share: replies cut into pieces (2026-10-29).** All 10
+questions still answered wrong had all of their evidence turns in the
+context.
+- **Four were assistant questions whose reply had only some of its
+  passages in.** The reader said so: "the second company was not named in
+  the notes", and "the full list of four ... is not available". The
+  evidence score counts a turn as found when any passage of it is in.
+- **The list question had a second cut.** The sentence split cut between
+  "27." and its item. Keeping a list number with its item re-cuts 13,165 of
+  49,095 messages on these 100 histories, and 61,862 passages would need new
+  embeddings. That fix is left for a run with the GPU (`TODO.md`).
+- **The other six are reading errors with all of the evidence present:**
+  counts off by one, and date arithmetic.
+
+**Fix:** for a question about what the assistant said, `recall()` returns
+each of the two best-scored replies with a passage in the context whole.
+- Its passages are joined in order into one result, so a list reads with
+  its numbers.
+- The replies get at most `REPLY_SHARE` (0.75) of the budget, the passages
+  nearest the found one first. The last chosen results are dropped to fit.
+- A passage's siblings are read by id. A message's passages are written
+  consecutively, and the count stored with each (`passages`) bounds the
+  read.
+- The first version completed the first-chosen reply. On the list question
+  that was an unrelated reply, so the best-scored ones are completed now.
+
+Results on the 11 assistant questions (S 31-130, 2,000 tokens):
+- The answer's words in the context: refinery processes 0 -> 7 of 7, two
+  companies 1 -> 3 of 3, alternative terms 6 -> 9 of 10, the 27th list
+  item 0 -> 5 of 6.
+- **Judged: 7 -> 11 of 11**, $0.014. No other question type is affected:
+  the step only runs for questions `asks_what_assistant_said` matches.
+
+**The six reading errors, looked at one by one.** They were re-asked with
+the same prompt and model at temperature 0, keeping the whole reply
+(`.cache/scratch/reader_working.py`, $0.007).
+- **Three came back right:** the tanks (3), the months since the museum
+  visit (5), and the museum visit with the user's dad, not a friend.
+  gpt-4.1-mini at temperature 0 does not give the same reply twice, so
+  differences of a few questions between two judged runs are within its
+  noise.
+- **Two depend on how the gold answer reads the notes.** The reader
+  counted "vegan" as a fifth cuisine; the gold answer is 4. The aunt's gift
+  is a crystal chandelier in the notes and jewelry in the question.
+- **One contradicts the dates in the history.** "I got them exactly three
+  weeks ago" and "the goldfinches seem to be returning" are both dated
+  2023-05-20, while the gold answer is "two weeks".
+- None of the six is lost evidence, and none is a prompt fault that six
+  questions could show. The remaining lever is the reader's own variance
+  (for example a majority of three replies), which triples the reader's
+  cost and is not a memory change.
+
+**List numbers stay with their items (2026-10-29).** `tsm.chunks` now keeps
+a list number with the item it numbers. A number that ends a sentence counts
+as a list number only in a run of consecutive numbers that starts at 1 or is
+at least `LIST_RUN` (3) long, so "we met in room 12." is left as it was said.
+- On S 31-130 this re-cuts 13,116 of 49,095 messages, and 61,710 passages
+  were embedded again on the GPU.
+- Free score: 91 of 96 with all evidence before and after (0 / 0). 58 of
+  the 96 contexts changed.
+- Judged, the new cut scored 84 against the old cut's 90. But re-asking
+  the old cut's contexts, unchanged, gave 85: a 0 / 5 drop with nothing
+  changed. Against that second draw the new cut is level (2 / 3, p = 1.0).
+- **The reader's variance:** the same 96 contexts, judged twice by
+  gpt-4.1-mini at temperature 0, came out 90 and 85. A single judged run
+  of about 100 questions cannot show a difference of a few questions.
+  Compare two arms judged in the same run, or more than one draw of each.
+- Cost of these two re-judgings: $0.24.
