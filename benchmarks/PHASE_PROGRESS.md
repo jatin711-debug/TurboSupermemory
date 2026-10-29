@@ -3821,4 +3821,14 @@ Questions with all of their evidence:
   - plain vector search: 77 -> 88 (11 / 0).
   - With cognitive search against plain search: 91 against 88 of the
     harness's 96 (3 / 0).
-- Free score only; not judged.
+- **Judged.** The same saved contexts of the shipped setup (messages with
+  cognitive search, 2,000 tokens) were read with `--reader notes` and
+  judged by gpt-4.1-mini, before and after (`--rejudge`,
+  `runs/judged_s100/`). On the 95 questions both runs share:
+  - **right 79 before, 85 after: 6 gained, 0 lost (p = 0.031)**;
+  - assistant questions 4 -> 7 of 11, multi-session 21 -> 23, temporal
+    18 -> 19, every other type level.
+  - The assistant questions now have all of their evidence (11 of 11) and
+    the reader still misses 4: a list position, a chord progression, and
+    two longer replies. That is the reader's share of what is left.
+  - Cost: 381 requests, $0.25.
