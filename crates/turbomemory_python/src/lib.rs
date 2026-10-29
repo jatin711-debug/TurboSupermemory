@@ -3,7 +3,7 @@
 //! Exposes a single `MemoryEngine` class with the exact API expected by
 //! `verify.py` and `benchmark.py`.
 
-use numpy::PyUntypedArrayMethods;
+use numpy::{PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -1088,6 +1088,63 @@ impl PyMemoryEngine {
                 .transpose()
             })
             .collect()
+    }
+
+    /// The stored embeddings of `ids` as a float32 array of shape
+    /// `(len(ids), dimension)`, and a list saying which ids were found (the
+    /// row of an id that is not live is all zeros). These are the vectors
+    /// the engine searches, so a caller comparing memories with each other
+    /// need not embed their text again.
+    fn get_vectors<'py>(
+        &self,
+        py: Python<'py>,
+        ids: Vec<String>,
+    ) -> PyResult<(Bound<'py, numpy::PyArray2<f32>>, Vec<bool>)> {
+        let engine = self.engine()?;
+        let dim = engine.config().dimension;
+        let n = ids.len();
+        let (rows, found) = py.allow_threads(|| engine.vectors_by_ids(&ids));
+        let array = numpy::PyArray1::from_vec(py, rows).reshape([n, dim])?;
+        Ok((array, found))
+    }
+
+    /// Choose the best set of `ids` that fits `token_budget`: greedy maximal
+    /// marginal relevance with a bonus for each turn not yet covered, the
+    /// selection `tsm.budget.select_under_budget` makes, run in the engine on
+    /// the stored embeddings. `scores`, `tokens` and `turns` (an int or
+    /// None each) are parallel to `ids`; `never_redundant` lists index pairs
+    /// that do not count against each other (a memory and the one that
+    /// replaced it). Returns indexes into `ids`, in the order chosen.
+    #[pyo3(signature = (ids, scores, tokens, turns, token_budget, lam=0.7, max_items=None,
+                        never_redundant=None, max_redundancy=0.95, new_turn_bonus=0.20))]
+    #[allow(clippy::too_many_arguments)]
+    fn pack_under_budget(
+        &self,
+        py: Python<'_>,
+        ids: Vec<String>,
+        scores: Vec<f32>,
+        tokens: Vec<u32>,
+        turns: Vec<Option<i64>>,
+        token_budget: u64,
+        lam: f64,
+        max_items: Option<usize>,
+        never_redundant: Option<Vec<(usize, usize)>>,
+        max_redundancy: f64,
+        new_turn_bonus: f64,
+    ) -> PyResult<Vec<usize>> {
+        let engine = self.engine()?;
+        let params = turbomemory_core::packing::PackParams {
+            token_budget,
+            lam,
+            max_items,
+            max_redundancy,
+            new_turn_bonus,
+        };
+        let pairs = never_redundant.unwrap_or_default();
+        py.allow_threads(|| {
+            engine.pack_under_budget(&ids, &scores, &tokens, &turns, &pairs, &params)
+        })
+        .map_err(storage_err)
     }
 
     /// Ids of the live records stored under exactly `scope`, oldest first

@@ -2966,3 +2966,72 @@ fn scoped_search_survives_replay() {
         .collect();
     assert_eq!(results, vec!["scoped_mem".to_string()]);
 }
+
+/// The packer reads the stored embeddings: a near-duplicate of a chosen
+/// memory is passed over without the caller sending any vector, an unknown
+/// id is similar to nothing, and `vectors_by_ids` returns rows in `ids`' order.
+#[test]
+fn pack_under_budget_uses_stored_vectors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+    let e = |i: usize| {
+        let mut v = [0.0f32; 8];
+        v[i] = 1.0;
+        v
+    };
+    let mut near = e(0);
+    near[1] = 0.05;
+    engine.insert("a", "the cat sat", &e(0), 1.0, &[]).unwrap();
+    engine
+        .insert("b", "the cat sat down", &near, 1.0, &[])
+        .unwrap();
+    engine.insert("c", "a dog barked", &e(2), 1.0, &[]).unwrap();
+
+    let ids: Vec<String> = ["c", "missing", "a"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let (rows, found) = engine.vectors_by_ids(&ids);
+    assert_eq!(found, vec![true, false, true]);
+    assert_eq!(&rows[0..8], &e(2));
+    assert!(rows[8..16].iter().all(|&x| x == 0.0));
+    assert_eq!(&rows[16..24], &e(0));
+
+    let ids: Vec<String> = ["a", "b", "c", "missing"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let params = turbomemory_core::packing::PackParams {
+        token_budget: 100,
+        ..Default::default()
+    };
+    let chosen = engine
+        .pack_under_budget(
+            &ids,
+            &[0.9, 0.88, 0.5, 0.4],
+            &[5, 5, 5, 5],
+            &[None, None, None, None],
+            &[],
+            &params,
+        )
+        .unwrap();
+    assert_eq!(chosen, vec![0, 2, 3], "b repeats a; the unknown id is kept");
+    let tight = turbomemory_core::packing::PackParams {
+        token_budget: 9,
+        ..Default::default()
+    };
+    let chosen = engine
+        .pack_under_budget(
+            &ids,
+            &[0.9, 0.88, 0.5, 0.4],
+            &[5, 5, 5, 5],
+            &[None; 4],
+            &[],
+            &tight,
+        )
+        .unwrap();
+    assert_eq!(chosen, vec![0]);
+    assert!(engine
+        .pack_under_budget(&ids, &[0.9], &[5], &[None], &[], &params)
+        .is_err());
+}

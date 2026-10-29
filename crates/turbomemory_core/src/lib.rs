@@ -5,6 +5,7 @@
 
 pub mod metrics;
 pub mod metrics_quantized;
+pub mod packing;
 pub mod quantization;
 pub mod quantized_search;
 pub mod rabitq;

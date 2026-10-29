@@ -866,4 +866,62 @@ impl StorageEngine {
             }
         })
     }
+
+    /// The stored embeddings of `ids`, one row of `dimension` values each,
+    /// flattened, and whether each id was found. The row of an id that is
+    /// not live is all zeros.
+    pub fn vectors_by_ids(&self, ids: &[String]) -> (Vec<f32>, Vec<bool>) {
+        let dim = self.config.dimension;
+        let offsets: Vec<Option<PointOffset>> = {
+            let idx = self.id_index.read();
+            ids.iter().map(|id| idx.get(id.as_str()).copied()).collect()
+        };
+        let mut rows = vec![0.0_f32; ids.len() * dim];
+        let mut found = vec![false; ids.len()];
+        // One read view, released before returning; nothing here waits on
+        // the Rayon pool (see the read_view invariant).
+        let view = self.vectors.read_view();
+        for (k, offset) in offsets.into_iter().enumerate() {
+            if let Some(vector) = offset.and_then(|o| view.get(o)) {
+                if vector.len() == dim {
+                    rows[k * dim..(k + 1) * dim].copy_from_slice(vector);
+                    found[k] = true;
+                }
+            }
+        }
+        (rows, found)
+    }
+
+    /// Choose the best set of `ids` that fits `params.token_budget`
+    /// (`turbomemory_core::packing::select_under_budget`), measuring
+    /// redundancy on the stored embeddings instead of embedding the
+    /// candidates' text again. `scores`, `tokens` and `turns` are parallel
+    /// to `ids`; an id that is not live is similar to nothing. Returns
+    /// indexes into `ids`, in the order chosen.
+    pub fn pack_under_budget(
+        &self,
+        ids: &[String],
+        scores: &[f32],
+        tokens: &[u32],
+        turns: &[Option<i64>],
+        never_redundant: &[(usize, usize)],
+        params: &turbomemory_core::packing::PackParams,
+    ) -> crate::Result<Vec<usize>> {
+        if scores.len() != ids.len() {
+            return Err(crate::StorageError::InvalidArgument(
+                "ids and scores must be the same length".into(),
+            ));
+        }
+        let (rows, _found) = self.vectors_by_ids(ids);
+        turbomemory_core::packing::select_under_budget(
+            &rows,
+            self.config.dimension,
+            scores,
+            tokens,
+            turns,
+            never_redundant,
+            params,
+        )
+        .map_err(|e| crate::StorageError::InvalidArgument(e.to_string()))
+    }
 }
