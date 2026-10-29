@@ -310,7 +310,8 @@ class TestPassages(unittest.TestCase):
         self.assertEqual(passages(None), [])
 
     def test_a_long_message_is_cut_between_sentences_and_nothing_is_lost(self):
-        text = " ".join(f"Sentence number {i} says something about topic {i}." for i in range(40))
+        text = " ".join(f"Sentence number {i} says something about topic {i} today."
+                        for i in range(40))
         parts = passages(text, max_tokens=30)
         self.assertGreater(len(parts), 1)
         self.assertTrue(all(estimate_tokens(p) <= 30 for p in parts))
@@ -322,6 +323,20 @@ class TestPassages(unittest.TestCase):
         parts = passages(text, max_tokens=20)
         self.assertTrue(all(estimate_tokens(p) <= 20 for p in parts))
         self.assertEqual(" ".join(parts).split(), text.split())
+
+    def test_a_list_number_stays_with_its_item(self):
+        items = " ".join(f"{i}. Item number {i} (e.g., one, two, three, etc.)" for i in range(1, 40))
+        text = "Here are the parameters you asked for: " + items
+        parts = passages(text, max_tokens=40)
+        self.assertGreater(len(parts), 3)
+        for part in parts[1:]:
+            self.assertRegex(part, r"^\d+\. Item number \d+", "a cut fell inside an item")
+        self.assertFalse(any(part.endswith(".") and part.rsplit(" ", 1)[-1][:-1].isdigit()
+                             for part in parts), "a number was left at the end of a passage")
+        self.assertEqual(" ".join(parts).split(), text.split())
+        # A number that ends a sentence outside a run is left where it was said.
+        prose = "We met in room 12. It was cold that day. " * 6
+        self.assertTrue(all(not p.startswith("12.") for p in passages(prose, max_tokens=12)))
 
     def test_lines_are_cut_too(self):
         text = "\n".join("- item %d of a long list that goes on for a while" % i for i in range(30))

@@ -34,6 +34,61 @@ PASSAGE_TOKENS = 100
 MESSAGE_ROLE = "message"
 
 _SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
+# A list number ("27.", "3)", "(4)") belongs to the item after it. The
+# sentence split leaves it at the end of the item before ("... etc.) 28.") or
+# on its own, and a cut there separated an item from its number: asked for
+# the 27th entry of a list, a reader found "Sound effects" with no number.
+_LIST_NUMBER = r"\(?\d{1,3}[.)]"
+_TRAILING_NUMBER = re.compile(r"\s(" + _LIST_NUMBER + r")$")
+_ONLY_NUMBER = re.compile(r"^" + _LIST_NUMBER + r"$")
+LIST_RUN = 3
+
+
+def _number(mark: Optional[str]) -> Optional[int]:
+    digits = re.sub(r"\D", "", mark or "")
+    return int(digits) if digits else None
+
+
+def _sentences(text: str) -> List[str]:
+    """``text`` split between sentences, each list number kept with the item
+    it numbers. A number that ends a sentence is taken for a list number
+    only in a run (the sentence before or after ends with the number before
+    or after it), so "... about topic 12." stays as it was said. The order
+    of the words does not change."""
+    raw = [s.strip() for s in _SENTENCE.split(text)]
+    raw = [s for s in raw if s]
+    ends = []
+    for sentence in raw:
+        trailing = _TRAILING_NUMBER.search(sentence)
+        ends.append(_number(trailing.group(1)) if trailing else None)
+    # Runs of sentences ending n, n+1, ...: a list when the run starts at 1
+    # or is at least LIST_RUN long.
+    in_list = [False] * len(raw)
+    k = 0
+    while k < len(raw):
+        j = k
+        while (ends[j] is not None and j + 1 < len(raw) and ends[j + 1] is not None
+               and ends[j + 1] == ends[j] + 1):
+            j += 1
+        if j > k and (ends[k] == 1 or j - k + 1 >= LIST_RUN):
+            in_list[k:j + 1] = [True] * (j - k + 1)
+        k = j + 1
+    out: List[str] = []
+    carry = ""
+    for k, sentence in enumerate(raw):
+        if carry:
+            sentence, carry = f"{carry} {sentence}", ""
+        if _ONLY_NUMBER.match(sentence):
+            carry = sentence
+            continue
+        trailing = _TRAILING_NUMBER.search(sentence)
+        if trailing and in_list[k]:
+            carry = trailing.group(1)
+            sentence = sentence[:trailing.start()].rstrip()
+        out.append(sentence)
+    if carry:
+        out.append(carry)
+    return out
 
 
 def message_role(role: Optional[str]) -> str:
@@ -68,9 +123,10 @@ def occasion(role: Optional[str], timestamp) -> Optional[int]:
 def passages(text: str, max_tokens: int = PASSAGE_TOKENS) -> List[str]:
     """``text`` cut into consecutive passages of at most ``max_tokens``.
 
-    Cuts fall between sentences; a sentence longer than the cap is cut
-    between words. Nothing is dropped and nothing repeated: the passages,
-    joined with spaces, read as the message (whitespace aside).
+    Cuts fall between sentences, never between a list number and its item;
+    a sentence longer than the cap is cut between words. Nothing is dropped
+    and nothing repeated: the passages, joined with spaces, read as the
+    message (whitespace aside).
     """
     text = (text or "").strip()
     if not text:
@@ -78,9 +134,7 @@ def passages(text: str, max_tokens: int = PASSAGE_TOKENS) -> List[str]:
     if estimate_tokens(text) <= max_tokens:
         return [text]
     units: List[str] = []
-    for sentence in (s.strip() for s in _SENTENCE.split(text)):
-        if not sentence:
-            continue
+    for sentence in _sentences(text):
         if estimate_tokens(sentence) <= max_tokens:
             units.append(sentence)
             continue
