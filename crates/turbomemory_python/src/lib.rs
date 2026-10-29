@@ -1112,11 +1112,15 @@ impl PyMemoryEngine {
     /// marginal relevance with a bonus for each turn not yet covered, the
     /// selection `tsm.budget.select_under_budget` makes, run in the engine on
     /// the stored embeddings. `scores`, `tokens` and `turns` (an int or
-    /// None each) are parallel to `ids`; `never_redundant` lists index pairs
-    /// that do not count against each other (a memory and the one that
-    /// replaced it). Returns indexes into `ids`, in the order chosen.
+    /// None each) are parallel to `ids`, and so is `occasions` when given
+    /// (when each was said, a day as an int or None: two candidates said on
+    /// different days are never skipped as duplicates of each other);
+    /// `never_redundant` lists index pairs that do not count against each
+    /// other (a memory and the one that replaced it). Returns indexes into
+    /// `ids`, in the order chosen.
     #[pyo3(signature = (ids, scores, tokens, turns, token_budget, lam=0.7, max_items=None,
-                        never_redundant=None, max_redundancy=0.95, new_turn_bonus=0.20))]
+                        never_redundant=None, max_redundancy=0.95, new_turn_bonus=0.20,
+                        occasions=None))]
     #[allow(clippy::too_many_arguments)]
     fn pack_under_budget(
         &self,
@@ -1131,8 +1135,27 @@ impl PyMemoryEngine {
         never_redundant: Option<Vec<(usize, usize)>>,
         max_redundancy: f64,
         new_turn_bonus: f64,
+        occasions: Option<Vec<Option<i64>>>,
     ) -> PyResult<Vec<usize>> {
         let engine = self.engine()?;
+        let occasions = occasions.unwrap_or_else(|| vec![None; ids.len()]);
+        if tokens.len() != ids.len() || turns.len() != ids.len() || occasions.len() != ids.len() {
+            return Err(PyValueError::new_err(
+                "ids, tokens, turns and occasions must be the same length",
+            ));
+        }
+        let candidates: Vec<turbomemory_core::packing::Candidate> = tokens
+            .iter()
+            .zip(&turns)
+            .zip(&occasions)
+            .map(
+                |((&tokens, &turn), &occasion)| turbomemory_core::packing::Candidate {
+                    tokens,
+                    turn,
+                    occasion,
+                },
+            )
+            .collect();
         let params = turbomemory_core::packing::PackParams {
             token_budget,
             lam,
@@ -1141,10 +1164,8 @@ impl PyMemoryEngine {
             new_turn_bonus,
         };
         let pairs = never_redundant.unwrap_or_default();
-        py.allow_threads(|| {
-            engine.pack_under_budget(&ids, &scores, &tokens, &turns, &pairs, &params)
-        })
-        .map_err(storage_err)
+        py.allow_threads(|| engine.pack_under_budget(&ids, &scores, &candidates, &pairs, &params))
+            .map_err(storage_err)
     }
 
     /// Ids of the live records stored under exactly `scope`, oldest first

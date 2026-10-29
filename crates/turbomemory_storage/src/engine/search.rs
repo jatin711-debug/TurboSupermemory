@@ -895,15 +895,14 @@ impl StorageEngine {
     /// Choose the best set of `ids` that fits `params.token_budget`
     /// (`turbomemory_core::packing::select_under_budget`), measuring
     /// redundancy on the stored embeddings instead of embedding the
-    /// candidates' text again. `scores`, `tokens` and `turns` are parallel
-    /// to `ids`; an id that is not live is similar to nothing. Returns
-    /// indexes into `ids`, in the order chosen.
+    /// candidates' text again. `scores` and `candidates` are parallel to
+    /// `ids`; an id that is not live is similar to nothing. Returns indexes
+    /// into `ids`, in the order chosen.
     pub fn pack_under_budget(
         &self,
         ids: &[String],
         scores: &[f32],
-        tokens: &[u32],
-        turns: &[Option<i64>],
+        candidates: &[turbomemory_core::packing::Candidate],
         never_redundant: &[(usize, usize)],
         params: &turbomemory_core::packing::PackParams,
     ) -> crate::Result<Vec<usize>> {
@@ -917,8 +916,7 @@ impl StorageEngine {
             &rows,
             self.config.dimension,
             scores,
-            tokens,
-            turns,
+            candidates,
             never_redundant,
             params,
         )

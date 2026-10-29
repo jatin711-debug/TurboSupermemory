@@ -3005,33 +3005,33 @@ fn pack_under_budget_uses_stored_vectors() {
         token_budget: 100,
         ..Default::default()
     };
+    let five = turbomemory_core::packing::Candidate {
+        tokens: 5,
+        ..Default::default()
+    };
+    let scores = [0.9, 0.88, 0.5, 0.4];
     let chosen = engine
-        .pack_under_budget(
-            &ids,
-            &[0.9, 0.88, 0.5, 0.4],
-            &[5, 5, 5, 5],
-            &[None, None, None, None],
-            &[],
-            &params,
-        )
+        .pack_under_budget(&ids, &scores, &[five; 4], &[], &params)
         .unwrap();
     assert_eq!(chosen, vec![0, 2, 3], "b repeats a; the unknown id is kept");
+    // Said on another day, b is another occurrence: kept, though it still
+    // weighs as redundant (after c, ahead of the far less relevant unknown).
+    let mut days = [five; 4];
+    days[0].occasion = Some(1);
+    days[1].occasion = Some(2);
+    let chosen = engine
+        .pack_under_budget(&ids, &scores, &days, &[], &params)
+        .unwrap();
+    assert_eq!(chosen, vec![0, 2, 1, 3]);
     let tight = turbomemory_core::packing::PackParams {
         token_budget: 9,
         ..Default::default()
     };
     let chosen = engine
-        .pack_under_budget(
-            &ids,
-            &[0.9, 0.88, 0.5, 0.4],
-            &[5, 5, 5, 5],
-            &[None; 4],
-            &[],
-            &tight,
-        )
+        .pack_under_budget(&ids, &scores, &[five; 4], &[], &tight)
         .unwrap();
     assert_eq!(chosen, vec![0]);
     assert!(engine
-        .pack_under_budget(&ids, &[0.9], &[5], &[None], &[], &params)
+        .pack_under_budget(&ids, &[0.9], &[five], &[], &params)
         .is_err());
 }
