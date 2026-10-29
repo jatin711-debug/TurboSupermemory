@@ -21,6 +21,11 @@ MAX_REDUNDANCY = 0.95
 # Marginal-gain bonus for the first memory taken from a not-yet-covered turn
 # (cross-turn / cross-session coverage).
 NEW_TURN_BONUS = 0.20
+# Gains closer than this are a tie, and a tie goes to the candidate ranked
+# first. Without it two candidates of equal relevance were told apart by the
+# last bit of a cosine, which numpy and the engine's packer
+# (``MemoryEngine.pack_under_budget``) round differently.
+GAIN_TIE = 1e-6
 
 
 def estimate_tokens(text: str) -> int:
@@ -112,7 +117,7 @@ def select_under_budget(
             t_idx = pool[i].get("turn_index")
             bonus = NEW_TURN_BONUS if (t_idx is not None and t_idx not in selected_turns) else 0.0
             gain = lam * float(rel[i]) - (1.0 - lam) * red + bonus
-            if gain > best_gain:
+            if gain > best_gain + GAIN_TIE:
                 best_gain, best_i = gain, i
         if best_i is None:
             break  # nothing else fits the budget or the redundancy threshold

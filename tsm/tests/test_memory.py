@@ -32,6 +32,8 @@ import numpy as np
 
 import tsm
 from tsm import CONVERSATIONAL_PROFILE, Memory
+from tsm.budget import select_under_budget
+from tsm.chunks import passages
 from tsm.gist import ExtractiveGistSummarizer
 from tsm.memory import STALE_MARK, time_tag
 from tsm.verification import LLMVerifier
@@ -100,11 +102,15 @@ class MemoryTestBase(unittest.TestCase):
             self.mem.close()
         shutil.rmtree(self.db_path, ignore_errors=True)
 
-    def make_memory(self, verifier=None, **kwargs):
+    def make_memory(self, verifier=None, extractor=None, **kwargs):
+        # The facts alone unless a test asks for the messages too, so a test
+        # of the facts' behaviour sees only them (TestKeepMessages covers the
+        # default).
+        kwargs.setdefault("keep_messages", False)
         self.mem = Memory(
             db_path=self.db_path,
             embedder=FakeEmbedder(),
-            extractor=FakeExtractor(),
+            extractor=extractor or FakeExtractor(),
             verifier=verifier,
             **kwargs,
         )
@@ -628,7 +634,7 @@ class TestRobustness(MemoryTestBase):
             from test_memory import FakeEmbedder, FakeExtractor
             from tsm import Memory
             mem = Memory(db_path={self.db_path!r}, embedder=FakeEmbedder(),
-                         extractor=FakeExtractor())
+                         extractor=FakeExtractor(), keep_messages=False)
             for i in range(25):
                 mem.add([{{"role": "user", "content": f"zebra fact number {{i}}."}}],
                         user_id="alice")
@@ -677,7 +683,7 @@ class TestRobustness(MemoryTestBase):
     def test_failed_add_stores_nothing_and_can_be_retried(self):
         embedder = PoisonableEmbedder()
         self.mem = mem = Memory(db_path=self.db_path, embedder=embedder,
-                                extractor=FakeExtractor())
+                                extractor=FakeExtractor(), keep_messages=False)
         message = [{"role": "user",
                     "content": "good fact one. poison fact two. good fact three."}]
         with self.assertRaises(ValueError):
@@ -1057,6 +1063,141 @@ class TestSourceTurns(MemoryTestBase):
                             source_tokens=30)
         self.assertIn("I adopted a beagle named Rex.", unit["text"])
         self.assertLessEqual(len(unit["text"]) // 4, 31)
+
+
+class CountingEmbedder(FakeEmbedder):
+    """FakeEmbedder that counts the texts it is asked to embed."""
+
+    def __init__(self, dim=1024):
+        super().__init__(dim)
+        self.texts = 0
+
+    def encode(self, texts):
+        self.texts += 1 if isinstance(texts, str) else len(texts)
+        return super().encode(texts)
+
+
+class NoFacts:
+    """Extractor that takes nothing from a message that mentions a beagle."""
+
+    def extract_facts(self, message, context=None):
+        return [] if "beagle" in message else FakeExtractor().extract_facts(message)
+
+
+class TestKeepMessages(MemoryTestBase):
+    """keep_messages stores every message, in passages, beside its facts."""
+
+    MESSAGE = "I adopted a beagle named Rex. He is three years old."
+
+    def test_a_message_nothing_was_taken_from_can_still_be_found(self):
+        mem = self.make_memory(keep_messages=True, extractor=NoFacts())
+        stored = mem.add([{"role": "user", "content": self.MESSAGE, "timestamp": "2024-03-02"},
+                          {"role": "assistant", "content": "Long walks suit hounds.",
+                           "timestamp": "2024-03-02"}], user_id="alice")
+        self.assertEqual(stored, 3)  # the user's passage; the reply's fact and passage
+        by_text = {r["text"]: r for r in mem.recall("beagle Rex", user_id="alice", top_k=10)}
+        rex = by_text[self.MESSAGE]
+        self.assertEqual(rex["role"], "message")
+        self.assertEqual(rex["context"], "[2024-03-02] user: " + self.MESSAGE)
+        reply = by_text["Long walks suit hounds."]
+        self.assertEqual(reply["role"], "message-assistant")
+        self.assertEqual(reply["context"], "[2024-03-02] assistant: Long walks suit hounds.")
+        self.assertEqual(by_text["Long walks suit hounds"]["role"], "assistant")
+
+    def test_extractor_none_stores_the_messages_only(self):
+        mem = self.make_memory(keep_messages=True, extractor="none")
+        long_message = " ".join(f"Day {i} of the trip was spent in town number {i}."
+                                for i in range(40))
+        stored = mem.add([{"role": "user", "content": self.MESSAGE},
+                          {"role": "user", "content": long_message}], user_id="alice")
+        self.assertEqual(stored, 1 + len(passages(long_message)))
+        self.assertGreater(len(passages(long_message)), 1)
+        roles = {r["role"] for r in mem.recall("trip town beagle", user_id="alice", top_k=50)}
+        self.assertEqual(roles, {"message"})
+
+    def test_passages_are_not_taken_for_updates_of_each_other(self):
+        verifier = AcceptAllVerifier()
+        mem = self.make_memory(verifier=verifier, keep_messages=True, extractor="none")
+        mem.add([{"role": "user", "content": "user user user user lives in paris."}],
+                user_id="alice")
+        mem.add([{"role": "user", "content": "user user user user lives in london."}],
+                user_id="alice")
+        self.assertEqual(mem.consolidate(), 0)
+        results = mem.recall("user lives", user_id="alice", top_k=10)
+        self.assertEqual(len(results), 2)
+        self.assertFalse(any("superseded_by" in r for r in results))
+
+    def test_not_combined_with_a_storage_budget(self):
+        with self.assertRaises(ValueError):
+            self.make_memory(keep_messages=True, max_user_tokens=500)
+
+    def test_on_by_default_unless_the_store_is_budgeted(self):
+        self.mem = Memory(self.db_path, embedder=FakeEmbedder(), extractor=FakeExtractor())
+        self.assertTrue(self.mem.keep_messages)
+        self.assertEqual(self.mem.add([{"role": "user", "content": self.MESSAGE}],
+                                      user_id="alice"), 3)  # two facts and the message
+        self.mem.close()
+        shutil.rmtree(self.db_path, ignore_errors=True)
+        self.mem = Memory(self.db_path, embedder=FakeEmbedder(), extractor=FakeExtractor(),
+                          max_user_tokens=500)
+        self.assertFalse(self.mem.keep_messages)
+
+    def test_extractor_none_needs_the_messages(self):
+        with self.assertRaises(ValueError):
+            self.make_memory(keep_messages=False, extractor="none")
+
+
+class TestEnginePacker(MemoryTestBase):
+    """With a token budget, recall() packs on the engine's stored embeddings
+    (MemoryEngine.pack_under_budget): the same choice the Python packer makes
+    on the same vectors, without embedding the candidates a second time."""
+
+    FACTS = [
+        "alice adopted a golden retriever puppy named charlie in june",
+        "alice adopted a golden retriever puppy named charlie in july",
+        "bob bought a red bicycle with ten speeds for commuting to work",
+        "carol visited the botanical garden and saw the orchids bloom",
+        "alice walks charlie the puppy every morning before work",
+        "dave learned to bake sourdough with a three-year-old starter",
+        "alice and bob went hiking with charlie near the lake",
+        "erin plays the cello in a small orchestra on sundays",
+        "alice took charlie the retriever to the vet for his shots",
+    ]
+
+    def test_the_engine_packs_what_python_would(self):
+        mem = self.make_memory()
+        self.assertTrue(hasattr(mem.engine, "pack_under_budget"), "stale turbomemory build")
+        for fact in self.FACTS:
+            mem.add([{"role": "user", "content": fact + "."}], user_id="alice")
+        pool = mem.recall("alice charlie puppy work", user_id="alice", top_k=50)
+        self.assertEqual(len(pool), len(self.FACTS))
+        embed = lambda texts: FakeEmbedder().encode(texts)  # noqa: E731
+        for budget in (12, 30, 60, 1000):
+            for lam in (0.3, 0.7):
+                ours = mem._pack([dict(p) for p in pool], budget, lam, None, stored=True)
+                theirs = select_under_budget(pool, budget, embed=embed, lam=lam)
+                self.assertEqual([p["id"] for p in ours], [p["id"] for p in theirs],
+                                 f"budget {budget}, lam {lam}")
+
+    def test_a_budgeted_recall_embeds_only_the_question(self):
+        emb = CountingEmbedder()
+        self.mem = Memory(db_path=self.db_path, embedder=emb, extractor=FakeExtractor())
+        self.mem.add([{"role": "user", "content": f + "."} for f in self.FACTS], user_id="alice")
+        emb.texts = 0
+        results = self.mem.recall("alice charlie", user_id="alice", token_budget=40)
+        self.assertTrue(results)
+        self.assertEqual(emb.texts, 1)
+
+    def test_stored_vectors_are_read_back_by_id(self):
+        mem = self.make_memory()
+        mem.add([{"role": "user", "content": "the sky is blue."}], user_id="alice")
+        [hit] = mem.recall("sky", user_id="alice")
+        rows, found = mem.engine.get_vectors([hit["id"], "no-such-id"])
+        self.assertEqual(rows.shape, (2, 1024))
+        self.assertEqual(found, [True, False])
+        self.assertAlmostEqual(_cosine(rows[0], FakeEmbedder().encode("the sky is blue")), 1.0,
+                               places=5)
+        self.assertFalse(rows[1].any())
 
 
 class TestReinforcement(MemoryTestBase):

@@ -58,6 +58,7 @@ class OtherEmbedder(FakeEmbedder):
 class TestQueryDocumentRouting(MemoryTestBase):
     def make(self, **kwargs):
         self.embedder = RecordingEmbedder()
+        kwargs.setdefault("keep_messages", False)
         self.mem = Memory(self.db_path, embedder=self.embedder, extractor=FakeExtractor(),
                           **kwargs)
         return self.mem
@@ -85,6 +86,11 @@ class TestQueryDocumentRouting(MemoryTestBase):
         self.embedder.calls.clear()
         results = mem.recall("where do I live", user_id="u", token_budget=100)
         self.assertTrue(results)
+        # Stored records are packed on the document vectors the engine keeps.
+        self.assertEqual(self.embedder.kinds(), ["query"])
+        self.embedder.calls.clear()
+        # A turn is not a stored record: its text is embedded, as a document.
+        mem.recall("where do I live", user_id="u", token_budget=100, sources="turn")
         self.assertEqual(self.embedder.kinds(), ["query", "document"])
 
     def test_gists_are_documents(self):

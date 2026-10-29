@@ -20,9 +20,11 @@ ASSISTANT_ROLE_DAMP = 0.85
 # A gist counts as its source: one written from what the user said is ranked
 # like a user fact, the other kind like an assistant fact (the role names are
 # `tsm.compaction.GIST_ROLE` / `GIST_OTHER_ROLE`). Without this a store that
-# has been compacted ranks every raw fact above the history behind it.
-USER_ROLES = frozenset({"user", "summary"})
-ASSISTANT_ROLES = frozenset({"assistant", "summary-assistant"})
+# has been compacted ranks every raw fact above the history behind it. A
+# stored passage of a message (`tsm.chunks.message_role`) counts as its
+# speaker too.
+USER_ROLES = frozenset({"user", "summary", "message"})
+ASSISTANT_ROLES = frozenset({"assistant", "summary-assistant", "message-assistant"})
 
 
 def is_first_person_query(query: str) -> bool:

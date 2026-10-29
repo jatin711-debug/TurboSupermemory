@@ -22,6 +22,7 @@ from tsm.budget import (
     pack_recent,
     select_under_budget,
 )
+from tsm.chunks import MESSAGE_ROLE, is_message, message_role, passages, spoken_by
 from tsm.compaction import GIST_OTHER_ROLE, GIST_ROLE, plan_compaction
 from tsm.concepts import extract_concepts
 from tsm.gist import ExtractiveGistSummarizer, OpenAIGistSummarizer, single_fact, strip_role
@@ -58,6 +59,12 @@ class TestSelectUnderBudget(unittest.TestCase):
         chosen = select_under_budget(pool, 25, embed=_embedder(pool))  # 10 tokens each
         self.assertEqual([p["text"][0] for p in chosen], ["a", "b"])
         self.assertLessEqual(sum(estimate_tokens(p["text"]) for p in chosen), 25)
+
+    def test_a_tie_within_rounding_goes_to_the_one_ranked_first(self):
+        # The second is ahead by less than GAIN_TIE: rounding, not relevance.
+        pool = [_item("a" * 40, 0.5, _A), _item("b" * 40, 0.5 + 1e-7, _B)]
+        chosen = select_under_budget(pool, 10, embed=_embedder(pool))
+        self.assertEqual([p["text"][0] for p in chosen], ["a"])
 
     def test_near_duplicate_is_skipped_not_just_penalized(self):
         pool = [_item("first", 0.9, _A), _item("paraphrase", 0.89, _A_DUP),
@@ -243,6 +250,50 @@ class TestGistRanking(unittest.TestCase):
         self.assertEqual(role_prior(True, GIST_ROLE), role_prior(True, "user"))
         self.assertEqual(role_prior(True, GIST_OTHER_ROLE), ASSISTANT_ROLE_DAMP)
         self.assertEqual(role_prior(False, GIST_ROLE), 1.0)
+
+
+class TestPassages(unittest.TestCase):
+    def test_a_short_message_is_one_passage(self):
+        self.assertEqual(passages("  I moved to Lisbon.  "), ["I moved to Lisbon."])
+        self.assertEqual(passages("   "), [])
+        self.assertEqual(passages(None), [])
+
+    def test_a_long_message_is_cut_between_sentences_and_nothing_is_lost(self):
+        text = " ".join(f"Sentence number {i} says something about topic {i}." for i in range(40))
+        parts = passages(text, max_tokens=30)
+        self.assertGreater(len(parts), 1)
+        self.assertTrue(all(estimate_tokens(p) <= 30 for p in parts))
+        self.assertTrue(all(p.endswith(".") for p in parts), "cuts fall between sentences")
+        self.assertEqual(" ".join(parts), text)
+
+    def test_an_overlong_sentence_is_cut_between_words(self):
+        text = " ".join(f"word{i}" for i in range(200))
+        parts = passages(text, max_tokens=20)
+        self.assertTrue(all(estimate_tokens(p) <= 20 for p in parts))
+        self.assertEqual(" ".join(parts).split(), text.split())
+
+    def test_lines_are_cut_too(self):
+        text = "\n".join("- item %d of a long list that goes on for a while" % i for i in range(30))
+        parts = passages(text, max_tokens=40)
+        self.assertGreater(len(parts), 1)
+        self.assertEqual(" ".join(parts).split(), text.split())
+
+    def test_roles(self):
+        self.assertEqual(message_role("user"), MESSAGE_ROLE)
+        self.assertEqual(message_role(None), MESSAGE_ROLE)
+        self.assertEqual(message_role("assistant"), "message-assistant")
+        for role in ("user", "assistant", "system"):
+            self.assertTrue(is_message(message_role(role)))
+            self.assertEqual(spoken_by(message_role(role)), role)
+        self.assertFalse(is_message("user"))
+        self.assertFalse(is_message("messages"))
+        self.assertFalse(is_message(None))
+        self.assertEqual(spoken_by("assistant"), "assistant")
+
+    def test_a_passage_is_ranked_like_its_speaker(self):
+        self.assertEqual(role_prior(True, message_role("user")), role_prior(True, "user"))
+        self.assertEqual(role_prior(True, message_role("assistant")),
+                         role_prior(True, "assistant"))
 
 
 class TestReading(unittest.TestCase):

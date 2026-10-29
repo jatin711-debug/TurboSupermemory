@@ -487,3 +487,16 @@ class PassthroughExtractor:
         pass
 
 
+class NullExtractor:
+    """Extracts nothing. With ``Memory(keep_messages=True)`` the store then
+    holds the messages as they were said and no model is asked at write time."""
+
+    stores_nothing = True
+
+    def extract_facts(self, message: str, context: Optional[List[str]] = None) -> List[str]:
+        return []
+
+    def flush_cache(self):
+        pass
+
+

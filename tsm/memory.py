@@ -19,6 +19,8 @@ preset (``profile="conversational"``):
   - MMR best-set recall under a token budget,
   - results that say when each memory is from (a date or a turn in front of
     the text handed to a model),
+  - the messages themselves kept next to the facts (``keep_messages``), so
+    what the extractor missed can still be found,
   - optionally, each user's memory kept under a token budget
     (``max_user_tokens``): the newest facts stay as they are and everything
     older is folded into a few short gists.
@@ -40,7 +42,8 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 import numpy as np
 
 from ._loader import load_turbomemory
-from .budget import select_under_budget, total_tokens
+from .budget import MAX_REDUNDANCY, NEW_TURN_BONUS, select_under_budget, total_tokens
+from .chunks import is_message, message_role, passages, spoken_by
 from .compaction import POLICIES, is_gist, plan_compaction
 from .concepts import extract_concepts
 from .identity import bind_embedder
@@ -227,6 +230,7 @@ class Memory:
         reranker: Optional[object] = None,
         max_user_tokens: Optional[int] = None,
         compaction: str = "refold",
+        keep_messages: Optional[bool] = None,
         allow_embedder_change: bool = False,
         idle_consolidation_secs: Optional[float] = None,
         **engine_kwargs,
@@ -249,6 +253,8 @@ class Memory:
                 and refuses another: two models of one dimension are not
                 comparable and search would return wrong results silently.
             extractor: ``Extractor`` implementation. Default: ``OpenAIExtractor``.
+                ``"none"`` extracts nothing: with ``keep_messages`` the store
+                then holds the messages as said, and ``add`` asks no model.
             verifier: ``Verifier`` implementation, or ``"nli"`` /``"llm"``
                 for the two in ``tsm.verification`` (``NLIVerifier``: a small
                 local cross-encoder; ``LLMVerifier``: a chat model, far more
@@ -278,6 +284,21 @@ class Memory:
                 This is per user and by tokens; the engine's ``max_records``
                 is one count for the whole store and keeps whatever is
                 newest.
+            keep_messages: also store every message as it was said, cut
+                into passages of about two sentences (``tsm.chunks``), each a
+                memory of its own beside the facts taken from the message.
+                A message the extractor took nothing from can then still be
+                found, and ``recall`` shows a passage with who said it
+                (``[2024-01-15] user: ...``). Passages are stored under the
+                roles ``"message"`` / ``"message-<role>"``, which belief
+                revision leaves alone and the role prior ranks like their
+                speaker. They cost no model call, only an embedding each.
+                Default (None): on, unless ``max_user_tokens`` is set
+                (compaction does not fold passages yet). On LongMemEval-S
+                (29 questions, judged) it answered 27 where the facts alone
+                answered 19 at 2,000 tokens of context, and 25 against 20 at
+                1,200 (``benchmarks/PHASE_PROGRESS.md``, 2026-10-29). With
+                ``extractor="none"`` it is the whole store: 26 of the 29.
             reranker: optional ``Reranker`` implementation or ``"colbert"``
                 to enable Stage-2 MultiVector late-interaction MaxSim precision
                 reranking (e.g. ``LFM2.5-ColBERT-350M``).
@@ -303,7 +324,7 @@ class Memory:
         # typo, and is reported now rather than at the first add().
         for kind, value, known in (
             ("embedder", embedder, ("openai", "sentence_transformer", "local", "minilm", "gemma")),
-            ("extractor", extractor, ("openai", "gliner", "passthrough")),
+            ("extractor", extractor, ("openai", "gliner", "passthrough", "none")),
             ("reranker", reranker, ("colbert",)),
             ("verifier", verifier, ("nli", "llm")),
         ):
@@ -342,6 +363,10 @@ class Memory:
             from .extractors import PassthroughExtractor
 
             extractor = PassthroughExtractor()
+        elif extractor == "none":
+            from .extractors import NullExtractor
+
+            extractor = NullExtractor()
         if reranker == "colbert":
             from .rerankers import ColBertReranker
 
@@ -395,6 +420,15 @@ class Memory:
         if compaction not in POLICIES:
             raise ValueError(f"compaction must be one of {POLICIES}")
         self.compaction = compaction
+        if keep_messages is None:
+            keep_messages = self.max_user_tokens is None
+        self.keep_messages = bool(keep_messages)
+        if not self.keep_messages and getattr(self.extractor, "stores_nothing", False):
+            raise ValueError('extractor="none" stores nothing without keep_messages')
+        if self.keep_messages and self.max_user_tokens is not None:
+            # Compaction folds by speaker and does not know passages yet: it
+            # would summarize the user's own messages with the assistant's.
+            raise ValueError("keep_messages cannot be combined with max_user_tokens yet")
         if idle_consolidation_secs is not None and not float(idle_consolidation_secs) > 0:
             raise ValueError("idle_consolidation_secs must be positive")
         self._idle_secs = (None if idle_consolidation_secs is None
@@ -472,9 +506,11 @@ class Memory:
             user_id: scope the facts are stored under (recall is scoped too).
 
         Returns:
-            The number of facts stored. Exact-text duplicates within the same
-            batch are skipped (write gate); cross-batch near-duplicates are
-            the engine's job (dedup config / belief revision).
+            The number of memories stored: facts, and with ``keep_messages``
+            the passages of the messages as well. Exact-text duplicates
+            within the same batch are skipped (write gate); cross-batch
+            near-duplicates are the engine's job (dedup config / belief
+            revision).
 
         The facts of one call are stored as a single batch that the engine
         validates before writing anything, so a call either stores all of its
@@ -496,18 +532,22 @@ class Memory:
             if not content:
                 continue
             role = msg.get("role", "user")
-            for fact in self.extractor.extract_facts(content, context):
+            said = [(fact, None) for fact in self.extractor.extract_facts(content, context)]
+            if self.keep_messages:
+                said += [(text, n) for n, text in enumerate(passages(content))]
+            for fact, passage in said:
                 norm = " ".join(fact.lower().split())
                 if not norm or norm in seen_in_batch:
                     continue  # write gate: exact duplicate within this batch
                 seen_in_batch.add(norm)
                 facts.append(fact)
                 metas.append({
-                    "role": role,
+                    "role": role if passage is None else message_role(role),
                     "timestamp": msg.get("timestamp", ""),
                     "content": content,
                     "turn": turn,
                     "turn_index": msg.get("turn_index"),
+                    "passage": passage,
                 })
             context.append(content)
 
@@ -532,13 +572,18 @@ class Memory:
                 turn_index = meta["turn_index"]
                 if turn_index is None:
                     turn_index = assigned_turns.setdefault(meta["turn"], self._insert_counter)
-                payloads.append(json.dumps({
+                payload = {
                     "timestamp": meta["timestamp"],
                     "role": meta["role"],
                     "user_id": user_id,
-                    "original_message": meta["content"],
                     "turn_index": turn_index,
-                }))
+                }
+                if meta["passage"] is None:
+                    payload["original_message"] = meta["content"]
+                else:
+                    # A passage is the message: its place in it is enough.
+                    payload["passage"] = meta["passage"]
+                payloads.append(json.dumps(payload))
             self.engine.insert_batch(
                 ids,
                 facts,
@@ -747,6 +792,8 @@ class Memory:
                 shown = annotate(shown, said_on(p["timestamp"]))
             if sources == "turn" and p.get("facts"):
                 shown = speaker(p["role"]) + shown
+            elif is_message(p["role"]):
+                shown = speaker(spoken_by(p["role"])) + shown
             if self._verified and p.get("superseded_by"):
                 shown = stale_mark(p.get("valid_until")) + shown
             if time_tags and not is_gist(p["role"]):
@@ -776,12 +823,33 @@ class Memory:
         # On a tie the current belief goes before the one it replaced.
         pool.sort(key=lambda p: (-p["score"], "superseded_by" in p))
         if token_budget is None:
-            final = pool[:top_k]
-        else:
-            final = select_under_budget(
-                pool, token_budget, embed=lambda texts: embed_documents(self.embedder, texts),
-                lam=lam, max_items=max_items)
-        return final
+            return pool[:top_k]
+        return self._pack(pool, token_budget, lam, max_items, stored=sources is None)
+
+    def _pack(self, pool: List[Dict], token_budget: int, lam: float,
+              max_items: Optional[int], stored: bool) -> List[Dict]:
+        """``select_under_budget`` on ``pool``. When every candidate is a
+        stored record read as stored (``stored``), the engine makes the same
+        selection on the embeddings it already holds
+        (``MemoryEngine.pack_under_budget``) instead of the candidates' text
+        being embedded a second time."""
+        pack = getattr(self.engine, "pack_under_budget", None)
+        turns = [p.get("turn_index") for p in pool]
+        if pack is not None and stored and all(
+                t is None or (isinstance(t, int) and not isinstance(t, bool)) for t in turns):
+            ids = [p["id"] for p in pool]
+            index = {mid: k for k, mid in enumerate(ids)}
+            pairs = [(k, index[p["superseded_by"]]) for k, p in enumerate(pool)
+                     if p.get("superseded_by") in index]
+            tokens = [max(1, len(p.get("context") or p["text"] or "") // 4) for p in pool]
+            chosen = pack(ids, [float(p["score"]) for p in pool], tokens, turns,
+                          int(token_budget), lam=float(lam), max_items=max_items or None,
+                          never_redundant=pairs, max_redundancy=MAX_REDUNDANCY,
+                          new_turn_bonus=NEW_TURN_BONUS)
+            return [pool[i] for i in chosen]
+        return select_under_budget(
+            pool, token_budget, embed=lambda texts: embed_documents(self.embedder, texts),
+            lam=lam, max_items=max_items)
 
     @staticmethod
     def _pool_item(mid: str, rec: Dict, score: float) -> Dict:
