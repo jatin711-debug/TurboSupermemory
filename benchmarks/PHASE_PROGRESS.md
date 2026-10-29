@@ -3600,3 +3600,129 @@ Two things changed in how the runs were made:
    account still has. `OpenAIGistSummarizer` defaults to gpt-4.1-nano, so
    its gists fail here. A failed gist removes nothing, so `max_user_tokens`
    then bounds nothing.
+
+---
+
+# The messages as said, next to the facts; the packer moves into the engine (2026-10-29)
+
+The 2026-10-28 entries found that every question missing evidence had a turn
+the extractor stored nothing from, and that ranking had little left to gain.
+This entry stores the messages too and measures it on LongMemEval-S, where
+most of each history is unrelated, at the budgets a local-first deployment
+can afford: 600, 1,200 and 2,000 tokens.
+
+**1. `Memory(keep_messages=True)`.** Every message is also stored, cut by
+`tsm/chunks.py` into passages of at most 100 tokens, each a record under the
+role `message` / `message-<role>`.
+- Belief revision leaves passages alone (`belief_source_roles=["user"]`), and
+  the role prior ranks them like their speaker.
+- `recall()` shows a passage as `[date] user: ...`.
+- `extractor="none"` keeps only the passages, so no model is asked at write
+  time.
+
+**2. The budget packer runs in the engine.** `select_under_budget` used to
+embed every candidate again to measure redundancy: 250 texts a recall at
+2,000 tokens, which with an API embedder is a paid call on every read.
+- `turbomemory_core::packing` makes the same greedy MMR choice on the vectors
+  the engine stores (`StorageEngine::pack_under_budget`, Python
+  `MemoryEngine.pack_under_budget`, `get_vectors`).
+- On a synthetic store of 2,274 records, a recall took 15 against 27 ms at
+  600 tokens and 23 against 110 ms at 2,000. It embedded 1 text against 76
+  and 251.
+- On the same pool, the two packers first disagreed on 5 selections. Each
+  time two candidates had exactly equal scores, and numpy and the Rust dot
+  product rounded their redundancy differently in the last bit. Both now
+  treat gains within `GAIN_TIE` = 1e-6 as a tie that goes to the candidate
+  ranked first.
+- The write path stays in Python. Profiled over 500 messages (2,510 records),
+  `insert_batch` took 0.35 s, a hash embedder 0.28 s, and all of `tsm`'s own
+  work (passages, concepts, payloads) about 0.15 s. A real embedder dominates.
+
+How these were run:
+- `shipped_stack_eval.py --variant s --limit 30` (29 questions, one has no
+  evidence turns), `--local-embedder google/embeddinggemma-2` on the GPU.
+- Extractions from the cache (`--extraction-cache-only`): gpt-4.1-nano, which
+  made them, now returns 404 on this account. 2 messages had none.
+- Judged with `--reader notes`, gpt-4.1-mini reading and judging.
+- Logs: `$TSM_EVAL_DIR/runs/free_messages/` and `runs/judged_s30/`.
+- Arms:
+  - `sdk_cognitive`: the facts, as shipped until now.
+  - `sdk_messages`: the facts and the passages in one store.
+  - `sdk_raw`: the passages only.
+
+**Store sizes per history:**
+
+| arm | records | tokens |
+|---|---|---|
+| `sdk_cognitive` | 2,380 | 48,600 |
+| `sdk_messages` | 3,990 | 168,818 |
+| `sdk_raw` | 1,611 | 120,241 |
+
+**Free score: questions with all of their evidence in the context, of 29.**
+
+| arm | 600 | 1,200 | 2,000 |
+|---|---|---|---|
+| `sdk_cognitive` | 16 | 16 | 16 |
+| `sdk_messages` | 24 (9 / 1) | 28 (12 / 0) | 28 (12 / 0) |
+| `sdk_raw` | 23 (10 / 3) | 26 (10 / 0) | 28 (12 / 0) |
+
+**Judged: right answers, of 29** (pairs against `sdk_cognitive`).
+
+| arm | 600 | 1,200 | 2,000 |
+|---|---|---|---|
+| `sdk_cognitive` | 19 | 20 | 19 |
+| `sdk_messages` | 23 (5 / 1, p = 0.22) | 25 (6 / 1, p = 0.12) | **27 (8 / 0, p = 0.01)** |
+| `sdk_raw` | 22 (4 / 1) | 24 (6 / 2) | **26 (8 / 1, p = 0.04)** |
+
+- **The facts have a ceiling the budget cannot lift.** Their evidence score
+  is 16 at every budget and their answers 19 to 20: what was not extracted is
+  not there to find.
+- **The messages lift both.** By 1,200 tokens almost every question has its
+  evidence (28 of 29), and at 2,000 the judged gain is significant even on 29
+  questions.
+- **Messages alone are close behind** (3 / 2 against facts plus messages at
+  2,000, p = 1.0), without a model call at write time.
+- **Against reading the whole history.** On 2026-10-21 the same 29 questions
+  were read in full: every message, about 124k tokens, with the same reader
+  and judge (`runs/s30_notes600.json`, `full_context`). That scored 22.
+  Paired question by question against that run:
+  - facts plus messages at 2,000 tokens: 27, 5 / 0 (p = 0.06);
+  - messages alone: 26, 7 / 3;
+  - the facts alone: 19, 3 / 6.
+  So 2,000 tokens of memory now answer more than the whole history does, on
+  about 1.6% of the tokens. The full-context verdicts are from the earlier
+  run.
+- At 600 tokens, facts plus messages missed 6. Four lacked evidence: the
+  questions with four to six evidence turns. Two were misread with the
+  evidence present.
+- On the free score, `sdk_cognitive_turns` (facts as keys, their turns
+  read) stayed level with or below the facts, as on 2026-10-21. The facts
+  cannot point to a turn they were never taken from.
+
+**The CUDA build.** The 2,000-token free run was repeated on the CUDA build
+(`target/cuda_ext`, picked up through the harness's new `TSM_EXT_DIR`).
+- The device answered the search in 8 stores: the facts-plus-messages
+  histories past 4,096 records, where the CPU build leaves the exact scan.
+- All 29 facts-plus-messages and 29 messages-only contexts were identical to
+  the CPU build's, so the exact device search and the CPU's tiered path chose
+  the same memories at this size.
+- Three facts-only contexts differed, in stores below the line. That CPU run
+  predates `GAIN_TIE` in the Rust packer, and duplicate extracted facts tie
+  exactly. Evidence was identical.
+- At this scale the GPU buys speed, not accuracy. On a 6,000-record store a
+  query took 0.5 ms from the device mirror, after a 2.6 s one-off CUDA
+  start.
+
+**Decision** (rule set before judging: the default changes if facts plus
+messages beats the facts at one budget and loses at none). `keep_messages`
+is on by default (`None`), except with `max_user_tokens`, which it does not
+support yet. Harness arms and the SDK's fact tests pin `keep_messages=False`,
+so earlier arms keep their meaning.
+
+**Caveats.**
+- These are 29 questions from one variant.
+- The evidence score counts a turn as found when any passage of it is in the
+  context. For a long assistant reply that may not be the passage with the
+  answer, so the judged numbers are the ones to quote.
+
+**Cost.** 517 reader and judge requests (485k tokens in, 52k out): $0.28.

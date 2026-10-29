@@ -93,7 +93,7 @@ def run(pairs, layout, verifier, overrides, embedder, rounds=1):
 
     db = tempfile.mkdtemp(prefix="tsm_belief_pairs_")
     memory = Memory(db, embedder=embedder, extractor="passthrough", verifier=verifier,
-                    **overrides)
+                    keep_messages=False, **overrides)
     try:
         def user(i):
             return "u" if layout == "mixed" else f"u{i}"

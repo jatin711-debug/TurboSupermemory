@@ -111,7 +111,8 @@ def evaluate_embedder(model_name: str, pairs: list, split: str):
     # 4. Storage Engine Candidate Retrieval & Consolidation in Mixed Layout
     db_dir = tempfile.mkdtemp(prefix=f"tsm_embed_eval_{model_name.replace('/', '_')}_")
     try:
-        mem = Memory(db_dir, embedder=embedder, extractor="passthrough", profile=None)
+        mem = Memory(db_dir, embedder=embedder, extractor="passthrough", profile=None,
+                     keep_messages=False)
         
         # Ingest all older facts first, then all newer facts
         t0 = time.perf_counter()

@@ -40,6 +40,7 @@ def main():
             db_path=db_path,
             embedder=embedder,
             extractor="passthrough",
+            keep_messages=False,
         )
         raw_facts = conv_facts(extractor, conv, roles=["user"])
         # Semantic deduplication of raw extracted facts

@@ -42,6 +42,7 @@ def inspect():
             db_path=db_path,
             embedder=embedder,
             extractor="passthrough",
+            keep_messages=False,
         )
         
         facts = conv_facts(extractor, conv, roles=None)

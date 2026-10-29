@@ -32,6 +32,14 @@ neighbouring arms belongs to one mechanism:
                     gists stay as written; only the two oldest are merged
                     when the gists outgrow their share
 
+  the messages as said (Memory(keep_messages=True): every message is also
+  stored, in passages of about two sentences, beside the facts)
+    sdk_messages    sdk_cognitive's facts and the messages' passages in one store
+    sdk_raw         the passages only (extractor="none"): no model is asked
+                    at write time
+    sdk_raw_plain   sdk_raw's passages without cognitive search: a plain
+                    vector pool, then recall()'s role prior, packer and tags
+
   any engine setting, as an arm of its own
     --config NAME:KEY=VALUE,...   adds the arm cfg_NAME: sdk_cognitive (the
                             conversational profile, belief detection off) with
@@ -124,6 +132,10 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
+# TSM_EXT_DIR: a directory holding another turbomemory build to run instead
+# of the repo root's (the CUDA one, copied to target/cuda_ext, say).
+if os.environ.get("TSM_EXT_DIR"):
+    sys.path.insert(0, os.path.abspath(os.environ["TSM_EXT_DIR"]))
 
 from cognitive_eval._secrets import ensure_openai_key, key_file_hint  # noqa: E402
 from cognitive_eval.benchmark_datasets.longmemeval import (  # noqa: E402
@@ -144,10 +156,11 @@ BOUNDED = ("sdk_evict", "sdk_evict_gist", "sdk_budget", "sdk_budget_rolling")
 RECALL_ARMS = ("sdk_cognitive", "sdk_cognitive_alpha1", "sdk_belief", "sdk_belief_llm",
                "sdk_belief_llm_exclude", "sdk_belief_llm_nodemote", "sdk_evict",
                "sdk_evict_gist", "sdk_budget", "sdk_budget_rolling", "sdk_budget_rolling_merge",
-               "sdk_budget_delete")
+               "sdk_budget_delete", "sdk_messages", "sdk_raw")
 DIAGNOSTIC = (("sdk_cognitive_trunc", "sdk_cognitive_alpha1", "sdk_pack_capped", "sdk_pack_tagged",
                "sdk_belief_llm_exclude", "sdk_belief_llm_nodemote", "sdk_budget_delete",
-               "sdk_budget_rolling_merge", "full_context")
+               "sdk_budget_rolling_merge", "full_context", "sdk_messages", "sdk_raw",
+               "sdk_raw_plain")
               + tuple(a + "_untagged" for a in RECALL_ARMS)
               + tuple(a + "_turns" for a in RECALL_ARMS))
 DEFAULT_ARMS = UNBOUNDED + BOUNDED
@@ -187,6 +200,12 @@ PAIRS = (
     ("sdk_pack_tagged", "full_context"),
     ("sdk_cognitive_turns", "sdk_cognitive"),
     ("sdk_cognitive_turns", "full_context"),
+    ("sdk_messages", "sdk_cognitive"),
+    ("sdk_raw", "sdk_cognitive"),
+    ("sdk_messages", "sdk_raw"),
+    ("sdk_messages", "full_context"),
+    ("sdk_raw", "full_context"),
+    ("sdk_raw", "sdk_raw_plain"),
 )
 
 
@@ -635,6 +654,11 @@ def main():
                          "run whose judging did not finish)")
     ap.add_argument("--offline", action="store_true",
                     help="no network: cached texts only, proxy judge, fake verdicts, extractive gists")
+    ap.add_argument("--extraction-cache-only", action="store_true",
+                    help="extract nothing: a message the extraction cache does not hold gives no "
+                         "facts (counted, as with --offline) while the judge and reader are real. "
+                         "For a judged run on the stores an --offline run scored, or when the "
+                         "extractor model is no longer served")
     ap.add_argument("--config", action="append", default=[], metavar="NAME:KEY=VALUE[,...]",
                     help="an extra arm cfg_NAME: sdk_cognitive with these engine settings "
                          "(values are read as JSON); may be given several times")
@@ -725,13 +749,16 @@ def main():
     from tsm import Memory
     from tsm._retry import QuotaExhausted
     from tsm.budget import select_under_budget
+    from tsm.chunks import is_message, spoken_by
     from tsm.compaction import is_gist
     from tsm.gist import ExtractiveGistSummarizer, OpenAIGistSummarizer
     from tsm.memory import time_tag
     from tsm.ranking import is_first_person_query, role_prior
+    from tsm.sources import speaker
     from tsm.verification import LLMVerifier
 
-    extraction = CachedExtraction(args.extractor_model, args.offline, mode=args.extraction)
+    extraction = CachedExtraction(args.extractor_model,
+                                  args.offline or args.extraction_cache_only, mode=args.extraction)
     if args.local_embedder:
         from tsm.embedders import SentenceTransformerEmbedder
 
@@ -784,10 +811,15 @@ def main():
 
     tasks = []
     stats = defaultdict(Counter)
+    gpu = Counter()  # what the GPU exact-search mirrors answered, over every store
 
-    def sdk_memory(**kwargs):
+    def sdk_memory(extractor=None, **kwargs):
+        # An arm stores what it names: the facts alone unless it asks for
+        # the messages too (Memory keeps them by default since 2026-10-29).
+        kwargs.setdefault("keep_messages", False)
         db = tempfile.mkdtemp(prefix="tsm_shipped_")
-        return Memory(db, embedder=embedder, extractor=Replay(per_message), **kwargs), db
+        return Memory(db, embedder=embedder, extractor=extractor or Replay(per_message),
+                      **kwargs), db
 
     started = time.time()
     skipped = []
@@ -902,6 +934,26 @@ def main():
                          + f"{m['role']}: {m['content']}", m["turn_index"]) for m in messages]
                 retrieve["full_context"] = lambda q, said=said: said
 
+            def packed(q, mem, cap=None, tags=False):
+                # recall()'s packing on a plain-vector pool of recall()'s size.
+                pool = sdk_pool(mem, embedder, q, user,
+                                max(args.pool_k, 30, args.token_budget // 8))
+                first_person = is_first_person_query(q)
+                for p in pool:
+                    p["score"] *= role_prior(first_person, p["role"])
+                    if tags:
+                        said = (speaker(spoken_by(p["role"])) if is_message(p["role"])
+                                else "")
+                        p["context"] = (time_tag(p["timestamp"], p["turn_index"],
+                                                 minutes=tag_mode == "minute")
+                                        + said + (p["text"] or ""))
+                pool.sort(key=lambda p: -p["score"])
+                chosen = select_under_budget(
+                    pool, args.token_budget,
+                    embed=getattr(embedder, "encode_document", None) or embedder.encode,
+                    lam=0.7, max_items=cap)
+                return [(p.get("context") or p["text"] or "", p["turn_index"]) for p in chosen]
+
             plain_arms = [a for a in ("sdk_plain", "sdk_pack", "sdk_pack_capped",
                                       "sdk_pack_tagged") if a in arms]
             if plain_arms:
@@ -913,31 +965,19 @@ def main():
                         [(p["text"] or "", p["turn_index"])
                          for p in sdk_pool(mem, embedder, q, user, args.pool_k)],
                         args.token_budget)
-
-                def packed(q, mem=mem, cap=None, tags=False):
-                    # recall()'s packing on a plain-vector pool of recall()'s size.
-                    pool = sdk_pool(mem, embedder, q, user,
-                                    max(args.pool_k, 30, args.token_budget // 8))
-                    first_person = is_first_person_query(q)
-                    for p in pool:
-                        p["score"] *= role_prior(first_person, p["role"])
-                        if tags:
-                            p["context"] = (time_tag(p["timestamp"], p["turn_index"],
-                                                     minutes=tag_mode == "minute")
-                                            + (p["text"] or ""))
-                    pool.sort(key=lambda p: -p["score"])
-                    chosen = select_under_budget(
-                        pool, args.token_budget,
-                        embed=getattr(embedder, "encode_document", None) or embedder.encode,
-                        lam=0.7, max_items=cap)
-                    return [(p.get("context") or p["text"] or "", p["turn_index"]) for p in chosen]
                 if "sdk_pack" in arms:
-                    retrieve["sdk_pack"] = packed
+                    retrieve["sdk_pack"] = lambda q, mem=mem: packed(q, mem)
                 if "sdk_pack_tagged" in arms:
-                    retrieve["sdk_pack_tagged"] = lambda q: packed(q, tags=True)
+                    retrieve["sdk_pack_tagged"] = lambda q, mem=mem: packed(q, mem, tags=True)
                 if "sdk_pack_capped" in arms:
                     old_cap = min(10, max(4, args.token_budget // 35))
-                    retrieve["sdk_pack_capped"] = lambda q: packed(q, cap=old_cap)
+                    retrieve["sdk_pack_capped"] = lambda q, mem=mem: packed(q, mem, cap=old_cap)
+            if "sdk_raw_plain" in arms:
+                # sdk_raw's passages read without cognitive search.
+                mem, db = sdk_memory(profile=None, keep_messages=True, extractor="none")
+                opened.append((mem.close, db))
+                mem.add(messages, user_id=user)
+                retrieve["sdk_raw_plain"] = lambda q, mem=mem: packed(q, mem, tags=True)
 
             def shown(results):
                 """What goes in the prompt (a result's context: the text, dated,
@@ -1003,6 +1043,10 @@ def main():
 
             recall_arm("sdk_cognitive", refinement_cosine_threshold=None,
                        contradiction_cosine_threshold=None, extra=list(readings))
+            recall_arm("sdk_messages", keep_messages=True, refinement_cosine_threshold=None,
+                       contradiction_cosine_threshold=None)
+            recall_arm("sdk_raw", keep_messages=True, extractor="none",
+                       refinement_cosine_threshold=None, contradiction_cosine_threshold=None)
             recall_arm("sdk_cognitive_alpha1", refinement_cosine_threshold=None,
                        contradiction_cosine_threshold=None, cognitive_alpha=1.0)
             for name, settings in configs.items():
@@ -1060,6 +1104,12 @@ def main():
         finally:
             for close, db in opened:
                 try:
+                    engine = getattr(getattr(close, "__self__", None), "engine", None)
+                    used = getattr(engine, "gpu_search_stats", lambda: None)()
+                    if used:
+                        gpu["stores"] += 1
+                        gpu["queries"] += used["queries"]
+                        gpu["switched_off"] += not used["active"]
                     close()
                 finally:
                     shutil.rmtree(db, ignore_errors=True)
@@ -1301,7 +1351,16 @@ def main():
         "extractor_calls": getattr(extraction.instance, "calls", 0),
         "skipped_conversations": skipped,
         "offline": args.offline,
+        "extraction_cache_only": args.extraction_cache_only,
+        "turbomemory": getattr(sys.modules.get("turbomemory"), "__file__", None),
+        "gpu_search": dict(gpu),
     }
+    logger.info("turbomemory: %s; GPU exact search answered %d queries in %d stores "
+                "(switched off in %d)", summary["turbomemory"], gpu["queries"], gpu["stores"],
+                gpu["switched_off"])
+    if args.extraction_cache_only and extraction.misses:
+        logger.warning("--extraction-cache-only: %d messages had no cached extraction and gave "
+                       "no facts", extraction.misses)
     if args.offline and (embedder.misses or extraction.misses):
         logger.warning(
             "offline: %d texts had no cached embedding and %d messages no cached extraction, so "
