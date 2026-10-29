@@ -1136,6 +1136,36 @@ class TestKeepMessages(MemoryTestBase):
         # Twice on one day says it again; another day is another occurrence.
         self.assertEqual(sorted(r["timestamp"] for r in results), ["2023-05-01", "2023-06-01"])
 
+    REPLY = (" ".join(f"Point {i} is about workplace safety programs and staff wellbeing."
+                      for i in range(12))
+             + " The first company is Patagonia. The second company is Southwest Airlines.")
+
+    def test_asked_what_the_assistant_said_the_reply_comes_back_whole(self):
+        mem = self.make_memory(keep_messages=True, extractor="none")
+        self.assertGreater(len(passages(self.REPLY)), 2)
+        mem.add([{"role": "user", "content": "Which companies look after their staff?",
+                  "timestamp": "2023-05-01"},
+                 {"role": "assistant", "content": self.REPLY, "timestamp": "2023-05-01"}],
+                user_id="alice")
+        mem.add([{"role": "user", "content": f"I like hiking near lake {i}.",
+                  "timestamp": "2023-06-01"} for i in range(5)], user_id="alice")
+        got = mem.recall("Can you remind me of the two companies you mentioned for staff "
+                         "wellbeing?", user_id="alice", token_budget=400)
+        [reply] = [r for r in got if "Point 0" in r["text"]]
+        self.assertEqual(reply["text"], " ".join(passages(self.REPLY)))
+        self.assertTrue(reply["context"].startswith("[2023-05-01] assistant: Point 0"))
+        self.assertEqual(len(reply["ids"]), len(passages(self.REPLY)))
+        self.assertFalse(any("Point 3" in r["text"] for r in got if r is not reply))
+        self.assertLessEqual(sum(len(r["context"]) // 4 for r in got), 400)
+        # Not asked what the assistant said: passages stay passages.
+        plain = mem.recall("workplace safety programs and staff wellbeing", user_id="alice",
+                           token_budget=400)
+        self.assertFalse(any("Point 0" in r["text"] and "Southwest" in r["text"] for r in plain))
+        # A budget too small for the whole reply takes the passages around the one found.
+        small = mem.recall("Can you remind me of the two companies you mentioned?",
+                           user_id="alice", token_budget=120)
+        self.assertLessEqual(sum(len(r["context"]) // 4 for r in small), 120)
+
     def test_not_combined_with_a_storage_budget(self):
         with self.assertRaises(ValueError):
             self.make_memory(keep_messages=True, max_user_tokens=500)

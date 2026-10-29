@@ -49,7 +49,7 @@ from .concepts import extract_concepts
 from .identity import bind_embedder
 from .interfaces import (  # noqa: F401  (Embedder, Extractor, Verifier: re-exported types)
     Embedder, Extractor, Verifier, embed_documents, embed_query, embedder_fingerprint)
-from .ranking import apply_role_prior, packing_lam
+from .ranking import apply_role_prior, asks_what_assistant_said, packing_lam
 from .sources import SOURCE_TOKENS, speaker, turn_units
 from .when import annotate, said_on
 
@@ -158,6 +158,15 @@ def time_tag(timestamp, turn_index, minutes: bool = False) -> str:
 IDLE_CLOSE_TIMEOUT_SECS = 30.0
 # The least an idle pass waits before trying again after it failed.
 IDLE_RETRY_FLOOR_SECS = 1.0
+
+# Asked what the assistant said, recall() returns the reply it found whole
+# (its passages joined in order), in at most this share of the token budget.
+REPLY_SHARE = 0.75
+# How many of the best-scored replies come back whole.
+REPLIES_WHOLE = 2
+# How many ids after a passage are read to find the rest of its message when
+# the passage was stored without the message's passage count.
+REPLY_WINDOW = 32
 
 # Engine methods this SDK cannot work without. The extension and the SDK ship
 # together; this guards against a stale locally-built turbomemory.pyd/.so.
@@ -533,8 +542,8 @@ class Memory:
                 continue
             role = msg.get("role", "user")
             said = [(fact, None) for fact in self.extractor.extract_facts(content, context)]
-            if self.keep_messages:
-                said += [(text, n) for n, text in enumerate(passages(content))]
+            parts = passages(content) if self.keep_messages else []
+            said += [(text, n) for n, text in enumerate(parts)]
             for fact, passage in said:
                 norm = " ".join(fact.lower().split())
                 if not norm or norm in seen_in_batch:
@@ -548,6 +557,7 @@ class Memory:
                     "turn": turn,
                     "turn_index": msg.get("turn_index"),
                     "passage": passage,
+                    "passages": len(parts),
                 })
             context.append(content)
 
@@ -583,6 +593,7 @@ class Memory:
                 else:
                     # A passage is the message: its place in it is enough.
                     payload["passage"] = meta["passage"]
+                    payload["passages"] = meta["passages"]
                 payloads.append(json.dumps(payload))
             self.engine.insert_batch(
                 ids,
@@ -825,8 +836,107 @@ class Memory:
         pool.sort(key=lambda p: (-p["score"], "superseded_by" in p))
         if token_budget is None:
             return pool[:top_k]
-        return self._pack(pool, token_budget, packing_lam(query, lam), max_items,
-                          stored=sources is None)
+        chosen = self._pack(pool, token_budget, packing_lam(query, lam), max_items,
+                            stored=sources is None)
+        if sources is None and asks_what_assistant_said(query):
+            chosen = self._whole_reply(chosen, token_budget)
+        return chosen
+
+    def _whole_reply(self, chosen: List[Dict], token_budget: int) -> List[Dict]:
+        """For a question about what the assistant said: each of the
+        ``REPLIES_WHOLE`` best-scored assistant replies with a passage in
+        ``chosen`` comes back whole, its passages joined in order into one
+        result in that passage's place.
+
+        A long reply is stored as several passages, and the packer took the
+        ones that read most like the question, not the whole list or the
+        second of two names the question asks about ("the two companies you
+        mentioned"). The replies take at most ``REPLY_SHARE`` of the budget
+        together, the passages nearest the chosen one first. The rest of
+        ``chosen`` keeps its order, and the last chosen are dropped until it
+        fits.
+        """
+        anchors = sorted((p for p in chosen if is_message(p["role"])
+                          and spoken_by(p["role"]) != "user" and p.get("passage") is not None),
+                         key=lambda p: -p["score"])
+        left = max(1, int(token_budget * REPLY_SHARE))
+        replies: Dict[str, Dict] = {}
+        taken = set()
+        seen = set()
+        for anchor in anchors:
+            if len(replies) == REPLIES_WHOLE:
+                break
+            if anchor["turn_index"] in seen:
+                continue
+            seen.add(anchor["turn_index"])
+            group, prefix = self._reply_around(anchor, left)
+            if len(group) < 2:
+                continue
+            text = " ".join(p["text"] for p in group)
+            replies[anchor["id"]] = dict(anchor, text=text, context=prefix + text,
+                                         ids=[p["id"] for p in group])
+            taken.update(p["id"] for p in group)
+            left -= max(1, len(prefix + text) // 4)
+        if not replies:
+            return chosen
+        out = []
+        for p in chosen:
+            if p["id"] in replies:
+                out.append(replies[p["id"]])
+            elif p["id"] not in taken:
+                out.append(p)
+        whole = {id(r) for r in replies.values()}
+        while len(out) > len(whole) and total_tokens([p["context"] for p in out]) > token_budget:
+            out.pop(max(k for k, p in enumerate(out) if id(p) not in whole))
+        return out
+
+    def _reply_around(self, anchor: Dict, cap: int) -> Tuple[List[Dict], str]:
+        """The passages of ``anchor``'s message around it, in order, that fit
+        ``cap`` tokens with the anchor's tags in front (returned with them)."""
+        context, text = anchor.get("context") or "", anchor["text"] or ""
+        if not text or not context.endswith(text):
+            return [], ""  # the text was rewritten for display (event_dates)
+        prefix = context[:len(context) - len(text)]
+        parts = self._reply_passages(anchor)
+        at = next((k for k, p in enumerate(parts) if p["id"] == anchor["id"]), None)
+        if at is None:
+            return [], prefix
+
+        def size(lo, hi):
+            return max(1, len(prefix + " ".join(p["text"] for p in parts[lo:hi])) // 4)
+
+        lo, hi = at, at + 1
+        if size(lo, hi) > cap:
+            return [], prefix
+        grown = True
+        while grown:
+            grown = False
+            for nlo, nhi in ((lo - 1, hi), (lo, hi + 1)):
+                if 0 <= nlo and nhi <= len(parts) and size(nlo, nhi) <= cap:
+                    lo, hi, grown = nlo, nhi, True
+        return parts[lo:hi], prefix
+
+    def _reply_passages(self, anchor: Dict) -> List[Dict]:
+        """The stored passages of the message ``anchor`` is a passage of, in
+        order. A message's passages are written in one batch, one after the
+        other, so their ids are consecutive; ``passages`` (the count stored
+        with each) bounds the ids to read. A passage stored before the count
+        was kept is read in a window of ``REPLY_WINDOW``."""
+        prefix, _, seq = anchor["id"].rpartition("_")
+        if not seq.isdigit():
+            return [anchor]
+        seq, at = int(seq), int(anchor["passage"])
+        count = anchor.get("passages")
+        last = seq + (int(count) - 1 - at if count else REPLY_WINDOW)
+        ids = [f"{prefix}_{k}" for k in range(max(0, seq - at), last + 1)]
+        parts = []
+        for mid, rec in self._records(ids).items():
+            payload = rec["payload"]
+            if (rec["source_role"] == anchor["role"] and rec["scope"] == anchor["scope"]
+                    and payload.get("turn_index") == anchor["turn_index"]
+                    and payload.get("passage") is not None):
+                parts.append(dict(self._pool_item(mid, rec, anchor["score"])))
+        return sorted(parts, key=lambda p: p["passage"])
 
     def _pack(self, pool: List[Dict], token_budget: int, lam: float,
               max_items: Optional[int], stored: bool) -> List[Dict]:
@@ -865,6 +975,8 @@ class Memory:
                 "timestamp": payload.get("timestamp"),
                 "source": payload.get("original_message"),
                 "span": payload.get("span"),
+                "passage": payload.get("passage"),
+                "passages": payload.get("passages"),
                 "occasion": occasion(rec["source_role"], payload.get("timestamp"))}
 
     def _resolve_beliefs(self, pool: List[Dict], user_id: Optional[str]) -> None:
