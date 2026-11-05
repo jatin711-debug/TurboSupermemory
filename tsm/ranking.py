@@ -1,6 +1,6 @@
 """Role prior applied to recall scores.
 
-A question phrased from the user's side ("what did I...", "how many ...") is
+A question about the user ("what did I buy", "how many tanks do I have") is
 far more often answered by something the user said than by the assistant's own
 reply, so user-sourced facts are boosted and assistant-sourced ones damped for
 such queries.
@@ -9,13 +9,21 @@ such queries.
 import re
 from typing import Dict, List, Optional
 
-# Tokens that mark a query as asking about the user's own facts. Deliberately
-# broad (it includes common question words): this is the cue set the
-# evaluations were run with, so change it together with a re-run.
+# Words that make a question one about the user: first-person pronouns only.
+# The list once held question words too ("what", "how", "did", "have",
+# "total", "number", "many"), so the prior fired on nearly every question,
+# including questions about someone else. On LoCoMo, conversations between
+# two people stored as "user" and "assistant", "What did Melanie paint?"
+# boosted the other speaker and buried Melanie's own words: 1,177 of 1,977
+# questions had all of their evidence in a 2,000-token context with the old
+# list, 1,560 with this one (422 / 39). LongMemEval, whose questions say "I"
+# and "my", did not move (S 31-130 with messages 91 / 91, the oracle dev
+# questions with facts 81 / 81; 2026-10-29).
 FIRST_PERSON_CUES = frozenset({
-    "i", "my", "me", "mine", "we", "our", "did", "have", "how", "what",
-    "total", "number", "many",
+    "i", "me", "my", "mine", "myself", "we", "us", "our", "ours", "ourselves",
+    "i'm", "i've", "i'd", "i'll", "we're", "we've", "we'd", "we'll",
 })
+_WORD = re.compile(r"[a-z]+(?:'[a-z]+)?")
 
 USER_ROLE_BOOST = 1.30
 ASSISTANT_ROLE_DAMP = 0.85
@@ -54,8 +62,9 @@ ASSISTANT_RECALL_CUES = re.compile(
 
 
 def is_first_person_query(query: str) -> bool:
-    """True when ``query`` contains any first-person / question cue token."""
-    return any(w in FIRST_PERSON_CUES for w in query.lower().split())
+    """True when ``query`` speaks of the user: it has a first-person pronoun."""
+    return any(w in FIRST_PERSON_CUES
+               for w in _WORD.findall((query or "").lower().replace("\u2019", "'")))
 
 
 def asks_what_assistant_said(query: str) -> bool:

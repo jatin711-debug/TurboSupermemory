@@ -250,6 +250,14 @@ class TestConceptsAndRanking(unittest.TestCase):
     def test_role_prior(self):
         self.assertTrue(is_first_person_query("What did I buy?"))
         self.assertFalse(is_first_person_query("capital of France"))
+        # Question words alone do not make a question about the user: on a
+        # history between two people the prior then buried the other one.
+        for q in ("What did Melanie paint?", "How many tanks does Bob have?",
+                  "When did Caroline go to the support group?", "What is the total?"):
+            self.assertFalse(is_first_person_query(q), q)
+        for q in ("How many tanks do I have?", "Where did we go?", "I'm curious about it",
+                  "Remind me of my sister's name"):
+            self.assertTrue(is_first_person_query(q), q)
         self.assertEqual(role_prior(True, "user"), 1.30)
         self.assertEqual(role_prior(True, "assistant"), 0.85)
         self.assertEqual(role_prior(True, "gist"), 1.0)
