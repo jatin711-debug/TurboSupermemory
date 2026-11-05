@@ -42,14 +42,16 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 import numpy as np
 
 from ._loader import load_turbomemory
-from .budget import MAX_REDUNDANCY, NEW_TURN_BONUS, select_under_budget, total_tokens
+from .budget import (MAX_REDUNDANCY, NEW_TURN_BONUS, estimate_tokens, select_under_budget,
+                     total_tokens)
 from .chunks import is_message, message_role, occasion, passages, spoken_by
 from .compaction import POLICIES, is_gist, plan_compaction
 from .concepts import extract_concepts
+from .events import EVENT_DIR, EVENT_POOL, EVENT_ROLE, EVENT_SHARE, event_note, event_text
 from .identity import bind_embedder
 from .interfaces import (  # noqa: F401  (Embedder, Extractor, Verifier: re-exported types)
     Embedder, Extractor, Verifier, embed_documents, embed_query, embedder_fingerprint)
-from .ranking import apply_role_prior, asks_what_assistant_said, packing_lam
+from .ranking import apply_role_prior, asks_what_assistant_said, is_counting_query, packing_lam
 from .sources import SOURCE_TOKENS, speaker, turn_units
 from .when import annotate, said_on
 
@@ -242,6 +244,7 @@ class Memory:
         keep_messages: Optional[bool] = None,
         allow_embedder_change: bool = False,
         idle_consolidation_secs: Optional[float] = None,
+        events: Optional[object] = None,
         **engine_kwargs,
     ):
         """
@@ -327,6 +330,21 @@ class Memory:
                 a verifier could not finish (``verifier.unresolved``), is
                 tried again after another idle period. ``close()`` stops the
                 thread first. Default ``None``: consolidate when you call it.
+            events: also list the events each user message reports (what
+                the user did, bought, attended, owns or plans, with amounts
+                and when; ``tsm.events``) and store each as a short record
+                in an engine of its own (``<db_path>/tsm_events``), so the
+                user's memories and their search are exactly as without
+                events. ``recall()`` of a question that
+                counts or totals then gives the best of them a share of its
+                budget (``EVENT_SHARE``), one dated line each, so the
+                instances a count needs fit where a few passages would.
+                ``True`` / ``"openai"`` is ``OpenAIEventExtractor``; any
+                object with ``extract_events(message, context)`` works (and
+                ``extract_many(items)`` is used when it has one). One request
+                per user message. Default ``None``: no events. A store that
+                has events uses them in ``recall()`` whether or not an
+                extractor is passed when it is reopened.
             **engine_kwargs: forwarded to ``turbomemory.MemoryEngine``.
         """
         # Backend names are resolved here; anything else that is a string is a
@@ -376,6 +394,17 @@ class Memory:
             from .extractors import NullExtractor
 
             extractor = NullExtractor()
+        if events is True or events == "openai":
+            import os
+
+            from .events import OpenAIEventExtractor
+
+            events = OpenAIEventExtractor(cache_dir=os.path.join(db_path, "tsm_cache"))
+        elif isinstance(events, str) or events is False:
+            if events is not False:
+                raise ValueError(f"unknown events {events!r}: use True, 'openai' or an instance")
+            events = None
+        self.events = events
         if reranker == "colbert":
             from .rerankers import ColBertReranker
 
@@ -494,6 +523,23 @@ class Memory:
         # when an existing database is reopened.
         self._insert_counter = max(0, int(self.engine.next_insert_seq()) - 1)
 
+        # Events live in an engine of their own: the word index and concept
+        # graph are shared by every scope of an engine, so event records in
+        # the main one changed the scores of every ordinary search.
+        import os
+
+        self._event_engine = None
+        self._event_counter = 0
+        event_dir = os.path.join(db_path, EVENT_DIR)
+        if self.events is not None or os.path.isdir(event_dir):
+            try:
+                self._event_engine = turbomemory.MemoryEngine(db_path=event_dir,
+                                                              dimension=self.dim)
+            except BaseException:
+                self.close()
+                raise
+            self._event_counter = max(0, int(self._event_engine.next_insert_seq()) - 1)
+
         if self._idle_secs is not None:
             # A store written by an earlier session may never have been
             # consolidated: the first idle period does it.
@@ -536,6 +582,7 @@ class Memory:
         metas: List[Dict] = []
         seen_in_batch = set()
         context: List[str] = []
+        reported = self._events_of(messages)
         for turn, msg in enumerate(messages):
             content = (msg.get("content") or "").strip()
             if not content:
@@ -559,6 +606,19 @@ class Memory:
                     "passage": passage,
                     "passages": len(parts),
                 })
+            for event in reported.get(turn, ()):
+                text = event_text(event)
+                # Two mentions of one kind of thing are what a count needs:
+                # the write gate only skips a repeat within one message.
+                norm = (turn, " ".join(text.lower().split()))
+                if norm in seen_in_batch:
+                    continue
+                seen_in_batch.add(norm)
+                facts.append(text)
+                metas.append({"role": EVENT_ROLE, "timestamp": msg.get("timestamp", ""),
+                              "content": content, "turn": turn,
+                              "turn_index": msg.get("turn_index"), "passage": None,
+                              "passages": 0, "event": event})
             context.append(content)
 
         if not facts:
@@ -575,7 +635,12 @@ class Memory:
             ids: List[str] = []
             payloads: List[str] = []
             for meta in metas:
-                ids.append(self._next_id(user_id))
+                if meta.get("event") is not None:
+                    self._event_counter += 1
+                    ids.append(f"{user_id}_e{self._event_counter}" if user_id
+                               else f"e{self._event_counter}")
+                else:
+                    ids.append(self._next_id(user_id))
                 # A caller-supplied turn index wins. Otherwise the turn is keyed
                 # by the sequence number of its first stored fact: unique per
                 # message and durable across restarts, like the ids themselves.
@@ -588,6 +653,8 @@ class Memory:
                     "user_id": user_id,
                     "turn_index": turn_index,
                 }
+                if meta.get("event") is not None:
+                    payload["event"] = meta["event"]
                 if meta["passage"] is None:
                     payload["original_message"] = meta["content"]
                 else:
@@ -595,21 +662,47 @@ class Memory:
                     payload["passage"] = meta["passage"]
                     payload["passages"] = meta["passages"]
                 payloads.append(json.dumps(payload))
-            self.engine.insert_batch(
-                ids,
-                facts,
-                embeddings,
-                [1.0] * len(facts),
-                [extract_concepts(fact) for fact in facts],
-                payloads,
-                [user_id] * len(facts) if user_id is not None else None,
-                [str(meta["role"]) for meta in metas],
-            )
+            mine = [k for k, meta in enumerate(metas) if meta.get("event") is None]
+            reported = [k for k, meta in enumerate(metas) if meta.get("event") is not None]
+            # The memories first, then their events: a failure on the events
+            # leaves the memories stored and raises.
+            for engine, rows in ((self.engine, mine), (self._event_engine, reported)):
+                if not rows:
+                    continue
+                engine.insert_batch(
+                    [ids[k] for k in rows],
+                    [facts[k] for k in rows],
+                    np.ascontiguousarray(embeddings[rows]),
+                    [1.0] * len(rows),
+                    [extract_concepts(facts[k]) for k in rows],
+                    [payloads[k] for k in rows],
+                    [user_id] * len(rows) if user_id is not None else None,
+                    [str(metas[k]["role"]) for k in rows],
+                )
             if self.max_user_tokens is not None and user_id is not None:
                 self._touched.add(user_id)
             self._pending = True
         self._activity = time.monotonic()
         return len(facts)
+
+    def _events_of(self, messages: List[Dict]) -> Dict[int, List[Dict]]:
+        """The events each user message in ``messages`` reports, by its
+        position, asked for all messages at once when the extractor can."""
+        if self.events is None:
+            return {}
+        asked, items, context = [], [], []
+        for turn, msg in enumerate(messages):
+            content = (msg.get("content") or "").strip()
+            if not content:
+                continue
+            if msg.get("role", "user") == "user":
+                asked.append(turn)
+                items.append((content, list(context)))
+            context.append(content)
+        many = getattr(self.events, "extract_many", None)
+        found = (many(items) if many is not None
+                 else [self.events.extract_events(m, c) for m, c in items])
+        return {turn: list(events or []) for turn, events in zip(asked, found)}
 
     def _compress_gist(self, texts: List[str]):
         """Gist-compressor callback handed to the engine (B4).
@@ -651,14 +744,15 @@ class Memory:
             if not self.engine.contains_id(memory_id):
                 return memory_id
 
-    def _records(self, ids: List[str]) -> Dict[str, Dict]:
-        """Stored record metadata for ``ids``, read back from the engine.
+    def _records(self, ids: List[str], engine=None) -> Dict[str, Dict]:
+        """Stored record metadata for ``ids``, read back from the engine
+        (``engine``, by default the memories' one).
 
         Maps id -> ``{"text", "scope", "source_role", "payload", ...}`` with
         ``payload`` parsed to a dict. Ids that are no longer live are omitted.
         """
         out: Dict[str, Dict] = {}
-        for rec in self.engine.get_records(list(ids)):
+        for rec in (engine or self.engine).get_records(list(ids)):
             if rec is None:
                 continue
             try:
@@ -685,6 +779,7 @@ class Memory:
         sources: Optional[str] = None,
         source_tokens: int = SOURCE_TOKENS,
         event_dates: bool = False,
+        events: Optional[float] = None,
     ) -> List[Dict]:
         """Search memories under ``user_id``'s scope.
 
@@ -747,6 +842,13 @@ class Memory:
         reader's arithmetic. A verified-superseded memory says by when it
         changed (``STALE_BY``: the date its replacement was said) whenever
         that date is known.
+
+        With a token budget and a question that counts or totals
+        (``tsm.ranking.is_counting_query``), the events stored with
+        ``Memory(events=...)`` are searched too and the best of them take up
+        to ``events`` of the budget (default ``EVENT_SHARE``; 0 turns this
+        off), each one dated line with role ``"event"``, after the memories
+        packed into the rest. Without stored events nothing changes.
 
         ``recall()`` is a read: asking does not change what the next call
         returns. Use ``reinforce()`` to tell the memory which results were
@@ -836,11 +938,47 @@ class Memory:
         pool.sort(key=lambda p: (-p["score"], "superseded_by" in p))
         if token_budget is None:
             return pool[:top_k]
-        chosen = self._pack(pool, token_budget, packing_lam(query, lam), max_items,
+        notes = []
+        share = EVENT_SHARE if events is None else float(events)
+        if share > 0 and is_counting_query(query):
+            notes = self._event_notes(query, query_embedding, user_id,
+                                      int(token_budget * min(share, 1.0)), time_tags)
+        budget = max(1, token_budget - sum(estimate_tokens(n["context"]) for n in notes))
+        chosen = self._pack(pool, budget, packing_lam(query, lam), max_items,
                             stored=sources is None)
         if sources is None and asks_what_assistant_said(query):
-            chosen = self._whole_reply(chosen, token_budget)
-        return chosen
+            chosen = self._whole_reply(chosen, budget)
+        return chosen + notes
+
+    def _event_notes(self, query: str, query_embedding, user_id: Optional[str],
+                     budget: int, time_tags) -> List[Dict]:
+        """The user's stored events that best match ``query``, best first, as
+        recall results, within ``budget`` tokens. Empty when none are stored."""
+        if budget <= 0 or self._event_engine is None:
+            return []
+        results = self._event_engine.search(query_text=query, query_embedding=query_embedding,
+                                            top_k=EVENT_POOL, scope=user_id)
+        if not results:
+            return []
+        records = self._records([mid for mid, _ in results], self._event_engine)
+        notes, used = [], 0
+        for mid, score in results:
+            rec = records.get(mid)
+            if rec is None or rec["scope"] != user_id:
+                continue
+            item = self._pool_item(mid, rec, float(score))
+            event = rec["payload"].get("event") or {"what": rec["text"] or ""}
+            shown = event_note(event, item["timestamp"])
+            if time_tags:
+                shown = time_tag(item["timestamp"], item["turn_index"],
+                                 minutes=time_tags == "minute") + shown
+            cost = estimate_tokens(shown)
+            if used + cost > budget:
+                continue  # a shorter one further down may still fit
+            used += cost
+            item.update(context=shown, event=event, source=rec["payload"].get("original_message"))
+            notes.append(item)
+        return notes
 
     def _whole_reply(self, chosen: List[Dict], token_budget: int) -> List[Dict]:
         """For a question about what the assistant said: each of the
@@ -1257,6 +1395,8 @@ class Memory:
         """Durably persist all pending writes."""
         self._require_open()
         self.engine.flush()
+        if self._event_engine is not None:
+            self._event_engine.flush()
 
     def close(self) -> None:
         """Flush and release the engine. Idempotent.
@@ -1268,7 +1408,13 @@ class Memory:
         if not self._closed:
             self._stop_idle_worker()
             try:
-                self.engine.close()
+                if getattr(self, "_event_engine", None) is not None:
+                    try:
+                        self._event_engine.close()
+                    finally:
+                        self.engine.close()
+                else:
+                    self.engine.close()
             finally:
                 # The engine handle is released even when its final flush
                 # raises, so this object is closed either way.
@@ -1278,7 +1424,8 @@ class Memory:
                 # hundred entries or at interpreter exit.
                 for backend, method in ((self.extractor, "flush_cache"),
                                         (self.embedder, "flush"),
-                                        (self.verifier, "flush_cache")):
+                                        (self.verifier, "flush_cache"),
+                                        (self.events, "flush_cache")):
                     flush = getattr(backend, method, None)
                     if callable(flush):
                         try:
