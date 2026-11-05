@@ -8,7 +8,7 @@ question using ONLY those memories -> an LLM judges the answer against gold.
 extraction:
   - "auto"   : Ollama if its server is reachable, else OpenAI (needs
                OPENAI_API_KEY), else a clear error.
-  - "ollama" / "openai" : force a backend.
+  - "ollama" / "openai" / "anthropic" : force a backend.
 """
 
 import logging
@@ -26,9 +26,14 @@ def create_judge(
     ollama_model="qwen2.5:3b",
     openai_model="gpt-4o-mini",
     minimax_model="MiniMax-M3",
+    anthropic_model="claude-haiku-5-5",
 ):
     if name == "openai":
         return OpenAIJudge(model=openai_model)
+    if name == "anthropic":
+        from .anthropic_judge import AnthropicJudge
+
+        return AnthropicJudge(model=anthropic_model)
     if name == "ollama":
         from .ollama_judge import OllamaJudge
         return OllamaJudge(model=ollama_model)

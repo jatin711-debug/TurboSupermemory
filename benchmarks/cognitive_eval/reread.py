@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from cognitive_eval._secrets import ensure_openai_key  # noqa: E402
-from cognitive_eval.judge.openai_judge import OpenAIJudge  # noqa: E402
+from cognitive_eval.judge import create_judge  # noqa: E402
 
 logger = logging.getLogger("reread")
 
@@ -50,14 +50,20 @@ def main():
     ap.add_argument("--arm", action="append", required=True, metavar="NAME=PATH:ARM")
     ap.add_argument("--reads", type=int, default=5)
     ap.add_argument("--reader", default="notes", choices=["plain", "notes", "tools"])
-    ap.add_argument("--judge-model", default="gpt-4.1-mini")
+    ap.add_argument("--provider", choices=["openai", "anthropic"], default="openai")
+    ap.add_argument("--judge-model", default=None,
+                    help="default gpt-4.1-mini (openai) or claude-haiku-5-5 (anthropic)")
+    ap.add_argument("--reader-effort", default=None,
+                    help="anthropic: the reader's effort (low ... max)")
     ap.add_argument("--workers", type=int, default=32)
     ap.add_argument("--out", default=None, help="write every read here (JSON)")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    if not ensure_openai_key():
+    if args.provider == "openai" and not ensure_openai_key():
         sys.exit("OPENAI_API_KEY is not set")
+    if args.judge_model is None:
+        args.judge_model = "claude-haiku-5-5" if args.provider == "anthropic" else "gpt-4.1-mini"
 
     arms = {}
     for spec in args.arm:
@@ -78,7 +84,9 @@ def main():
     for a in arms.values():
         for q in shared:
             distinct.setdefault(key(a[q]), a[q])
-    judge = OpenAIJudge(model=args.judge_model)
+    judge = create_judge(args.provider, openai_model=args.judge_model,
+                         anthropic_model=args.judge_model)
+    judge.reader_effort = args.reader_effort
     logger.info("%d arms, %d shared questions, %d distinct contexts, %d reads each",
                 len(arms), len(shared), len(distinct), args.reads)
 

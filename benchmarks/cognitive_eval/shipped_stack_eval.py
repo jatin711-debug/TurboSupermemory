@@ -680,8 +680,11 @@ def main():
     ap.add_argument("--event-model", default="gpt-4o-mini",
                     help="the model sdk_raw_events lists each user message's events with")
     ap.add_argument("--verifier-model", default="gpt-4o-mini")
-    ap.add_argument("--judge", choices=["openai", "none"], default="openai")
-    ap.add_argument("--judge-model", default="gpt-4.1-mini")
+    ap.add_argument("--judge", choices=["openai", "anthropic", "none"], default="openai",
+                    help="who reads and grades: OpenAI, Anthropic (Claude), or no one "
+                         "(the free evidence score)")
+    ap.add_argument("--judge-model", default=None,
+                    help="default gpt-4.1-mini (openai) or claude-haiku-5-5 (anthropic)")
     ap.add_argument("--reader-model", default=None,
                     help="answer with this model instead of the judge's (the judge still "
                          "grades), e.g. gpt-5-mini")
@@ -835,7 +838,11 @@ def main():
     else:
         from cognitive_eval.judge import create_judge
 
-        judge = create_judge("openai", openai_model=args.judge_model)
+        if args.judge_model is None:
+            args.judge_model = ("claude-haiku-5-5" if args.judge == "anthropic"
+                                else "gpt-4.1-mini")
+        judge = create_judge(args.judge, openai_model=args.judge_model,
+                             anthropic_model=args.judge_model)
         judge.reader_model = args.reader_model
         judge.reader_effort = args.reader_effort
     def asked(*names):

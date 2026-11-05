@@ -79,3 +79,30 @@ def minimax_key_file_hint() -> str:
         f"Create a file containing the key, e.g. {_MINIMAX_CANDIDATES[0]}, or set "
         "MINIMAX_API_KEY. The file is gitignored and never printed."
     )
+
+
+_ANTHROPIC_CANDIDATES = [
+    _REPO_ROOT / "claude_key.txt",
+    _REPO_ROOT / ".claude_key",
+    Path.home() / ".claude_key",
+]
+
+
+def ensure_anthropic_key() -> bool:
+    """Load ANTHROPIC_API_KEY from the environment or a gitignored key file
+    (``claude_key.txt``: the bare key or ``ANTHROPIC_API_KEY=...``)."""
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return True
+    for path in _ANTHROPIC_CANDIDATES:
+        try:
+            if not path.exists():
+                continue
+            key = path.read_text(encoding="utf-8").strip()
+            if key.upper().startswith("ANTHROPIC_API_KEY"):
+                key = key.split("=", 1)[-1].strip().strip('"').strip("'")
+            if key:
+                os.environ["ANTHROPIC_API_KEY"] = key
+                return True
+        except OSError:
+            continue
+    return False
