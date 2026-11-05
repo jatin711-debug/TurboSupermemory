@@ -4099,7 +4099,7 @@ and leaves the judge alone.
 - Cost: reader 1.40M tokens in and 0.32M out (about $1.00), judge about
   $0.05.
 
-# A typed event table for counting questions (2026-11-05, inconclusive)
+# A typed event table for counting questions (2026-11-05): no gain
 
 **What was built.** `tsm/events.py` and `Memory(events=...)`, off by default.
 Each user message with a first-person word is asked (gpt-4o-mini, JSON mode,
@@ -4136,10 +4136,24 @@ The extraction prompt was written looking at the first 12 of these questions.
 - Before events, 15 of the 20 wrong answers had all their evidence in the
   context: the reader miscounts what it has (jewelry 2 for 3, properties 5 for
   4, weddings 4 for 3, charity $8,750 for $3,750).
-- A reading of every context five times (`benchmarks/cognitive_eval/reread.py`)
-  was started to settle it and stopped: the OpenAI account ran out of credit.
-  That is the next step: `reread.py --reads 5` over `ms_raw_2000.json` and
-  `ms_events2_2000.json`, then the 367 other S questions (non-counting
-  contexts are now unchanged, so only the judge's noise is at stake there).
+- **Settled with five readings of every context** (`reread.py --provider
+  anthropic --reads 5`, claude-haiku-5-5 reading and judging, after the
+  OpenAI account ran out of credit; `runs/2026-11-05b/reread5_haiku.json`):
+
+  | contexts | mean right of 121 | right in all 5 |
+  |---|---|---|
+  | sdk_raw | **95.8** | 83 |
+  | sdk_raw_events, events in the memories' engine | 93.4 | 84 |
+  | sdk_raw_events, events in their own engine | 93.6 | 83 |
+
+  sdk_raw is right more often on 13 questions and less often on 9 against
+  the second (p = 0.52), 18 / 14 against the first. **The event table does
+  not improve answers**; if anything the 30% of the budget it takes from
+  the passages costs a little. It stays opt-in and off. Bringing in more of
+  the instances (evidence 116 against 111) did not change what the reader
+  counts.
+- Haiku reads this slice worse than gpt-4.1-mini (95.8 of 121 against 101
+  to 104 in single reads), so its scores are for comparing arms, not for
+  quoting. Cost: 3,343 requests, 6.1M tokens in and 1.0M out, about $1.10.
 - Cost: about 21,000 extraction requests (gpt-4o-mini, roughly $3) and three
   judged passes over 121 to 242 answers.
