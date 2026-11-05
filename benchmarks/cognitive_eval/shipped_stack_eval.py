@@ -236,12 +236,17 @@ class Embeddings:
     file for texts it does not hold. Another run may be writing the shared
     cache, so this one never does.
 
-    ``Memory.close()`` flushes its embedder, so ``flush`` runs once per store:
-    it writes only when vectors were added since the last write (it used to
-    rewrite the whole overlay, hundreds of MB, after every history), holds a
-    lock against the threads of ``--jobs``, and writes through a temporary
-    file named by this process, so two runs sharing a work dir do not collide
-    on it (the last one to finish still decides what the overlay holds)."""
+    ``Memory.close()`` flushes its embedder, so ``flush`` is called once per
+    store. It writes only when vectors were added since the last write, and
+    then at most every ``OVERLAY_FLUSH_SECS`` unless forced (the run forces it
+    when it is done and at exit). Each write is the whole overlay: on all of
+    LongMemEval-S it reached 2.7 GB, and writing it after every history made
+    each history slower than the one before (2026-11-05). A run that dies
+    loses at most that many seconds of vectors, fetched again on resume. It
+    holds a lock against the threads of ``--jobs`` and writes through a
+    temporary file named by this process, so two runs sharing a work dir do
+    not collide on it (the last one to finish still decides what the overlay
+    holds)."""
 
     def __init__(self, model, overlay_path, offline):
         from cognitive_eval.openai_embedder import OpenAIEmbedder
@@ -258,7 +263,8 @@ class Embeddings:
         self.hits = self.misses = 0
         self._lock = threading.Lock()
         self._dirty = False
-        atexit.register(self.flush)
+        self._flushed_at = time.monotonic()
+        atexit.register(self.flush, True)
 
     def get_sentence_embedding_dimension(self):
         return self.dimension
@@ -290,8 +296,10 @@ class Embeddings:
         out = np.vstack([np.asarray(self._lookup(t), dtype=np.float32) for t in items])
         return out[0] if single else out
 
-    def flush(self):
+    def flush(self, force=False):
         if not (self._dirty and self._overlay_path and not self._offline):
+            return
+        if not force and time.monotonic() - self._flushed_at < OVERLAY_FLUSH_SECS:
             return
         with self._lock:
             tmp = f"{self._overlay_path}.{os.getpid()}.tmp"
@@ -299,6 +307,11 @@ class Embeddings:
                 pickle.dump(self._overlay, fh)
             os.replace(tmp, self._overlay_path)
             self._dirty = False
+            self._flushed_at = time.monotonic()
+
+
+# The OpenAI overlay is written at most this often while a run goes on.
+OVERLAY_FLUSH_SECS = 600
 
 
 class LocalEmbeddings:
@@ -364,7 +377,7 @@ class LocalEmbeddings:
     def encode_query(self, texts):
         return self._encode("query", texts)
 
-    def flush(self):
+    def flush(self, force=False):  # noqa: ARG002 — written when dirty, always
         if not self._dirty:
             return
         with self._lock:
@@ -1275,7 +1288,7 @@ def main():
         logger.info("%d answers already have a verdict in %s", own, args.out)
         settle()
     save()  # contexts first: a judging failure can then be resumed with --rejudge
-    embedder.flush()
+    embedder.flush(True)
 
     for path in (args.reuse.split(",") if args.reuse else []):
         with open(path.strip(), encoding="utf-8") as fh:
@@ -1481,7 +1494,7 @@ def main():
         logger.info("Wrote per-question results to %s", args.out)
     if checkpoint and os.path.exists(checkpoint):
         os.remove(checkpoint)
-    embedder.flush()
+    embedder.flush(True)
 
 
 if __name__ == "__main__":
