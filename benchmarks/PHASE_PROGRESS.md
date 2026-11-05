@@ -4098,3 +4098,48 @@ and leaves the judge alone.
   table for counts in the 2026-10-28 plan.
 - Cost: reader 1.40M tokens in and 0.32M out (about $1.00), judge about
   $0.05.
+
+# A typed event table for counting questions (2026-11-05, inconclusive)
+
+**What was built.** `tsm/events.py` and `Memory(events=...)`, off by default.
+Each user message with a first-person word is asked (gpt-4o-mini, JSON mode,
+cached by the message and the end of the two messages before it) for the
+events it reports: `what`, `kind`, `amount`/`unit`, `when` as written,
+`status` (done / has / planned). Each event is one record in an engine of its
+own (`<db>/tsm_events`). `recall()` of a counting question
+(`is_counting_query`) searches them and gives the best up to `EVENT_SHARE`
+(0.3) of the budget, one dated line each (`[2023-05-05] event: bought a Bell
+Zephyr helmet (helmet; 120 USD)`, a relative `when` resolved by `tsm.when`);
+the memories are packed into the rest. Harness arm: `sdk_raw_events`.
+
+**Why its own engine.** The first version kept events in the memories' engine
+under a scope of their own. The word index and the concept graph are shared by
+an engine's scopes, so the events changed 17 of the 20 contexts of questions
+that drew no events. In a separate engine every such context is identical to
+the arm without events.
+
+**Measured.** Every LongMemEval-S multi-session question (121 judged; 12
+abstentions skipped), 2,000 tokens, messages alone (`sdk_raw`) with and
+without events, `--reader notes`, gpt-4.1-mini (`runs/2026-11-05b/`).
+The extraction prompt was written looking at the first 12 of these questions.
+
+| run | sdk_raw | sdk_raw_events | events better / worse |
+|---|---|---|---|
+| events in the memories' engine | 101 | 106 | 9 / 4 (p = 0.27) |
+| events in their own engine | 104 | 100 | 4 / 8 (p = 0.39) |
+
+- `sdk_raw`'s contexts are identical in both runs and in the baseline run
+  (101): the reader and judge alone moved 5 to 6 of 121 verdicts between
+  runs. Both differences above are inside that.
+- With events, all the evidence was in the context for 116 questions against
+  111 (first run): the events do bring in instances the passages missed.
+- Before events, 15 of the 20 wrong answers had all their evidence in the
+  context: the reader miscounts what it has (jewelry 2 for 3, properties 5 for
+  4, weddings 4 for 3, charity $8,750 for $3,750).
+- A reading of every context five times (`benchmarks/cognitive_eval/reread.py`)
+  was started to settle it and stopped: the OpenAI account ran out of credit.
+  That is the next step: `reread.py --reads 5` over `ms_raw_2000.json` and
+  `ms_events2_2000.json`, then the 367 other S questions (non-counting
+  contexts are now unchanged, so only the judge's noise is at stake there).
+- Cost: about 21,000 extraction requests (gpt-4o-mini, roughly $3) and three
+  judged passes over 121 to 242 answers.
