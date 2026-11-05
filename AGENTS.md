@@ -66,6 +66,7 @@ make api-server
   - OpenAI embeddings are not bit-for-bit repeatable between fetches, so two runs that fetched their own vectors can differ by a few contexts. Compare arms within one run, or runs that share one cache.
 - Judged runs worth knowing about (`shipped_stack_eval.py`, 2026-10-21):
   - `full_context` is the no-memory control: every message of the history, dated, with no budget.
+  - A bigger budget is not free: on LongMemEval-S 31-130 (messages alone, `--reader notes`, 2026-11-05) the evidence score rose from 91 to 96 of 96 between 2,000 and 8,000 tokens while judged answers fell from 91 to 82 (10 / 1, p = 0.012), all of it counts and dates. Judge a budget change; never read the evidence score as answers.
   - `--skip 120 --limit 500` runs the 355 held-out questions that no setting was chosen on. The extraction cache covers them, so only the judge is paid.
   - `--recall NAME:KEY=VALUE` adds an arm `rcl_NAME`, which reads the `sdk_cognitive` store with those `recall()` arguments. Identical contexts share a verdict, so a read-time change costs only the questions it changes.
   - `--reader tools` asks with `tsm.answering`.
