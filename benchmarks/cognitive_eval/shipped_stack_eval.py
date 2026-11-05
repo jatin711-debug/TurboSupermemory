@@ -122,6 +122,7 @@ import pickle
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -228,7 +229,14 @@ def variants(name):
 class Embeddings:
     """The harness's OpenAI embedding cache, read-only, plus a small overlay
     file for texts it does not hold. Another run may be writing the shared
-    cache, so this one never does."""
+    cache, so this one never does.
+
+    ``Memory.close()`` flushes its embedder, so ``flush`` runs once per store:
+    it writes only when vectors were added since the last write (it used to
+    rewrite the whole overlay, hundreds of MB, after every history), holds a
+    lock against the threads of ``--jobs``, and writes through a temporary
+    file named by this process, so two runs sharing a work dir do not collide
+    on it (the last one to finish still decides what the overlay holds)."""
 
     def __init__(self, model, overlay_path, offline):
         from cognitive_eval.openai_embedder import OpenAIEmbedder
@@ -243,6 +251,8 @@ class Embeddings:
                 self._overlay = pickle.load(fh)
         self.dimension = self._base.get_sentence_embedding_dimension()
         self.hits = self.misses = 0
+        self._lock = threading.Lock()
+        self._dirty = False
         atexit.register(self.flush)
 
     def get_sentence_embedding_dimension(self):
@@ -262,21 +272,28 @@ class Embeddings:
             for t in missing:  # a stand-in direction; offline runs only check plumbing
                 seed = int(hashlib.sha256(t.encode("utf-8")).hexdigest()[:8], 16)
                 v = np.random.default_rng(seed).standard_normal(self.dimension)
-                self._overlay[t] = (v / np.linalg.norm(v)).astype(np.float32)
+                with self._lock:
+                    self._overlay[t] = (v / np.linalg.norm(v)).astype(np.float32)
         elif missing:
             for start in range(0, len(missing), self._base.batch):
                 chunk = missing[start:start + self._base.batch]
-                for t, v in zip(chunk, self._base._embed_batch(chunk)):
-                    self._overlay[t] = np.asarray(v, dtype=np.float32)
+                vectors = self._base._embed_batch(chunk)
+                with self._lock:
+                    for t, v in zip(chunk, vectors):
+                        self._overlay[t] = np.asarray(v, dtype=np.float32)
+                    self._dirty = True
         out = np.vstack([np.asarray(self._lookup(t), dtype=np.float32) for t in items])
         return out[0] if single else out
 
     def flush(self):
-        if self._overlay and self._overlay_path and not self._offline:
-            tmp = self._overlay_path + ".tmp"
+        if not (self._dirty and self._overlay_path and not self._offline):
+            return
+        with self._lock:
+            tmp = f"{self._overlay_path}.{os.getpid()}.tmp"
             with open(tmp, "wb") as fh:
                 pickle.dump(self._overlay, fh)
             os.replace(tmp, self._overlay_path)
+            self._dirty = False
 
 
 class LocalEmbeddings:
@@ -308,6 +325,7 @@ class LocalEmbeddings:
         if os.path.exists(self._path):
             self._cache = _load_cache(self._path)
         self._dirty = False
+        self._lock = threading.Lock()
         atexit.register(self.flush)
 
     def get_sentence_embedding_dimension(self):
@@ -323,10 +341,12 @@ class LocalEmbeddings:
                       else self._embedder.encode_document)
             for start in range(0, len(missing), 256):
                 chunk = missing[start:start + 256]
-                for t, v in zip(chunk, encode(chunk)):
-                    self._cache[(kind, t)] = np.asarray(v, dtype=np.float32)
+                vectors = encode(chunk)
+                with self._lock:
+                    for t, v in zip(chunk, vectors):
+                        self._cache[(kind, t)] = np.asarray(v, dtype=np.float32)
+                    self._dirty = True
             self.computed += len(missing)
-            self._dirty = True
         out = np.vstack([self._cache[(kind, t)] for t in items])
         return out[0] if single else out
 
@@ -340,8 +360,10 @@ class LocalEmbeddings:
         return self._encode("query", texts)
 
     def flush(self):
-        if self._dirty:
-            tmp = self._path + ".tmp"
+        if not self._dirty:
+            return
+        with self._lock:
+            tmp = f"{self._path}.{os.getpid()}.tmp"
             with open(tmp, "wb") as fh:
                 pickle.dump(self._cache, fh)
             os.replace(tmp, self._path)
@@ -638,11 +660,16 @@ def main():
                          "as JSON (truncate_dim=256, query_prompt_name=\"QuestionAnswering\"); "
                          "may be given several times")
     ap.add_argument("--extractor-model", default="gpt-4.1-nano")
-    ap.add_argument("--gist-model", default="gpt-4.1-nano")
+    ap.add_argument("--gist-model", default="gpt-4o-mini")
     ap.add_argument("--verifier-model", default="gpt-4o-mini")
     ap.add_argument("--judge", choices=["openai", "none"], default="openai")
     ap.add_argument("--judge-model", default="gpt-4.1-mini")
-    ap.add_argument("--workers", type=int, default=10)
+    ap.add_argument("--jobs", type=int, default=4,
+                    help="histories built and asked at once, each in its own stores (the "
+                         "engine releases the GIL); 1 builds them one after another")
+    ap.add_argument("--workers", type=int, default=32,
+                    help="answers read and judged at once (the account allows 5,000 requests "
+                         "a minute)")
     ap.add_argument("--work-dir", default=None,
                     help="where paid results are kept: verdicts, gists, the embedding overlay "
                          "and the runs written with --out (default: $TSM_EVAL_DIR, else "
@@ -823,14 +850,6 @@ def main():
     stats = defaultdict(Counter)
     gpu = Counter()  # what the GPU exact-search mirrors answered, over every store
 
-    def sdk_memory(extractor=None, **kwargs):
-        # An arm stores what it names: the facts alone unless it asks for
-        # the messages too (Memory keeps them by default since 2026-10-29).
-        kwargs.setdefault("keep_messages", False)
-        db = tempfile.mkdtemp(prefix="tsm_shipped_")
-        return Memory(db, embedder=embedder, extractor=extractor or Replay(per_message),
-                      **kwargs), db
-
     started = time.time()
     skipped = []
     if args.rejudge:
@@ -885,14 +904,30 @@ def main():
                         stats[arm].update(counts)
         logger.info("Resuming: %d histories already done", len(done))
 
-    for index, unit in enumerate(units):
+    # Histories are independent (each gets its own stores), so --jobs of them
+    # are worked on at once. What they share is written under `shared`.
+    shared = threading.Lock()
+    finished = [0]
+
+    def run_unit(unit):
+        nonlocal nli
         unit_id = unit[0].conv_id
         if unit_id in done:
-            continue
+            return
         questions = [(conv, q) for conv in unit for q in conv.queries if not q.is_abstention]
         if not questions:
-            continue
+            return
         messages, per_message = history_inputs(unit, extraction, in_order=not args.file_order)
+
+        def sdk_memory(extractor=None, **kwargs):
+            # An arm stores what it names: the facts alone unless it asks for
+            # the messages too (Memory keeps them by default since 2026-10-29).
+            # Defined per history: it replays this history's facts.
+            kwargs.setdefault("keep_messages", False)
+            db = tempfile.mkdtemp(prefix="tsm_shipped_")
+            return Memory(db, embedder=embedder, extractor=extractor or Replay(per_message),
+                          **kwargs), db
+
         if args.time_tags == "turn":
             for m in messages:
                 m["timestamp"] = ""
@@ -920,10 +955,11 @@ def main():
                 retrieve["naive"] = lambda q, ad=ad: [
                     (text, None) for text in naive_retrieve(ad, q, args.pool_k, args.token_budget)]
             if "adapter" in arms:
-                if nli is None:
-                    from cognitive_eval.verification import get_shared_verifier
+                with shared:
+                    if nli is None:
+                        from cognitive_eval.verification import get_shared_verifier
 
-                    nli = get_shared_verifier()
+                        nli = get_shared_verifier()
                 db = tempfile.mkdtemp(prefix="tsm_adapter_")
                 ad = TSMAdapter(db_path=db, extractor="openai",
                                 extractor_instance=extraction.instance, cognitive_features=True,
@@ -1090,17 +1126,19 @@ def main():
                         "turns": None if arm in UNATTRIBUTED else [turn for _, turn in pairs],
                         "evidence": sorted(evidence[asked_of.conv_id])})
             # Only a history every arm handled is scored, so arms stay paired.
-            tasks.extend(conv_tasks)
-            for arm, counts in conv_stats.items():
-                stats[arm].update(counts)
-            if checkpoint:
-                with open(checkpoint, "a", encoding="utf-8") as fh:
-                    fh.write(json.dumps({"setup": setup, "conversation_id": unit_id,
-                                         "tasks": conv_tasks,
-                                         "stats": {a: dict(c) for a, c in conv_stats.items()}})
-                             + "\n")
-            if summarizer is not None:
-                summarizer.flush()
+            with shared:
+                tasks.extend(conv_tasks)
+                for arm, counts in conv_stats.items():
+                    stats[arm].update(counts)
+                if checkpoint:
+                    with open(checkpoint, "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps({"setup": setup, "conversation_id": unit_id,
+                                             "tasks": conv_tasks,
+                                             "stats": {a: dict(c)
+                                                       for a, c in conv_stats.items()}})
+                                 + "\n")
+                if summarizer is not None:
+                    summarizer.flush()
         except QuotaExhausted as e:
             # Every later history would fail the same way, and a run that went
             # on would compare arms built with and without their model calls.
@@ -1109,22 +1147,33 @@ def main():
         except Exception as e:  # noqa: BLE001 — one bad history must not sink the run
             logger.warning("history %s skipped for every arm: %s: %s", unit_id,
                            type(e).__name__, e)
-            skipped.append(unit_id)
+            with shared:
+                skipped.append(unit_id)
         finally:
             for close, db in opened:
                 try:
                     engine = getattr(getattr(close, "__self__", None), "engine", None)
                     used = getattr(engine, "gpu_search_stats", lambda: None)()
                     if used:
-                        gpu["stores"] += 1
-                        gpu["queries"] += used["queries"]
-                        gpu["switched_off"] += not used["active"]
+                        with shared:
+                            gpu["stores"] += 1
+                            gpu["queries"] += used["queries"]
+                            gpu["switched_off"] += not used["active"]
                     close()
                 finally:
                     shutil.rmtree(db, ignore_errors=True)
-        if (index + 1) % 20 == 0:
-            logger.info("ingested %d/%d histories (%.0fs)", index + 1, len(units),
-                        time.time() - started)
+        with shared:
+            finished[0] += 1
+            if finished[0] % 20 == 0:
+                logger.info("ingested %d/%d histories (%.0fs)", finished[0], len(units),
+                            time.time() - started)
+
+    with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as unit_pool:
+        for _ in unit_pool.map(run_unit, units):
+            pass  # map re-raises here what a history raised (a spent quota stops the run)
+    # In history order, whatever order they finished in.
+    order = {conv.conv_id: k for k, unit in enumerate(units) for conv in unit}
+    tasks.sort(key=lambda t: order.get(t["conversation_id"], -1))
 
     for t in tasks:
         stats[t["arm"]]["items"] += len(t["retrieved"])

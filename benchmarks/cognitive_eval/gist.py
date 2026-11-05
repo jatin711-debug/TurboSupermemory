@@ -20,7 +20,7 @@ from tsm.gist import single_fact as _single_fact
 class OpenAIGister(OpenAIGistSummarizer):
     """The shipped OpenAI gist summarizer, with the harness's key-file lookup."""
 
-    def __init__(self, model="gpt-4.1-nano", max_retries=6, request_timeout=30.0, max_tokens=120):
+    def __init__(self, model="gpt-4o-mini", max_retries=6, request_timeout=30.0, max_tokens=120):
         from ._secrets import ensure_openai_key, key_file_hint
         if not ensure_openai_key():
             raise RuntimeError("No OpenAI key. " + key_file_hint())
@@ -64,7 +64,7 @@ class MiniMaxGister(OpenAIGister):
 
 def create_gister(name="openai", model=None):
     if name == "openai":
-        return OpenAIGister(model=model or "gpt-4.1-nano")
+        return OpenAIGister(model=model or "gpt-4o-mini")
     if name == "minimax":
         return MiniMaxGister(model=model or "MiniMax-M3")
     if name == "ollama":

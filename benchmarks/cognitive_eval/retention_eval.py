@@ -278,7 +278,7 @@ def main():
                          "(B4) — eviction victims are compressed into gists that stay "
                          "retrievable instead of being dropped")
     ap.add_argument("--gist-model", type=str, default=None,
-                    help="gister model (default: gpt-4.1-nano for --gist openai)")
+                    help="gister model (default: gpt-4o-mini for --gist openai)")
     ap.add_argument("--gist-chunk-facts", type=int, default=24,
                     help="evicted facts per gist call (chunk size)")
     ap.add_argument("--gist-max-tokens", type=int, default=120,

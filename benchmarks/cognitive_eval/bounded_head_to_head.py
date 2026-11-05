@@ -208,7 +208,7 @@ def main():
     parser.add_argument("--extractor", choices=["mock", "ollama", "openai", "minimax", "auto"], default="openai")
     parser.add_argument("--extractor-model", type=str, default="gpt-4.1-nano")
     parser.add_argument("--gister", choices=["extractive", "ollama", "openai", "minimax"], default="openai")
-    parser.add_argument("--gist-model", type=str, default="gpt-4.1-nano")
+    parser.add_argument("--gist-model", type=str, default="gpt-4o-mini")
     parser.add_argument("--mem0-model", type=str, default="gpt-4.1-nano")
     parser.add_argument("--mem0-llm-provider", choices=["openai", "minimax"], default="openai")
     parser.add_argument("--mem0-embed-provider", choices=["openai", "ollama"], default="openai")

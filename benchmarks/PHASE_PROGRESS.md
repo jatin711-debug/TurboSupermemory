@@ -3901,3 +3901,146 @@ at least `LIST_RUN` (3) long, so "we met in room 12." is left as it was said.
   of about 100 questions cannot show a difference of a few questions.
   Compare two arms judged in the same run, or more than one draw of each.
 - Cost of these two re-judgings: $0.24.
+
+
+---
+
+# LoCoMo: a second benchmark, and the role prior's cue list (2026-10-29)
+
+Asked whether the work so far improves memory or fits LongMemEval, the
+owner had it tested on a second benchmark, with fixes kept general.
+- **Data:** LoCoMo (Maharana et al. 2024, `snap-research/locomo`,
+  `locomo10.json`). Ten conversations between two people, 5,882 turns over
+  up to 35 dated sessions. 1,986 questions, 1,982 with the turns that hold
+  the answer.
+- **Runner:** `benchmarks/cognitive_eval/locomo_shipped_eval.py`. Each
+  conversation's store is built once and asked all of its questions.
+  Free evidence score; `--judge-sample` reads a fixed sample.
+- **How it was run:** speakers stored as "user" and "assistant" (`--roles
+  ab`, the usual way of feeding LoCoMo to a user/assistant memory). Each
+  message's text starts with the speaker's name. EmbeddingGemma 2 at
+  2,000 tokens. Nothing in `tsm` was tuned on it.
+
+**The role prior's cue list was LongMemEval's, not a rule about users.**
+- `FIRST_PERSON_CUES` held "what", "how", "did", "have", "total",
+  "number" and "many" besides the pronouns, so nearly every question
+  boosted "user" memories x1.30 and damped "assistant" ones x0.85.
+- On LoCoMo the "assistant" is the other person: "What did Melanie paint?"
+  buried Melanie's own words.
+- Free score, messages alone:
+  - first conversation (196 questions with evidence): 95 with all of their
+    evidence; 161 with the speakers stored under their names (no prior
+    applies); 162 with the prior off; 162 with the pronoun-only list;
+  - all ten conversations: 1,177 of 1,977 with the old list, 1,560 with the
+    pronoun-only one (422 / 39, p < 1e-80). Single-hop 594 -> 766 of 841,
+    temporal 219 -> 284 of 320, multi-hop 78 -> 113 of 281.
+- LongMemEval did not move: S 31-130 with messages 91 / 91 of 96, the
+  oracle dev questions with facts at 600 tokens 81 / 81 of 115 (0 / 0
+  each). Its questions say "I" and "my", so the prior still fires there.
+- The list is now first-person pronouns only.
+
+**What is left on LoCoMo is a different kind of question.** On the first
+three conversations, 51 of the 67 missing evidence turns were in the
+250-candidate pool and lost to the 2,000-token cut, and 16 were outside it.
+Almost all belong to questions that gather a list from many conversations
+("What activities does Melanie partake in?": pottery, camping, painting,
+swimming). Each mention matches the question only loosely ("I just signed
+up for a pottery class" ranks 140th). No ranking change fixes that; a fact
+taken from each message ("Melanie does pottery") is the general remedy,
+which is what the facts arm measures.
+
+**Facts, messages, or both, on LoCoMo** (`runs/locomo_all_ab.json`, the
+pronoun-only prior; facts extracted by gpt-4o-mini, about $0.45). All
+evidence in the context, of 1,977:
+
+| store | all evidence | multi-hop | single-hop | temporal |
+|---|---|---|---|---|
+| old default (facts, the old cue list) | 1,595 | 197 | 768 | 291 |
+| facts | 1,698 | 201 | 782 | 291 |
+| **facts and messages (the default)** | **1,737** | 198 | 808 | 299 |
+| messages alone | 1,560 | 113 | 766 | 284 |
+
+- On LoCoMo, as on LongMemEval, facts and messages together find more than
+  facts alone (81 / 42, p = 0.001).
+- Unlike LongMemEval, messages alone trail far behind on multi-hop (113 /
+  198): questions that gather a list from many conversations need the
+  facts.
+- Against the old default: 169 / 27 (p < 1e-25).
+
+Judged, 120 questions drawn with seed 0 (adversarial excluded),
+`--reader notes`, gpt-4.1-mini, the three stores judged in one run
+(`.cache/scratch/locomo_judge.py`, `runs/locomo_judged_120.json`, $0.55):
+
+| store | right of 120 | multi-hop | temporal | open-domain | single-hop |
+|---|---|---|---|---|---|
+| old default | 89 | 12/18 | 11/16 | 6/8 | 60/78 |
+| facts and messages | 91 | 12/18 | 11/16 | 8/8 | 60/78 |
+| messages alone | 97 | 10/18 | 12/16 | 7/8 | 68/78 |
+
+- Old against new default: level (12 / 14, p = 0.85).
+- Messages alone answered the most despite finding the least evidence:
+  10 / 16 against the default (p = 0.33), single-hop 68 against 60. Within
+  the reader's noise (2026-10-29: 90 against 85 on one context set).
+- The facts are well attributed ("Caroline's grandma is from Sweden"). A
+  possible general cause is that short facts are many and fill the budget,
+  leaving fewer messages, which carry the details. Not established.
+
+
+---
+
+# A replacement for gpt-4.1-nano, OpenAI embeddings, and faster runs (2026-11-05)
+
+**gpt-4.1-nano is gone.** It returned 404 from 2026-10-28 and was no longer
+listed on 2026-11-05.
+- `OpenAIGistSummarizer` defaulted to it, so every gist failed and
+  `max_user_tokens` bounded nothing.
+- The default is now gpt-4o-mini, which wrote the gists of the judged
+  compaction runs on 2026-10-28.
+- Still served on the account: gpt-4o-mini, gpt-4.1-mini, gpt-5-nano and
+  gpt-5-mini. gpt-5.4-nano/-mini work only with `reasoning_effort="none"`.
+- The harness's `--extractor-model` default stays gpt-4.1-nano, because it
+  names the extraction cache that covers the oracle file. A new history
+  needs another model (`--extractor-model gpt-4o-mini`).
+
+**Where a run's time went.** Judging was never the slow part: about 30 s
+per 100 answers.
+- `import sentence_transformers` takes 3 to 4 minutes on this machine
+  (it pulls in `transformers`). Without it the harness starts in 3 s, so
+  R&D runs use OpenAI's `text-embedding-3-small` for now.
+- `Memory.close()` flushes its embedder, and the harness's OpenAI cache
+  rewrote its whole overlay file on every flush, 1 GB by today. That cost
+  about 12 s per history. It now writes only what changed, under a lock,
+  through a temporary file of its own process.
+- `--jobs N` (default 4) builds N histories at once in threads, in both
+  runners (`shipped_stack_eval.py` and `locomo_shipped_eval.py`). With one
+  embedding cache the contexts are identical to `--jobs 1` (12 of 12 on
+  six S histories; 43 s against 21 s).
+- `--workers` defaults to 32 (the account allows 5,000 requests a minute).
+- The LoCoMo runner embeds a conversation's questions in one request and
+  keeps its verdicts (`<work-dir>/verdicts`), so a rerun pays only for
+  contexts that changed.
+- All of LoCoMo with three stores takes 4 minutes; it used to take about
+  30.
+- OpenAI embeddings are not bit-for-bit repeatable: two runs that fetched
+  their own vectors differed in 3 of 12 contexts. Compare arms within one
+  run, or runs that share one cache.
+
+**LoCoMo with OpenAI embeddings** (`runs/2026-11-05/locomo_all_openai.json`,
+extraction from the cache, no judge). All evidence in a 2,000-token
+context, of 1,977:
+
+| store | all evidence | multi-hop | single-hop | temporal |
+|---|---|---|---|---|
+| facts | 1,769 | 213 | 802 | 297 |
+| **facts and messages (the default)** | **1,805** | 216 | 817 | 306 |
+| messages alone | 1,643 | 138 | 794 | 281 |
+
+- The same order as with EmbeddingGemma 2, and every store finds more.
+- Facts and messages against facts: 72 / 36 (p = 0.001).
+- Facts and messages against messages alone: 197 / 35.
+
+**LongMemEval-S with OpenAI embeddings.** Messages alone (`sdk_raw`),
+questions 31-130 (96 with an answer), 2,000 tokens: 91 of 96 with all
+their evidence (`runs/2026-11-05/s100_raw_2000.json`). EmbeddingGemma 2
+also gave 91 on 2026-10-29. The 4,000- and 8,000-token runs, and judging
+all three, are next.

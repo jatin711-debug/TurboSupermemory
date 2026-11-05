@@ -17,7 +17,7 @@ EVICTED fact — that subset is where compression can possibly help.
 Usage:
     python benchmarks/cognitive_eval/compress_eval.py --limit 120 --budget 8 \
         --token-budget 150 --extractor openai --extractor-model gpt-4.1-nano \
-        --gist-model gpt-4.1-nano --judge openai --judge-model gpt-4.1-mini --workers 10
+        --gist-model gpt-4o-mini --judge openai --judge-model gpt-4.1-mini --workers 10
 """
 
 import argparse
@@ -91,7 +91,7 @@ def main():
                     help="OpenAI embedding model when --tsm-embedder openai")
     ap.add_argument("--extractor", type=str, default="openai")
     ap.add_argument("--extractor-model", type=str, default=None)
-    ap.add_argument("--gist-model", type=str, default="gpt-4.1-nano")
+    ap.add_argument("--gist-model", type=str, default="gpt-4o-mini")
     ap.add_argument("--gister", choices=["openai", "ollama"], default="openai")
     ap.add_argument("--judge", choices=["auto", "ollama", "openai"], default="openai")
     ap.add_argument("--judge-model", type=str, default=None)
