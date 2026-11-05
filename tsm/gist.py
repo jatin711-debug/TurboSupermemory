@@ -58,9 +58,14 @@ class OpenAIGistSummarizer:
     Reads the key from ``OPENAI_API_KEY`` unless a preconfigured ``client``
     (any OpenAI-compatible endpoint) is passed. ``calls`` / ``input_tokens`` /
     ``output_tokens`` accumulate usage for cost accounting.
+
+    The default model is gpt-4o-mini: the gists of the judged compaction runs
+    (2026-10-28) were written by it. It was gpt-4.1-nano until OpenAI withdrew
+    that model (404 from 2026-10-28, no longer listed by 2026-11-05), after which
+    every gist failed and ``max_user_tokens`` bounded nothing.
     """
 
-    def __init__(self, model: str = "gpt-4.1-nano", max_retries: int = 6,
+    def __init__(self, model: str = "gpt-4o-mini", max_retries: int = 6,
                  request_timeout: float = 30.0, max_tokens: int = 120,
                  client=None, extra_body: Optional[dict] = None):
         if client is None:
