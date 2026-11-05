@@ -602,6 +602,17 @@ def evidence_scores(tasks, arms):
     return scores
 
 
+def verdict_source(judge):
+    """Who a verdict comes from: the judge's model, and the reader's when
+    another model answers (a verdict grades the reader's answer, so another
+    reader means other verdicts)."""
+    name = getattr(judge, "model", "?")
+    if getattr(judge, "reader_model", None):
+        name += f" (reader {judge.reader_model}"
+        name += f", effort {judge.reader_effort})" if judge.reader_effort else ")"
+    return name
+
+
 def sdk_pool(mem, embedder, query, user_id, k):
     """The plain-vector pool recall() would rank: nearest records of the scope."""
     from tsm.chunks import occasion
@@ -664,6 +675,12 @@ def main():
     ap.add_argument("--verifier-model", default="gpt-4o-mini")
     ap.add_argument("--judge", choices=["openai", "none"], default="openai")
     ap.add_argument("--judge-model", default="gpt-4.1-mini")
+    ap.add_argument("--reader-model", default=None,
+                    help="answer with this model instead of the judge's (the judge still "
+                         "grades), e.g. gpt-5-mini")
+    ap.add_argument("--reader-effort", default=None,
+                    choices=["none", "minimal", "low", "medium", "high"],
+                    help="reasoning_effort of a reasoning --reader-model")
     ap.add_argument("--jobs", type=int, default=4,
                     help="histories built and asked at once, each in its own stores (the "
                          "engine releases the GIL); 1 builds them one after another")
@@ -812,6 +829,8 @@ def main():
         from cognitive_eval.judge import create_judge
 
         judge = create_judge("openai", openai_model=args.judge_model)
+        judge.reader_model = args.reader_model
+        judge.reader_effort = args.reader_effort
     def asked(*names):
         return any(a in arms for name in names for a in variants(name))
 
@@ -856,7 +875,7 @@ def main():
         with open(args.rejudge, encoding="utf-8") as fh:
             saved = json.load(fh)
         tasks = saved["tasks"]
-        other_judge = saved.get("judge_model") != getattr(judge, "model", "?")
+        other_judge = saved.get("judge_model") != verdict_source(judge)
         for t in tasks:
             if other_judge or (t.get("reader") or "plain") != args.reader:
                 # The same contexts read another way, or by another judge (a
@@ -1181,7 +1200,7 @@ def main():
     if not args.offline:
         extraction.flush()  # what was extracted in this run is paid for: keep it
 
-    judge_model = getattr(judge, "model", "?")
+    judge_model = verdict_source(judge)
 
     # The judge sees a question (with its date, when the reader is told it), a
     # context and the gold answer, never the arm: the same ones get the same
@@ -1394,7 +1413,10 @@ def main():
         "file_order": args.file_order, "question_date": args.question_date,
         "configs": configs, "readings": readings, "extraction": args.extraction,
         "reader": args.reader,
-        "judge_model": getattr(judge, "model", "?"), "judge_calls": getattr(judge, "calls", 0),
+        "judge_model": verdict_source(judge),
+        "reader_input_tokens": getattr(judge, "reader_input_tokens", 0),
+        "reader_output_tokens": getattr(judge, "reader_output_tokens", 0),
+        "judge_calls": getattr(judge, "calls", 0),
         "judge_input_tokens": getattr(judge, "input_tokens", 0),
         "judge_output_tokens": getattr(judge, "output_tokens", 0),
         "verifier_model": args.verifier_model if verifier else None,

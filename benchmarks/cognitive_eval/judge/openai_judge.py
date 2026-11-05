@@ -14,6 +14,7 @@ module never receives, stores, or logs the raw key.
 import logging
 import os
 import random
+import re
 import threading
 import time
 
@@ -62,8 +63,19 @@ _JUDGE_SYS = (
 )
 
 
+def is_reasoning_model(model):
+    """gpt-5 and the o-series: no temperature 0, ``max_completion_tokens``
+    (which also counts the hidden reasoning), and ``reasoning_effort``."""
+    return bool(re.match(r"(gpt-5|o\d)", model or ""))
+
+
 class OpenAIJudge:
-    def __init__(self, model="gpt-4o-mini", max_retries=10, request_timeout=60.0):
+    """``model`` judges; ``reader_model``, when given, answers instead of it,
+    so a reader can be changed while the verdicts stay the same judge's.
+    ``reader_effort`` is the ``reasoning_effort`` of a reasoning reader."""
+
+    def __init__(self, model="gpt-4o-mini", max_retries=10, request_timeout=60.0,
+                 reader_model=None, reader_effort=None):
         from .._secrets import ensure_openai_key, key_file_hint
         if not ensure_openai_key():
             raise RuntimeError("No OpenAI key. " + key_file_hint())
@@ -73,25 +85,38 @@ class OpenAIJudge:
         # never passed through or logged here.
         self._client = OpenAI(timeout=request_timeout)
         self.model = model
+        self.reader_model = reader_model
+        self.reader_effort = reader_effort
         self.max_retries = max_retries
         self.calls = 0
         self._calls_lock = threading.Lock()
         self.extra_body = None
         self.input_tokens = 0
         self.output_tokens = 0
+        # What the reader, when it is another model, used of the totals above.
+        self.reader_input_tokens = 0
+        self.reader_output_tokens = 0
 
-    def _chat(self, system, user, max_tokens):
+    def _chat(self, system, user, max_tokens, model=None):
+        model = model or self.model
         for attempt in range(self.max_retries):
             try:
                 with self._calls_lock:
                     self.calls += 1
                 kwargs = {
-                    "model": self.model,
+                    "model": model,
                     "messages": [{"role": "system", "content": system},
                                  {"role": "user", "content": user}],
-                    "temperature": 0.0,
-                    "max_tokens": max_tokens,
                 }
+                if is_reasoning_model(model):
+                    # The reasoning counts against the limit: room for it on
+                    # top of the reply.
+                    kwargs["max_completion_tokens"] = max_tokens + 8000
+                    if self.reader_effort and model == self.reader_model:
+                        kwargs["reasoning_effort"] = self.reader_effort
+                else:
+                    kwargs["temperature"] = 0.0
+                    kwargs["max_tokens"] = max_tokens
                 if self.extra_body:
                     kwargs["extra_body"] = self.extra_body
                 resp = self._client.chat.completions.create(**kwargs)
@@ -99,6 +124,9 @@ class OpenAIJudge:
                     with self._calls_lock:
                         self.input_tokens += resp.usage.prompt_tokens or 0
                         self.output_tokens += resp.usage.completion_tokens or 0
+                        if model != self.model:
+                            self.reader_input_tokens += resp.usage.prompt_tokens or 0
+                            self.reader_output_tokens += resp.usage.completion_tokens or 0
                 return (resp.choices[0].message.content or "").strip()
             except Exception as e:  # noqa: BLE001 — transient API errors: backoff + retry
                 from tsm._retry import QuotaExhausted, is_quota_exhausted
@@ -132,7 +160,8 @@ class OpenAIJudge:
 
             if turns and len(turns) == len(memories):
                 memories = [{"context": m, "turn_index": t} for m, t in zip(memories, turns)]
-            out = answer_with_tools(self._client, self.model, question, memories, today,
+            out = answer_with_tools(self._client, self.reader_model or self.model, question,
+                                    memories, today,
                                     max_retries=self.max_retries)
             with self._calls_lock:
                 self.calls += out["requests"]
@@ -147,11 +176,12 @@ class OpenAIJudge:
             system, user = (m["content"] for m in answer_prompt(question, memories, today))
             # Replies average about 200 tokens; at 500, three of 115 were cut off
             # before their answer line (a question over many notes).
-            return final_answer(self._chat(system, user, max_tokens=800)) or "NO ANSWER"
+            return final_answer(self._chat(system, user, max_tokens=800,
+                                           model=self.reader_model)) or "NO ANSWER"
         ctx = "\n".join(f"{i + 1}. {m}" for i, m in enumerate(memories) if m)
         when = f"Current date: {today}\n" if today else ""
         user = f"Memories:\n{ctx}\n\n{when}Question: {question}\nAnswer:"
-        return self._chat(_ANSWER_SYS, user, max_tokens=100)
+        return self._chat(_ANSWER_SYS, user, max_tokens=100, model=self.reader_model)
 
     def judge(self, question, gold, prediction):
         """True if `prediction` matches `gold` for `question`."""

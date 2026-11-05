@@ -4076,3 +4076,25 @@ to 18k tokens, so the budget looked like the next lever. Setup:
 - EmbeddingGemma 2 also found all the evidence for 91 at 2,000 on
   2026-10-29.
 - Cost: 571 requests, $0.66.
+
+**A stronger reader does not help either.** The same saved contexts were
+answered by gpt-5-mini (default reasoning effort, the same reading
+prompt) and judged by gpt-4.1-mini. `--reader-model` changes who answers
+and leaves the judge alone.
+
+| budget | gpt-4.1-mini | gpt-5-mini | gpt-5-mini better / worse |
+|---|---|---|---|
+| 2,000 | **91** | 84 | 1 / 8 (p = 0.039) |
+| 4,000 | 84 | 83 | 6 / 7 |
+| 8,000 | 82 | 83 | 9 / 8 |
+
+- gpt-5-mini says NO ANSWER more often (5 against 1 at 2,000) and
+  miscounts the same kinds of question: tanks, properties viewed, times
+  worn, the grocery store spent at most.
+- It holds up better than gpt-4.1-mini as the context grows (temporal
+  23 / 24 at 8,000 against 18), but never above gpt-4.1-mini at 2,000.
+- What is left is counting and adding up across sessions. Neither more
+  context nor a bigger reader fixes it; the next step is the typed event
+  table for counts in the 2026-10-28 plan.
+- Cost: reader 1.40M tokens in and 0.32M out (about $1.00), judge about
+  $0.05.
