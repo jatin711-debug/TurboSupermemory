@@ -48,6 +48,8 @@ from .chunks import is_message, message_role, occasion, passages, spoken_by
 from .compaction import POLICIES, is_gist, plan_compaction
 from .concepts import extract_concepts
 from .events import EVENT_DIR, EVENT_POOL, EVENT_ROLE, EVENT_SHARE, event_note, event_text
+from .observe import (OBSERVATION_DIR, OBSERVATION_ROLE, conversations,
+                      observation_context)
 from .identity import bind_embedder
 from .interfaces import (  # noqa: F401  (Embedder, Extractor, Verifier: re-exported types)
     Embedder, Extractor, Verifier, embed_documents, embed_query, embedder_fingerprint)
@@ -245,6 +247,7 @@ class Memory:
         allow_embedder_change: bool = False,
         idle_consolidation_secs: Optional[float] = None,
         events: Optional[object] = None,
+        observer: Optional[object] = None,
         **engine_kwargs,
     ):
         """
@@ -345,6 +348,18 @@ class Memory:
                 per user message. Default ``None``: no events. A store that
                 has events uses them in ``recall()`` whether or not an
                 extractor is passed when it is reopened.
+            observer: consolidate conversations into observations
+                (``tsm.observe``): on each ``consolidate()`` every message not
+                yet observed is handed, a day's conversation at a time, to the
+                observer, which writes down everything in it worth keeping as
+                short self-contained lines (asides included, one occasion per
+                line, what the assistant gave briefly). They are stored in an
+                engine of their own (``<db_path>/tsm_observations``) and read
+                with ``observations()``, or by ``recall(observations=...)``.
+                ``"anthropic"`` is ``AnthropicObserver`` (claude-haiku-5-5),
+                ``"openai"`` is ``OpenAIObserver``; any object with
+                ``observe(messages)`` (and optionally ``observe_many``) works.
+                Needs the messages (``keep_messages``). Default ``None``.
             **engine_kwargs: forwarded to ``turbomemory.MemoryEngine``.
         """
         # Backend names are resolved here; anything else that is a string is a
@@ -405,6 +420,22 @@ class Memory:
                 raise ValueError(f"unknown events {events!r}: use True, 'openai' or an instance")
             events = None
         self.events = events
+        if observer == "anthropic":
+            import os
+
+            from .observe import AnthropicObserver
+
+            observer = AnthropicObserver(cache_dir=os.path.join(db_path, "tsm_cache"))
+        elif observer == "openai":
+            import os
+
+            from .observe import OpenAIObserver
+
+            observer = OpenAIObserver(cache_dir=os.path.join(db_path, "tsm_cache"))
+        elif isinstance(observer, str):
+            raise ValueError(f"unknown observer {observer!r}: use 'anthropic', 'openai' "
+                             "or an instance")
+        self.observer = observer
         if reranker == "colbert":
             from .rerankers import ColBertReranker
 
@@ -463,6 +494,8 @@ class Memory:
         self.keep_messages = bool(keep_messages)
         if not self.keep_messages and getattr(self.extractor, "stores_nothing", False):
             raise ValueError('extractor="none" stores nothing without keep_messages')
+        if self.observer is not None and not self.keep_messages:
+            raise ValueError("an observer reads the messages: it needs keep_messages")
         if self.keep_messages and self.max_user_tokens is not None:
             # Compaction folds by speaker and does not know passages yet: it
             # would summarize the user's own messages with the assistant's.
@@ -539,6 +572,20 @@ class Memory:
                 self.close()
                 raise
             self._event_counter = max(0, int(self._event_engine.next_insert_seq()) - 1)
+
+        # Observations, too, have an engine of their own: the long-term
+        # record, searched apart from the messages it was written from.
+        self._obs_engine = None
+        self._obs_counter = 0
+        self._observed: Dict[Optional[str], int] = {}  # user -> last message seq observed
+        obs_dir = os.path.join(db_path, OBSERVATION_DIR)
+        if self.observer is not None or os.path.isdir(obs_dir):
+            try:
+                self._obs_engine = turbomemory.MemoryEngine(db_path=obs_dir, dimension=self.dim)
+            except BaseException:
+                self.close()
+                raise
+            self._obs_counter = max(0, int(self._obs_engine.next_insert_seq()) - 1)
 
         if self._idle_secs is not None:
             # A store written by an earlier session may never have been
@@ -1192,6 +1239,10 @@ class Memory:
         summarizer failure there leaves that user's memories as they are, to
         be tried again on the next pass.
 
+        With an ``observer``, every message not yet observed is then
+        observed (``observe_pending``). A failure there stores nothing for
+        that pass; the messages are observed on the next one.
+
         Returns:
             The number of supersession edges committed (0 without a verifier).
         """
@@ -1204,6 +1255,13 @@ class Memory:
             try:
                 self.engine.trigger_consolidation()
                 committed = self._verify_supersessions()
+                if self.observer is not None:
+                    try:
+                        self.observe_pending()
+                    except Exception as e:  # noqa: BLE001 — nothing stored; retried later
+                        self._retry = True
+                        logger.warning("messages not observed (will retry): %s",
+                                       type(e).__name__)
                 if self.max_user_tokens is not None:
                     for user in sorted(self._touched):
                         try:
@@ -1217,6 +1275,146 @@ class Memory:
                 self._pending = True
                 raise
         return committed
+
+    def observe_pending(self) -> int:
+        """Observe every message not yet observed, for every user: a day's
+        conversation at a time, all of them at once when the observer can.
+        A user's observations of one pass are stored in one batch, so a pass
+        either records all of them or (raising) none. Returns how many
+        observations were stored."""
+        self._require_open()
+        if self.observer is None or self._obs_engine is None:
+            return 0
+        users = [u for u in (self.engine.scopes() if hasattr(self.engine, "scopes") else [])]
+        work = []  # (user, last seq, conversations)
+        for user in users:
+            last, messages = self._unobserved(user)
+            if messages:
+                work.append((user, last, conversations(messages)))
+        convs = [c for _, _, cs in work for c in cs]
+        if not convs:
+            return 0
+        many = getattr(self.observer, "observe_many", None)
+        found = many(convs) if many is not None else [self.observer.observe(c) for c in convs]
+        stored, k = 0, 0
+        for user, last, cs in work:
+            texts, payloads = [], []
+            for conv in cs:
+                lines = found[k]
+                k += 1
+                first = conv[0]
+                for line in lines:
+                    texts.append(line)
+                    payloads.append({"timestamp": first.get("timestamp", ""),
+                                     "turn_index": first.get("turn_index"),
+                                     "role": OBSERVATION_ROLE, "user_id": user,
+                                     "through": last,
+                                     "observes": [m.get("turn_index") for m in conv]})
+            if not texts:
+                # Nothing worth keeping: remember that it was read.
+                self._observed[user] = last
+                continue
+            vectors = np.ascontiguousarray(embed_documents(self.embedder, texts),
+                                           dtype=np.float32)
+            with self._write_lock:
+                ids = []
+                for _ in texts:
+                    self._obs_counter += 1
+                    ids.append(f"{user}_o{self._obs_counter}" if user
+                               else f"o{self._obs_counter}")
+                self._obs_engine.insert_batch(
+                    ids, texts, vectors, [1.0] * len(texts),
+                    [extract_concepts(t) for t in texts],
+                    [json.dumps(p) for p in payloads],
+                    [user] * len(texts) if user is not None else None,
+                    [OBSERVATION_ROLE] * len(texts))
+            self._observed[user] = last
+            stored += len(texts)
+        return stored
+
+    def _unobserved(self, user: Optional[str]) -> Tuple[int, List[Dict]]:
+        """``(last message seq, messages)`` of ``user`` not yet observed, the
+        messages rebuilt from their stored passages in the order said."""
+        if user not in self._observed:
+            through = 0
+            for rec in self._obs_engine.get_records(self._obs_engine.scope_ids(user)):
+                if rec is None:
+                    continue
+                try:
+                    through = max(through, int(json.loads(rec["payload"]).get("through") or 0))
+                except (TypeError, ValueError):
+                    continue
+            self._observed[user] = through
+        through = self._observed[user]
+        fresh = []
+        for mid in self.engine.scope_ids(user):
+            head, _, tail = str(mid).rpartition("_")
+            if tail.isdigit() and int(tail) > through:
+                fresh.append((int(tail), mid))
+        if not fresh:
+            return through, []
+        fresh.sort()
+        records = self._records([mid for _, mid in fresh])
+        turns: Dict[object, Dict] = {}
+        for seq, mid in fresh:
+            rec = records.get(mid)
+            if rec is None or not is_message(rec["source_role"]):
+                continue
+            payload = rec["payload"]
+            turn = payload.get("turn_index")
+            msg = turns.setdefault(turn, {"role": spoken_by(rec["source_role"]),
+                                          "timestamp": payload.get("timestamp", ""),
+                                          "turn_index": turn, "parts": [], "seq": seq})
+            msg["parts"].append((payload.get("passage") or 0, rec["text"] or ""))
+        messages = []
+        for msg in sorted(turns.values(), key=lambda m: m["seq"]):
+            msg["content"] = " ".join(text for _, text in sorted(msg.pop("parts")))
+            messages.append(msg)
+        return fresh[-1][0], messages
+
+    def observations(self, user_id: Optional[str], query: Optional[str] = None,
+                     token_budget: Optional[int] = None, time_tags: bool = True) -> List[Dict]:
+        """The observations of ``user_id`` in the order said, each with
+        ``"context"``: the date of its conversation, then the line, with each
+        relative time followed by the date it points to. With ``query`` and
+        ``token_budget``, only the observations that best match the query
+        and fit the budget, still in the order said."""
+        self._require_open()
+        if self._obs_engine is None:
+            return []
+        if query is not None and token_budget is not None:
+            vector = np.asarray(embed_query(self.embedder, query), dtype=np.float32)
+            found = self._obs_engine.search(query_text=query, query_embedding=vector,
+                                            top_k=max(50, int(token_budget) // 8),
+                                            scope=user_id) or []
+            scores = {mid: float(score) for mid, score in found}
+            ids = [mid for mid, _ in found]
+        else:
+            ids, scores = list(self._obs_engine.scope_ids(user_id)), {}
+        records = self._records(ids, self._obs_engine)
+        items = []
+        for mid in ids:
+            rec = records.get(mid)
+            if rec is None or rec["scope"] != user_id:
+                continue
+            item = self._pool_item(mid, rec, scores.get(mid, 0.0))
+            item["context"] = observation_context(rec["text"] or "", item["timestamp"],
+                                                  time_tags)
+            items.append(item)
+        if token_budget is not None:
+            kept, used = [], 0
+            for item in items:  # best first when searched
+                cost = estimate_tokens(item["context"])
+                if used + cost <= token_budget:
+                    kept.append(item)
+                    used += cost
+            items = kept
+
+        def order(item):
+            seq = str(item["id"]).rpartition("_o")[2]
+            return (str(said_on(item["timestamp"]) or ""), int(seq) if seq.isdigit() else 0)
+
+        return sorted(items, key=order)
 
     def _idle_loop(self) -> None:
         """Background thread of ``idle_consolidation_secs``: consolidate when
@@ -1397,6 +1595,8 @@ class Memory:
         self.engine.flush()
         if self._event_engine is not None:
             self._event_engine.flush()
+        if self._obs_engine is not None:
+            self._obs_engine.flush()
 
     def close(self) -> None:
         """Flush and release the engine. Idempotent.
@@ -1408,13 +1608,14 @@ class Memory:
         if not self._closed:
             self._stop_idle_worker()
             try:
-                if getattr(self, "_event_engine", None) is not None:
-                    try:
-                        self._event_engine.close()
-                    finally:
-                        self.engine.close()
-                else:
-                    self.engine.close()
+                for side in ("_obs_engine", "_event_engine"):
+                    engine = getattr(self, side, None)
+                    if engine is not None:
+                        try:
+                            engine.close()
+                        except Exception as e:  # noqa: BLE001 — the main engine still closes
+                            logger.warning("%s close failed: %s", side, e)
+                self.engine.close()
             finally:
                 # The engine handle is released even when its final flush
                 # raises, so this object is closed either way.
@@ -1425,7 +1626,8 @@ class Memory:
                 for backend, method in ((self.extractor, "flush_cache"),
                                         (self.embedder, "flush"),
                                         (self.verifier, "flush_cache"),
-                                        (self.events, "flush_cache")):
+                                        (self.events, "flush_cache"),
+                                        (self.observer, "flush_cache")):
                     flush = getattr(backend, method, None)
                     if callable(flush):
                         try:
