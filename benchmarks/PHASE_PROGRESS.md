@@ -4157,3 +4157,63 @@ The extraction prompt was written looking at the first 12 of these questions.
   quoting. Cost: 3,343 requests, 6.1M tokens in and 1.0M out, about $1.10.
 - Cost: about 21,000 extraction requests (gpt-4o-mini, roughly $3) and three
   judged passes over 121 to 242 answers.
+
+# Observational memory: consolidating conversations into observations (2026-11-05)
+
+**Why.** On the jewelry question ("how many pieces did I acquire in the last two
+months?") the 2,000-token context held 28 passages: about 22 were requests for
+cleaning tips and the assistant's lists, and the three acquisitions were
+"by the way" clauses at the ends of messages. Published systems that report the
+highest LongMemEval scores consolidate instead of retrieving raw chunks:
+Mastra's observational memory (an Observer writes dense, dated observations of
+each conversation; 84% with gpt-4o and 95% with gpt-5-mini as reader, their own
+figures) and Hindsight (narrative facts with time ranges, entity links).
+
+**What was built.** `tsm/observe.py`: an Observer prompt (everything the user
+reveals, asides included, one occasion per line, numbers and names exact, time
+expressions as written, what the assistant gave in one line each),
+`AnthropicObserver` (claude-haiku-5-5, thinking off) and `OpenAIObserver`, a
+disk cache by conversation text. `Memory(observer=...)`: `consolidate()`
+observes every message not yet observed, a day's conversation at a time, and
+stores the lines in a third engine (`<db>/tsm_observations`); a user's pass is
+one batch, and what was observed is recorded in the observations themselves
+(`through`), so a reopened store does not observe again. `Memory.observations
+(user, query=None, token_budget=None)` returns them dated and in the order
+said, relative times resolved (`tsm.when`). Off by default.
+
+**Observing LongMemEval-S.** The 121 multi-session histories (5,695 sessions,
+claude-haiku-5-5): 21.6M tokens in, 2.7M out, about $3.50. A history of about
+120,000 tokens becomes about 17,600 tokens of observations (7x). Inspected on
+the questions it lost, the observer had kept the facts (the bedtime "2 AM last
+Wednesday", "left home at 7 AM" and "took two hours" to the clinic, the
+jewelry purchases); one loss was a rewording ("downloaded" became "listening
+on Spotify").
+
+**Judged** (`benchmarks/cognitive_eval/observe_eval.py` builds the contexts,
+`reread.py --provider anthropic` reads each one three times; claude-haiku-5-5
+reads and judges; `runs/2026-11-05b/`):
+
+| context | mean right of 121 |
+|---|---|
+| raw passages, 2,000 tokens (`sdk_raw`, OpenAI vectors, recall()) | **94.7 / 96.0** (two runs) |
+| every observation of the history (~17,600 tokens) | 93.0 |
+| the observations that best match the question, 2,000 tokens | 90.7 |
+| the same, 4,000 tokens | 91.7 |
+| best observations in 1,000 tokens + the first 1,000 of the raw context | 93.0 |
+| the same at 4,000 | 92.0 |
+
+None differs from the raw passages beyond the reader's noise (15 / 10 at best,
+p = 0.42). The observation selection ranked by EmbeddingGemma 2 cosine alone
+(no OpenAI credit for embeddings), the raw context by recall() on OpenAI
+vectors; the whole log needs no ranking and did no better.
+
+**What this says.** Every representation tried on these 121 questions (raw
+passages at 2,000 to 8,000 tokens, facts, events, observations whole or
+selected) lands at the same accuracy for a given reader, and the evidence is
+already in the context for 111 of them. The remaining errors are the
+reader's: counting, deduplicating and windowing what it is shown. Mastra's own
+numbers point the same way: the same observations scored 84% with gpt-4o and
+95% with gpt-5-mini, an eleven-point difference that is all reader. The
+observation tier stays as an opt-in: it is a seven-times smaller long-term
+record that answers about as well as the raw messages, not a gain in answers.
+Cost of the judged reads: about $2.
