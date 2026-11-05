@@ -4217,3 +4217,46 @@ numbers point the same way: the same observations scored 84% with gpt-4o and
 observation tier stays as an opt-in: it is a seven-times smaller long-term
 record that answers about as well as the raw messages, not a gain in answers.
 Cost of the judged reads: about $2.
+
+# Every LongMemEval-S question: 87.4% at 2,000 tokens (2026-11-05)
+
+`shipped_stack_eval.py --variant s --limit 500 --arms sdk_raw,sdk_raw_plain
+--token-budget 2000 --reader notes`: the 470 answerable questions (the 30
+abstention questions are skipped), each history about 120,000 tokens kept as
+messages (1,617 passages), recalled into 2,000 tokens, read with the
+`tsm.reading` prompt and judged by gpt-4.1-mini, OpenAI embeddings
+(`runs/2026-11-05c/s500_raw_2000.json`). One judged pass: the reader alone
+moves about 1 question in 20 between passes.
+
+| type | n | sdk_raw (recall()) | sdk_raw_plain | all evidence in context (sdk_raw) |
+|---|---|---|---|---|
+| knowledge-update | 72 | 70 (97.2%) | 69 | 70 |
+| multi-session | 121 | 101 (83.5%) | 103 | 111 |
+| single-session-assistant | 56 | **54 (96.4%)** | 41 | 56 |
+| single-session-preference | 30 | 20 (66.7%) | 22 | 29 |
+| single-session-user | 64 | 61 (95.3%) | 61 | 62 |
+| temporal-reasoning | 127 | 105 (82.7%) | 105 | 111 |
+| **all** | **470** | **411 (87.4%)** | 401 (85.3%) | 439 (93.4%) |
+
+- **Recall finds the evidence**: all of it is in the 2,000 tokens (1.7% of the
+  history) for 439 of 470 questions.
+- **The graph adds nothing here.** sdk_raw_plain is the same store read through
+  a plain vector pool with recall()'s role prior, packer and tags. All of
+  sdk_raw's lead (25 / 15) is the single-session-assistant questions (13 / 0),
+  where recall() returns the assistant's reply whole (`_whole_reply`) and the
+  plain arm does not; both arms had all the evidence for all 56. Without that
+  type the plain search is level or ahead: 357 against 360 of 414 (12 / 15,
+  p = 0.70). On evidence, cognitive search found it all for 4 more questions
+  (4 / 0, p = 0.12), which the reader did not turn into answers.
+- **What is left is the reader's**: of the 59 wrong answers, 31 had all their
+  evidence. The weakest type is preference (20 of 30 with the evidence in 29):
+  the question asks for advice fitted to the user, and the answer is graded
+  on whether it uses what the user said.
+- Published figures for comparison, not like for like (other readers, the
+  abstention questions included, their own judges): Mastra's observational
+  memory 84.2% with gpt-4o and 94.9% with gpt-5-mini; Hindsight 91.4% with
+  Gemini 3 Pro.
+- The run's embedding overlay reached 2.7 GB and was rewritten after every
+  history, so each history took longer than the one before; it is now
+  written at most every 10 minutes and at the end (`OVERLAY_FLUSH_SECS`).
+- Cost: embeddings for ~370 new histories and 940 judged answers, about $3.
