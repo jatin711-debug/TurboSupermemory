@@ -39,6 +39,10 @@ neighbouring arms belongs to one mechanism:
                     at write time
     sdk_raw_plain   sdk_raw's passages without cognitive search: a plain
                     vector pool, then recall()'s role prior, packer and tags
+    sdk_raw_events  sdk_raw plus the events each user message reports
+                    (Memory(events=...), tsm.events; --event-model): a
+                    counting question gets the best of them in a share of
+                    the budget, one dated line each
 
   any engine setting, as an arm of its own
     --config NAME:KEY=VALUE,...   adds the arm cfg_NAME: sdk_cognitive (the
@@ -157,11 +161,11 @@ BOUNDED = ("sdk_evict", "sdk_evict_gist", "sdk_budget", "sdk_budget_rolling")
 RECALL_ARMS = ("sdk_cognitive", "sdk_cognitive_alpha1", "sdk_belief", "sdk_belief_llm",
                "sdk_belief_llm_exclude", "sdk_belief_llm_nodemote", "sdk_evict",
                "sdk_evict_gist", "sdk_budget", "sdk_budget_rolling", "sdk_budget_rolling_merge",
-               "sdk_budget_delete", "sdk_messages", "sdk_raw")
+               "sdk_budget_delete", "sdk_messages", "sdk_raw", "sdk_raw_events")
 DIAGNOSTIC = (("sdk_cognitive_trunc", "sdk_cognitive_alpha1", "sdk_pack_capped", "sdk_pack_tagged",
                "sdk_belief_llm_exclude", "sdk_belief_llm_nodemote", "sdk_budget_delete",
                "sdk_budget_rolling_merge", "full_context", "sdk_messages", "sdk_raw",
-               "sdk_raw_plain")
+               "sdk_raw_plain", "sdk_raw_events")
               + tuple(a + "_untagged" for a in RECALL_ARMS)
               + tuple(a + "_turns" for a in RECALL_ARMS))
 DEFAULT_ARMS = UNBOUNDED + BOUNDED
@@ -207,6 +211,7 @@ PAIRS = (
     ("sdk_messages", "full_context"),
     ("sdk_raw", "full_context"),
     ("sdk_raw", "sdk_raw_plain"),
+    ("sdk_raw_events", "sdk_raw"),
 )
 
 
@@ -672,6 +677,8 @@ def main():
                          "may be given several times")
     ap.add_argument("--extractor-model", default="gpt-4.1-nano")
     ap.add_argument("--gist-model", default="gpt-4o-mini")
+    ap.add_argument("--event-model", default="gpt-4o-mini",
+                    help="the model sdk_raw_events lists each user message's events with")
     ap.add_argument("--verifier-model", default="gpt-4o-mini")
     ap.add_argument("--judge", choices=["openai", "none"], default="openai")
     ap.add_argument("--judge-model", default="gpt-4.1-mini")
@@ -846,6 +853,17 @@ def main():
                 model=args.gist_model),
             None if args.offline else os.path.join(
                 work_dir, f"gists_{args.gist_model.replace('/', '_')}.json"))
+    events = None
+    if asked("sdk_raw_events"):
+        if args.offline:
+            sys.exit("sdk_raw_events asks a model for each user message's events; "
+                     "run it without --offline (--judge none still skips the judge)")
+        from tsm.events import OpenAIEventExtractor
+
+        # One extractor for every history: its cache is shared, and it asks
+        # for a history's messages --workers at a time.
+        events = OpenAIEventExtractor(model=args.event_model, cache_dir=work_dir,
+                                      workers=args.workers)
     nli = None
 
     convs = load_longmemeval(args.data_dir)[args.skip:args.limit]
@@ -900,7 +918,8 @@ def main():
              "variant": args.variant, "pool": size, "time_tags": args.time_tags,
              "file_order": args.file_order, "question_date": args.question_date,
              "configs": configs, "reader": args.reader, "skip": args.skip,
-             "source_tokens": args.source_tokens, "readings": readings}
+             "source_tokens": args.source_tokens, "readings": readings,
+             **({"event_model": args.event_model} if events is not None else {})}
     done = set()
     if checkpoint and os.path.exists(checkpoint):
         with open(checkpoint, encoding="utf-8") as fh:
@@ -1110,6 +1129,8 @@ def main():
             recall_arm("sdk_messages", keep_messages=True, refinement_cosine_threshold=None,
                        contradiction_cosine_threshold=None)
             recall_arm("sdk_raw", keep_messages=True, extractor="none",
+                       refinement_cosine_threshold=None, contradiction_cosine_threshold=None)
+            recall_arm("sdk_raw_events", keep_messages=True, extractor="none", events=events,
                        refinement_cosine_threshold=None, contradiction_cosine_threshold=None)
             recall_arm("sdk_cognitive_alpha1", refinement_cosine_threshold=None,
                        contradiction_cosine_threshold=None, cognitive_alpha=1.0)
