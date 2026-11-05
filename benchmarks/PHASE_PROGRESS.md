@@ -4039,8 +4039,40 @@ context, of 1,977:
 - Facts and messages against facts: 72 / 36 (p = 0.001).
 - Facts and messages against messages alone: 197 / 35.
 
-**LongMemEval-S with OpenAI embeddings.** Messages alone (`sdk_raw`),
-questions 31-130 (96 with an answer), 2,000 tokens: 91 of 96 with all
-their evidence (`runs/2026-11-05/s100_raw_2000.json`). EmbeddingGemma 2
-also gave 91 on 2026-10-29. The 4,000- and 8,000-token runs, and judging
-all three, are next.
+**LongMemEval-S: a bigger context finds all the evidence and answers
+less.** The 2026 systems at 90-96% on LongMemEval-S give their reader 5k
+to 18k tokens, so the budget looked like the next lever. Setup:
+- Messages alone (`sdk_raw`), OpenAI embeddings.
+- Questions 31-130, 96 with an answer (`runs/2026-11-05/s100_raw_*`).
+- Judged with `--reader notes` by gpt-4.1-mini, on the contexts the free
+  runs saved (`--rejudge`).
+
+| budget | all evidence in the context | judged right | multi-session | temporal |
+|---|---|---|---|---|
+| **2,000** | 91 | **91** | 24/25 | 21/24 |
+| 4,000 | 95 | 84 | 18/25 | 20/24 |
+| 8,000 | **96** | 82 | 18/25 | 18/24 |
+
+- Paired: 2,000 against 4,000 is 7 / 0 (p = 0.016); against 8,000,
+  10 / 1 (p = 0.012). 4,000 against 8,000: 5 / 3.
+- Knowledge-update, both single-session user types and preference are
+  the same at every budget. The losses are counts and dates.
+- Wrong at 8,000: "How many hours of jogging and yoga did I do last
+  week?" (gold 0.5, answered 0); "How many graduation ceremonies ... in
+  the past three months?" (3, answered four); "How many days a week do I
+  attend fitness classes?" (4, answered 3); "Did I visit [the museum]
+  with a friend or not?" (no, answered yes).
+- More passages bring more near-miss instances of the same activity:
+  other weeks, other ceremonies, another museum visit. The reader counts
+  or dates them as if they were the ones asked about.
+- So the budget is not the lever for this reader. More context needs a
+  reader that can tell the instances apart, or the instances
+  structured beforehand (the typed event table for counts in the
+  2026-10-28 plan). 2,000 tokens stays the operating point.
+- 91 of 96 at 2,000 is above the 85 of 95 judged on 2026-10-29
+  (EmbeddingGemma 2). Those contexts differ and the reader varies by
+  about five questions on identical contexts, so that is not evidence
+  that OpenAI vectors read better.
+- EmbeddingGemma 2 also found all the evidence for 91 at 2,000 on
+  2026-10-29.
+- Cost: 571 requests, $0.66.
