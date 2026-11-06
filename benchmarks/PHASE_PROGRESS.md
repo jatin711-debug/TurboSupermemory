@@ -4248,8 +4248,9 @@ moves about 1 question in 20 between passes.
   type the plain search is level or ahead: 357 against 360 of 414 (12 / 15,
   p = 0.70). On evidence, cognitive search found it all for 4 more questions
   (4 / 0, p = 0.12), which the reader did not turn into answers.
-- **What is left is the reader's**: of the 59 wrong answers, 31 had all their
-  evidence. The weakest type is preference (20 of 30 with the evidence in 29):
+- **What is left is the reader's**: of the 59 wrong answers, 41 had all their
+  evidence (corrected 2026-11-06; this said 31, the count of questions
+  without all of it). The weakest type is preference (20 of 30 with the evidence in 29):
   the question asks for advice fitted to the user, and the answer is graded
   on whether it uses what the user said.
 - Published figures for comparison, not like for like (other readers, the
@@ -4260,3 +4261,94 @@ moves about 1 question in 20 between passes.
   history, so each history took longer than the one before; it is now
   written at most every 10 minutes and at the end (`OVERLAY_FLUSH_SECS`).
 - Cost: embeddings for ~370 new histories and 940 judged answers, about $3.
+
+# Questions that point at a time, and advice questions (2026-11-06)
+
+The 59 wrong answers of the 470-question run, by what went wrong:
+
+| type | wrong | with all evidence | without |
+|---|---|---|---|
+| temporal-reasoning | 22 | 12 | 10 |
+| multi-session | 20 | 15 | 5 |
+| single-session-preference | 10 | 9 | 1 |
+| single-session-user | 3 | 2 | 1 |
+| knowledge-update | 2 | 1 | 1 |
+| single-session-assistant | 2 | 2 | 0 |
+
+**Temporal questions without their evidence.** Ten wrong answers had evidence
+missing, and seven of those questions name a time and little else: "what
+kitchen appliance did I buy 10 days ago", "the life event of a relative a
+week ago", "the business milestone I mentioned four weeks ago". Each evidence
+message was said exactly that long before the question (10, 7, 27 and 28
+days). `recall()` was never told when the question is asked, so "10 days ago"
+narrowed nothing, and in a 120,000-token history every other message on the
+topic outscored the right day's.
+
+**Fix: `recall(now=...)`** (`tsm.when.question_windows`). A time expression in
+the question ("N days / weeks / months ago", "yesterday", "last week /
+weekend / month / Tuesday", "this week", "in the past N weeks", a month or a
+date) is resolved against `now` into a window of days, widened a day before
+and three after (a thing is mentioned the day it happens or soon after). The
+best 30 of the user's memories said in it, from the 1,000 nearest the
+question, are packed first in up to half the budget; the rest of the pool
+fills the remainder. A question without such an expression, or a window with
+nothing said in it, gets the old result exactly. `now` defaults to today's
+date, so a live caller gets it without doing anything; a replay must pass the
+date the question was asked (harness arm `sdk_raw_dated`).
+
+Temporal questions, 2,000 tokens, free evidence score
+(`runs/2026-11-06/temporal_dated.json`):
+
+| | all evidence in context, of 127 | share of the evidence turns |
+|---|---|---|
+| sdk_raw | 111 | 92.6% |
+| sdk_raw_dated | **114** | **94.8%** |
+
+- 23 contexts changed, every one of them for a question with a time
+  expression; 3 gained all their evidence and none lost any (p = 0.25).
+- Judged, the 23 changed contexts read five times each (gpt-4.1-mini reader
+  and judge, `--reader notes`, `runs/2026-11-06/reread5_temporal_dated.json`):
+  15.8 against 13.4 right per read, 4 / 1 (p = 0.38). The one loss went from
+  4 of 5 reads to 3 of 5 with its evidence in both contexts.
+- Not fixed: "the business milestone I mentioned four weeks ago" has 644
+  passages in its window and the evidence ("I just signed a contract with my
+  first client") ranks 193rd. "What did I buy for the competition four weeks
+  ago" has its evidence 7th in the window, but the packer took less relevant
+  passages: every score in the window is between 0.22 and 0.34, and the
+  variety term counted the evidence against the passage before it in the same
+  conversation (the sculpture competition). "5 days ago" in one question
+  points at a message said 10 days before it.
+
+All 470 questions (`runs/2026-11-06/s500_dated.json`): 47 contexts changed,
+23 temporal and 24 others, every one for a question with a time expression
+(20 of the 24 are multi-session counts over a span: "how many plants did I
+acquire in the last month", "how many doctor's appointments in March").
+All the evidence: 441 for sdk_raw_dated against 439 (3 / 1, p = 0.62). The
+one loss is "how many pieces of furniture ... in the past few months": two
+messages of one day both say "I just got a new coffee table", and the window
+pack kept one. Judged, the 24 changed non-temporal contexts read five times
+each: 18.8 against 18.4 (3 / 2, p = 1.0, `reread5_other_dated.json`). So the
+window helps the questions it is for and leaves counting over a span level.
+
+**Advice questions.** Preference questions ask for advice ("any tips for my
+phone's battery?") and are graded on whether the answer builds on what the
+user said (the power bank they bought). The evidence was in the context for
+29 of 30; 20 were answered right. Three misses were refusals (NO ANSWER: the
+prompt says to use only the notes), the rest generic advice that ignored
+what the notes said (turbinado sugar suggested to someone already baking
+with it; meditation apps for someone whose phone keeps them awake).
+
+Two rewordings of `ANSWER_SYSTEM`, read against the shipped prompt on the
+same 30 contexts (`reread.py --system`, new; gpt-4.1-mini):
+
+| prompt | right per read, of 30 | vs shipped |
+|---|---|---|
+| shipped | 23.7 (3 reads) / 23.0 (5 reads) | |
+| advice: always answer a request, build on what the user has, did, liked, plans or must avoid, do not offer what they already do | 23.7 (3 reads) | 7 / 6, p = 1.0 |
+| narrow: only "a request for advice is always answered" | 24.0 (5 reads) | 8 / 6, p = 0.79 |
+
+Both rewordings stopped most refusals, and lost about as many answers
+elsewhere (Tokyo transit tips, keeping the kitchen clean), where the same
+kind of answer is graded right on one read and wrong on the next. The shipped
+prompt stays. A single pass (20 of 30) understates the reader: read five
+times, the shipped prompt averages 23.
