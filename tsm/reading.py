@@ -97,7 +97,8 @@ def in_order(memories: Sequence[Memory]) -> List[Memory]:
 
 
 def answer_prompt(question: str, memories: Sequence[Memory],
-                  today: Optional[str] = None) -> List[Dict[str, str]]:
+                  today: Optional[str] = None,
+                  system: Optional[str] = None) -> List[Dict[str, str]]:
     """Chat messages that ask a model to answer ``question`` from ``memories``.
 
     ``memories`` is what ``recall()`` returned (their ``"context"`` is shown:
@@ -106,13 +107,15 @@ def answer_prompt(question: str, memories: Sequence[Memory],
     of the model's reply with ``final_answer``. Give the model room for about
     800 tokens: a reply is some 200 on average, but a question that draws on
     many notes needs more, and a reply cut off before its last line has no
-    answer in it.
+    answer in it. ``system`` replaces ``ANSWER_SYSTEM`` (to try another
+    wording on the same notes).
     """
     notes = [text for text in (_text(memory) for memory in in_order(memories)) if text]
     listing = "\n".join(f"{number}. {text}" for number, text in enumerate(notes, 1))
     when = f"Current date: {today}\n" if today else ""
     user = f"Notes:\n{listing or '(none)'}\n\n{when}Question: {question}"
-    return [{"role": "system", "content": ANSWER_SYSTEM}, {"role": "user", "content": user}]
+    return [{"role": "system", "content": system or ANSWER_SYSTEM},
+            {"role": "user", "content": user}]
 
 
 def final_answer(reply: Optional[str]) -> str:

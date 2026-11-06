@@ -140,7 +140,8 @@ class OpenAIJudge:
                 time.sleep(wait)
         raise RuntimeError("OpenAI call failed after retries")
 
-    def answer(self, question, memories, today=None, reader="plain", turns=None):
+    def answer(self, question, memories, today=None, reader="plain", turns=None,
+               system=None):
         """Answer `question` using only `memories` (list of snippet strings).
 
         `today` is the date the question is asked, when the dataset gives one:
@@ -150,7 +151,8 @@ class OpenAIJudge:
         memories in the order they were said, and the model lists what
         matters and works the answer out before giving it. `turns` is the
         turn each memory is from, which `recall()` results carry: it orders
-        the memories of one day."""
+        the memories of one day. `system` replaces the "notes" reader's
+        instructions (`tsm.reading.ANSWER_SYSTEM`)."""
         if not memories:
             return "NO ANSWER"
         if reader == "tools":
@@ -173,7 +175,8 @@ class OpenAIJudge:
 
             if turns and len(turns) == len(memories):
                 memories = [{"context": m, "turn_index": t} for m, t in zip(memories, turns)]
-            system, user = (m["content"] for m in answer_prompt(question, memories, today))
+            system, user = (m["content"] for m in
+                            answer_prompt(question, memories, today, system=system))
             # Replies average about 200 tokens; at 500, three of 115 were cut off
             # before their answer line (a question over many notes).
             return final_answer(self._chat(system, user, max_tokens=800,

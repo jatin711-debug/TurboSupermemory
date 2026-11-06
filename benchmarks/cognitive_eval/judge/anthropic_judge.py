@@ -80,7 +80,8 @@ class AnthropicJudge:
             return ""
         return "".join(b.text for b in resp.content if b.type == "text").strip()
 
-    def answer(self, question, memories, today=None, reader="plain", turns=None):
+    def answer(self, question, memories, today=None, reader="plain", turns=None,
+               system=None):
         """As ``OpenAIJudge.answer`` (``reader`` "plain" or "notes")."""
         from .openai_judge import _ANSWER_SYS
 
@@ -93,7 +94,8 @@ class AnthropicJudge:
 
             if turns and len(turns) == len(memories):
                 memories = [{"context": m, "turn_index": t} for m, t in zip(memories, turns)]
-            system, user = (m["content"] for m in answer_prompt(question, memories, today))
+            system, user = (m["content"] for m in
+                            answer_prompt(question, memories, today, system=system))
             return final_answer(self._chat(system, user, 800, reader=True)) or "NO ANSWER"
         ctx = "\n".join(f"{i + 1}. {m}" for i, m in enumerate(memories) if m)
         when = f"Current date: {today}\n" if today else ""

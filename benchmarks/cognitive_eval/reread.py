@@ -16,6 +16,11 @@ per-question results ``PATH`` (``--out`` of the harness). Arms are compared
 on the questions they share; identical contexts are read once per read and
 shared between arms. Paid: one reader and one judge request per distinct
 context per read.
+
+``--system NAME=FILE`` (repeatable; ``NAME=-`` is the shipped
+``tsm.reading.ANSWER_SYSTEM``) reads every arm with each of these reader
+instructions instead, as arms ``ARM/NAME``: a prompt change compared on the
+same contexts.
 """
 
 import argparse
@@ -57,6 +62,8 @@ def main():
                     help="anthropic: the reader's effort (low ... max)")
     ap.add_argument("--workers", type=int, default=32)
     ap.add_argument("--out", default=None, help="write every read here (JSON)")
+    ap.add_argument("--system", action="append", default=[], metavar="NAME=FILE",
+                    help="--reader notes: read with these instructions too ('-': shipped)")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -74,16 +81,28 @@ def main():
         if not tasks:
             sys.exit(f"no tasks of arm {arm} in {path}")
         arms[name] = {t["query_id"]: t for t in tasks}
-    shared = set.intersection(*(set(a) for a in arms.values()))
+    systems = {None: None}
+    if args.system:
+        systems = {}
+        for spec in args.system:
+            name, file = spec.split("=", 1)
+            if file == "-":
+                systems[name] = None
+            else:
+                with open(file, encoding="utf-8") as fh:
+                    systems[name] = fh.read().strip()
+        arms = {f"{arm}/{name}": dict(tasks, **{"": name})
+                for arm, tasks in arms.items() for name in systems}
+    shared = set.intersection(*(set(a) - {""} for a in arms.values()))
     names = list(arms)
 
-    def key(t):
-        return json.dumps([t["query"], t["gold"], t.get("asked"), t["retrieved"]])
+    def key(t, system=None):
+        return json.dumps([t["query"], t["gold"], t.get("asked"), t["retrieved"], system])
 
-    distinct = {}
+    distinct = {}  # key -> (task, system name)
     for a in arms.values():
         for q in shared:
-            distinct.setdefault(key(a[q]), a[q])
+            distinct.setdefault(key(a[q], a.get("")), (a[q], a.get("")))
     judge = create_judge(args.provider, openai_model=args.judge_model,
                          anthropic_model=args.judge_model)
     judge.reader_effort = args.reader_effort
@@ -92,8 +111,10 @@ def main():
 
     def read(job):
         k, _ = job
-        t = distinct[k]
+        t, system = distinct[k]
         how = {"reader": args.reader}
+        if systems.get(system):
+            how["system"] = systems[system]
         if t.get("asked"):
             how["today"] = t["asked"]
         if t.get("turns"):
@@ -109,7 +130,8 @@ def main():
             right[k] += ok
             log[k].append([prediction, ok])
 
-    rate = {name: {q: right[key(a[q])] / args.reads for q in shared} for name, a in arms.items()}
+    rate = {name: {q: right[key(a[q], a.get(""))] / args.reads for q in shared}
+            for name, a in arms.items()}
     print(f"\nmean answered right over {args.reads} reads, {len(shared)} questions")
     for name in names:
         per_read = sum(rate[name].values())

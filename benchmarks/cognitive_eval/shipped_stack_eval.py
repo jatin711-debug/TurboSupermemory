@@ -58,6 +58,9 @@ neighbouring arms belongs to one mechanism:
   diagnostics (not run by default)
     <recall arm>_untagged   the same store, recall(time_tags=False): the
                             facts without their turn or date
+    <recall arm>_dated      the same store, recall(now=the question's date): a
+                            question that points at a time ("ten days ago")
+                            gets the memories said then first
     <recall arm>_turns      the same store, recall(sources="turn"): the facts
                             are the keys and the reader gets the turns they
                             were taken from (--source-tokens caps a long one)
@@ -167,7 +170,8 @@ DIAGNOSTIC = (("sdk_cognitive_trunc", "sdk_cognitive_alpha1", "sdk_pack_capped",
                "sdk_budget_rolling_merge", "full_context", "sdk_messages", "sdk_raw",
                "sdk_raw_plain", "sdk_raw_events")
               + tuple(a + "_untagged" for a in RECALL_ARMS)
-              + tuple(a + "_turns" for a in RECALL_ARMS))
+              + tuple(a + "_turns" for a in RECALL_ARMS)
+              + tuple(a + "_dated" for a in RECALL_ARMS))
 DEFAULT_ARMS = UNBOUNDED + BOUNDED
 ARMS = DEFAULT_ARMS + DIAGNOSTIC
 # (arm, baseline): each pair differs in one mechanism.
@@ -196,6 +200,7 @@ PAIRS = (
     ("sdk_pack_tagged", "sdk_pack"),
     ("sdk_cognitive", "sdk_pack_tagged"),
     ("sdk_cognitive_alpha1", "sdk_cognitive"),
+    ("sdk_raw_dated", "sdk_raw"),
     ("sdk_cognitive_alpha1", "sdk_pack_tagged"),
     ("sdk_belief_llm", "sdk_pack_tagged"),
     ("sdk_belief_llm", "sdk_belief_llm_exclude"),
@@ -228,7 +233,7 @@ def default_work_dir():
 
 def variants(name):
     """A recall() arm and the diagnostics served from the same store."""
-    return (name, name + "_trunc", name + "_untagged", name + "_turns")
+    return (name, name + "_trunc", name + "_untagged", name + "_turns", name + "_dated")
 
 
 class Embeddings:
@@ -997,6 +1002,7 @@ def main():
         conv = unit[0]
         opened = []  # (close, db) of everything built for this history
         retrieve = {}  # arm -> question -> [(text for the prompt, turn it is from or None)]
+        asking = {}  # the question being asked: its date, for the _dated arms
         conv_tasks = []
         conv_stats = defaultdict(Counter)
         try:
@@ -1127,6 +1133,10 @@ def main():
                         mem.recall(q, user_id=user, **{
                             "token_budget": args.token_budget, "pool_k": args.pool_k,
                             "time_tags": tag_mode, **turn_options, **how}))
+                retrieve[name + "_dated"] = lambda q, mem=mem: shown(
+                    mem.recall(q, user_id=user, token_budget=args.token_budget,
+                               pool_k=args.pool_k, time_tags=tag_mode,
+                               now=asking.get("date") or None))
                 retrieve[name + "_turns"] = lambda q, mem=mem: shown(
                     mem.recall(q, user_id=user, token_budget=args.token_budget,
                                pool_k=args.pool_k, time_tags=tag_mode, sources="turn",
@@ -1174,6 +1184,7 @@ def main():
             recall_arm("sdk_budget_delete", max_user_tokens=args.user_tokens)
 
             for asked_of, q in questions:
+                asking["date"] = getattr(q, "question_date", "") or ""
                 for arm in arms:
                     pairs = retrieve[arm](q.query_text)
                     conv_tasks.append({
