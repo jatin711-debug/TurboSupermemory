@@ -33,7 +33,9 @@ from tsm.reading import ANSWER_SYSTEM, answer_prompt, final_answer, in_order
 from tsm.answering import (add_days, answer_with_tools, calculate, count_distinct,
                            days_between, run_tool)
 from tsm.sources import excerpt, turn_units
-from tsm.when import annotate, said_on
+from datetime import date, datetime
+
+from tsm.when import annotate, question_windows, said_on
 
 
 def _item(text, score, vec, turn_index=None):
@@ -656,6 +658,56 @@ class TestEventDates(unittest.TestCase):
                      "I may go there", "back in 2019"):
             self.check(text, text)
         self.assertEqual(annotate("two weeks ago", None), "two weeks ago")
+
+
+class TestQuestionWindows(unittest.TestCase):
+    """The stretch of days a question points at, counted from when it is asked."""
+
+    NOW = "2023/06/22 (Thu) 10:00"
+
+    def check(self, question, *spans, now=NOW):
+        expected = [(date.fromisoformat(a), date.fromisoformat(b)) for a, b in spans]
+        self.assertEqual(question_windows(question, now), expected)
+
+    def test_so_long_ago(self):
+        self.check("What kitchen appliance did I buy 10 days ago?",
+                   ("2023-03-13", "2023-03-17"), now="2023/03/25 (Sat) 09:00")
+        self.check("What did I start a week ago?", ("2023-06-12", "2023-06-18"))
+        self.check("What did I buy four weeks ago?", ("2023-05-20", "2023-05-30"))
+        self.check("Where was I two months ago?", ("2023-04-07", "2023-05-07"))
+
+    def test_named_days_and_weeks(self):
+        self.check("What did I say yesterday?", ("2023-06-21", "2023-06-21"))
+        self.check("What did I do last weekend?", ("2023-06-17", "2023-06-18"))
+        self.check("Who did I meet last week?", ("2023-06-12", "2023-06-18"))
+        self.check("What did I cook last Tuesday?", ("2023-06-20", "2023-06-20"))
+        self.check("What did I read last month?", ("2023-05-01", "2023-05-31"))
+        self.check("What did I buy this week?", ("2023-06-19", "2023-06-22"))
+
+    def test_a_span_up_to_now(self):
+        self.check("Which concerts did I attend in the past two months?",
+                   ("2023-04-22", "2023-06-22"))
+        self.check("What did I cook over the last few weeks?", ("2023-06-01", "2023-06-22"))
+
+    def test_a_month_or_day_without_a_year_is_the_latest_one_begun(self):
+        self.check("What did I buy in March?", ("2022-03-01", "2022-03-31"),
+                   now="2023/02/01")
+        self.check("What did I buy in March?", ("2023-03-01", "2023-03-31"))
+        self.check("What happened on March 4th?", ("2023-03-04", "2023-03-04"))
+        self.check("What happened on December 30th?", ("2022-12-30", "2022-12-30"))
+
+    def test_nothing_ahead_and_nothing_vague(self):
+        for question in ("What are my plans for next week?", "How many days ago did I go?",
+                         "What should I pack tomorrow?", "What did I buy this weekend?",
+                         "Where do I work?", "What did I do last year?"):
+            self.check(question)
+        self.assertEqual(question_windows("What did I buy 10 days ago?", None), [])
+
+    def test_now_as_a_date_a_datetime_or_a_timestamp(self):
+        expected = question_windows("What did I do yesterday?", self.NOW)
+        for now in (date(2023, 6, 22), datetime(2023, 6, 22, 10), "2023-06-22",
+                    1687428000):
+            self.assertEqual(question_windows("What did I do yesterday?", now), expected)
 
 
 class _Call:

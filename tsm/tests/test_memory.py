@@ -1452,6 +1452,54 @@ class TestUserBudget(MemoryTestBase):
             mem.compact("alice")
 
 
+class TestRecallWindow(MemoryTestBase):
+    """recall(now=...): a question that points at a time gets what was said then."""
+
+    QUESTION = "What kitchen appliance did I buy 10 days ago?"
+    NOW = "2023/03/25 (Sat) 09:00"
+
+    def setUp(self):
+        super().setUp()
+        mem = self.make_memory(keep_messages=True, extractor="none")
+        said = [{"role": "user", "timestamp": f"2023/01/{day:02d} (Mon) 10:00",
+                 "content": f"My kitchen appliance number {day} is a kitchen appliance I like."}
+                for day in range(2, 28)]
+        said.append({"role": "user", "timestamp": "2023/03/15 (Wed) 10:00",
+                     "content": "Got a new air fryer today."})
+        mem.add(said, user_id="alice")
+
+    def texts(self, **kwargs):
+        return [r["text"] for r in self.mem.recall(self.QUESTION, user_id="alice", **kwargs)]
+
+    def test_what_was_said_then_is_packed_first(self):
+        self.assertNotIn("Got a new air fryer today.", self.texts(token_budget=60))
+        dated = self.texts(token_budget=60, now=self.NOW)
+        self.assertEqual(dated[0], "Got a new air fryer today.")
+        self.assertGreater(len(dated), 1)  # the rest of the budget is filled as before
+
+    def test_without_a_time_in_the_question_now_changes_nothing(self):
+        question = "Which kitchen appliance do I like?"
+        plain = self.mem.recall(question, user_id="alice", token_budget=60)
+        dated = self.mem.recall(question, user_id="alice", token_budget=60, now=self.NOW)
+        self.assertEqual([r["id"] for r in plain], [r["id"] for r in dated])
+
+    def test_a_window_with_nothing_said_in_it_changes_nothing(self):
+        plain = self.texts(token_budget=60)
+        self.assertEqual(self.texts(token_budget=60, now="2024/01/01"), plain)
+
+    def test_without_a_budget_they_are_among_the_candidates(self):
+        self.assertIn("Got a new air fryer today.", self.texts(top_k=40, now=self.NOW))
+
+    def test_by_default_the_question_is_asked_today(self):
+        from datetime import date, timedelta
+
+        said = (date.today() - timedelta(days=10)).strftime("%Y/%m/%d (Mon) 10:00")
+        self.mem.add([{"role": "user", "content": "Bought a slow cooker.", "timestamp": said}],
+                     user_id="alice")
+        self.assertEqual(self.texts(token_budget=60)[0], "Bought a slow cooker.")
+        self.assertNotIn("Bought a slow cooker.", self.texts(token_budget=60, now=False))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

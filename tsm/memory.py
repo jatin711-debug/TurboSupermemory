@@ -36,7 +36,7 @@ import math
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
@@ -55,7 +55,7 @@ from .interfaces import (  # noqa: F401  (Embedder, Extractor, Verifier: re-expo
     Embedder, Extractor, Verifier, embed_documents, embed_query, embedder_fingerprint)
 from .ranking import apply_role_prior, asks_what_assistant_said, is_counting_query, packing_lam
 from .sources import SOURCE_TOKENS, speaker, turn_units
-from .when import annotate, said_on
+from .when import annotate, question_windows, said_on
 
 logger = logging.getLogger("tsm.memory")
 
@@ -171,6 +171,22 @@ REPLIES_WHOLE = 2
 # How many ids after a passage are read to find the rest of its message when
 # the passage was stored without the message's passage count.
 REPLY_WINDOW = 32
+
+# A question that points at a time ("ten days ago", "last week") given
+# recall(now=...): the memories said then take up to this share of the budget,
+# the best of them packed before the rest.
+WINDOW_SHARE = 0.5
+# How many of them are offered to that packing, best-scored first.
+WINDOW_POOL = 30
+# How many of the user's memories nearest the question are looked through for
+# them (the memories of a few days are a small part of a long history).
+WINDOW_SCAN = 1000
+# A thing is mentioned the day it happens or soon after ("I got it
+# yesterday"): a window ends this many days after the time it points to.
+WINDOW_LAG_DAYS = 3
+# ... and starts a day before it: the clock that dates a question and the one
+# that dated a message need not agree on the day (time zones).
+WINDOW_LEAD_DAYS = 1
 
 # Engine methods this SDK cannot work without. The extension and the SDK ship
 # together; this guards against a stale locally-built turbomemory.pyd/.so.
@@ -827,6 +843,7 @@ class Memory:
         source_tokens: int = SOURCE_TOKENS,
         event_dates: bool = False,
         events: Optional[float] = None,
+        now=None,
     ) -> List[Dict]:
         """Search memories under ``user_id``'s scope.
 
@@ -897,6 +914,24 @@ class Memory:
         off), each one dated line with role ``"event"``, after the memories
         packed into the rest. Without stored events nothing changes.
 
+        ``now`` is when the question is asked (a date, a datetime, or a
+        timestamp as stored with messages); by default today's date on this
+        machine's clock, and ``now=False`` turns what follows off. A question
+        that points at a time before it ("what did I buy ten days ago", "last
+        weekend", "in the past two months": ``tsm.when.question_windows``) is
+        also matched against the memories said in that time (from
+        ``WINDOW_LEAD_DAYS`` before it to ``WINDOW_LAG_DAYS`` after), and the
+        best of those are packed first, in up to ``WINDOW_SHARE`` of the
+        budget. Such a question often names nothing else to search for, and
+        in a long history the memories of a few days are outscored by
+        everything else on the topic. Without a budget they are among the
+        candidates, ranked by score. Without such an expression, or with
+        nothing said in that time, nothing changes. Pass ``now`` whenever the
+        question is not being asked today (a replayed conversation, a
+        benchmark): on LongMemEval-S it brought all the evidence of 3 more of
+        127 temporal questions into a 2,000-token context and lost none
+        (``benchmarks/PHASE_PROGRESS.md``, 2026-11-06).
+
         ``recall()`` is a read: asking does not change what the next call
         returns. Use ``reinforce()`` to tell the memory which results were
         actually used.
@@ -944,6 +979,10 @@ class Memory:
             pool.append(self._pool_item(mid, rec, float(score)))
         if not pool:
             return []
+        windows = [] if now is False else question_windows(
+            query, datetime.now() if now is None else now)
+        if windows:
+            self._add_window(pool, windows, query_embedding, user_id)
         if resolve_beliefs:
             self._resolve_beliefs(pool, user_id)
         if sources == "turn":
@@ -991,8 +1030,20 @@ class Memory:
             notes = self._event_notes(query, query_embedding, user_id,
                                       int(token_budget * min(share, 1.0)), time_tags)
         budget = max(1, token_budget - sum(estimate_tokens(n["context"]) for n in notes))
-        chosen = self._pack(pool, budget, packing_lam(query, lam), max_items,
-                            stored=sources is None)
+        lam = packing_lam(query, lam)
+        then = [p for p in pool if p.get("in_window")][:WINDOW_POOL]
+        chosen = []
+        if then:
+            chosen = self._pack(then, max(1, int(budget * WINDOW_SHARE)), lam, max_items,
+                                stored=sources is None)
+        if not max_items or len(chosen) < max_items:
+            taken = {p["id"] for p in chosen}
+            rest = [p for p in pool if p["id"] not in taken]
+            left = budget - total_tokens([p["context"] for p in chosen])
+            if rest and left > 0:
+                chosen += self._pack(rest, left, lam,
+                                     max_items - len(chosen) if max_items else None,
+                                     stored=sources is None)
         if sources is None and asks_what_assistant_said(query):
             chosen = self._whole_reply(chosen, budget)
         return chosen + notes
@@ -1026,6 +1077,49 @@ class Memory:
             item.update(context=shown, event=event, source=rec["payload"].get("original_message"))
             notes.append(item)
         return notes
+
+    def _add_window(self, pool: List[Dict], windows, query_embedding,
+                    user_id: Optional[str]) -> None:
+        """Mark the memories in ``pool`` said in one of ``windows`` (each
+        widened by ``WINDOW_LEAD_DAYS`` and ``WINDOW_LAG_DAYS``) with
+        ``in_window``, and add
+        the best-scored others said then, ``WINDOW_POOL`` in all at most,
+        from the ``WINDOW_SCAN`` memories nearest the question."""
+        lead, lag = timedelta(days=WINDOW_LEAD_DAYS), timedelta(days=WINDOW_LAG_DAYS)
+        spans = [(first - lead, last + lag) for first, last in windows]
+
+        def said_then(item: Dict) -> bool:
+            if is_gist(item["role"]):
+                return False  # a gist's date is a span, not when one thing was said
+            day = said_on(item["timestamp"])
+            return day is not None and any(first <= day <= last for first, last in spans)
+
+        found = 0
+        for p in pool:
+            if said_then(p):
+                p["in_window"] = True
+                found += 1
+        if found >= WINDOW_POOL:
+            return
+        have = {p["id"] for p in pool}
+        hits = self.engine.search_ann(query_embedding, top_k=WINDOW_SCAN, scope=user_id)
+        scores = dict(hits)
+        ids = [mid for mid, _ in hits if mid not in have]
+        for start in range(0, len(ids), 200):  # read in rank order; stop when enough
+            chunk = ids[start:start + 200]
+            records = self._records(chunk)
+            for mid in chunk:
+                rec = records.get(mid)
+                if rec is None or (user_id is not None and rec["scope"] not in (None, user_id)):
+                    continue
+                item = self._pool_item(mid, rec, float(scores[mid]))
+                if not said_then(item):
+                    continue
+                item["in_window"] = True
+                pool.append(item)
+                found += 1
+                if found >= WINDOW_POOL:
+                    return
 
     def _whole_reply(self, chosen: List[Dict], token_budget: int) -> List[Dict]:
         """For a question about what the assistant said: each of the
