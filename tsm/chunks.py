@@ -109,6 +109,13 @@ def spoken_by(role: Optional[str]) -> str:
     return role[len(MESSAGE_ROLE) + 1:] if is_message(role) else (role or "")
 
 
+def speaker(role: Optional[str]) -> str:
+    """How a passage names who said it in front of its text: ``"user: "``,
+    ``"assistant: "``; ``""`` without a role."""
+    role = (role or "").strip()
+    return f"{role}: " if role else ""
+
+
 def occasion(role: Optional[str], timestamp) -> Optional[int]:
     """The day a passage of a message was said (a date ordinal), for the
     packer: two passages said on different days are two occurrences and are

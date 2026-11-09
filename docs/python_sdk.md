@@ -109,22 +109,20 @@ worse at arithmetic than gpt-4.1-mini.
     (the point after).
   - `source` is the message the memory was extracted from. It is `None` for
     gists.
-- Source turns are opt-in. `recall(..., sources="turn")` searches on the
-  facts and returns the turns they came from: one result per message, with
-  `facts` and `ids` listing the facts it stands for, and the speaker named
-  in `context`. A long turn is cut to its sentences that share words with
-  those facts and the question (`source_tokens`, 120 by default). At a
-  600-token budget this cost judged answers, 86 of 115 right against 98 for
-  facts (6 gained, 18 lost), because far fewer turns than facts fit. Cut to
-  30 tokens, turns fit as well as facts and scored 67: the cut often dropped
-  the short sentence that held the answer.
-- Event dates are opt-in. With `recall(..., event_dates=True)`, a relative
-  time in what is shown is followed by the date it points to, counted from
-  the day it was said: "two weeks ago [week of 2023-05-08]", "last Saturday
-  [2023-05-20]", "on March 3rd [2023-03-03]". `tsm.when.annotate` does this
-  with rules, no model. Only 2.4% of extracted facts have such a phrase. It
-  was level on judged answers: 100 against 98 of 115, and 298 against 296 of
-  355 held out (8 gained and 4 lost over both).
+- Two read-time options were measured, did not pay, and were removed on
+  2026-11-09 (`benchmarks/PHASE_PROGRESS.md`; the code is at
+  `git show 26092df:tsm/sources.py` and `git show 26092df:tsm/when.py`):
+  - Source turns, `recall(..., sources="turn")`: search on the facts and
+    return the turns they came from. At a 600-token budget this cost judged
+    answers, 86 of 115 right against 98 for facts (6 gained, 18 lost),
+    because far fewer turns than facts fit. Cut to 30 tokens, turns fit as
+    well as facts and scored 67: the cut often dropped the short sentence
+    that held the answer.
+  - Event dates, `recall(..., event_dates=True)`: a relative time followed
+    by the date it points to ("two weeks ago [week of 2023-05-08]"). Only
+    2.4% of extracted facts have such a phrase. It was level on judged
+    answers: 100 against 98 of 115, and 298 against 296 of 355 held out
+    (8 gained and 4 lost over both).
 - Time tags: `context` starts with the memory's date when its message was
   added with one (`{"role": "user", "content": ..., "timestamp":
   "2024-03-02T18:00:00Z"}`; an ISO date or epoch seconds), as in

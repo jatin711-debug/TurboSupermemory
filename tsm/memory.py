@@ -42,20 +42,15 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 import numpy as np
 
 from ._loader import load_turbomemory
-from .budget import (MAX_REDUNDANCY, NEW_TURN_BONUS, estimate_tokens, select_under_budget,
-                     total_tokens)
-from .chunks import is_message, message_role, occasion, passages, spoken_by
+from .budget import MAX_REDUNDANCY, NEW_TURN_BONUS, select_under_budget, total_tokens
+from .chunks import is_message, message_role, occasion, passages, speaker, spoken_by
 from .compaction import POLICIES, is_gist, plan_compaction
 from .concepts import extract_concepts
-from .events import EVENT_DIR, EVENT_POOL, EVENT_ROLE, EVENT_SHARE, event_note, event_text
-from .observe import (OBSERVATION_DIR, OBSERVATION_ROLE, conversations,
-                      observation_context)
 from .identity import bind_embedder
 from .interfaces import (  # noqa: F401  (Embedder, Extractor, Verifier: re-exported types)
     Embedder, Extractor, Verifier, embed_documents, embed_query, embedder_fingerprint)
-from .ranking import apply_role_prior, asks_what_assistant_said, is_counting_query, packing_lam
-from .sources import SOURCE_TOKENS, speaker, turn_units
-from .when import annotate, question_windows, said_on
+from .ranking import apply_role_prior, asks_what_assistant_said, packing_lam
+from .when import question_windows, said_on
 
 logger = logging.getLogger("tsm.memory")
 
@@ -262,8 +257,6 @@ class Memory:
         keep_messages: Optional[bool] = None,
         allow_embedder_change: bool = False,
         idle_consolidation_secs: Optional[float] = None,
-        events: Optional[object] = None,
-        observer: Optional[object] = None,
         **engine_kwargs,
     ):
         """
@@ -349,33 +342,6 @@ class Memory:
                 a verifier could not finish (``verifier.unresolved``), is
                 tried again after another idle period. ``close()`` stops the
                 thread first. Default ``None``: consolidate when you call it.
-            events: also list the events each user message reports (what
-                the user did, bought, attended, owns or plans, with amounts
-                and when; ``tsm.events``) and store each as a short record
-                in an engine of its own (``<db_path>/tsm_events``), so the
-                user's memories and their search are exactly as without
-                events. ``recall()`` of a question that
-                counts or totals then gives the best of them a share of its
-                budget (``EVENT_SHARE``), one dated line each, so the
-                instances a count needs fit where a few passages would.
-                ``True`` / ``"openai"`` is ``OpenAIEventExtractor``; any
-                object with ``extract_events(message, context)`` works (and
-                ``extract_many(items)`` is used when it has one). One request
-                per user message. Default ``None``: no events. A store that
-                has events uses them in ``recall()`` whether or not an
-                extractor is passed when it is reopened.
-            observer: consolidate conversations into observations
-                (``tsm.observe``): on each ``consolidate()`` every message not
-                yet observed is handed, a day's conversation at a time, to the
-                observer, which writes down everything in it worth keeping as
-                short self-contained lines (asides included, one occasion per
-                line, what the assistant gave briefly). They are stored in an
-                engine of their own (``<db_path>/tsm_observations``) and read
-                with ``observations()``, or by ``recall(observations=...)``.
-                ``"anthropic"`` is ``AnthropicObserver`` (claude-haiku-5-5),
-                ``"openai"`` is ``OpenAIObserver``; any object with
-                ``observe(messages)`` (and optionally ``observe_many``) works.
-                Needs the messages (``keep_messages``). Default ``None``.
             **engine_kwargs: forwarded to ``turbomemory.MemoryEngine``.
         """
         # Backend names are resolved here; anything else that is a string is a
@@ -425,33 +391,6 @@ class Memory:
             from .extractors import NullExtractor
 
             extractor = NullExtractor()
-        if events is True or events == "openai":
-            import os
-
-            from .events import OpenAIEventExtractor
-
-            events = OpenAIEventExtractor(cache_dir=os.path.join(db_path, "tsm_cache"))
-        elif isinstance(events, str) or events is False:
-            if events is not False:
-                raise ValueError(f"unknown events {events!r}: use True, 'openai' or an instance")
-            events = None
-        self.events = events
-        if observer == "anthropic":
-            import os
-
-            from .observe import AnthropicObserver
-
-            observer = AnthropicObserver(cache_dir=os.path.join(db_path, "tsm_cache"))
-        elif observer == "openai":
-            import os
-
-            from .observe import OpenAIObserver
-
-            observer = OpenAIObserver(cache_dir=os.path.join(db_path, "tsm_cache"))
-        elif isinstance(observer, str):
-            raise ValueError(f"unknown observer {observer!r}: use 'anthropic', 'openai' "
-                             "or an instance")
-        self.observer = observer
         if reranker == "colbert":
             from .rerankers import ColBertReranker
 
@@ -510,8 +449,6 @@ class Memory:
         self.keep_messages = bool(keep_messages)
         if not self.keep_messages and getattr(self.extractor, "stores_nothing", False):
             raise ValueError('extractor="none" stores nothing without keep_messages')
-        if self.observer is not None and not self.keep_messages:
-            raise ValueError("an observer reads the messages: it needs keep_messages")
         if self.keep_messages and self.max_user_tokens is not None:
             # Compaction folds by speaker and does not know passages yet: it
             # would summarize the user's own messages with the assistant's.
@@ -572,37 +509,6 @@ class Memory:
         # when an existing database is reopened.
         self._insert_counter = max(0, int(self.engine.next_insert_seq()) - 1)
 
-        # Events live in an engine of their own: the word index and concept
-        # graph are shared by every scope of an engine, so event records in
-        # the main one changed the scores of every ordinary search.
-        import os
-
-        self._event_engine = None
-        self._event_counter = 0
-        event_dir = os.path.join(db_path, EVENT_DIR)
-        if self.events is not None or os.path.isdir(event_dir):
-            try:
-                self._event_engine = turbomemory.MemoryEngine(db_path=event_dir,
-                                                              dimension=self.dim)
-            except BaseException:
-                self.close()
-                raise
-            self._event_counter = max(0, int(self._event_engine.next_insert_seq()) - 1)
-
-        # Observations, too, have an engine of their own: the long-term
-        # record, searched apart from the messages it was written from.
-        self._obs_engine = None
-        self._obs_counter = 0
-        self._observed: Dict[Optional[str], int] = {}  # user -> last message seq observed
-        obs_dir = os.path.join(db_path, OBSERVATION_DIR)
-        if self.observer is not None or os.path.isdir(obs_dir):
-            try:
-                self._obs_engine = turbomemory.MemoryEngine(db_path=obs_dir, dimension=self.dim)
-            except BaseException:
-                self.close()
-                raise
-            self._obs_counter = max(0, int(self._obs_engine.next_insert_seq()) - 1)
-
         if self._idle_secs is not None:
             # A store written by an earlier session may never have been
             # consolidated: the first idle period does it.
@@ -645,7 +551,6 @@ class Memory:
         metas: List[Dict] = []
         seen_in_batch = set()
         context: List[str] = []
-        reported = self._events_of(messages)
         for turn, msg in enumerate(messages):
             content = (msg.get("content") or "").strip()
             if not content:
@@ -669,19 +574,6 @@ class Memory:
                     "passage": passage,
                     "passages": len(parts),
                 })
-            for event in reported.get(turn, ()):
-                text = event_text(event)
-                # Two mentions of one kind of thing are what a count needs:
-                # the write gate only skips a repeat within one message.
-                norm = (turn, " ".join(text.lower().split()))
-                if norm in seen_in_batch:
-                    continue
-                seen_in_batch.add(norm)
-                facts.append(text)
-                metas.append({"role": EVENT_ROLE, "timestamp": msg.get("timestamp", ""),
-                              "content": content, "turn": turn,
-                              "turn_index": msg.get("turn_index"), "passage": None,
-                              "passages": 0, "event": event})
             context.append(content)
 
         if not facts:
@@ -698,12 +590,7 @@ class Memory:
             ids: List[str] = []
             payloads: List[str] = []
             for meta in metas:
-                if meta.get("event") is not None:
-                    self._event_counter += 1
-                    ids.append(f"{user_id}_e{self._event_counter}" if user_id
-                               else f"e{self._event_counter}")
-                else:
-                    ids.append(self._next_id(user_id))
+                ids.append(self._next_id(user_id))
                 # A caller-supplied turn index wins. Otherwise the turn is keyed
                 # by the sequence number of its first stored fact: unique per
                 # message and durable across restarts, like the ids themselves.
@@ -716,8 +603,6 @@ class Memory:
                     "user_id": user_id,
                     "turn_index": turn_index,
                 }
-                if meta.get("event") is not None:
-                    payload["event"] = meta["event"]
                 if meta["passage"] is None:
                     payload["original_message"] = meta["content"]
                 else:
@@ -725,47 +610,21 @@ class Memory:
                     payload["passage"] = meta["passage"]
                     payload["passages"] = meta["passages"]
                 payloads.append(json.dumps(payload))
-            mine = [k for k, meta in enumerate(metas) if meta.get("event") is None]
-            reported = [k for k, meta in enumerate(metas) if meta.get("event") is not None]
-            # The memories first, then their events: a failure on the events
-            # leaves the memories stored and raises.
-            for engine, rows in ((self.engine, mine), (self._event_engine, reported)):
-                if not rows:
-                    continue
-                engine.insert_batch(
-                    [ids[k] for k in rows],
-                    [facts[k] for k in rows],
-                    np.ascontiguousarray(embeddings[rows]),
-                    [1.0] * len(rows),
-                    [extract_concepts(facts[k]) for k in rows],
-                    [payloads[k] for k in rows],
-                    [user_id] * len(rows) if user_id is not None else None,
-                    [str(metas[k]["role"]) for k in rows],
-                )
+            self.engine.insert_batch(
+                ids,
+                facts,
+                embeddings,
+                [1.0] * len(facts),
+                [extract_concepts(fact) for fact in facts],
+                payloads,
+                [user_id] * len(facts) if user_id is not None else None,
+                [str(meta["role"]) for meta in metas],
+            )
             if self.max_user_tokens is not None and user_id is not None:
                 self._touched.add(user_id)
             self._pending = True
         self._activity = time.monotonic()
         return len(facts)
-
-    def _events_of(self, messages: List[Dict]) -> Dict[int, List[Dict]]:
-        """The events each user message in ``messages`` reports, by its
-        position, asked for all messages at once when the extractor can."""
-        if self.events is None:
-            return {}
-        asked, items, context = [], [], []
-        for turn, msg in enumerate(messages):
-            content = (msg.get("content") or "").strip()
-            if not content:
-                continue
-            if msg.get("role", "user") == "user":
-                asked.append(turn)
-                items.append((content, list(context)))
-            context.append(content)
-        many = getattr(self.events, "extract_many", None)
-        found = (many(items) if many is not None
-                 else [self.events.extract_events(m, c) for m, c in items])
-        return {turn: list(events or []) for turn, events in zip(asked, found)}
 
     def _compress_gist(self, texts: List[str]):
         """Gist-compressor callback handed to the engine (B4).
@@ -807,15 +666,14 @@ class Memory:
             if not self.engine.contains_id(memory_id):
                 return memory_id
 
-    def _records(self, ids: List[str], engine=None) -> Dict[str, Dict]:
-        """Stored record metadata for ``ids``, read back from the engine
-        (``engine``, by default the memories' one).
+    def _records(self, ids: List[str]) -> Dict[str, Dict]:
+        """Stored record metadata for ``ids``, read back from the engine.
 
         Maps id -> ``{"text", "scope", "source_role", "payload", ...}`` with
         ``payload`` parsed to a dict. Ids that are no longer live are omitted.
         """
         out: Dict[str, Dict] = {}
-        for rec in (engine or self.engine).get_records(list(ids)):
+        for rec in self.engine.get_records(list(ids)):
             if rec is None:
                 continue
             try:
@@ -839,10 +697,6 @@ class Memory:
         reranker: Optional[object] = None,
         max_items: Optional[int] = None,
         time_tags: Union[bool, str] = True,
-        sources: Optional[str] = None,
-        source_tokens: int = SOURCE_TOKENS,
-        event_dates: bool = False,
-        events: Optional[float] = None,
         now=None,
     ) -> List[Dict]:
         """Search memories under ``user_id``'s scope.
@@ -888,31 +742,10 @@ class Memory:
         ordered; ``"date"`` is the same as True.
 
         Every result carries ``"source"``, the message it was taken from
-        (``None`` for gists and for records stored before messages were
-        kept). With ``sources="turn"`` the facts are the keys and the turns
-        are what is returned (``tsm.sources.turn_units``): the facts found
-        for one message become one result whose ``"text"`` is that message
-        as it was said, cut to its sentences that bear on the facts and the
-        question when it is longer than ``source_tokens``, with ``"facts"``
-        and ``"ids"`` listing the facts it stands for. Its ``"context"``
-        names the speaker after the time tag (``[2024-01-15] user: ...``).
-        A fact does not always say what it is about ("The workshop was
-        free"); the message it came from does.
-
-        With ``event_dates``, a relative time in what is shown is followed by
-        the date it points to, counted from the date the memory was said
-        (``tsm.when.annotate``): "two weeks ago [week of 2023-05-08]". When
-        something happened is then written out instead of left to the
-        reader's arithmetic. A verified-superseded memory says by when it
-        changed (``STALE_BY``: the date its replacement was said) whenever
-        that date is known.
-
-        With a token budget and a question that counts or totals
-        (``tsm.ranking.is_counting_query``), the events stored with
-        ``Memory(events=...)`` are searched too and the best of them take up
-        to ``events`` of the budget (default ``EVENT_SHARE``; 0 turns this
-        off), each one dated line with role ``"event"``, after the memories
-        packed into the rest. Without stored events nothing changes.
+        (``None`` for gists, for message passages, which are the message,
+        and for records stored before messages were kept). A
+        verified-superseded memory says by when it changed (``STALE_BY``:
+        the date its replacement was said) whenever that date is known.
 
         ``now`` is when the question is asked (a date, a datetime, or a
         timestamp as stored with messages); by default today's date on this
@@ -944,8 +777,6 @@ class Memory:
         self._activity = time.monotonic()
         if time_tags not in (True, False, "date", "minute"):
             raise ValueError("time_tags must be True, False, 'date' or 'minute'")
-        if sources not in (None, "turn"):
-            raise ValueError("sources must be None or 'turn'")
         query_embedding = np.asarray(embed_query(self.embedder, query), dtype=np.float32)
 
         active_reranker = reranker or (self.reranker if rerank else None)
@@ -985,16 +816,10 @@ class Memory:
             self._add_window(pool, windows, query_embedding, user_id)
         if resolve_beliefs:
             self._resolve_beliefs(pool, user_id)
-        if sources == "turn":
-            pool = turn_units(pool, query, source_tokens)
         for p in pool:
             # Set before packing: what is shown is what the budget counts.
             shown = p["text"] or ""
-            if event_dates and not is_gist(p["role"]):
-                shown = annotate(shown, said_on(p["timestamp"]))
-            if sources == "turn" and p.get("facts"):
-                shown = speaker(p["role"]) + shown
-            elif is_message(p["role"]):
+            if is_message(p["role"]):
                 shown = speaker(spoken_by(p["role"])) + shown
             if self._verified and p.get("superseded_by"):
                 shown = stale_mark(p.get("valid_until")) + shown
@@ -1024,59 +849,22 @@ class Memory:
         pool.sort(key=lambda p: (-p["score"], "superseded_by" in p))
         if token_budget is None:
             return pool[:top_k]
-        notes = []
-        share = EVENT_SHARE if events is None else float(events)
-        if share > 0 and is_counting_query(query):
-            notes = self._event_notes(query, query_embedding, user_id,
-                                      int(token_budget * min(share, 1.0)), time_tags)
-        budget = max(1, token_budget - sum(estimate_tokens(n["context"]) for n in notes))
+        budget = max(1, token_budget)
         lam = packing_lam(query, lam)
         then = [p for p in pool if p.get("in_window")][:WINDOW_POOL]
         chosen = []
         if then:
-            chosen = self._pack(then, max(1, int(budget * WINDOW_SHARE)), lam, max_items,
-                                stored=sources is None)
+            chosen = self._pack(then, max(1, int(budget * WINDOW_SHARE)), lam, max_items)
         if not max_items or len(chosen) < max_items:
             taken = {p["id"] for p in chosen}
             rest = [p for p in pool if p["id"] not in taken]
             left = budget - total_tokens([p["context"] for p in chosen])
             if rest and left > 0:
                 chosen += self._pack(rest, left, lam,
-                                     max_items - len(chosen) if max_items else None,
-                                     stored=sources is None)
-        if sources is None and asks_what_assistant_said(query):
+                                     max_items - len(chosen) if max_items else None)
+        if asks_what_assistant_said(query):
             chosen = self._whole_reply(chosen, budget)
-        return chosen + notes
-
-    def _event_notes(self, query: str, query_embedding, user_id: Optional[str],
-                     budget: int, time_tags) -> List[Dict]:
-        """The user's stored events that best match ``query``, best first, as
-        recall results, within ``budget`` tokens. Empty when none are stored."""
-        if budget <= 0 or self._event_engine is None:
-            return []
-        results = self._event_engine.search(query_text=query, query_embedding=query_embedding,
-                                            top_k=EVENT_POOL, scope=user_id)
-        if not results:
-            return []
-        records = self._records([mid for mid, _ in results], self._event_engine)
-        notes, used = [], 0
-        for mid, score in results:
-            rec = records.get(mid)
-            if rec is None or rec["scope"] != user_id:
-                continue
-            item = self._pool_item(mid, rec, float(score))
-            event = rec["payload"].get("event") or {"what": rec["text"] or ""}
-            shown = event_note(event, item["timestamp"])
-            if time_tags:
-                shown = time_tag(item["timestamp"], item["turn_index"],
-                                 minutes=time_tags == "minute") + shown
-            cost = estimate_tokens(shown)
-            if used + cost > budget:
-                continue  # a shorter one further down may still fit
-            used += cost
-            item.update(context=shown, event=event, source=rec["payload"].get("original_message"))
-            notes.append(item)
-        return notes
+        return chosen
 
     def _add_window(self, pool: List[Dict], windows, query_embedding,
                     user_id: Optional[str]) -> None:
@@ -1174,7 +962,7 @@ class Memory:
         ``cap`` tokens with the anchor's tags in front (returned with them)."""
         context, text = anchor.get("context") or "", anchor["text"] or ""
         if not text or not context.endswith(text):
-            return [], ""  # the text was rewritten for display (event_dates)
+            return [], ""  # what is shown no longer ends with the stored text
         prefix = context[:len(context) - len(text)]
         parts = self._reply_passages(anchor)
         at = next((k for k, p in enumerate(parts) if p["id"] == anchor["id"]), None)
@@ -1218,15 +1006,16 @@ class Memory:
         return sorted(parts, key=lambda p: p["passage"])
 
     def _pack(self, pool: List[Dict], token_budget: int, lam: float,
-              max_items: Optional[int], stored: bool) -> List[Dict]:
-        """``select_under_budget`` on ``pool``. When every candidate is a
-        stored record read as stored (``stored``), the engine makes the same
-        selection on the embeddings it already holds
-        (``MemoryEngine.pack_under_budget``) instead of the candidates' text
-        being embedded a second time."""
+              max_items: Optional[int]) -> List[Dict]:
+        """``select_under_budget`` on ``pool``. Every candidate is a stored
+        record, so the engine makes the selection on the embeddings it
+        already holds (``MemoryEngine.pack_under_budget``) instead of the
+        candidates' text being embedded a second time. The Python packer is
+        the fallback for an older extension without it, and for turn indexes
+        the engine cannot take (anything but an integer)."""
         pack = getattr(self.engine, "pack_under_budget", None)
         turns = [p.get("turn_index") for p in pool]
-        if pack is not None and stored and all(
+        if pack is not None and all(
                 t is None or (isinstance(t, int) and not isinstance(t, bool)) for t in turns):
             ids = [p["id"] for p in pool]
             index = {mid: k for k, mid in enumerate(ids)}
@@ -1333,10 +1122,6 @@ class Memory:
         summarizer failure there leaves that user's memories as they are, to
         be tried again on the next pass.
 
-        With an ``observer``, every message not yet observed is then
-        observed (``observe_pending``). A failure there stores nothing for
-        that pass; the messages are observed on the next one.
-
         Returns:
             The number of supersession edges committed (0 without a verifier).
         """
@@ -1349,13 +1134,6 @@ class Memory:
             try:
                 self.engine.trigger_consolidation()
                 committed = self._verify_supersessions()
-                if self.observer is not None:
-                    try:
-                        self.observe_pending()
-                    except Exception as e:  # noqa: BLE001 — nothing stored; retried later
-                        self._retry = True
-                        logger.warning("messages not observed (will retry): %s",
-                                       type(e).__name__)
                 if self.max_user_tokens is not None:
                     for user in sorted(self._touched):
                         try:
@@ -1369,146 +1147,6 @@ class Memory:
                 self._pending = True
                 raise
         return committed
-
-    def observe_pending(self) -> int:
-        """Observe every message not yet observed, for every user: a day's
-        conversation at a time, all of them at once when the observer can.
-        A user's observations of one pass are stored in one batch, so a pass
-        either records all of them or (raising) none. Returns how many
-        observations were stored."""
-        self._require_open()
-        if self.observer is None or self._obs_engine is None:
-            return 0
-        users = [u for u in (self.engine.scopes() if hasattr(self.engine, "scopes") else [])]
-        work = []  # (user, last seq, conversations)
-        for user in users:
-            last, messages = self._unobserved(user)
-            if messages:
-                work.append((user, last, conversations(messages)))
-        convs = [c for _, _, cs in work for c in cs]
-        if not convs:
-            return 0
-        many = getattr(self.observer, "observe_many", None)
-        found = many(convs) if many is not None else [self.observer.observe(c) for c in convs]
-        stored, k = 0, 0
-        for user, last, cs in work:
-            texts, payloads = [], []
-            for conv in cs:
-                lines = found[k]
-                k += 1
-                first = conv[0]
-                for line in lines:
-                    texts.append(line)
-                    payloads.append({"timestamp": first.get("timestamp", ""),
-                                     "turn_index": first.get("turn_index"),
-                                     "role": OBSERVATION_ROLE, "user_id": user,
-                                     "through": last,
-                                     "observes": [m.get("turn_index") for m in conv]})
-            if not texts:
-                # Nothing worth keeping: remember that it was read.
-                self._observed[user] = last
-                continue
-            vectors = np.ascontiguousarray(embed_documents(self.embedder, texts),
-                                           dtype=np.float32)
-            with self._write_lock:
-                ids = []
-                for _ in texts:
-                    self._obs_counter += 1
-                    ids.append(f"{user}_o{self._obs_counter}" if user
-                               else f"o{self._obs_counter}")
-                self._obs_engine.insert_batch(
-                    ids, texts, vectors, [1.0] * len(texts),
-                    [extract_concepts(t) for t in texts],
-                    [json.dumps(p) for p in payloads],
-                    [user] * len(texts) if user is not None else None,
-                    [OBSERVATION_ROLE] * len(texts))
-            self._observed[user] = last
-            stored += len(texts)
-        return stored
-
-    def _unobserved(self, user: Optional[str]) -> Tuple[int, List[Dict]]:
-        """``(last message seq, messages)`` of ``user`` not yet observed, the
-        messages rebuilt from their stored passages in the order said."""
-        if user not in self._observed:
-            through = 0
-            for rec in self._obs_engine.get_records(self._obs_engine.scope_ids(user)):
-                if rec is None:
-                    continue
-                try:
-                    through = max(through, int(json.loads(rec["payload"]).get("through") or 0))
-                except (TypeError, ValueError):
-                    continue
-            self._observed[user] = through
-        through = self._observed[user]
-        fresh = []
-        for mid in self.engine.scope_ids(user):
-            head, _, tail = str(mid).rpartition("_")
-            if tail.isdigit() and int(tail) > through:
-                fresh.append((int(tail), mid))
-        if not fresh:
-            return through, []
-        fresh.sort()
-        records = self._records([mid for _, mid in fresh])
-        turns: Dict[object, Dict] = {}
-        for seq, mid in fresh:
-            rec = records.get(mid)
-            if rec is None or not is_message(rec["source_role"]):
-                continue
-            payload = rec["payload"]
-            turn = payload.get("turn_index")
-            msg = turns.setdefault(turn, {"role": spoken_by(rec["source_role"]),
-                                          "timestamp": payload.get("timestamp", ""),
-                                          "turn_index": turn, "parts": [], "seq": seq})
-            msg["parts"].append((payload.get("passage") or 0, rec["text"] or ""))
-        messages = []
-        for msg in sorted(turns.values(), key=lambda m: m["seq"]):
-            msg["content"] = " ".join(text for _, text in sorted(msg.pop("parts")))
-            messages.append(msg)
-        return fresh[-1][0], messages
-
-    def observations(self, user_id: Optional[str], query: Optional[str] = None,
-                     token_budget: Optional[int] = None, time_tags: bool = True) -> List[Dict]:
-        """The observations of ``user_id`` in the order said, each with
-        ``"context"``: the date of its conversation, then the line, with each
-        relative time followed by the date it points to. With ``query`` and
-        ``token_budget``, only the observations that best match the query
-        and fit the budget, still in the order said."""
-        self._require_open()
-        if self._obs_engine is None:
-            return []
-        if query is not None and token_budget is not None:
-            vector = np.asarray(embed_query(self.embedder, query), dtype=np.float32)
-            found = self._obs_engine.search(query_text=query, query_embedding=vector,
-                                            top_k=max(50, int(token_budget) // 8),
-                                            scope=user_id) or []
-            scores = {mid: float(score) for mid, score in found}
-            ids = [mid for mid, _ in found]
-        else:
-            ids, scores = list(self._obs_engine.scope_ids(user_id)), {}
-        records = self._records(ids, self._obs_engine)
-        items = []
-        for mid in ids:
-            rec = records.get(mid)
-            if rec is None or rec["scope"] != user_id:
-                continue
-            item = self._pool_item(mid, rec, scores.get(mid, 0.0))
-            item["context"] = observation_context(rec["text"] or "", item["timestamp"],
-                                                  time_tags)
-            items.append(item)
-        if token_budget is not None:
-            kept, used = [], 0
-            for item in items:  # best first when searched
-                cost = estimate_tokens(item["context"])
-                if used + cost <= token_budget:
-                    kept.append(item)
-                    used += cost
-            items = kept
-
-        def order(item):
-            seq = str(item["id"]).rpartition("_o")[2]
-            return (str(said_on(item["timestamp"]) or ""), int(seq) if seq.isdigit() else 0)
-
-        return sorted(items, key=order)
 
     def _idle_loop(self) -> None:
         """Background thread of ``idle_consolidation_secs``: consolidate when
@@ -1687,10 +1325,6 @@ class Memory:
         """Durably persist all pending writes."""
         self._require_open()
         self.engine.flush()
-        if self._event_engine is not None:
-            self._event_engine.flush()
-        if self._obs_engine is not None:
-            self._obs_engine.flush()
 
     def close(self) -> None:
         """Flush and release the engine. Idempotent.
@@ -1702,13 +1336,6 @@ class Memory:
         if not self._closed:
             self._stop_idle_worker()
             try:
-                for side in ("_obs_engine", "_event_engine"):
-                    engine = getattr(self, side, None)
-                    if engine is not None:
-                        try:
-                            engine.close()
-                        except Exception as e:  # noqa: BLE001 — the main engine still closes
-                            logger.warning("%s close failed: %s", side, e)
                 self.engine.close()
             finally:
                 # The engine handle is released even when its final flush
@@ -1719,9 +1346,7 @@ class Memory:
                 # hundred entries or at interpreter exit.
                 for backend, method in ((self.extractor, "flush_cache"),
                                         (self.embedder, "flush"),
-                                        (self.verifier, "flush_cache"),
-                                        (self.events, "flush_cache"),
-                                        (self.observer, "flush_cache")):
+                                        (self.verifier, "flush_cache")):
                     flush = getattr(backend, method, None)
                     if callable(flush):
                         try:

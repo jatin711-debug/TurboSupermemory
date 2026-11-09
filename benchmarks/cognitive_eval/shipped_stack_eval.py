@@ -39,10 +39,6 @@ neighbouring arms belongs to one mechanism:
                     at write time
     sdk_raw_plain   sdk_raw's passages without cognitive search: a plain
                     vector pool, then recall()'s role prior, packer and tags
-    sdk_raw_events  sdk_raw plus the events each user message reports
-                    (Memory(events=...), tsm.events; --event-model): a
-                    counting question gets the best of them in a share of
-                    the budget, one dated line each
 
   any engine setting, as an arm of its own
     --config NAME:KEY=VALUE,...   adds the arm cfg_NAME: sdk_cognitive (the
@@ -53,7 +49,7 @@ neighbouring arms belongs to one mechanism:
   any recall() argument, as an arm of its own
     --recall NAME:KEY=VALUE,...   adds the arm rcl_NAME: the sdk_cognitive
                             store read with these recall() arguments, e.g.
-                            --recall dates:event_dates=true
+                            --recall lam9:lam=0.9
 
   diagnostics (not run by default)
     <recall arm>_untagged   the same store, recall(time_tags=False): the
@@ -61,9 +57,6 @@ neighbouring arms belongs to one mechanism:
     <recall arm>_dated      the same store, recall(now=the question's date): a
                             question that points at a time ("ten days ago")
                             gets the memories said then first
-    <recall arm>_turns      the same store, recall(sources="turn"): the facts
-                            are the keys and the reader gets the turns they
-                            were taken from (--source-tokens caps a long one)
     sdk_cognitive_trunc     cognitive search results, untagged and truncated
                             like sdk_plain (cognitive search without the packer)
     sdk_cognitive_alpha1    sdk_cognitive with cognitive_alpha=1.0: the graph
@@ -164,13 +157,12 @@ BOUNDED = ("sdk_evict", "sdk_evict_gist", "sdk_budget", "sdk_budget_rolling")
 RECALL_ARMS = ("sdk_cognitive", "sdk_cognitive_alpha1", "sdk_belief", "sdk_belief_llm",
                "sdk_belief_llm_exclude", "sdk_belief_llm_nodemote", "sdk_evict",
                "sdk_evict_gist", "sdk_budget", "sdk_budget_rolling", "sdk_budget_rolling_merge",
-               "sdk_budget_delete", "sdk_messages", "sdk_raw", "sdk_raw_events")
+               "sdk_budget_delete", "sdk_messages", "sdk_raw")
 DIAGNOSTIC = (("sdk_cognitive_trunc", "sdk_cognitive_alpha1", "sdk_pack_capped", "sdk_pack_tagged",
                "sdk_belief_llm_exclude", "sdk_belief_llm_nodemote", "sdk_budget_delete",
                "sdk_budget_rolling_merge", "full_context", "sdk_messages", "sdk_raw",
-               "sdk_raw_plain", "sdk_raw_events")
+               "sdk_raw_plain")
               + tuple(a + "_untagged" for a in RECALL_ARMS)
-              + tuple(a + "_turns" for a in RECALL_ARMS)
               + tuple(a + "_dated" for a in RECALL_ARMS))
 DEFAULT_ARMS = UNBOUNDED + BOUNDED
 ARMS = DEFAULT_ARMS + DIAGNOSTIC
@@ -208,15 +200,12 @@ PAIRS = (
     ("sdk_belief_llm_nodemote", "sdk_cognitive"),
     ("sdk_cognitive", "full_context"),
     ("sdk_pack_tagged", "full_context"),
-    ("sdk_cognitive_turns", "sdk_cognitive"),
-    ("sdk_cognitive_turns", "full_context"),
     ("sdk_messages", "sdk_cognitive"),
     ("sdk_raw", "sdk_cognitive"),
     ("sdk_messages", "sdk_raw"),
     ("sdk_messages", "full_context"),
     ("sdk_raw", "full_context"),
     ("sdk_raw", "sdk_raw_plain"),
-    ("sdk_raw_events", "sdk_raw"),
 )
 
 
@@ -233,7 +222,7 @@ def default_work_dir():
 
 def variants(name):
     """A recall() arm and the diagnostics served from the same store."""
-    return (name, name + "_trunc", name + "_untagged", name + "_turns", name + "_dated")
+    return (name, name + "_trunc", name + "_untagged", name + "_dated")
 
 
 class Embeddings:
@@ -673,10 +662,6 @@ def main():
     ap.add_argument("--arms", default=",".join(DEFAULT_ARMS))
     ap.add_argument("--token-budget", type=int, default=150, help="answer-context token cap")
     ap.add_argument("--pool-k", type=int, default=20)
-    ap.add_argument("--source-tokens", type=int, default=None,
-                    help="the _turns arms and any --recall arm with sources=\"turn\": cut a "
-                         "turn longer than this to its sentences that bear on the question "
-                         "(default: tsm.sources.SOURCE_TOKENS)")
     ap.add_argument("--user-tokens", type=int, default=256,
                     help="storage budget of the sdk_budget arms (tokens per conversation)")
     ap.add_argument("--rolling-passes", type=int, default=4,
@@ -695,8 +680,6 @@ def main():
                          "may be given several times")
     ap.add_argument("--extractor-model", default="gpt-4.1-nano")
     ap.add_argument("--gist-model", default="gpt-4o-mini")
-    ap.add_argument("--event-model", default="gpt-4o-mini",
-                    help="the model sdk_raw_events lists each user message's events with")
     ap.add_argument("--verifier-model", default="gpt-4o-mini")
     ap.add_argument("--judge", choices=["openai", "anthropic", "none"], default="openai",
                     help="who reads and grades: OpenAI, Anthropic (Claude), or no one "
@@ -828,12 +811,11 @@ def main():
     from tsm import Memory
     from tsm._retry import QuotaExhausted
     from tsm.budget import select_under_budget
-    from tsm.chunks import is_message, spoken_by
+    from tsm.chunks import is_message, speaker, spoken_by
     from tsm.compaction import is_gist
     from tsm.gist import ExtractiveGistSummarizer, OpenAIGistSummarizer
     from tsm.memory import time_tag
     from tsm.ranking import apply_role_prior, packing_lam
-    from tsm.sources import speaker
     from tsm.verification import LLMVerifier
 
     extraction = CachedExtraction(args.extractor_model,
@@ -878,17 +860,6 @@ def main():
                 model=args.gist_model),
             None if args.offline else os.path.join(
                 work_dir, f"gists_{args.gist_model.replace('/', '_')}.json"))
-    events = None
-    if asked("sdk_raw_events"):
-        if args.offline:
-            sys.exit("sdk_raw_events asks a model for each user message's events; "
-                     "run it without --offline (--judge none still skips the judge)")
-        from tsm.events import OpenAIEventExtractor
-
-        # One extractor for every history: its cache is shared, and it asks
-        # for a history's messages --workers at a time.
-        events = OpenAIEventExtractor(model=args.event_model, cache_dir=work_dir,
-                                      workers=args.workers)
     nli = None
 
     convs = load_longmemeval(args.data_dir)[args.skip:args.limit]
@@ -943,8 +914,7 @@ def main():
              "variant": args.variant, "pool": size, "time_tags": args.time_tags,
              "file_order": args.file_order, "question_date": args.question_date,
              "configs": configs, "reader": args.reader, "skip": args.skip,
-             "source_tokens": args.source_tokens, "readings": readings,
-             **({"event_model": args.event_model} if events is not None else {})}
+             "readings": readings}
     done = set()
     if checkpoint and os.path.exists(checkpoint):
         with open(checkpoint, encoding="utf-8") as fh:
@@ -955,6 +925,10 @@ def main():
                     continue  # a line cut off by the interruption
                 was = dict(row.get("setup") or {})
                 had = set(was.pop("arms", ()))
+                # A setting of the turn arms, removed 2026-11-09: a checkpoint
+                # written before then still resumes when it was left unset.
+                if was.get("source_tokens", 0) is None:
+                    del was["source_tokens"]
                 if was != {k: v for k, v in setup.items() if k != "arms"}:
                     sys.exit(f"{checkpoint} was written with different settings; "
                              "remove it or choose another --out")
@@ -1126,21 +1100,15 @@ def main():
                 retrieve[name + "_untagged"] = lambda q, mem=mem: shown(
                     mem.recall(q, user_id=user, token_budget=args.token_budget,
                                pool_k=args.pool_k, time_tags=False))
-                turn_options = {} if args.source_tokens is None else {
-                    "source_tokens": args.source_tokens}
                 for arm in extra:
                     retrieve[arm] = lambda q, mem=mem, how=readings[arm]: shown(
                         mem.recall(q, user_id=user, **{
                             "token_budget": args.token_budget, "pool_k": args.pool_k,
-                            "time_tags": tag_mode, **turn_options, **how}))
+                            "time_tags": tag_mode, **how}))
                 retrieve[name + "_dated"] = lambda q, mem=mem: shown(
                     mem.recall(q, user_id=user, token_budget=args.token_budget,
                                pool_k=args.pool_k, time_tags=tag_mode,
                                now=asking.get("date") or None))
-                retrieve[name + "_turns"] = lambda q, mem=mem: shown(
-                    mem.recall(q, user_id=user, token_budget=args.token_budget,
-                               pool_k=args.pool_k, time_tags=tag_mode, sources="turn",
-                               **turn_options))
                 retrieve[name + "_trunc"] = lambda q, mem=mem: truncated(
                     shown(mem.recall(q, user_id=user, top_k=args.pool_k, time_tags=False)),
                     args.token_budget)
@@ -1159,8 +1127,6 @@ def main():
             recall_arm("sdk_messages", keep_messages=True, refinement_cosine_threshold=None,
                        contradiction_cosine_threshold=None)
             recall_arm("sdk_raw", keep_messages=True, extractor="none",
-                       refinement_cosine_threshold=None, contradiction_cosine_threshold=None)
-            recall_arm("sdk_raw_events", keep_messages=True, extractor="none", events=events,
                        refinement_cosine_threshold=None, contradiction_cosine_threshold=None)
             recall_arm("sdk_cognitive_alpha1", refinement_cosine_threshold=None,
                        contradiction_cosine_threshold=None, cognitive_alpha=1.0)
@@ -1408,7 +1374,7 @@ def main():
     pairs = list(PAIRS) + [(name, base) for name in configs
                            for base in ("sdk_cognitive", "sdk_cognitive_alpha1", "sdk_pack_tagged")]
     pairs += [(name, base) for name in readings
-              for base in ("sdk_cognitive", "sdk_cognitive_turns", "full_context")]
+              for base in ("sdk_cognitive", "full_context")]
     evidence_by_arm = evidence_scores(tasks, arms)
     evidence_pairs = {}
     if evidence_by_arm:

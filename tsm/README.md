@@ -56,12 +56,13 @@ with Memory("./my_db") as mem:                       # conversational profile
   tell which of two facts came first. `time_tags=False` leaves that out;
   `time_tags="minute"` adds the time of day.
 - Each result also carries `source`, the message the fact was taken from.
-  Two read-time options were measured and left off by default:
-  - `sources="turn"` returns those messages in place of the facts. At a
+  Two read-time options built on it were measured and removed on 2026-11-09
+  (`benchmarks/PHASE_PROGRESS.md`):
+  - `sources="turn"` returned those messages in place of the facts. At a
     600-token budget it lost judged answers, because fewer turns than facts
-    fit (`tsm.sources`).
-  - `event_dates=True` writes the date after a relative time ("two weeks ago
-    [week of 2023-05-08]"; `tsm.when`). Judged answers came out level.
+    fit.
+  - `event_dates=True` wrote the date after a relative time ("two weeks ago
+    [week of 2023-05-08]"). Judged answers came out level.
 - Asking a model to answer from what was recalled: `tsm.reading` has the
   prompt. `answer_prompt(question, results, today=...)` puts the memories in
   the order they were said and tells the model to list what bears on the

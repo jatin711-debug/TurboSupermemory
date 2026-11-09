@@ -9,7 +9,7 @@ no verdict cache) and reports, per arm, the mean number answered right and
 the questions where one arm is right more often than the other.
 
     python benchmarks/cognitive_eval/reread.py --reads 5 \\
-        --arm raw=RUN.json:sdk_raw --arm events=RUN2.json:sdk_raw_events
+        --arm raw=RUN.json:sdk_raw --arm dated=RUN.json:sdk_raw_dated
 
 Each ``--arm NAME=PATH:ARM`` takes the contexts of arm ``ARM`` from the
 per-question results ``PATH`` (``--out`` of the harness). Arms are compared

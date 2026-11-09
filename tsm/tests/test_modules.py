@@ -22,7 +22,8 @@ from tsm.budget import (
     pack_recent,
     select_under_budget,
 )
-from tsm.chunks import MESSAGE_ROLE, is_message, message_role, occasion, passages, spoken_by
+from tsm.chunks import (MESSAGE_ROLE, is_message, message_role, occasion, passages, speaker,
+                        spoken_by)
 from tsm.compaction import GIST_OTHER_ROLE, GIST_ROLE, plan_compaction
 from tsm.concepts import extract_concepts
 from tsm.gist import ExtractiveGistSummarizer, OpenAIGistSummarizer, single_fact, strip_role
@@ -32,10 +33,9 @@ from tsm.ranking import (ASSISTANT_ROLE_DAMP, COUNTING_LAM, PRIOR_SPARES_TOP, RE
 from tsm.reading import ANSWER_SYSTEM, answer_prompt, final_answer, in_order
 from tsm.answering import (add_days, answer_with_tools, calculate, count_distinct,
                            days_between, run_tool)
-from tsm.sources import excerpt, turn_units
 from datetime import date, datetime
 
-from tsm.when import annotate, question_windows, said_on
+from tsm.when import question_windows, said_on
 
 
 def _item(text, score, vec, turn_index=None):
@@ -372,6 +372,8 @@ class TestPassages(unittest.TestCase):
         self.assertFalse(is_message("messages"))
         self.assertFalse(is_message(None))
         self.assertEqual(spoken_by("assistant"), "assistant")
+        self.assertEqual(speaker(spoken_by(message_role("assistant"))), "assistant: ")
+        self.assertEqual(speaker(None), "")
 
     def test_a_passage_is_ranked_like_its_speaker(self):
         self.assertEqual(role_prior(True, message_role("user")), role_prior(True, "user"))
@@ -565,99 +567,13 @@ class TestCompactionPlan(unittest.TestCase):
             plan_compaction(["u " + "x" * 80] * 3, ["user"] * 3, 30, broken)
 
 
-class TestSourceUnits(unittest.TestCase):
-    def test_a_short_message_is_kept_whole(self):
-        self.assertEqual(excerpt("  I moved to Lisbon.  ", ["moved"], 20), "I moved to Lisbon.")
-
-    def test_a_long_message_keeps_the_sentences_its_facts_share_words_with(self):
-        message = ("We talked about many things. The weather was grey all week. "
-                   "My sister Ana moved to Porto in May. We also cooked pasta. "
-                   "Ana now teaches chemistry there.")
-        cut = excerpt(message, ["Ana moved to Porto", "Ana teaches chemistry"], 20)
-        self.assertEqual(cut, "My sister Ana moved to Porto in May. ... "
-                              "Ana now teaches chemistry there.")
-
-    def test_one_overlong_sentence_is_cut_not_dropped(self):
-        cut = excerpt("word " * 200, ["word"], 10)
-        self.assertTrue(cut)
-        self.assertLessEqual(len(cut) // 4, 10)
-
-    def test_facts_of_one_turn_become_one_unit(self):
-        pool = [
-            {"id": "a", "text": "Ana moved to Porto", "score": 0.9, "turn_index": 3,
-             "source": "Ana moved to Porto and teaches there.", "scope": "u"},
-            {"id": "b", "text": "Ana teaches", "score": 0.5, "turn_index": 3,
-             "source": "Ana moved to Porto and teaches there.", "scope": "u"},
-            {"id": "c", "text": "a gist", "score": 0.7, "turn_index": None, "source": None},
-            {"id": "d", "text": "I like tea", "score": 0.6, "turn_index": 4,
-             "source": "I like tea.", "scope": "u", "superseded_by": "x", "chain": ["d", "x"]},
-        ]
-        units = turn_units(pool, "where does Ana live")
-        self.assertEqual([u["id"] for u in units], ["a", "c", "d"])
-        self.assertEqual(units[0]["ids"], ["a", "b"])
-        self.assertEqual(units[0]["facts"], ["Ana moved to Porto", "Ana teaches"])
-        self.assertEqual(units[0]["text"], "Ana moved to Porto and teaches there.")
-        self.assertNotIn("source", units[0])
-        self.assertEqual(units[1]["text"], "a gist")  # no source: as it was
-        self.assertEqual(units[2]["superseded_by"], "x")  # every fact of it is stale
-
-    def test_a_turn_is_stale_only_when_all_its_facts_are(self):
-        pool = [
-            {"id": "a", "text": "I live in Rome", "score": 0.9, "turn_index": 1,
-             "source": "I live in Rome and work at a bakery.", "superseded_by": "z"},
-            {"id": "b", "text": "I work at a bakery", "score": 0.4, "turn_index": 1,
-             "source": "I live in Rome and work at a bakery."},
-        ]
-        [unit] = turn_units(pool)
-        self.assertNotIn("superseded_by", unit)
-
-
-class TestEventDates(unittest.TestCase):
-    SAID = said_on("2023/05/22 (Mon) 14:05")  # a Monday
-
-    def check(self, text, expected):
-        self.assertEqual(annotate(text, self.SAID), expected)
-
+class TestSaidOn(unittest.TestCase):
     def test_the_date_a_message_was_said(self):
-        self.assertEqual(str(self.SAID), "2023-05-22")
+        self.assertEqual(str(said_on("2023/05/22 (Mon) 14:05")), "2023-05-22")
         self.assertEqual(str(said_on("2023-05-22T10:00:00Z")), "2023-05-22")
         self.assertEqual(str(said_on(1684749600)), "2023-05-22")
         self.assertIsNone(said_on("last week"))
         self.assertIsNone(said_on(None))
-
-    def test_relative_times_get_the_date_they_point_to(self):
-        self.check("I saw the dentist two weeks ago.",
-                   "I saw the dentist two weeks ago [week of 2023-05-08].")
-        self.check("We moved 3 days ago", "We moved 3 days ago [2023-05-19]")
-        self.check("I started a month ago", "I started a month ago [2023-04]")
-        self.check("I quit two years ago", "I quit two years ago [2021]")
-        self.check("I ran last Saturday", "I ran last Saturday [2023-05-20]")
-        self.check("I ran last Monday", "I ran last Monday [2023-05-15]")
-        self.check("Party next Friday", "Party next Friday [2023-05-26]")
-        self.check("I flew yesterday", "I flew yesterday [2023-05-21]")
-        self.check("I went last weekend", "I went last weekend [weekend of 2023-05-20]")
-        self.check("It was busy last month", "It was busy last month [2023-04]")
-        self.check("It started this year", "It started this year [2023]")
-        self.check("I got it on the 15th of last month",
-                   "I got it on the 15th of last month [2023-04-15]")
-
-    def test_a_date_without_a_year_gets_the_nearest_year(self):
-        self.check("I saw Dr. Smith on March 3rd.", "I saw Dr. Smith on March 3rd [2023-03-03].")
-        self.check("My birthday is on the 15th of December",
-                   "My birthday is on the 15th of December [2022-12-15]")
-        self.check("Symptoms started in late January", "Symptoms started in late January [2023-01]")
-        self.check("We go in August", "We go in August [2023-08]")
-        self.check("It snowed in December", "It snowed in December [2022-12]")
-        self.check("It rained in May", "It rained in May [2023-05]")
-        self.assertEqual(annotate("in February", said_on("2023-11-20")), "in February [2024-02]")
-        self.assertEqual(annotate("in May", said_on("2023-11-20")), "in May [2023-05]")
-
-    def test_what_is_already_a_date_or_cannot_be_placed_is_left_alone(self):
-        for text in ("I earned it in May 2016.", "On 2023-02-10 we met.", "I did it today.",
-                     "I learned it in two weeks.", "a few weeks ago", "March 3, 2021",
-                     "I may go there", "back in 2019"):
-            self.check(text, text)
-        self.assertEqual(annotate("two weeks ago", None), "two weeks ago")
 
 
 class TestQuestionWindows(unittest.TestCase):

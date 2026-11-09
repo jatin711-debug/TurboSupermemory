@@ -1014,8 +1014,8 @@ class TestTimeTags(MemoryTestBase):
         self.assertLessEqual(sum(len(r["context"]) // 4 for r in tagged), 18)
 
 
-class TestSourceTurns(MemoryTestBase):
-    """Each fact knows the message it came from; sources="turn" returns that."""
+class TestSourceMessage(MemoryTestBase):
+    """Each fact knows the message it came from."""
 
     MESSAGE = "I adopted a beagle named Rex. He is three years old."
 
@@ -1026,43 +1026,6 @@ class TestSourceTurns(MemoryTestBase):
         self.assertEqual({r["text"] for r in results},
                          {"I adopted a beagle named Rex", "He is three years old"})
         self.assertEqual({r["source"] for r in results}, {self.MESSAGE})
-
-    def test_facts_of_one_message_come_back_as_that_message(self):
-        mem = self.make_memory()
-        mem.add([{"role": "user", "content": self.MESSAGE, "timestamp": "2024-03-02"}],
-                user_id="alice")
-        mem.add([{"role": "assistant", "content": "Beagles need long walks."}], user_id="alice")
-        units = mem.recall("beagle Rex years walks", user_id="alice", sources="turn")
-        self.assertEqual(len(units), 2)
-        by_role = {u["role"]: u for u in units}
-        rex = by_role["user"]
-        self.assertEqual(rex["text"], self.MESSAGE)
-        self.assertEqual(rex["context"], "[2024-03-02] user: " + self.MESSAGE)
-        self.assertEqual(sorted(rex["facts"]),
-                         ["He is three years old", "I adopted a beagle named Rex"])
-        self.assertEqual(len(rex["ids"]), 2)
-        self.assertEqual(by_role["assistant"]["context"],
-                         "[turn 3] assistant: Beagles need long walks.")
-        with self.assertRaises(ValueError):
-            mem.recall("beagle", user_id="alice", sources="session")
-
-    def test_a_turn_counts_against_the_budget_as_shown(self):
-        mem = self.make_memory()
-        mem.add([{"role": "user", "content": self.MESSAGE}], user_id="alice")
-        units = mem.recall("beagle Rex years", user_id="alice", sources="turn", token_budget=10)
-        self.assertEqual(units, [])  # the turn is longer than 10 tokens
-        units = mem.recall("beagle Rex years", user_id="alice", sources="turn", token_budget=40)
-        self.assertEqual([u["text"] for u in units], [self.MESSAGE])
-
-    def test_a_long_turn_is_cut_to_what_bears_on_the_question(self):
-        mem = self.make_memory()
-        filler = " ".join(f"Sentence {i} talks about the weather in general." for i in range(30))
-        message = filler + " I adopted a beagle named Rex. " + filler
-        mem.add([{"role": "user", "content": message}], user_id="alice")
-        [unit] = mem.recall("beagle named Rex", user_id="alice", sources="turn", top_k=1,
-                            source_tokens=30)
-        self.assertIn("I adopted a beagle named Rex.", unit["text"])
-        self.assertLessEqual(len(unit["text"]) // 4, 31)
 
 
 class CountingEmbedder(FakeEmbedder):
@@ -1213,7 +1176,7 @@ class TestEnginePacker(MemoryTestBase):
         embed = lambda texts: FakeEmbedder().encode(texts)  # noqa: E731
         for budget in (12, 30, 60, 1000):
             for lam in (0.3, 0.7):
-                ours = mem._pack([dict(p) for p in pool], budget, lam, None, stored=True)
+                ours = mem._pack([dict(p) for p in pool], budget, lam, None)
                 theirs = select_under_budget(pool, budget, embed=embed, lam=lam)
                 self.assertEqual([p["id"] for p in ours], [p["id"] for p in theirs],
                                  f"budget {budget}, lam {lam}")

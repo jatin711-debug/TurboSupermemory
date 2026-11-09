@@ -88,9 +88,12 @@ class TestQueryDocumentRouting(MemoryTestBase):
         self.assertTrue(results)
         # Stored records are packed on the document vectors the engine keeps.
         self.assertEqual(self.embedder.kinds(), ["query"])
+        # A turn index the engine's packer cannot take (not an integer) goes
+        # to the Python packer, which embeds the candidates, as documents.
+        mem.add([{"role": "user", "content": "I work in Porto", "turn_index": "t1"}],
+                user_id="u")
         self.embedder.calls.clear()
-        # A turn is not a stored record: its text is embedded, as a document.
-        mem.recall("where do I live", user_id="u", token_budget=100, sources="turn")
+        mem.recall("where do I live", user_id="u", token_budget=100)
         self.assertEqual(self.embedder.kinds(), ["query", "document"])
 
     def test_gists_are_documents(self):

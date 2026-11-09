@@ -1,23 +1,19 @@
-"""When a memory says something happened, as opposed to when it was said.
+"""Dates: when a memory was said, and the days a question points at.
 
-A message dated 2023-05-22 that says "I saw the dentist two weeks ago" is
-about the week of 2023-05-08. A reader told only the first date has to do
-that arithmetic itself, and readers get it wrong: of the temporal questions
-answered wrong with all their evidence present, most needed a date computed
-from a relative one. Systems that store event time apart from mention time
-(Zep's bi-temporal edges, Chronos's dated event records, Hindsight's
-occurrence intervals) report their largest gains on exactly these questions.
+``said_on`` reads the calendar date out of a stored timestamp.
 
-``annotate`` resolves the time expressions in a text against the date it was
-said and writes the date each one points to after it, in brackets:
+``question_windows`` resolves the time expressions in a question ("ten days
+ago", "last weekend", "in the past two months", "in March") against the date
+it is asked, into stretches of days. ``Memory.recall(now=...)`` matches those
+against the dates memories were said. It is rule-based (English only) and
+leaves what it does not recognise alone: an expression it cannot place gets
+no window rather than a guess. Nothing here calls a model or an engine.
 
-    annotate("I saw the dentist two weeks ago", date(2023, 5, 22))
-    -> "I saw the dentist two weeks ago [week of 2023-05-08]"
-
-It is rule-based (English only), runs at read time, and leaves what it does
-not recognise alone: an expression it cannot place precisely gets no
-annotation rather than a guess. ``said_on`` reads the date out of a stored
-timestamp. Nothing here calls a model or an engine.
+Until 2026-11-09 this module also wrote the date a relative time points to
+after it in a memory's text (``annotate``, ``recall(event_dates=True)``:
+"two weeks ago [week of 2023-05-08]"). Judged over 470 questions that came
+out level (8 gained, 4 lost) and it was removed
+(``benchmarks/PHASE_PROGRESS.md``, 2026-11-09).
 """
 
 import math
@@ -45,8 +41,7 @@ _COUNT = r"(\d{1,3}|a couple of|couple of|an?|one|two|three|four|five|six|seven|
          r"eleven|twelve)"
 _UNIT = r"(day|week|month|year)s?"
 
-# Most specific first; each match is annotated once and the text it covers
-# is not matched again.
+# Most specific first; the text a match covers is not matched again.
 _PATTERNS = [
     ("iso", re.compile(r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b")),
     ("month_day", re.compile(
@@ -63,9 +58,8 @@ _PATTERNS = [
     ("in_month", re.compile(rf"\b(?:in|during|since|until|by|back in|early|late)\s+{_MONTH_NAME}\b"
                             r"(?!\s+\d)", re.I)),
 ]
-# Not annotated: "in two weeks" (as often a duration as a date), "today" and
-# "this morning" (the date the message was said, which its tag already
-# gives), a bare year (already a date).
+# Not matched: "in two weeks" (as often a duration as a date), "today",
+# "this morning", a bare year.
 
 
 def said_on(timestamp) -> Optional[date]:
@@ -110,111 +104,9 @@ def _add_months(day: date, months: int) -> date:
     return date(index // 12, index % 12 + 1, 1)
 
 
-def _nearest_year(month: int, day: int, said: date) -> Optional[date]:
-    """The date with this month and day nearest to ``said``."""
-    best = None
-    for year in (said.year - 1, said.year, said.year + 1):
-        try:
-            candidate = date(year, month, day)
-        except ValueError:
-            continue
-        if best is None or abs((candidate - said).days) < abs((best - said).days):
-            best = candidate
-    return best
-
-
-def _week_of(day: date) -> str:
-    return f"week of {day - timedelta(days=day.weekday()):%Y-%m-%d}"
-
-
-def _resolve(kind: str, groups: Tuple[str, ...], said: date) -> Optional[str]:
-    """The date an expression points to, as written in its annotation."""
-    if kind == "iso":
-        return None  # already a date
-    if kind in ("month_day", "day_month"):
-        month_word, day_word, year = ((groups[0], groups[1], groups[2]) if kind == "month_day"
-                                      else (groups[1], groups[0], groups[2]))
-        if year:
-            return None  # already a full date
-        resolved = _nearest_year(_month(month_word), int(day_word), said)
-        return f"{resolved:%Y-%m-%d}" if resolved else None
-    if kind == "month_year":
-        return None  # already as precise as it gets
-    if kind == "nth_of_month":
-        first = _add_months(said, {"last": -1, "this": 0, "next": 1}[groups[1].lower()])
-        try:
-            return f"{first.replace(day=int(groups[0])):%Y-%m-%d}"
-        except ValueError:
-            return None
-    if kind == "ago":
-        n = _count(groups[0])
-        if n is None or n > 100:
-            return None
-        unit = groups[1].lower()
-        if unit == "day":
-            return f"{said - timedelta(days=n):%Y-%m-%d}"
-        if unit == "week":
-            return _week_of(said - timedelta(weeks=n))
-        if unit == "month":
-            return f"{_add_months(said, -n):%Y-%m}"
-        return f"{said.year - n}"
-    if kind == "last_weekday":
-        which, weekday = groups[0].lower(), _WEEKDAYS[groups[1].lower()]
-        if which == "next":
-            ahead = (weekday - said.weekday()) % 7 or 7
-            return f"{said + timedelta(days=ahead):%Y-%m-%d}"
-        back = (said.weekday() - weekday) % 7 or 7
-        return f"{said - timedelta(days=back):%Y-%m-%d}"
-    if kind == "relative_unit":
-        which, unit = groups[0].lower(), groups[1].lower()
-        step = {"last": -1, "this": 0, "next": 1}[which]
-        if unit == "week":
-            return _week_of(said + timedelta(weeks=step))
-        if unit == "weekend":
-            saturday = said + timedelta(days=(5 - said.weekday()) % 7)
-            if which == "last" or (which == "this" and said.weekday() == 6):
-                saturday = said - timedelta(days=(said.weekday() - 5) % 7 or 7)
-            elif which == "next":
-                saturday += timedelta(weeks=1)
-            return f"weekend of {saturday:%Y-%m-%d}"
-        if unit == "month":
-            return f"{_add_months(said, step):%Y-%m}"
-        return f"{said.year + step}"
-    if kind == "relative_day":
-        offset = {"the day before yesterday": -2, "yesterday": -1, "tomorrow": 1}[
-            groups[0].lower()]
-        return f"{said + timedelta(days=offset):%Y-%m-%d}"
-    if kind == "in_month":
-        month = _month(groups[0])
-        # The nearest such month, the past one on a tie: "in August" said in
-        # May is a plan, said in December it is history.
-        ahead = (month - said.month) % 12
-        year = said.year + (said.month + ahead > 12) if ahead < 6 else (
-            said.year - (month > said.month))
-        return f"{year}-{month:02d}"
-    return None
-
-
-def expressions(text: str, said: date) -> List[Tuple[int, int, str]]:
-    """``(start, end, resolved)`` for each time expression in ``text`` that
-    can be placed relative to ``said``, in order."""
-    found: List[Tuple[int, int, str]] = []
-    taken: List[Tuple[int, int]] = []
-    for kind, pattern in _PATTERNS:
-        for match in pattern.finditer(text or ""):
-            start, end = match.span()
-            if any(start < b and a < end for a, b in taken):
-                continue
-            taken.append((start, end))
-            resolved = _resolve(kind, match.groups(), said)
-            if resolved:
-                found.append((start, end, resolved))
-    return sorted(found)
-
-
 # A question can point at a stretch of time rather than at a topic: "what did
 # I buy ten days ago", "the trips I took in the past three months". The
-# expressions above say when; these also cover "in the past N weeks".
+# patterns above say when; this one also covers "in the past N weeks".
 _PAST_SPAN = re.compile(
     rf"\b(?:in|over|during|within|for)\s+the\s+(?:past|last)\s+(?:{_COUNT}\s+|(few)\s+)?"
     rf"{_UNIT}\b", re.I)
@@ -367,20 +259,3 @@ def question_windows(text: str, now) -> List[Tuple[date, date]]:
             if span and span[0] <= now:
                 found.append((start, (span[0], min(span[1], now))))
     return [span for _, span in sorted(found)]
-
-
-def annotate(text: str, said: Optional[date]) -> str:
-    """``text`` with the date each of its relative time expressions points
-    to written after it in brackets. Unchanged without ``said``."""
-    if not text or said is None:
-        return text
-    found = expressions(text, said)
-    if not found:
-        return text
-    out, last = [], 0
-    for start, end, resolved in found:
-        out.append(text[last:end])
-        out.append(f" [{resolved}]")
-        last = end
-    out.append(text[last:])
-    return "".join(out)
