@@ -4387,9 +4387,9 @@ working (two of them an engine of their own) for no measured gain.
   fallback (an extension without `pack_under_budget`, a turn index that is
   not an integer).
 - Not deleted: `second_look` / `keep_unextracted` and
-  `compaction="merge_oldest"` (each waits on a run that is still owed),
-  `tsm/answering.py` (never part of `Memory`), and the ColBERT reranker
-  (never judged, so there is nothing to decide it on yet).
+  `compaction="merge_oldest"` (each waits on a run that is still owed), and
+  the ColBERT reranker (never judged, so there is nothing to decide it on
+  yet). `tsm/answering.py` went later the same day (section 4).
 - A database written with events or an observer still has `tsm_events` /
   `tsm_observations` under its `db_path`. Nothing opens them now.
 - Saved run files with `sdk_raw_events` or `_turns` arms are still read by
@@ -4429,3 +4429,43 @@ with Mem0, each with its sample size.
 - Found while writing it: `docs/python_sdk.md` does not describe
   `keep_messages`, `extractor="none"` or `recall(now=...)`, and the ColBERT
   reranker has no judged run. Both are in `TODO.md`.
+
+**4. A wider cleanup, the same day.** The owner then asked for what the
+project does not need to go, and chose each of the larger items. One commit
+each, so any of them comes back with one `git revert`; the files are at
+`git show 55933a6:<path>`.
+
+| removed | size | why |
+|---|---|---|
+| `benchmarks/memory_benchmarks/` | 56 files, 16,260 lines | a copy of `mem0ai/memory-benchmarks` (its runners and a Next.js results UI) with one TSM client. Nothing referenced it; its one result was the BEAM table |
+| `run_longmemeval.py`, `run_locomo.py`, `run_comparison.py`, `report.py`, `metrics/`, `adapters/mem0_adapter.py`, `benchmark_datasets/locomo.py`; Makefile `longmemeval`, `locomoco`, `compare`, `report` | 2,089 lines | word-overlap recall@K from before the judged harness. No number in the README or `AGENTS.md` comes from them |
+| `tsm/answering.py`, harness `--reader tools` | 245 lines and 3 tests | reader tools: 94 against 98 of 115 (2026-10-21) |
+| `Improvements.md` | 286 lines | a blueprint that opened with a table of where it was wrong; what was built from it is in the 2026-10-19 entry |
+| `eval_embedder_belief.py`, `inspect_multi_session.py`, `multi_session_drilldown.py` | 415 lines | nothing ran or documented the first; the other two were diagnostics for four questions of an early sample |
+
+- The repository went from 248 tracked files to 173.
+- Kept, although only this log mentions them: `reinforcement_eval.py`,
+  `run_abstraction_longmemeval.py`, `retention_eval.py` and
+  `verify_supersessions.py` (re-running the retrieval-side levers on OpenAI
+  embeddings is still open in `TODO.md`), `leak_repro.py`, and the two
+  quantizer scripts, which `docs/core_quantization.md` now points at. The
+  quantizer audit's recall column tests nothing: it stores 2,000 vectors, and
+  at 4,096 or fewer every search is an exact scan.
+- The harness's own unit tests (`test_budgeting.py`, `test_diagnostics.py`,
+  `test_longmemeval_loader.py`, `test_role_aware.py`: 28 tests, no data or
+  keys) pass and are run by nothing. `benchmarks/cognitive_eval/README.md`,
+  rewritten, says how.
+- `download.py` no longer fetches LoCoMo-MC10; a copy already under
+  `benchmarks/cognitive_eval/data/locomo/` is no longer read. What the Mem0
+  suite left locally (`results/`, `logs/`, `datasets/`, a `.env`) is still on
+  disk and ignored.
+- `pyproject.toml` still lists `scikit-learn` in the `eval` extra. Nothing
+  imports it; left for a change that also updates `uv.lock`.
+- Found by the plumbing check afterwards (`shipped_stack_eval.py --offline
+  --limit 5`): two of five histories were "skipped for every arm" with
+  `ImportError: cannot import name 'AutoModelForSequenceClassification'`.
+  The `adapter` arm's NLI verifier is shared by the `--jobs` threads and two
+  of them loaded it at once, racing inside transformers' lazy imports. Not
+  from this cleanup: the load is now behind a lock
+  (`verification/nli.py`), and the same check skips none.
+- `make gate` passed 8 of 8 on the result; the SDK suite is 215 tests.

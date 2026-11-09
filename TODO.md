@@ -31,7 +31,9 @@ This file is only the short list of open engineering work, grouped by area.
 > deleted from the SDK and the harness (events, observations,
 > `recall(sources="turn")`, `recall(event_dates=True)`), a Linux CI workflow
 > came back, and the README was rewritten around the measured results (entry
-> of that date in `PHASE_PROGRESS.md`).
+> of that date in `PHASE_PROGRESS.md`). A wider cleanup followed: the
+> vendored Mem0 benchmark suite, the recall@K runners, the reader tools
+> (`tsm.answering`) and `Improvements.md` are gone (section 4 of that entry).
 
 ## Durability and operations
 
