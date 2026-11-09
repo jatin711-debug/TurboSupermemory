@@ -2866,7 +2866,8 @@ totals computed in code rather than by the reader.
 
 # A local stack: EmbeddingGemma 2 against MiniLM and the OpenAI vectors (2026-10-19)
 
-`Improvements.md` proposes EmbeddingGemma 2 as the embedder, a ternary
+`Improvements.md` (removed 2026-11-09, `git show 271cea3:Improvements.md`)
+proposes EmbeddingGemma 2 as the embedder, a ternary
 Bonsai model as the local verifier, and consolidation while the memory is
 idle. This entry measures what can be measured on this machine (RTX 3050
 Laptop 4 GB, PyTorch 2.8, sentence-transformers 6.1) before any of it
