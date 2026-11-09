@@ -4352,3 +4352,79 @@ elsewhere (Tokyo transit tips, keeping the kitchen clean), where the same
 kind of answer is graded right on one read and wrong on the next. The shipped
 prompt stays. A single pass (20 of 30) understates the reader: read five
 times, the shipped prompt averages 23.
+
+---
+
+# Four features deleted, a Linux CI, and a README that says what was measured (2026-11-09)
+
+A review of the codebase found three things: the README led with claims the
+log does not support, nothing had been built on Linux since the workflow was
+removed, and `tsm.Memory` carried four opt-in features that had each measured
+level or worse. The owner asked for all three to be fixed and chose deletion
+over moving the features to the harness.
+
+**1. Deleted, not left off.** Each was a path through `Memory` to keep
+working (two of them an engine of their own) for no measured gain.
+
+| removed | what it did | what it measured | entry |
+|---|---|---|---|
+| `Memory(events=...)`, `recall(events=...)`, `tsm/events.py`, arm `sdk_raw_events`, `--event-model` | one record per event a user message reports, in a second engine; a share of a counting question's budget | 93.6 against 95.8 of 121, five reads each (9 / 13, p = 0.52) | 2026-11-05 |
+| `Memory(observer=...)`, `observe_pending()`, `observations()`, `tsm/observe.py`, `observe_eval.py` | each day's conversation rewritten as self-contained lines, in a third engine | best 93.0 against 94.7 to 96.0 of 121 for the raw passages | 2026-11-05 |
+| `recall(sources="turn", source_tokens=...)`, `tsm/sources.py`, the `_turns` arms, `--source-tokens` | the turns in place of the facts taken from them | 86 against 98 of 115 at 600 tokens | 2026-10-21 |
+| `recall(event_dates=True)`, `tsm.when.annotate` | the date written after a relative time | 8 gained, 4 lost over 470 | 2026-10-21 |
+
+- The code is at `git show 26092df:<path>`: `tsm/events.py`, `tsm/observe.py`,
+  `tsm/sources.py`, `tsm/when.py`, `tsm/memory.py`,
+  `tsm/tests/test_events.py`, `tsm/tests/test_observe.py`,
+  `benchmarks/cognitive_eval/observe_eval.py` and
+  `benchmarks/cognitive_eval/shipped_stack_eval.py`.
+- What stays of those modules: `speaker()` moved to `tsm/chunks.py`;
+  `tsm/when.py` keeps `said_on` and `question_windows`.
+- `tsm/memory.py` went from 1,736 to 1,361 lines and the SDK unit suite from
+  252 to 218 tests. `Memory._pack` lost its `stored` argument: every
+  candidate is a stored record now, and the Python packer is only the
+  fallback (an extension without `pack_under_budget`, a turn index that is
+  not an integer).
+- Not deleted: `second_look` / `keep_unextracted` and
+  `compaction="merge_oldest"` (each waits on a run that is still owed),
+  `tsm/answering.py` (never part of `Memory`), and the ColBERT reranker
+  (never judged, so there is nothing to decide it on yet).
+- A database written with events or an observer still has `tsm_events` /
+  `tsm_observations` under its `db_path`. Nothing opens them now.
+- Saved run files with `sdk_raw_events` or `_turns` arms are still read by
+  `reread.py`, which takes contexts by arm name. The paid caches
+  (`events_gpt-4o-mini.json`, `observe_anthropic_claude-haiku-5-5.json` in
+  `$TSM_EVAL_DIR`) are untouched and no longer read. A checkpoint written
+  with `source_tokens` unset still resumes.
+
+**The default path did not change.** `shipped_stack_eval.py --offline --judge
+none --limit 120 --arms
+sdk_pack_tagged,sdk_cognitive,sdk_messages,sdk_raw,sdk_raw_dated` at 150
+tokens, run on an export of `26092df` and on the pruned tree with the same
+caches: all 575 contexts (115 questions x 5 arms) are identical, with the
+same retrieved text, turns and evidence for every question. No judge was
+paid; nothing a reader sees moved. `make gate` passed 8 of 8 on the pruned
+tree (ANN recall 100.0%).
+
+**2. CI, Linux only.** `.github/workflows/ci.yml`: format check, clippy, the
+Rust suite, a debug build of the extension and the SDK unit suite on
+`ubuntu-latest`, on pushes to `main` / `development`, pull requests and
+manual dispatch. One job does what the Linux jobs of the workflow removed on
+2026-10-21 did, with newer action versions (`checkout@v5`,
+`setup-python@v6`) and without the Windows and macOS jobs. It had not run
+when this was written. `make gate` is still the merge gate.
+
+**3. The README.** Rewritten around the judged results: the LongMemEval-S
+table of 2026-11-05 first, then what moved answers, what did not (the graph
+on OpenAI vectors, belief revision's effect on answers, a larger budget, the
+four features above), the controls, LoCoMo and the bounded-store comparison
+with Mem0, each with its sample size.
+- Taken out: the 66.7% against 55.6% Mem0 head-to-head and the 20-question
+  BEAM table (neither has an entry here), the "mathematical foundations"
+  section, and the tier diagram that showed RaBitQ / TurboQuant as what the
+  tiers use. Both tiers default to 8-bit scalar (`config.rs`);
+  `docs/core_quantization.md` called 1-bit sign the cold default and was
+  corrected.
+- Found while writing it: `docs/python_sdk.md` does not describe
+  `keep_messages`, `extractor="none"` or `recall(now=...)`, and the ColBERT
+  reranker has no judged run. Both are in `TODO.md`.

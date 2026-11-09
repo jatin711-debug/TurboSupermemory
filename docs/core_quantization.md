@@ -116,7 +116,7 @@ classDiagram
 
 Lloyd-Max quantization is the mathematically optimal scalar quantizer for a given probability density function (PDF). Since preconditioning projects vector dimensions into a normal distribution \(\mathcal{N}(0, 1/d)\), `turbomemory_core` stores precomputed [Lloyd-Max centroids](file:///d:/personal-projects/TurboSuperMemory/crates/turbomemory_core/src/quantization.rs#L19-L55) for \(\mathcal{N}(0, 1)\) at resolutions between 1 and 8 bits. During quantization, these centroids are scaled by \(1/\sqrt{d}\).
 
-### 4.2 Scalar Quantizer (Warm Tier Default)
+### 4.2 Scalar Quantizer (Warm and Cold Tier Default)
 
 The [`ScalarQuantizer`](file:///d:/personal-projects/TurboSuperMemory/crates/turbomemory_core/src/quantization.rs#L62) is calibrated on a sample dataset to compute a global min/max range. Each float dimension is mapped linearly to a \(b\)-bit unsigned integer (typically 8 bits for the Warm tier):
 \[
@@ -126,7 +126,7 @@ q_i = \text{round}\left( \frac{x_i - \text{min}}{\text{max} - \text{min}} \cdot 
 * **Compression**: 4x compression (32-bit float to 8-bit int).
 * **Search**: Direct SIMD dot-product against float queries without prior decompression.
 
-### 4.3 1-bit Sign Quantizer (Cold Tier Default)
+### 4.3 1-bit Sign Quantizer (Cold Tier Option)
 
 For maximum compression, the [`SignQuantizer`](file:///d:/personal-projects/TurboSuperMemory/crates/turbomemory_core/src/quantization.rs#L211) quantizes each dimension to its sign:
 \[
@@ -325,10 +325,10 @@ This amortizes the cost of loading the query vector across 4 distance computatio
 | Quantizer | Bits | Compression | Recall@10 (768-dim) | Speed | Use Case |
 |---|---|---|---|---|---|
 | FP32 (baseline) | 32 | 1x | 100% | Baseline | Hot tier, reranking |
-| Scalar 8-bit | 8 | 4x | ~95% | Fast | Warm tier default |
+| Scalar 8-bit | 8 | 4x | ~95% | Fast | Warm and cold tier default |
 | TurboQuant Prod | 4 | 8x | ~92% | Fast | Warm tier alternative |
 | TurboQuant MSE | 2 | 16x | ~85% | Very Fast | Cold tier alternative |
-| Sign 1-bit | 1 | 32x | ~71% | Fastest | Cold tier default |
+| Sign 1-bit | 1 | 32x | ~71% | Fastest | Cold tier option |
 
 *Note: Recall figures are approximate and depend on dataset characteristics. Clustered embeddings (realistic text) show higher recall than random Gaussian data.*
 

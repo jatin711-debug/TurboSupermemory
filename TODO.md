@@ -17,7 +17,7 @@ This file is only the short list of open engineering work, grouped by area.
 > behaviour": those change what recall returns and need a judged re-run.
 >
 > **2026-10-07.** GPU search over device-resident vectors, `sync_writes`,
-> a CI workflow (removed again on 2026-10-21), and verified belief revision landed (entry of that date in
+> a CI workflow (removed on 2026-10-21, back for Linux on 2026-11-09), and verified belief revision landed (entry of that date in
 > `PHASE_PROGRESS.md`). What each of them leaves open is listed under its
 > heading below.
 >
@@ -26,6 +26,12 @@ This file is only the short list of open engineering work, grouped by area.
 > cognitive mechanism beats plain vector search with OpenAI embeddings, and
 > why the shipped stack trailed it. The four items it produced lead the
 > "SDK" and "Cognitive behaviour" lists below.
+>
+> **2026-11-09.** Four opt-in features that measured level or worse were
+> deleted from the SDK and the harness (events, observations,
+> `recall(sources="turn")`, `recall(event_dates=True)`), a Linux CI workflow
+> came back, and the README was rewritten around the measured results (entry
+> of that date in `PHASE_PROGRESS.md`).
 
 ## Durability and operations
 
@@ -58,12 +64,16 @@ This file is only the short list of open engineering work, grouped by area.
   graph snapshot are versioned.
 - **A failed insert after the WAL append** (text-index failure) is reported as
   failed although the record is durable.
-- **No CI.** The workflow was removed on 2026-10-21. `make gate`, run on
-  this Windows machine, is the only check. Linux and macOS are not built or
-  tested anywhere. The AArch64 NEON kernels in
+- **CI is Linux only, and new.** `.github/workflows/ci.yml` (2026-11-09) runs
+  the format check, clippy, the Rust suite and the SDK unit suite on
+  `ubuntu-latest`. It had not run when this was written: the first run is the
+  first time since 2026-10-21 that anything here is built on Linux, so expect
+  it to find something. `make gate`, run on this Windows machine, is still
+  the merge gate and the only place the evaluations run. macOS is not built
+  or tested anywhere. The AArch64 NEON kernels in
   `turbomemory_core/src/metrics.rs` are only type-checked
   (`cargo clippy --target aarch64-unknown-linux-gnu`), never compiled into a
-  binary or run. The last place they ran was that workflow's macOS job.
+  binary or run. The last place they ran was the old workflow's macOS job.
 - Request timeouts, body-size configuration and CORS on the REST server.
 - Metrics and tracing: the optimizer reports failures with `eprintln!`, and
   the Python extension initialises no logger, so the engine's warnings
@@ -147,8 +157,9 @@ The numbers are in `benchmarks/PHASE_PROGRESS.md`. In short:
   where memory scores 98. On LongMemEval-S (29 questions) the raw 124k-token
   sessions score 22 and memory 20.
 - **Not adopted**, all level or worse:
-  - source turns as the read unit (`recall(sources="turn")`);
-  - event dates (`event_dates=True`);
+  - source turns as the read unit (`recall(sources="turn")`; removed
+    2026-11-09);
+  - event dates (`event_dates=True`; removed 2026-11-09);
   - reader tools (`tsm.answering`);
   - two verifier-prompt rules for repeat occurrences (dev pairs only).
 
@@ -163,9 +174,10 @@ Still open, in this order:
 2. **LongMemEval-S on more questions.** The 29 here detect only large
    differences. The other 85 of the 115 need about 37k extraction requests,
    about $5, with `benchmarks/cognitive_eval/prefetch_extraction.py`.
-3. **The `sources="turn"` excerpt picks sentences by word overlap** and drops
-   the short sentence that answers. Choose by the facts' embeddings, and
-   measure only at budgets where turns fit (1,500 tokens or more).
+3. ~~The `sources="turn"` excerpt picks sentences by word overlap~~ Dropped:
+   `sources="turn"` was removed on 2026-11-09. If turns as the read unit are
+   tried again, choose the excerpt by the facts' embeddings and measure only
+   at budgets where turns fit (1,500 tokens or more).
 4. **Evidence is lost on the write path, not in ranking** (addressed
    2026-10-29 by keeping the messages, above)
    (`benchmarks/cognitive_eval/evidence_rank_report.py`, 2026-10-28 entry in
@@ -507,18 +519,23 @@ recall results:
   allowance. State the store sizes next to any Mem0 comparison.
 - The 2026-10-07 judged run did not reproduce a lead of the stack over plain
   vector search (adapter 0.504, plain 0.539, 120 conversations, gpt-4.1-mini
-  judge). The README's head-to-head table (50 conversations, gpt-4o-mini
-  judge) shows one; re-run that table's exact configuration before relying
-  on it, and say which system (adapter or SDK) each number measures.
+  judge). The README's old head-to-head table showed one; it was taken out
+  of the README on 2026-11-09. Re-run its configuration (50 conversations,
+  gpt-4o-mini judge) before quoting it again, and say which system (adapter
+  or SDK) each number measures.
 - Re-run the retrieval-side levers on OpenAI embeddings; their original lifts
   were measured on MiniLM only.
-- The README's benchmark tables are the owner's own runs. To let a reader
-  check them, state the number of questions next to each table and commit the
-  configuration and raw output: the LongMemEval head-to-head percentages
-  (66.7% vs 55.6%) imply a small set and are identical at all three budgets,
-  and the BEAM table is 20 questions. The 48-question multi-budget audit in
-  `PHASE_PROGRESS.md` (56.2% vs 39.6% at 150 tokens) is a larger sample of
-  the same comparison.
+- The README's benchmark tables are the owner's own runs. Since 2026-11-09
+  each states its sample size and date and has an entry in
+  `PHASE_PROGRESS.md`; the 66.7% vs 55.6% head-to-head and the 20-question
+  BEAM table, which had neither, are gone. Still owed: commit the
+  configuration and raw output of the headline run (the per-question files
+  are under `$TSM_EVAL_DIR/runs/`, outside the checkout), so a reader can
+  check it.
+- The ColBERT reranker has never been judged. Either measure it
+  (`reread.py`, same contexts with and without) or stop offering it.
+- `docs/python_sdk.md` does not describe `keep_messages`, `extractor="none"`
+  or `recall(now=...)`; the README and `tsm/README.md` do.
 
 ## Retired with the 1M × 4k axis
 

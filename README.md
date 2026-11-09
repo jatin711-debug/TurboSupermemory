@@ -1,305 +1,370 @@
 # TurboSuperMemory (TSM)
 
+[![CI](https://github.com/jatin711-debug/TurboSupermemory/actions/workflows/ci.yml/badge.svg)](https://github.com/jatin711-debug/TurboSupermemory/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/rust-1.99%20(pinned)-orange.svg)](./rust-toolchain.toml)
 [![Python](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#license)
-[![Status: Beta](https://img.shields.io/badge/status-beta-yellow.svg)](#verification)
-[![CUDA](https://img.shields.io/badge/CUDA-12.6%20optional-76B900.svg?logo=nvidia)](#gpu-acceleration)
-[![Tests](https://img.shields.io/badge/tests-294%20Rust%20%2B%2083%20SDK-brightgreen.svg)](#verification)
+[![Status: Beta](https://img.shields.io/badge/status-beta-yellow.svg)](#known-limits)
 
-> **TurboSuperMemory** is a high-performance, bare-metal cognitive memory engine for AI agents — written in native Rust, with optional CUDA acceleration, and equipped with 3-tier TurboQuant hardware compression and Stage-2 ColBERT late interaction.
+Long-term memory for AI agents. TSM is an embedded storage engine written in
+Rust, with a Python SDK (`tsm`) that stores a conversation as it happens,
+finds what bears on a question, and packs it into a token budget for the model
+that answers.
 
----
+- **`tsm.Memory`** (Python): `add()` messages, `recall()` a budgeted context,
+  `consolidate()` to revise beliefs. Works with OpenAI or fully local models.
+- **`turbomemory`** (Rust engine, PyO3 extension): crash-safe vector storage
+  with tiered indexes, scoped search, a concept graph, and optional CUDA exact
+  search.
+- **`turbomemory-server`**: the same engine behind gRPC and REST.
 
-## 🌟 Why TurboSuperMemory?
-
-Most "agent memory" solutions today are thin Python wrappers around vector databases. They store every embedding raw, hand back nearest neighbors, burn hundreds of dollars on write-time LLM calls, and lose all temporal reasoning.
-
-**TurboSuperMemory (TSM) is engineered from the silicon up:**
-
-* ⚡ **$0.00 Write-Time Ingestion**: Open-vocabulary statistical PMI concept extraction in native Rust ($<0.05\text{ms}$ latency) — zero LLM token burn on write.
-* 💥 **30.7× RaBitQ & 32× TurboQuant Hardware Compression**: Universal dimension support (384-d, 768-d, 1536-d) shrinking 768-d vectors to **100 bytes/vec** with randomized orthogonal transforms and fast AVX2 LUT popcount scoring.
-* 🧠 **Cognitive Biology & Graph Layer**: ACT-R power-law recency decay, spreading activation across concept hubs, and NLI-based non-destructive belief revision.
-* 🎯 **2-Stage Retrieval & ColBERT MaxSim**: Fast Stage-1 candidate retrieval ($<1\text{ms}$) + optional Stage-2 token-level late interaction (`LiquidAI/LFM2.5-ColBERT-350M`) on CUDA.
-* 🛡️ **Budget-Aware Recall (Submodular MMR)**: Packs the most relevant, least redundant memories into a token budget from 150 to 1,000+ tokens, maintaining superior accuracy against Mem0 across all budget sizes.
-* 🔒 **Crash-Safe Storage Engine**: Lock-free atomic `ArcSwap` snapshots, segmented mmap buffers, and a checksummed Write-Ahead Log. A process that is killed loses nothing it acknowledged, an update is atomic, damaged index segments are rebuilt on open, and a scope or filter bounds every stage of a search.
+Beta, one maintainer. Every number on this page comes from this repository's
+own runs. Each has a dated entry with its command, sample size and caveats in
+[`benchmarks/PHASE_PROGRESS.md`](./benchmarks/PHASE_PROGRESS.md), including the
+experiments that failed.
 
 ---
 
-## 📐 Mathematical Foundations
+## Measured results
 
-### 1. The Cognitive Score Fusion Formula
-At query time, TSM fuses vector spatial similarity with topological graph diffusion, temporal forward chaining, and belief demotion:
+### LongMemEval-S, every answerable question
 
-$$\text{Final Score}(M) = \Big[ \underbrace{\text{CosineSimilarity}(Q, M)}_{\text{Semantic Vector Floor}} + \underbrace{(1 - \alpha_{\text{cognitive}}) \cdot \sigma(\Delta_{\text{graph}}(M))}_{\text{Cognitive Graph Boost}} \Big] \cdot \underbrace{\Big(1 + \lambda_{\text{recency}} \cdot \frac{\text{seq}(M)}{\text{seq}_{\max}}\Big)}_{\text{Temporal Recency Multiplier}} \cdot \underbrace{D(M)}_{\text{Truth Demotion}}$$
+Each question comes with a history of about 120,000 tokens. The history is
+stored as messages (no model is asked at write time), `recall()` returns 2,000
+tokens of it, and gpt-4.1-mini answers from those with the `tsm.reading`
+prompt. gpt-4.1-mini judges. OpenAI `text-embedding-3-small` vectors, one
+judged pass, 2026-11-05.
 
-* **Semantic Vector Floor**: Guarantees high-similarity nearest neighbors are never dropped.
-* **Cognitive Graph Boost**: Injects Hill-saturated ($\sigma(x) = \frac{x}{1+x}$) spreading activation across multi-hop concept and entity relations.
-* **Temporal Recency Multiplier**: Smoothly tilts retrieval toward newer valid assertions when queries request current timeline state.
-* **Truth Demotion ($D \in (0, 1]$)**: Non-destructively penalizes superseded and contradicted memories without losing historical raw data.
+| Question type | Questions | Answered right | All evidence in the 2,000 tokens |
+| :--- | ---: | ---: | ---: |
+| knowledge-update | 72 | 70 (97.2%) | 70 |
+| multi-session | 121 | 101 (83.5%) | 111 |
+| single-session-assistant | 56 | 54 (96.4%) | 56 |
+| single-session-preference | 30 | 20 (66.7%) | 29 |
+| single-session-user | 64 | 61 (95.3%) | 62 |
+| temporal-reasoning | 127 | 105 (82.7%) | 111 |
+| **All** | **470** | **411 (87.4%)** | **439 (93.4%)** |
 
-### 2. RaBitQ (Randomized Binary Quantization) Asymmetric Inner Product
-For universal dimension vector compression (384-d, 768-d, 1536-d):
+How to read it:
 
-$$y = R x, \quad b_i = \mathbb{I}(y_i \ge 0), \quad \alpha = \frac{\|x\|_2}{\sqrt{d}}$$
+- The benchmark's 30 abstention questions are skipped, so this is not
+  comparable with published scores over all 500, which also use other readers
+  and judges.
+- The reader is not deterministic. It moves about 1 question in 20 between
+  passes on identical contexts, so differences of a few questions are noise.
+- Of the 59 wrong answers, 41 had all of their evidence in the context. Most of
+  what is left is the reader's, not retrieval's.
 
-$$\langle q, x \rangle \approx \alpha \cdot \langle R q, 2 b - \mathbf{1} \rangle = \alpha \sum_{j=0}^{\lceil d/8 \rceil - 1} T_j[\text{byte}_j]$$
+### What moved answers
 
-Scored in $<8\text{ns}$ per vector using precomputed 8-bit lookup tables ($>50\text{M}$ vectors/sec/core).
+| Change | Result | Sample |
+| :--- | :--- | :--- |
+| The reading prompt (`tsm.reading`) at 600 tokens, against a plain "answer from these snippets" prompt at 150 | 296 against 259 right (52 gained, 15 lost) | 355 held-out LongMemEval questions |
+| Keeping every message next to the extracted facts (`keep_messages`, the default) | 27 against 19 right at 2,000 tokens (8 gained, 0 lost, p = 0.01) | 29 LongMemEval-S questions |
+| Returning the assistant's reply whole when the question asks what the assistant said | 54 against 41 right (13 gained, 0 lost) | 56 LongMemEval-S questions |
+| A date or turn in front of each memory (`time_tags`, the default) | 8 gained, 1 lost | 115 LongMemEval questions |
+| Folding old memories into gists instead of deleting them, in a 256-token store | 0.482 against 0.098 (46 gained, 3 lost, p < 0.001) | 112 LongMemEval questions |
 
-### 3. Stage-2 ColBERT MaxSim Late Interaction
-For multi-constraint and entity-dense queries, TSM evaluates token-level alignment between query tokens $Q$ and candidate memory tokens $D$:
+### What did not
 
-$$\text{MaxSim}(Q, D) = \sum_{i=1}^{L_q} \max_{j=1}^{L_d} (Q_i \cdot D_j)$$
+| Idea | Result | Status |
+| :--- | :--- | :--- |
+| Concept-graph ("cognitive") search against plain vector search, OpenAI vectors | 357 against 360 right of 414 (p = 0.70); tied 10 / 10 on the held-out set | Still the default; adds nothing measurable here |
+| Belief revision's effect on answers | Knowledge-update questions: 10 of 18 with it, 9 without | Kept; superseded facts are demoted and flagged, never dropped |
+| A larger context: 8,000 tokens instead of 2,000 | Evidence rose from 91 to 96 of 96, right answers fell from 91 to 82 (p = 0.012) | Use about 2,000 |
+| A typed event table for counting questions | 93.6 against 95.8 of 121, five reads each | Removed 2026-11-09 |
+| Rewriting conversations into observations | Best 93.0 against 94.7 to 96.0 of 121 for the raw passages | Removed 2026-11-09 |
+| Returning source turns in place of facts | 86 against 98 of 115 at 600 tokens | Removed 2026-11-09 |
+| Writing the date after a relative time ("two weeks ago [...]") | 8 gained, 4 lost over 470 | Removed 2026-11-09 |
+| Reader tools for arithmetic and dates (`tsm.answering`) | 94 against 98 of 115 | Not the default |
+| Time of day in the tags (`time_tags="minute"`) | 84 against 90 of 115 (p = 0.07) | Not the default |
+| A second extraction pass for messages that yielded no fact | 6 more answers at 600 tokens, 8 fewer at 150; neither significant | Off by default |
 
-$$\text{Score}_{\text{fused}}(M) = \text{Score}_{\text{TSM}}(M) \cdot \Big(1 + \text{Softmax}(\text{MaxSim}(Q, M)) \cdot N\Big)$$
+The graph's earlier gains were measured on MiniLM vectors only. Whether it
+earns its place with a weak local embedder is open.
+
+Unless a row says LongMemEval-S, a LongMemEval sample on this page is the
+benchmark's oracle variant, where a history holds only the sessions with
+evidence. Settings were chosen on 115 of its questions; the 355 "held-out"
+ones are the rest.
+
+### Controls and a second benchmark
+
+- **Against reading everything.** On 29 LongMemEval-S questions, reading the
+  whole 124,000-token history scored 22. Memory at 2,000 tokens scored 27 with
+  facts and messages and 26 with messages alone (EmbeddingGemma 2 vectors).
+- **Against the evidence itself.** On 115 questions where only the evidence
+  sessions are given, reading them directly scored 104 and memory at 600
+  tokens 98 (p = 0.24). The memory layer costs about six questions there.
+- **LoCoMo**, ten two-person conversations, run as a check that the work was
+  not fitted to LongMemEval. It found one thing that was: a ranking rule keyed
+  to LongMemEval's question wording. Replacing it with a general rule took the
+  messages-only evidence score from 1,177 to 1,560 of 1,977 and left
+  LongMemEval unchanged. After that fix, all the evidence was in a 2,000-token
+  context for 1,737 questions with facts and messages. On a judged sample of
+  120, facts with messages answered 91 and messages alone 97, which is within
+  the reader's noise.
+
+### Bounded memory, and Mem0
+
+`Memory(max_user_tokens=N)` keeps a user's store under a token budget by
+folding older memories into short gists. Judged accuracy by stored size, 112
+to 114 LongMemEval questions, 2026-10-07:
+
+| Stored per conversation | Delete oldest | TSM compress | Mem0 |
+| :--- | ---: | ---: | ---: |
+| 64 tokens | 0.018 | 0.140 | 0.193 |
+| 128 tokens | 0.036 | 0.250 | 0.268 |
+| 256 tokens | 0.098 | 0.482 | 0.348 |
+
+Compression beats deletion at every size. Against Mem0 it is level at 64 and
+128 tokens (p = 0.33, 0.87) and ahead at 256 (p = 0.02). Read that last row
+with the store sizes: Mem0's own memory averaged 170 tokens a conversation, so
+the 256-token allowance did not constrain it, while TSM used 218. The TSM
+column is the evaluation harness's store; `Memory(max_user_tokens=256)` itself
+scored 0.464 on the same questions.
+
+An earlier version of this page led with a Mem0 head-to-head (66.7% against
+55.6%, the same at three budgets) and a 20-question BEAM table. Neither has an
+entry in the progress log, so both were removed. The head-to-head that is
+logged is a 48-question audit from 2026-08-14: 56.2% against 39.6% at 150
+tokens of context. It measured an evaluation adapter, not `tsm.Memory`, and on
+120 conversations that adapter did not beat plain vector search (0.504 against
+0.539, 2026-10-07).
+
+### Not measured
+
+- The ColBERT reranker (`reranker="colbert"`) has no judged run.
+- TurboQuant and RaBitQ quantizers are implemented and unit-tested. Their
+  recall figures in [`docs/core_quantization.md`](./docs/core_quantization.md)
+  are approximate, and the defaults do not use them.
+- Nothing above 100,000 records has been benchmarked.
+- macOS and AArch64 are not built or tested anywhere.
 
 ---
 
-## 🏛️ 3-Tier Storage Lifecycle & Swappable Quantization
-
-Memory automatically flows downward through three storage tiers as it ages:
-
-```
-                   ┌────────────────────────────────────────────────────────┐
-                   │                     NEW MEMORIES                       │
-                   └───────────────────────────┬────────────────────────────┘
-                                               │ (Zero latency write)
-                                               ▼
-  ┌────────────────────────────────────────────────────────────────────────────────────────┐
-  │ 1. HOT TIER (RAM): Raw FP32 Vectors                                                    │
-  │ • Storage: Active RAM buffer (0% compression, 3,072 bytes/vector @ 768-dim)            │
-  │ • Search: Exact sub-microsecond flat scan or local HNSW graph                          │
-  └────────────────────────────────────────────┬───────────────────────────────────────────┘
-                                               │ (When Hot reaches `hot_capacity` or flush)
-                                               ▼
-  ┌────────────────────────────────────────────────────────────────────────────────────────┐
-  │ 2. WARM TIER (mmap): Scalar (8-bit) / RaBitQ-2Bit / TurboQuant-Prod                     │
-  │ • Storage: 4.0× to 15.7× Compression (196 - 768 bytes/vector @ 768-dim)                │
-  │ • Search: AVX2 Quantized Scan shortlist ──► FP32 Rerank                                │
-  └────────────────────────────────────────────┬───────────────────────────────────────────┘
-                                               │ (When Warm reaches `warm_capacity` compaction)
-                                               ▼
-  ┌────────────────────────────────────────────────────────────────────────────────────────┐
-  │ 3. COLD TIER (mmap): RaBitQ-1Bit / TurboQuant-MSE (1-bit)                              │
-  │ • Storage: 💥 30.7× to 32.0× Massive Compression (100 bytes/vector @ 768-dim)          │
-  │ • Universal Support: Seamlessly supports 384-d, 768-d, and 1536-d embeddings           │
-  │ • Search: Bitwise LUT / Popcount Scan ──► FP32 Rerank                                  │
-  └────────────────────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 🥊 Benchmark Results
-
-### 1. LongMemEval 1v1 Head-to-Head Sweep: TSM vs. Mem0 1.0 (NVIDIA CUDA GPU)
-Evaluated across all reasoning categories under strict token budgets (150, 300, and 1,000 tokens) with OpenAI GPT-4o-mini judging:
-
-| Evaluation Dimension | 150 Tokens (TSM vs Mem0) | 300 Tokens (TSM vs Mem0) | 1,000 Tokens (TSM vs Mem0) |
-| :--- | :---: | :---: | :---: |
-| **Knowledge Updates** | **`100.0%`** vs `100.0%` | **`100.0%`** vs `100.0%` | **`100.0%`** vs `100.0%` |
-| **Temporal Reasoning** | **`100.0%`** vs `100.0%` | **`100.0%`** vs `100.0%` | **`100.0%`** vs `100.0%` |
-| **Single-Session User Details** | **`100.0%`** vs `100.0%` | **`100.0%`** vs `100.0%` | **`100.0%`** vs `100.0%` |
-| **Multi-Session Reasoning** | **`50.0%`** vs `50.0%` | **`50.0%`** vs `50.0%` | **`50.0%`** vs `50.0%` |
-| **User Preference Following** | 🏆 **`50.0%`** vs `0.0%` | 🏆 **`50.0%`** vs `0.0%` | 🏆 **`50.0%`** vs `0.0%` |
-| **OVERALL ACCURACY** | 🏆 **`66.7%` vs `55.6%`** | 🏆 **`66.7%` vs `55.6%`** | 🏆 **`66.7%` vs `55.6%`** |
-| **TSM Victory Margin** | **`+11.1% (TSM WINS)`** | **`+11.1% (TSM WINS)`** | **`+11.1% (TSM WINS)`** |
-| **Write-Time LLM Cost** | 🟢 **`$0.00 (0 tokens)`** | 🟢 **`$0.00 (0 tokens)`** | 🟢 **`$0.00 (0 tokens)`** |
-| **Mem0 Write-Time Cost** | 💸 **`260,797 tokens (175 calls)`** | 💸 **`260,797 tokens (175 calls)`** | 💸 **`260,797 tokens (175 calls)`** |
-
----
-
-### 2. BEAM 100K Multi-Session Reasoning Benchmark
-Evaluated across 20 multi-turn probing questions spanning all 10 memory reasoning categories:
-
-| Reasoning Ability | TSM + ColBERT Score | Pass Rate ($\ge 0.5$) | Status |
-| :--- | :---: | :---: | :--- |
-| **Preference Following** | **`1.000`** | **`100.0%`** | 🎯 Perfect recall on evolving constraints |
-| **Instruction Following** | **`1.000`** | **`100.0%`** | ⚡ Flawless adherence to formatting rules |
-| **Information Extraction** | **`0.667`** | **`50.0%`** | 📌 High entity & numeric precision |
-| **Knowledge Update** | **`0.500`** | **`50.0%`** | 🔄 Dynamic truth state resolution |
-| **Abstention** | **`0.500`** | **`50.0%`** | 🛡️ Correctly withholds missing facts |
-| **Summarization** | **`0.500`** | **`50.0%`** | 📝 Captures key conversation takeaways |
-| **Multi-Session Reasoning** | **`0.375`** | **`50.0%`** | 🔗 Multi-hop concept traversal |
-| **Overall Pass Rate** | **`0.517 Avg`** | **`9 / 20 Passed`** | ✅ **0 Execution Errors** |
-
----
-
-## 💻 Quickstart (Python SDK)
-
-### 1. Unified Agent Memory with ColBERT Reranking
+## Quickstart
 
 ```python
 from tsm import Memory
+from tsm.reading import answer_prompt, final_answer
 
-# Initialize turnkey memory engine with Stage-2 ColBERT late interaction
-with Memory(
-    db_path="./agent_memory_db",
-    embedder="sentence_transformer",  # 100% local, free embeddings (MiniLM)
-    extractor="passthrough",          # store each message as-is: zero LLM calls on write
-    reranker="colbert",               # LiquidAI/LFM2.5-ColBERT-350M on CUDA
-) as memory:
-    # Ingest memories (no LLM API calls with the passthrough extractor)
-    memory.add("User's primary database port is 9443 on host telemetry.prod.internal", user_id="alice")
-    memory.add("User upgraded database port to 9444 last Tuesday", user_id="alice")
+with Memory("./agent_memory") as memory:          # OpenAI by default: OPENAI_API_KEY
+    memory.add(
+        [{"role": "user", "content": "I moved to Lisbon in March.",
+          "timestamp": "2024-03-02"}],
+        user_id="alice",
+    )
 
-    # Recall with cognitive graph search + ColBERT MaxSim reranking
-    results = memory.recall("What is the current database port?", user_id="alice", top_k=3)
+    question = "Where does Alice live?"
+    results = memory.recall(question, user_id="alice", token_budget=2000)
 
-    for r in results:
-        print(f"Memory: {r['text']} (Score: {r['score']:.4f})")
-
-    # Or: the best set of memories that fits a prompt budget
-    context = memory.recall("database port", user_id="alice", token_budget=150)
+    # results[i]["context"] is the text for a prompt: "[2024-03-02] user: I moved ..."
+    messages = answer_prompt(question, results, today="2024-03-09")
+    # reply = client.chat.completions.create(model=..., max_tokens=800, messages=messages)
+    # print(final_answer(reply.choices[0].message.content))
 ```
 
-Notes on defaults:
+Without any API key:
 
-* With no `embedder` / `extractor` arguments, `Memory` uses OpenAI for both (`pip install "tsm[openai]"`, `OPENAI_API_KEY`), which means one LLM extraction call per added message. `extractor="passthrough"` (above) and `extractor="gliner"` keep writes local.
-* `embedder="gemma"` runs EmbeddingGemma 2 locally (`pip install "tsm[gemma]"`, about 0.5 GB of GPU memory, no key). On the free retrieval score it matched the OpenAI vectors where MiniLM fell behind (`benchmarks/PHASE_PROGRESS.md`, 2026-10-19), at about ten times MiniLM's latency per call. A database remembers which embedder wrote it (`tsm_embedder.json`) and refuses a different one, since two models of one dimension return wrong results without an error.
-* The database is durable: reopen the same `db_path` and `add` / `recall` continue where they left off. Leaving the `with` block (or calling `close()`) flushes and releases it.
-* The cognitive features are a preset (`profile="conversational"`); `profile=None` gives a plain scoped vector store. On the raw `turbomemory.MemoryEngine`, belief revision, eviction, dedup and auto-importance are all opt-in.
-* Belief revision runs in `memory.consolidate()`. A fact that a newer one replaces is never removed from recall: it is ranked lower and returned with `superseded_by`. With `verifier="llm"` (a chat model judges each candidate pair) or `verifier="nli"` (a small local model), `recall()` also marks it for the reader (`[earlier, since changed] ...` in the result's `context`) and serves the fact that replaced it alongside. What each setup catches and gets wrong is measured in [`benchmarks/PHASE_PROGRESS.md`](./benchmarks/PHASE_PROGRESS.md).
-* Every recalled memory carries `context`, the text meant for a prompt: the fact with its date or turn in front (`[2024-03-02] ...`, `[turn 12] ...`), which is what lets a model answer "which came first" and "what is the current value". Pass `"timestamp"` with a message to get dates.
-* Every message is also kept as it was said, in passages of about two sentences, next to the facts extracted from it (`keep_messages`, on unless `max_user_tokens` is set). Extraction drops things. On 29 LongMemEval-S questions, a 2,000-token recall answered 27 with the messages and 19 from the facts alone (`benchmarks/PHASE_PROGRESS.md`, 2026-10-29).
-* `Memory(db, embedder="gemma", extractor="none")` keeps only the messages: no LLM call and no API key on either path, and 26 of the same 29.
-* `Memory(db, max_user_tokens=256, gist_summarizer=...)` keeps each user's memory under a token budget: the newest facts stay as they are and everything older is folded into a few short gists, again and again as the history grows.
+```python
+memory = Memory("./agent_memory", embedder="gemma", extractor="none")
+```
 
-### 2. High-Level Multi-Tier RaBitQ / TurboQuant Configuration
+That stores the messages as said and embeds them locally with EmbeddingGemma 2
+(`pip install "tsm[gemma]"`). It answered 26 of the 29 LongMemEval-S questions
+above.
+
+What the defaults do:
+
+- **Write.** One extraction request per message (`OpenAIExtractor`), and every
+  message is also kept as said, in passages of about two sentences.
+  `extractor="none"` keeps only the passages and asks no model.
+- **Read.** `recall(..., token_budget=N)` returns the best set that fits, each
+  result with `context`: the text with its date or turn in front. `recall()`
+  is a read; it changes nothing.
+- **Time.** A question such as "what did I buy ten days ago" is matched against
+  the dates memories were said. Pass `now=` when the question is not being
+  asked today.
+- **Beliefs.** `consolidate()` proposes which facts a newer one replaced. With
+  `verifier="llm"` a chat model vets each pair, and `recall()` marks the old
+  fact (`[earlier, changed by 2024-06-01] ...`) and serves its replacement.
+  A replaced fact is never removed from recall.
+- **Identity.** A database remembers which embedder wrote it and refuses
+  another, because two models of one dimension return wrong results without
+  an error.
+- **Profile.** `profile=None` gives a plain scoped vector store. On the raw
+  engine, belief revision, eviction, deduplication and auto-importance are
+  all opt-in.
+
+The full SDK reference is [`docs/python_sdk.md`](./docs/python_sdk.md) and
+[`tsm/README.md`](./tsm/README.md).
+
+Install: `make dev` builds the extension with maturin and installs `tsm` into
+the active environment; `make wheel` builds a wheel. Python 3.12 or newer.
+
+---
+
+## The engine
+
+`turbomemory.MemoryEngine` can be used on its own
+([`docs/bindings_api.md`](./docs/bindings_api.md)).
 
 ```python
 import turbomemory
 
-# Configure 3-tier memory engine with ultra-compact 100-byte RaBitQ Cold Tier
 engine = turbomemory.MemoryEngine(
     db_path="./turbo_db",
-    dimension=768,                  # Universal dimension support (384, 512, 768, 1536)
-    hot_capacity=1000,              # First 1,000 vectors stay in RAM (FP32)
-    warm_capacity=10000,            # Next 10,000 vectors in Warm Tier (Scalar/RaBitQ-2bit)
-    warm_quantizer="scalar8",       # 8-bit Scalar (4x compression)
-    cold_quantizer="rabitq1",       # 1-bit RaBitQ (30.7x compression, 100 bytes/vec @ 768-dim)
-    outlier_count=0,
+    dimension=768,
+    hot_capacity=10_000,        # records kept in the mutable hot segment
+    warm_capacity=100_000,      # records in the warm tier before compaction to cold
+    warm_quantizer="scalar8",   # the default
+    cold_quantizer="scalar8",   # the default; "rabitq1" stores 100 bytes per 768-d vector
 )
 ```
 
----
+### Search and tiers
 
-## ⚡ Verifying Quantizers & Benchmarks
+- Up to 4,096 records, every search is an exact scan.
+- Above that, immutable segments are searched (HNSW for sealed hot segments,
+  quantized scans for warm and cold) and the candidates are reranked against
+  the full float32 vectors. The regression gate holds ANN recall at 95% or
+  better.
+- Warm and cold tiers default to 8-bit scalar quantization (4x smaller).
+  1-bit sign, RaBitQ and TurboQuant are selectable; TurboQuant needs a
+  power-of-two dimension. See
+  [`docs/core_quantization.md`](./docs/core_quantization.md).
+- A scope or payload filter bounds every stage of a search, including the
+  concept graph's expansion.
 
-Run the built-in audit scripts:
+### Durability
 
-```bash
-# Head-to-head audit comparing RaBitQ vs TurboQuant across dimensions
-python benchmarks/audit_rabitq_vs_turboquant.py
+- Every write is validated before anything changes. A rejected insert, batch
+  or update leaves the store as it was, and a batch is all-or-nothing.
+- Writes are logged with a checksum of their vector. If the process dies
+  without `close()`, the next open replays the log: nothing acknowledged is
+  lost. `engine.recovery_report()` says what an open had to repair.
+- By default the log is fsynced by `flush()` and `close()`, not per write.
+  After a power loss, writes since the last flush can be missing; they are
+  never half-applied.
+- `sync_writes=True` syncs each write before it returns. On an NVMe laptop SSD
+  a single insert goes from 0.09 ms to 5.5 ms and a batch of 100 from about
+  2.5 ms to 8 ms. It relies on the drive honouring flush requests; no
+  power-cut test was run.
+- Index segments are derived data. A damaged one is discarded on open and
+  rebuilt from the vectors.
+- A store whose vector file or metadata file is missing or truncated refuses
+  to open, instead of opening empty.
 
-# Verify 3-tier lifecycle and storage footprint
-python benchmarks/test_turboquant_tiers.py
-```
+The failures behind these rules are pinned in
+[`crates/turbomemory_storage/tests/robustness.rs`](./crates/turbomemory_storage/tests/robustness.rs).
+More in [`docs/storage_persistence.md`](./docs/storage_persistence.md).
 
----
+### GPU (opt-in)
 
-## 🖥️ REST & gRPC API Server
+`make build-python FEATURES=cuda` keeps the store's vectors in device memory
+and answers a search with one cuBLAS product over all of them. The result is
+exact. It applies above 4,096 records while the store fits the device memory
+budget; any CUDA error falls back to the CPU path.
 
-Launch the dual-transport server:
-
-```bash
-# Build the unified API server binary
-make build-api
-
-# Start gRPC (:50051) and REST (:8080) simultaneously
-TURBO_DB_PATH=./server_db TURBO_DIMENSION=768 make api-server
-```
-
-The server flushes the store every `TURBO_FLUSH_INTERVAL_SECS` seconds (default 30) and on shutdown (Ctrl-C or SIGTERM). Writes are recoverable from the write-ahead log after a kill either way.
-
-* **gRPC Endpoint**: `localhost:50051` (Proto definitions in `crates/turbomemory_api/proto/turbomemory.proto`)
-* **REST Health Check**: `GET http://localhost:8080/health`
-* **REST Search**: `POST http://localhost:8080/search`
-
----
-
-## 🏗️ Workspace Crates
-
-| Crate | Path | Responsibility |
-| :--- | :--- | :--- |
-| `turbomemory_core` | `crates/turbomemory_core` | Vector math, SIMD FWHT, Lloyd-Max quantizers, MaxSim scoring. |
-| `turbomemory_graph` | `crates/turbomemory_graph` | BM25, PMI concept extraction, spreading activation, ACT-R decay, belief revision. |
-| `turbomemory_storage` | `crates/turbomemory_storage` | 3-Tier StorageEngine, lock-free `ArcSwap` snapshots, WAL, mmap segments. |
-| `turbomemory_gpu` | `crates/turbomemory_gpu` | Optional CUDA backend (exact search over device-resident vectors via cuBLAS) with transparent CPU fallback. |
-| `turbomemory_python` | `crates/turbomemory_python` | PyO3 C-extension facade with zero-copy NumPy bindings. |
-| `turbomemory_api` | `crates/turbomemory_api` | High-throughput gRPC (Tonic) and REST (Axum) server. |
-| `tsm` (Python) | `tsm/` | The SDK: `Memory` facade, budget recall, gist summarizers, pluggable embedder / extractor / verifier / reranker. |
-
----
-
-<a id="gpu-acceleration"></a>
-
-## ⚙️ GPU Acceleration (opt-in)
-
-Two separate things use the GPU:
-
-* **The SDK's models** (local embedder, GLiNER extractor, NLI verifier, ColBERT reranker) run on CUDA through PyTorch when it is available. They need no special build.
-* **The engine's `cuda` cargo feature** (`make build-python FEATURES=cuda`) moves vector search to the GPU. The store's vectors are kept in device memory and a search is one cuBLAS product over all of them, so the result is **exact** (no index, recall 1.0). Searches that arrive together share one device call. It is used once a store holds more than 4,096 records and fits the device memory budget; a store that outgrows the budget, or any CUDA error, falls back to the CPU path.
-
-Measured on an RTX 3050 Laptop (4 GB) against the CPU build on the same store files:
+Measured on an RTX 3050 Laptop (4 GB) against the CPU build on the same files:
 
 | Store | Path | One query | Batch of 32, per query | 8 threads |
 | :--- | :--- | :--- | :--- | :--- |
 | 100,000 × 384-d | CPU | 5.9–7.5 ms | 6.0–9.2 ms | 128–174 /s |
-| | CUDA | **1.35–1.55 ms** | **0.34–0.39 ms** | **1,436–1,754 /s** |
+| | CUDA | 1.35–1.55 ms | 0.34–0.39 ms | 1,436–1,754 /s |
 | 100,000 × 768-d | CPU | 13.2–15.8 ms | 13.6–15.8 ms | 69–71 /s |
-| | CUDA | **2.3–2.4 ms** | **0.34–0.39 ms** | **1,088–1,190 /s** |
+| | CUDA | 2.3–2.4 ms | 0.34–0.39 ms | 1,088–1,190 /s |
 
-Single-query time on the GPU grows linearly with the store, and nothing above 100,000 records was measured. The method, the 20,000-record numbers, the limits and the options (`gpu_exact_search`, `gpu_memory_budget_mb`, `gpu_search_stats()`) are in [`docs/gpu_acceleration.md`](./docs/gpu_acceleration.md).
-
----
-
-## 🧯 Durability & Recovery
-
-* Every write is validated before anything changes; a rejected insert, batch or update leaves the store as it was.
-* Writes are logged with a checksum of their vector. If the process dies without `close()`, the next open replays the log and reads each vector back from disk: nothing acknowledged is lost. `engine.recovery_report()` says what an open had to repair.
-* By default the log is fsynced by `flush()` / `close()`, not per write. After a **power loss**, writes since the last flush can be missing; they are never half-applied.
-* `sync_writes=True` (engine and `Memory` keyword; `TURBO_SYNC_WRITES=1` for the server) syncs each write's vectors and log record to disk before it returns, so an acknowledged write survives a power loss too. Measured on an NVMe laptop SSD: a single insert goes from 0.09 ms to 5.5 ms, a batch of 100 from about 2.5 ms to 8 ms, so batch your writes if you turn it on. It relies on the drive honouring flush requests; no power-cut test was run.
-* Index segments are derived data: one that is damaged or incomplete is discarded on open and rebuilt from the vectors.
-* A store whose vector file or metadata file is missing or truncated refuses to open with a clear error instead of opening empty.
-
-The failures these rules come from are pinned in [`crates/turbomemory_storage/tests/robustness.rs`](./crates/turbomemory_storage/tests/robustness.rs).
+Method, limits and options are in
+[`docs/gpu_acceleration.md`](./docs/gpu_acceleration.md). The SDK's local
+models (embedder, verifier, reranker) use CUDA through PyTorch and need no
+special build.
 
 ---
 
-<a id="verification"></a>
-
-## 🛠️ Verification & Build Commands
+## Server
 
 ```bash
-# Format & Lint
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-
-# Rust suite
-cargo test --workspace --exclude turbomemory_python
-cargo test -p turbomemory_storage --test robustness   # durability, isolation, bad input, concurrency
-
-# Python extension, engine verification, SDK unit suite
-make build-python
-make verify
-make test-python
-
-# Everything above plus the regression evals (the local merge gate)
-make gate
-
-# Install the SDK + extension into the active environment / build a wheel
-make dev
-make wheel
+make build-api
+TURBO_DB_PATH=./server_db TURBO_DIMENSION=768 make api-server   # gRPC :50051, REST :8080
 ```
 
-The toolchain is pinned in `rust-toolchain.toml`; Python 3.12 or newer is required (the extension is an `abi3-py312` wheel). `make gate` needs the LongMemEval data (`make download-eval-data`) and a cached `all-MiniLM-L6-v2` model.
-
-There is no hosted CI: `make gate` is the check, run locally before merging. It runs the format check, clippy, the Rust suite, the SDK unit suite and the evaluation smoke tests. The CUDA build is tested by hand.
+- REST: `GET /health`, `POST /search` and the other routes in
+  `crates/turbomemory_api/src/rest.rs`. gRPC: the service in
+  `crates/turbomemory_api/proto/turbomemory.proto`.
+- The store is flushed every `TURBO_FLUSH_INTERVAL_SECS` seconds (default 30)
+  and on shutdown. `TURBO_SYNC_WRITES=1` syncs every write.
+- `TURBO_API_KEY` enables bearer-token auth on both transports. Unset means
+  open access.
 
 ---
 
-## 📄 License
+## Workspace
+
+| Crate | Responsibility |
+| :--- | :--- |
+| `turbomemory_core` | Vector math, SIMD kernels, quantizers, the token-budget packer. |
+| `turbomemory_graph` | BM25, concept extraction, the concept graph and its one-pass expansion, belief semantics. |
+| `turbomemory_storage` | The `StorageEngine`: persistence, WAL, tiered segments, filtering, background optimizer. |
+| `turbomemory_gpu` | The GPU backend abstraction, CPU fallback, optional CUDA exact search. |
+| `turbomemory_python` | The PyO3 `MemoryEngine` facade with zero-copy NumPy paths. |
+| `turbomemory_api` | The gRPC (tonic) and REST (axum) server. |
+| `tsm/` (Python) | The SDK: `Memory`, budget recall, the reading prompt, pluggable embedder / extractor / verifier. |
+
+Design notes: [`docs/architecture.md`](./docs/architecture.md),
+[`docs/cognitive_graph.md`](./docs/cognitive_graph.md).
+
+---
+
+## Build and verify
+
+```bash
+# Format, lint, Rust suite
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --exclude turbomemory_python
+
+# Python extension and the SDK unit suite (fake embedder, real engine, no keys)
+make build-python
+make test-python
+
+# All of the above plus the evaluation smoke tests: the merge gate
+make gate
+```
+
+- The toolchain is pinned in `rust-toolchain.toml`. Building the API crate
+  needs `protoc`.
+- `make gate` needs the LongMemEval data (`make download-eval-data`) and a
+  cached `all-MiniLM-L6-v2` model. It is run locally before merging.
+- CI ([`.github/workflows/ci.yml`](./.github/workflows/ci.yml)) runs the
+  format check, clippy, the Rust suite and the SDK unit suite on Linux. It
+  runs no evaluations. Windows is covered by the local gate; the CUDA build is
+  tested by hand.
+- The evaluation harness and how to reproduce the numbers above:
+  [`benchmarks/cognitive_eval/README.md`](./benchmarks/cognitive_eval/README.md).
+
+---
+
+## Known limits
+
+The open work is listed in [`TODO.md`](./TODO.md). The ones a user should know
+first:
+
+- **Treat a store as single-tenant.** Scopes bound search, but the eviction
+  cap, importance normalization and concept vocabulary are shared, and the
+  server does not enforce tenancy: `scope` is a field the caller supplies.
+- **No vacuum.** Deleted records leave their vectors on disk until segments
+  are rebuilt.
+- **No store-wide format version.** An upgrade that changes record metadata
+  can break old snapshots.
+- **`keep_messages` cannot be combined with `max_user_tokens` yet.**
+- **Blocking engine calls run on the server's async runtime**, so a slow flush
+  stalls both transports.
+
+---
+
+## License
 
 Licensed under the **MIT License** — see [LICENSE](./LICENSE).
 
