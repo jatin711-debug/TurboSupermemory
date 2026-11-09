@@ -25,7 +25,8 @@ set is configurable and can be calibrated on a labelled sample (see
 
 import logging
 import os
-from typing import Dict, List, Optional, Sequence, Tuple
+import threading
+from typing import Dict, List, Sequence, Tuple
 
 logger = logging.getLogger("cognitive_eval.verification.nli")
 
@@ -71,10 +72,20 @@ class NLIVerifier:
         self._allow_download = allow_download
         self._model = None
         self._labels: List[str] = _FALLBACK_LABELS
+        # One verifier is shared by the threads of a run (--jobs). Loading it
+        # from two of them at once raced inside transformers' lazy imports
+        # (ImportError: cannot import name 'AutoModelForSequenceClassification')
+        # and on the offline flags below; both histories were then skipped.
+        self._load_lock = threading.Lock()
 
     def _load(self):
         if self._model is not None:
             return
+        with self._load_lock:
+            if self._model is None:
+                self._load_locked()
+
+    def _load_locked(self):
         # NOTE: we deliberately use `transformers` directly rather than
         # `sentence_transformers.CrossEncoder`. On this Windows setup importing
         # sentence_transformers pulls in torchcodec, whose FFmpeg DLLs fail to
