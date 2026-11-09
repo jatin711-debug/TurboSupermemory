@@ -31,8 +31,8 @@ ENV/
 /bench_results/
 *.csv
 *.parquet
-# Downloaded eval datasets are large (LoCoMo alone is ~240MB). Fetch them
-# with `make download-eval-data`; never commit them.
+# Downloaded eval datasets are large. Fetch them with
+# `make download-eval-data`; never commit them.
 benchmarks/cognitive_eval/data/
 # Generated benchmark outputs (result JSON, predicted answers, scratch DBs).
 benchmarks/**/results/

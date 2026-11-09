@@ -1,7 +1,4 @@
 """Download benchmark datasets from HuggingFace."""
-import os
-import json
-import zipfile
 from pathlib import Path
 from typing import Optional
 import urllib.request
@@ -113,33 +110,6 @@ def download_longmemeval_official(variants=("oracle",), force: bool = False) -> 
     return dataset_dir
 
 
-def download_locomo(force: bool = False) -> Optional[Path]:
-    """Download LoCoMo dataset from HuggingFace.
-
-    Uses the Percena/locomo-mc10 dataset which contains the actual LoCoMo-MC10 benchmark.
-    """
-    data_dir = get_data_dir()
-    data_dir.mkdir(parents=True, exist_ok=True)
-
-    # LoCoMo-MC10 dataset from HuggingFace
-    url = "https://huggingface.co/datasets/Percena/locomo-mc10/resolve/main/data/locomo_mc10.json"
-
-    dataset_dir = data_dir / "locomo"
-    dataset_dir.mkdir(exist_ok=True)
-
-    dest = dataset_dir / "locomo_mc10.json"
-    if dest.exists() and not force:
-        print(f"{dest.name} already exists, skipping.")
-        return dataset_dir
-
-    if not download_file(url, dest):
-        print(f"Failed to download LoCoMo dataset")
-        return None
-
-    print(f"LoCoMo dataset downloaded to {dataset_dir}")
-    return dataset_dir
-
-
 def download_all(force: bool = False) -> dict:
     """Download all benchmark datasets."""
     results = {}
@@ -149,12 +119,6 @@ def download_all(force: bool = False) -> dict:
     results["longmemeval"] = download_longmemeval(force=force)
     # Small, and it carries the evidence labels and question dates.
     results["longmemeval_official"] = download_longmemeval_official(("oracle",), force=force)
-
-    print("\n" + "=" * 60)
-    print("Downloading LoCoMo dataset...")
-    print("=" * 60)
-    results["locomo"] = download_locomo(force=force)
-
     return results
 
 
@@ -167,9 +131,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--dataset",
-        choices=["longmemeval", "locomo", "all"],
+        choices=["longmemeval", "all"],
         default="all",
-        help="Which dataset to download",
+        help="Which dataset to download: the LongMemEval parquet copy, or (all) that and "
+             "the official oracle file. LoCoMo for locomo_shipped_eval.py is fetched as its "
+             "docstring says",
     )
     parser.add_argument(
         "--official",
@@ -187,5 +153,3 @@ if __name__ == "__main__":
         download_all(force=args.force)
     elif args.dataset == "longmemeval":
         download_longmemeval(force=args.force)
-    elif args.dataset == "locomo":
-        download_locomo(force=args.force)

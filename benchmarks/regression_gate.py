@@ -99,7 +99,7 @@ def _eval_data_present():
     data = COG / "data"
     return any(data.glob("longmemeval/*.parquet")) or (
         data / "test_longmemeval.json"
-    ).exists() or (data / "locomo" / "locomo_mc10.json").exists()
+    ).exists()
 
 
 def check_synthetic_belief():

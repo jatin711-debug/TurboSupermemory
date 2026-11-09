@@ -1,174 +1,127 @@
-# Cognitive Evaluation Benchmarks for TurboSuperMemory
+# Evaluation harness
 
-Industry-standard memory benchmarks to validate TurboSuperMemory's (TSM) cognitive quality before scaling to 1M+ vectors.
+How the numbers in the top-level README and in
+[`../PHASE_PROGRESS.md`](../PHASE_PROGRESS.md) are produced. Results are not
+kept here: every run has a dated entry in `PHASE_PROGRESS.md` with its
+command, sample size and caveats.
 
-## Benchmarks
+Run everything from the repository root with Python 3.12, after
+`make build-python` has put the extension at the root (`make verify` and
+`make gate` do that too).
 
-### LongMemEval
-Tests long-context memory retrieval in conversational AI. Measures whether a memory system can retrieve relevant facts from long conversation histories.
+## What measures what
 
-**Dataset**: 500 conversations, 10,960 messages, 500 queries from [HuggingFace](https://huggingface.co/datasets/MemoryAsModality/LongMemEval)
+| Script | Measures | Cost |
+| :--- | :--- | :--- |
+| `shipped_stack_eval.py` | `tsm.Memory` as it ships, on LongMemEval, one mechanism per arm | free evidence score; judged runs are paid |
+| `locomo_shipped_eval.py` | `tsm.Memory` on LoCoMo (ten two-person conversations) | free evidence score; `--judge-sample` is paid |
+| `reread.py` | saved contexts read several times, arms compared on the mean | paid |
+| `pair_runs.py` | two arms question by question, from one run file or two | free |
+| `prefetch_extraction.py` | extracts many histories in parallel into the runner's cache | paid; `--dry` prints the request count |
+| `evidence_rank_report.py` | why a question's evidence did not reach the context | free |
+| `belief_pairs_eval.py` | belief revision on 260 labeled sentence pairs (`belief_pairs.jsonl`) | free with `--verifier none` / `nli` |
+| `head_to_head_eval.py`, `full_harness_audit.py` | the evaluation adapter (`adapters/tsm_adapter.py`) against naive RAG and Mem0 | paid |
+| `bounded_head_to_head.py` | stores held to a token budget: compress, delete, Mem0 | paid |
+| `run_belief_longmemeval.py`, `belief_revision.py` | belief revision in isolation, retrieval level; the gate runs both | free |
+| `retention_eval.py`, `reinforcement_eval.py`, `run_abstraction_longmemeval.py`, `budget_recall_eval.py`, `compress_eval.py`, `verify_supersessions.py` | one engine mechanism each | see each docstring |
 
-**Metrics**: recall@K, MRR, hit rate, latency
+Two things to keep apart:
 
-### LoCoMo (MC10)
-Tests temporal reasoning — retrieving current vs past facts correctly from multi-session conversations.
+- **The adapter is not the SDK.** `TSMAdapter` has its own settings and
+  additions. The head-to-head runners measure it; `shipped_stack_eval.py`
+  measures `tsm.Memory`. On 120 conversations the adapter did not beat plain
+  vector search (0.504 against 0.539, 2026-10-07).
+- **Retrieval-level scores are not answers.** A rank win that a reader never
+  sees does not change an answer, and the free evidence score says nothing
+  about what a reader does with the context. Judge a change before claiming
+  it, and compare arms with `reread.py --reads 5`: the reader alone flips 5 to
+  6 verdicts of 121 on identical contexts.
 
-**Dataset**: 55,014 sessions, 1,986 queries from [HuggingFace](https://huggingface.co/datasets/Percena/locomo-mc10)
-
-**Metrics**: recall@K, temporal accuracy, recency bias
-
-### Belief pairs (in the repository, no download)
-Tests belief revision directly: does a newer statement retire the older one when it replaces it, and only then?
-
-**Dataset**: `belief_pairs.jsonl`, 260 labeled pairs of first-person statements written for this repository (110 updates, 120 pairs where both stay true, 30 rewordings), split in half into `dev` and `test`. They are not sampled from real conversations.
-
-**Metrics**: updates caught (recall), still-true facts wrongly retired, precision
-
-**Run**: `python benchmarks/cognitive_eval/belief_pairs_eval.py --verifier none|nli|llm --split dev|test` through the shipped `tsm.Memory`. Needs only the cached MiniLM model; `--verifier llm` also needs an OpenAI-compatible chat endpoint (`--llm-base-url` for a local one). Tune on `dev`, quote `test`.
-
-## Quick Start (Optimized for Local Hardware)
-
-### Hardware Requirements
-
-| Hardware | Recommended Model | Batch Size | Expected Speed |
-|----------|-------------------|------------|----------------|
-| **4GB VRAM, 16GB RAM** | `all-MiniLM-L6-v2` (384d) | 64 | ~1 min per 10 conversations |
-| **8GB+ VRAM, 32GB+ RAM** | `BAAI/bge-large-en-v1.5` (1024d) | 32 | ~2 min per 10 conversations |
-| **CPU only** | `all-MiniLM-L6-v2` (384d) | 32 | ~3 min per 10 conversations |
-
-### 1. Download Datasets
-
-```bash
-# Download LongMemEval and LoCoMo datasets
-python benchmarks/cognitive_eval/benchmark_datasets/download.py --dataset all
-```
-
-### 2. Run LongMemEval Benchmark
+## Data
 
 ```bash
-# Quick test (5 conversations, ~1-2 minutes) - Recommended for local testing
-python benchmarks/cognitive_eval/run_longmemeval.py --quick --quick-n 5 --lightweight
-
-# Medium test (25 conversations, ~5-10 minutes)
-python benchmarks/cognitive_eval/run_longmemeval.py --quick --quick-n 25 --lightweight --batch-size 64
-
-# Full benchmark (500 conversations, ~6 minutes with ANN mode)
-python benchmarks/cognitive_eval/run_longmemeval.py --lightweight --batch-size 64
+make download-eval-data     # LongMemEval (oracle variant) and its official file with evidence labels
+python benchmarks/cognitive_eval/benchmark_datasets/download.py --official s   # LongMemEval-S, 277 MB
 ```
 
-### 3. Run LoCoMo Benchmark
+- The default LongMemEval copy is the benchmark's oracle variant: each
+  history holds only the sessions with evidence. `--variant s` runs the
+  standard histories (about 120,000 tokens a question).
+- LoCoMo is fetched as the docstring of `locomo_shipped_eval.py` says.
+- Datasets are too large to check in. They live under `data/`, which is
+  ignored.
+
+## The shipped-stack runner
 
 ```bash
-# Quick test (10 queries, sampled sessions, ~5 minutes)
-python benchmarks/cognitive_eval/run_locomo.py --quick --quick-n 10 --lightweight
-
-# Full benchmark requires significant time due to 55K sessions
-# Consider using cloud GPU for full LoCoMo benchmark
-```
-
-### Optimization Flags
-
-| Flag | Description | When to Use |
-|------|-------------|-------------|
-| `--lightweight` | Use `all-MiniLM-L6-v2` (384d, ~80MB) instead of `BAAI/bge-large-en-v1.5` (1024d, ~1.3GB) | **Always for local testing** |
-| `--batch-size 64` | Process 64 texts at once (higher = faster but more memory) | With lightweight model |
-| `--batch-size 32` | Process 32 texts at once | With large model or limited RAM |
-| `--quick --quick-n N` | Only test first N conversations/queries | For rapid iteration |
-
-## Results
-
-### 1. Multi-Budget Head-to-Head Matrix (50 Conversations, LongMemEval)
-
-Tested across 50 full conversations (~150 queries) with identical OpenAI `text-embedding-3-small` (1536-d) vectors and judged by `gpt-4o-mini`:
-
-| Token Budget | TurboSuperMemory (TSM + CUDA) | Mem0 1.0 (Official Usage) | Naive-RAG (Vector Baseline) | TSM vs Mem0 Advantage |
-| :---: | :---: | :---: | :---: | :---: |
-| **150 tokens** (~3–5 memories) | **56.2%** (`27/48`) | 39.6% (`19/48`) | 50.0% (`24/48`) | **+16.7% Lead** |
-| **300 tokens** (~6–10 memories) | **60.4%** (`29/48`) | 37.5% (`18/48`) | 54.2% (`26/48`) | **+22.9% Lead** |
-| **600 tokens** (~12–18 memories)| **62.5%** (`30/48`) | 37.5% (`18/48`) | 60.4% (`29/48`) | **+25.0% Lead** |
-
-### 2. Category-by-Category Accuracy Breakdown
-
-| Question Category | Questions (\(n\)) | TSM Accuracy | Mem0 Accuracy | Naive-RAG Accuracy | TSM vs Competitors |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **Knowledge Updates / Beliefs** | 6 | **66.7%** | 66.7% | 50.0% | **+16.7% vs Naive** |
-| **Temporal Reasoning** | 14 | **42.9%** | 28.6% | 35.7% | **+14.3% vs Mem0, +7.2% vs Naive** |
-| **Single-Session Assistant Facts** | 3 | **100.0%** | 0.0% | 100.0% | **+100.0% vs Mem0** |
-| **Single-Session User Facts** | 12 | **83.3%** | 66.7% | 91.7% | **+16.6% vs Mem0** |
-| **Single-Session Preference** | 3 | **33.3%** | 0.0% | 66.7% | **+33.3% vs Mem0** |
-| **Multi-Session Chaining** | 10 | **20.0%** | 30.0% | 20.0% | Baseline parity |
-
-### 3. Economics & Ingestion Efficiency
-
-| Metric | TurboSuperMemory (TSM) | Mem0 1.0 | Naive-RAG |
-| :--- | :---: | :---: | :---: |
-| **Write-Time LLM Calls** | **0 calls** | 708 calls | 0 calls |
-| **Write-Time Tokens Burned** | **0 tokens ($0.00)** | **1,130,633 tokens (~$1.13)** | 0 tokens ($0.00) |
-| **Ingestion Time (50 convs)** | **~8 seconds** (CUDA) | **~40 minutes** (Cloud API) | ~8 seconds |
-| **Latency per Turn** | **< 1 ms** | ~3,700 ms | < 1 ms |
-
----
-
-## Evaluation Architecture
-
-```
-benchmarks/cognitive_eval/
-├── benchmark_datasets/
-│   ├── download.py          # HuggingFace dataset downloader (LongMemEval, LoCoMo)
-│   ├── longmemeval.py       # LongMemEval parquet/json loader
-│   └── locomo.py            # LoCoMo multi-session loader
-├── adapters/
-│   ├── tsm_adapter.py       # TSM cognitive wrapper with temporal tagging & MMR
-│   └── mem0_adapter.py      # Mem0 official integration wrapper
-├── judge/
-│   ├── openai_judge.py      # LLM-as-a-Judge (GPT-4o / GPT-4o-mini)
-│   └── ollama_judge.py      # Local Ollama judge
-├── head_to_head_eval.py     # Main A4 judged head-to-head harness
-├── shipped_stack_eval.py    # Judged check of tsm.Memory itself, one mechanism per arm
-├── full_harness_audit.py    # Multi-budget audit (150, 300, 600 tokens)
-├── budget_recall_eval.py    # Submodular MMR vs truncation evaluator
-└── retention_eval.py        # Ebbinghaus forgetting & reinforcement evaluator
-```
-
-## Running the Benchmarks
-
-```bash
-# 1. Run the Multi-Budget Full Harness Audit (150, 300, 600 tokens)
-python benchmarks/cognitive_eval/full_harness_audit.py --limit 50 --budgets 150,300,600 --mem0-path ./mem0_eval_db
-
-# 1b. Judge the shipped SDK (tsm.Memory), one mechanism per arm, with per-question output
-python benchmarks/cognitive_eval/shipped_stack_eval.py --limit 120 --token-budget 150 --judge openai --judge-model gpt-4.1-mini --out shipped.json
-#     no network: cached texts, proxy judge (checks the plumbing only)
+# plumbing check, no network: cached texts only, proxy judge
 python benchmarks/cognitive_eval/shipped_stack_eval.py --offline --limit 5
-#     An interrupted run started again with the same --out continues after the last finished
-#     conversation and keeps the verdicts it already paid for. --reuse a.json,b.json takes
-#     verdicts for identical contexts from earlier runs; --arms picks arms (see the docstring).
-#     A free retrieval score, no network: for how many questions the turns the dataset marks as
-#     evidence are all in the context (needs `benchmark_datasets/download.py --official oracle`).
-#     --config adds an arm with any engine setting; --pool N builds each history from N
-#     conversations, so most of the store is distractors.
-python benchmarks/cognitive_eval/shipped_stack_eval.py --offline --limit 120 --arms sdk_pack_tagged,sdk_cognitive --config gw25:graph_weight=0.25
-python benchmarks/cognitive_eval/shipped_stack_eval.py --offline --limit 120 --pool 20 --arms sdk_pack_tagged,sdk_cognitive
-#     --local-embedder MODEL embeds with a local sentence-transformers model instead of the
-#     cached OpenAI vectors, so the same score needs no network or key (set HF_HUB_OFFLINE=1
-#     once the model is cached). --local-embedder-opt KEY=VALUE passes an argument of
-#     tsm.embedders.SentenceTransformerEmbedder (JSON value). Vectors are cached in
-#     --work-dir/embeddings_local by the embedder's fingerprint; an interrupted run resumes
-#     only with the same embedder.
-python benchmarks/cognitive_eval/shipped_stack_eval.py --offline --limit 120 --arms sdk_pack_tagged,sdk_cognitive --local-embedder google/embeddinggemma-2 --local-embedder-opt 'query_prompt_name="QuestionAnswering"'
-#     --extraction picks whose facts the arms get: the SDK extractor as it ships, its first
-#     prompt alone (shipped, the default); with its second prompt for a message the first
-#     finds nothing in (second); with that and the stored statements of a message both find
-#     nothing in (all); or the harness's earlier extractor, the same facts as shipped (legacy). --reader notes asks the answering model
-#     with the SDK's prompt (tsm.reading) instead of the plain one. To read saved contexts
-#     another way without building the stores again: --rejudge run.json --reader notes.
-#     Verdicts, gists and embeddings fetched along the way are kept in --work-dir
-#     (default $TSM_EVAL_DIR, else ~/.tsm_eval/shipped_stack_eval: outside the checkout, so
-#     cleaning it does not delete what was paid for). Compare two runs question by question
-#     with pair_runs.py; extract long histories in parallel first with prefetch_extraction.py.
-python benchmarks/cognitive_eval/shipped_stack_eval.py --limit 120 --arms sdk_cognitive --token-budget 600 --reader notes --out notes600.json
 
-# 2. Run the 50-Conversation Head-to-Head Evaluation
-python benchmarks/cognitive_eval/head_to_head_eval.py --limit 50 --systems tsm,mem0,naive --token-budget 150 --tsm-embedder openai --embed-model text-embedding-3-small --extractor mock --judge openai --judge-model gpt-4o-mini
+# the free evidence score: for how many questions every evidence turn is in the context
+python benchmarks/cognitive_eval/shipped_stack_eval.py --offline --limit 120 \
+    --arms sdk_pack_tagged,sdk_cognitive --config gw25:graph_weight=0.25
+python benchmarks/cognitive_eval/shipped_stack_eval.py --offline --limit 120 --pool 20 \
+    --arms sdk_pack_tagged,sdk_cognitive
+
+# the same score on a local embedder, no key
+python benchmarks/cognitive_eval/shipped_stack_eval.py --offline --limit 120 \
+    --arms sdk_pack_tagged,sdk_cognitive --local-embedder google/embeddinggemma-2
+
+# judged
+python benchmarks/cognitive_eval/shipped_stack_eval.py --limit 120 --arms sdk_cognitive \
+    --token-budget 600 --reader notes --out "$TSM_EVAL_DIR/runs/notes600.json"
+
+# the headline run: every LongMemEval-S question, messages only, 2,000 tokens
+python benchmarks/cognitive_eval/shipped_stack_eval.py --variant s --limit 500 \
+    --arms sdk_raw,sdk_raw_plain --token-budget 2000 --reader notes \
+    --out "$TSM_EVAL_DIR/runs/s500_raw_2000.json"
 ```
+
+- The arms are listed in the script's docstring. `--config NAME:KEY=VALUE`
+  adds an arm with any engine setting, `--recall NAME:KEY=VALUE` one with any
+  `recall()` argument, and `--pool N` builds each history from N
+  conversations so most of the store is distractors.
+- `--reader notes` asks the answering model with the SDK's prompt
+  (`tsm.reading`); the default is the harness's plain prompt.
+- `--judge anthropic` reads and judges with Claude (key in `claude_key.txt`);
+  embeddings still need OpenAI unless `--local-embedder` is given.
+- An interrupted run started again with the same `--out` continues after the
+  last finished history. `--reuse a.json,b.json` takes verdicts for identical
+  contexts from earlier runs, and `--rejudge run.json` reads saved contexts
+  again without rebuilding the stores.
+- Paid results (verdicts, gists, the embedding overlay, run files) go to
+  `$TSM_EVAL_DIR`, by default `~/.tsm_eval/shipped_stack_eval`, outside the
+  checkout. Deleting that folder deletes what was paid for. Set the variable
+  before using it in `--out` as above.
+
+## Belief pairs
+
+```bash
+python benchmarks/cognitive_eval/belief_pairs_eval.py --verifier none --split dev
+```
+
+260 pairs of first-person statements written for this repository (110 updates,
+120 pairs where both stay true, 30 rewordings), split in half into `dev` and
+`test`. They are not sampled from real conversations. Tune on `dev`, quote
+`test`. `--verifier llm` needs an OpenAI-compatible chat endpoint
+(`--llm-base-url` for a local one).
+
+## Tests of the harness itself
+
+```bash
+cd benchmarks && python -m unittest cognitive_eval.test_budgeting \
+    cognitive_eval.test_diagnostics cognitive_eval.test_longmemeval_loader \
+    cognitive_eval.test_role_aware
+```
+
+No dataset, model or key needed. Nothing else runs them: neither the gate nor
+CI.
+
+## Removed
+
+- The recall@K runners (`run_longmemeval.py`, `run_locomo.py`,
+  `run_comparison.py`, `report.py`, `metrics/`) and their Makefile targets,
+  on 2026-11-09. They scored word-overlap retrieval from before the judged
+  harness existed. `git show 55933a6:benchmarks/cognitive_eval/<path>`.
+- The 48-question Mem0 audit tables that used to be on this page are in
+  `PHASE_PROGRESS.md` (2026-08-14), with what they measured.

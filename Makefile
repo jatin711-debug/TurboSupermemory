@@ -34,7 +34,7 @@ FEATURES    ?=
 # Build flags: add --features cuda if FEATURES=cuda
 CARGO_FEATURES := $(if $(FEATURES),--features $(FEATURES),)
 
-.PHONY: build build-python build-api test test-python verify audit benchmark benchmark-gpu cognitive-benchmark batch-test clippy fmt clean api-server download-eval-data longmemeval locomoco compare report gate dev wheel
+.PHONY: build build-python build-api test test-python verify audit benchmark benchmark-gpu cognitive-benchmark batch-test clippy fmt clean api-server download-eval-data gate dev wheel
 
 build:
 	export PYO3_PYTHON="$(PYO3_PYTHON)" && cargo build --workspace $(CARGO_FEATURES)
@@ -109,21 +109,7 @@ api-server: build-api
 	export TURBO_REST_ADDR=0.0.0.0:8080 && \
 	./target/release/turbomemory-server$(EXE_EXT)
 
-# Cognitive evaluation benchmarks (LongMemEval, LoCoMo)
+# LongMemEval data for `make gate` and the evaluation harness
+# (benchmarks/cognitive_eval/README.md says how the runners are used).
 download-eval-data:
 	"$(PYTHON)" benchmarks/cognitive_eval/benchmark_datasets/download.py
-
-longmemeval: build-python
-	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
-	"$(PYTHON)" benchmarks/cognitive_eval/run_longmemeval.py --quick
-
-locomoco: build-python
-	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
-	"$(PYTHON)" benchmarks/cognitive_eval/run_locomo.py --quick
-
-compare: build-python
-	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
-	"$(PYTHON)" benchmarks/cognitive_eval/run_comparison.py --quick --output benchmarks/cognitive_eval/results/
-
-report:
-	"$(PYTHON)" benchmarks/cognitive_eval/report.py --input benchmarks/cognitive_eval/results/ --output benchmarks/cognitive_eval/results/report.md

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """LongMemEval — belief-revision isolation on REAL conversational data.
 
-The stock `run_longmemeval.py` measures only a loose word-overlap recall and
-throws away `question_type`, so it cannot see belief revision. This runner:
+A plain recall@K run (`run_longmemeval.py`, removed 2026-11-09) measures only
+a loose word-overlap recall and throws away `question_type`, so it cannot see
+belief revision. This runner:
 
   1. Breaks results out by `question_type` (knowledge-update is the belief-
      revision subset: "what camera do I have NOW", "PREVIOUS status", ...).

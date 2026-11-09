@@ -1,7 +1,9 @@
 """System adapters for benchmark comparison.
 
-Provides unified interfaces for different memory systems (TSM, Mem0)
-so benchmarks can run against any system with the same code.
+``TSMAdapter`` is the evaluation adapter the head-to-head runners measure
+(its own settings and additions; ``tsm.Memory`` is measured by
+``shipped_stack_eval.py``). Mem0 is driven directly by
+``head_to_head_eval.make_mem0``.
 """
 
-__all__ = ["TSMAdapter", "Mem0Adapter"]
+__all__ = ["TSMAdapter"]
