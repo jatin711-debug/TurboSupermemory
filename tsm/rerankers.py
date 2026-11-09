@@ -4,7 +4,7 @@ Provides token-level MaxSim precision reranking over candidate shortlists
 retrieved from TSM's tiered vector and cognitive graph layer.
 """
 
-from typing import List, Optional, Sequence
+from typing import Optional, Sequence
 import numpy as np
 import logging
 

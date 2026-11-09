@@ -332,6 +332,11 @@ This amortizes the cost of loading the query vector across 4 distance computatio
 
 *Note: Recall figures are approximate and depend on dataset characteristics. Clustered embeddings (realistic text) show higher recall than random Gaussian data.*
 
+Two scripts exercise the quantizers through the engine:
+
+- `python benchmarks/audit_rabitq_vs_turboquant.py` prints bytes per vector, compression ratio and encode speed for each quantizer at 384, 768 and 512 dimensions. Its recall column does not test them: it stores 2,000 vectors, and at 4,096 records or fewer every search is an exact scan.
+- `python benchmarks/test_turboquant_tiers.py` walks records through Hot, Warm and Cold with the TurboQuant quantizers at 512 dimensions and prints which tier answered each hit.
+
 ---
 
 ## 8. Integration with Storage Tiers
