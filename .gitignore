@@ -36,7 +36,9 @@ ENV/
 benchmarks/cognitive_eval/data/
 # Generated benchmark outputs (result JSON, predicted answers, scratch DBs).
 benchmarks/**/results/
-benchmarks/memory_benchmarks/datasets/
+# The vendored Mem0 benchmark suite was removed on 2026-11-09. What it left
+# behind locally (results, logs, datasets, a .env with keys) stays ignored.
+benchmarks/memory_benchmarks/
 mem0_eval_db/
 # Machine-local client settings.
 .claude/settings.local.json
