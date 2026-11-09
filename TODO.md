@@ -160,7 +160,7 @@ The numbers are in `benchmarks/PHASE_PROGRESS.md`. In short:
   - source turns as the read unit (`recall(sources="turn")`; removed
     2026-11-09);
   - event dates (`event_dates=True`; removed 2026-11-09);
-  - reader tools (`tsm.answering`);
+  - reader tools (`tsm.answering`; removed 2026-11-09);
   - two verifier-prompt rules for repeat occurrences (dev pairs only).
 
 Still open, in this order:

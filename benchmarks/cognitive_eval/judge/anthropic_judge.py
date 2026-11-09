@@ -87,8 +87,6 @@ class AnthropicJudge:
 
         if not memories:
             return "NO ANSWER"
-        if reader == "tools":
-            raise ValueError("--reader tools is OpenAI-only")
         if reader == "notes":
             from tsm.reading import answer_prompt, final_answer
 

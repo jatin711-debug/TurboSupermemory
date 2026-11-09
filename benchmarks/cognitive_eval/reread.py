@@ -54,7 +54,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--arm", action="append", required=True, metavar="NAME=PATH:ARM")
     ap.add_argument("--reads", type=int, default=5)
-    ap.add_argument("--reader", default="notes", choices=["plain", "notes", "tools"])
+    ap.add_argument("--reader", default="notes", choices=["plain", "notes"])
     ap.add_argument("--provider", choices=["openai", "anthropic"], default="openai")
     ap.add_argument("--judge-model", default=None,
                     help="default gpt-4.1-mini (openai) or claude-haiku-5-5 (anthropic)")

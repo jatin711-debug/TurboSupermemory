@@ -31,8 +31,6 @@ from tsm.ranking import (ASSISTANT_ROLE_DAMP, COUNTING_LAM, PRIOR_SPARES_TOP, RE
                          USER_ROLE_BOOST, apply_role_prior, asks_what_assistant_said,
                          is_counting_query, is_first_person_query, packing_lam, role_prior)
 from tsm.reading import ANSWER_SYSTEM, answer_prompt, final_answer, in_order
-from tsm.answering import (add_days, answer_with_tools, calculate, count_distinct,
-                           days_between, run_tool)
 from datetime import date, datetime
 
 from tsm.when import question_windows, said_on
@@ -624,74 +622,6 @@ class TestQuestionWindows(unittest.TestCase):
         for now in (date(2023, 6, 22), datetime(2023, 6, 22, 10), "2023-06-22",
                     1687428000):
             self.assertEqual(question_windows("What did I do yesterday?", now), expected)
-
-
-class _Call:
-    def __init__(self, call_id, name, arguments):
-        self.id = call_id
-        self.function = type("F", (), {"name": name, "arguments": arguments})()
-
-
-class _ToolClient:
-    """Asks for one calculation, then answers with its result."""
-
-    def __init__(self):
-        self.requests = []
-        self.chat = type("C", (), {"completions": self})()
-
-    def create(self, **kwargs):
-        self.requests.append(kwargs)
-        if len(self.requests) == 1:
-            message = type("M", (), {"content": "", "tool_calls": [
-                _Call("c1", "calculate", '{"expression": "120 + 85 + 1,200"}')]})()
-        else:
-            result = kwargs["messages"][-1]["content"]
-            message = type("M", (), {"content": f"1. ...\nAnswer: ${result}",
-                                     "tool_calls": None})()
-        usage = type("U", (), {"prompt_tokens": 10, "completion_tokens": 3})()
-        return type("R", (), {"choices": [type("Ch", (), {"message": message})()],
-                              "usage": usage})()
-
-
-class TestAnsweringTools(unittest.TestCase):
-    def test_calculate(self):
-        self.assertEqual(calculate("(120 + 85) * 2"), "410")
-        self.assertEqual(calculate("1,200 + 300"), "1500")
-        self.assertEqual(calculate("max(3, 5) + round(2.456, 1)"), "7.5")
-        self.assertEqual(calculate("sum([10, 20, 30]) / 3"), "20")
-        self.assertEqual(calculate("10 / 4"), "2.5")
-        self.assertEqual(calculate("$45 * 3"), "135")
-        self.assertTrue(calculate("1 / 0").startswith("error"))
-        self.assertTrue(calculate("__import__('os')").startswith("error"))
-        self.assertTrue(calculate("2 ** 1000").startswith("error"))
-        self.assertTrue(calculate("x + 1").startswith("error"))
-
-    def test_dates_and_counts(self):
-        self.assertEqual(days_between("2023-03-01", "2023-05-22"),
-                         "82 days (11 weeks and 5 days; 2 whole months; 0.22 years)")
-        self.assertTrue(days_between("2023-05-22", "2023-03-01").startswith("-82 days"))
-        self.assertTrue(days_between("soon", "2023-03-01").startswith("error"))
-        self.assertEqual(add_days("2023-05-22", -14), "2023-05-08 (Monday)")
-        self.assertEqual(count_distinct(["Yoga", "yoga!", "Pilates", " spin "]),
-                         "3 distinct: Yoga; Pilates; spin")
-        self.assertEqual(run_tool("calculate", '{"expression": "2+2"}'), "4")
-        self.assertTrue(run_tool("calculate", "not json").startswith("error"))
-        self.assertTrue(run_tool("delete_everything", "{}").startswith("error"))
-
-    def test_the_model_calls_a_tool_then_answers(self):
-        client = _ToolClient()
-        out = answer_with_tools(client, "m", "How much did I spend?",
-                                ["[2023-05-01] I paid $120", "[2023-05-02] I paid $85"])
-        self.assertEqual(out["answer"], "$1405")
-        self.assertEqual(out["requests"], 2)
-        self.assertEqual(out["tool_calls"],
-                         [("calculate", '{"expression": "120 + 85 + 1,200"}', "1405")])
-        self.assertEqual(out["input_tokens"], 20)
-        first, second = client.requests
-        self.assertEqual(first["tool_choice"], "auto")
-        self.assertIn("calculate", first["messages"][0]["content"])
-        self.assertEqual(second["messages"][-1], {"role": "tool", "tool_call_id": "c1",
-                                                  "content": "1405"})
 
 
 if __name__ == "__main__":

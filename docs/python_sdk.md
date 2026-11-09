@@ -92,12 +92,11 @@ still gets totals, changed values and date arithmetic wrong.
 
 So the gain holds on questions the prompt was not written against.
 
-`tsm.answering.answer_with_tools(client, model, question, results, today)`
-asks the same way and also gives the model four tools: arithmetic, the days
-between two dates, a date some days away, and a count of distinct items.
-It did not help. On the same 115 questions it answered 94 against 98 for the
-plain reading prompt (3 gained, 7 lost). It is there for models that are
-worse at arithmetic than gpt-4.1-mini.
+The same prompt with four deterministic tools (arithmetic, the days between
+two dates, a date some days away, a count of distinct items) did not help: on
+the same 115 questions it answered 94 against 98 (3 gained, 7 lost). It was
+`tsm.answering` and was removed on 2026-11-09
+(`git show 55933a6:tsm/answering.py`).
 
 ### Results, budgets, and lifecycle
 

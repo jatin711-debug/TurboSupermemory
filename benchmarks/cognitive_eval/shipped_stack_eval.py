@@ -742,11 +742,10 @@ def main():
                          "they took place")
     ap.add_argument("--no-question-date", dest="question_date", action="store_false",
                     help="do not tell the reader when the question is asked")
-    ap.add_argument("--reader", choices=["plain", "notes", "tools"], default="plain",
-                    help="how the answering model is asked: the harness's plain prompt, the "
+    ap.add_argument("--reader", choices=["plain", "notes"], default="plain",
+                    help="how the answering model is asked: the harness's plain prompt, or the "
                          "SDK's (tsm.reading: memories in the order they were said, and the "
-                         "model works the answer out before giving it), or the SDK's with "
-                         "tools for arithmetic, dates and counting (tsm.answering)")
+                         "model works the answer out before giving it)")
     ap.add_argument("--extraction", choices=["shipped", "second", "all", "legacy"],
                     default="shipped",
                     help="whose facts every arm is given: the SDK's extractor as it ships "

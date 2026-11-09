@@ -84,8 +84,9 @@ with Memory("./my_db") as mem:                       # conversational profile
   LongMemEval questions that none of this was tuned on, this prompt at 600
   tokens answered 296 where the plain prompt at 150 answered 259
   (`benchmarks/PHASE_PROGRESS.md`, 2026-10-21).
-  `tsm.answering.answer_with_tools` adds tools for arithmetic, dates and
-  counting. It did not help gpt-4.1-mini: 94 of 115 against 98.
+  A variant that gave the model tools for arithmetic, dates and counting
+  (`tsm.answering`) answered 94 of 115 against 98 and was removed on
+  2026-11-09.
 - `recall()` is a read: it does not change what the next call returns.
   `mem.reinforce(ids)` strengthens the memories that were actually used.
 - Compress instead of delete: with `max_records` set, pass

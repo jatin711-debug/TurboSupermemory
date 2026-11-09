@@ -76,7 +76,7 @@ How to read it:
 | Rewriting conversations into observations | Best 93.0 against 94.7 to 96.0 of 121 for the raw passages | Removed 2026-11-09 |
 | Returning source turns in place of facts | 86 against 98 of 115 at 600 tokens | Removed 2026-11-09 |
 | Writing the date after a relative time ("two weeks ago [...]") | 8 gained, 4 lost over 470 | Removed 2026-11-09 |
-| Reader tools for arithmetic and dates (`tsm.answering`) | 94 against 98 of 115 | Not the default |
+| Reader tools for arithmetic and dates | 94 against 98 of 115 | Removed 2026-11-09 |
 | Time of day in the tags (`time_tags="minute"`) | 84 against 90 of 115 (p = 0.07) | Not the default |
 | A second extraction pass for messages that yielded no fact | 6 more answers at 600 tokens, 8 fewer at 150; neither significant | Off by default |
 
