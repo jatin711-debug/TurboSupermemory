@@ -68,9 +68,9 @@ This file is only the short list of open engineering work, grouped by area.
   failed although the record is durable.
 - **CI is Linux only, and new.** `.github/workflows/ci.yml` (2026-11-09) runs
   the format check, clippy, the Rust suite and the SDK unit suite on
-  `ubuntu-latest`. It had not run when this was written: the first run is the
-  first time since 2026-10-21 that anything here is built on Linux, so expect
-  it to find something. `make gate`, run on this Windows machine, is still
+  `ubuntu-latest`. Its first runs, on 2026-11-10 at `0baf141`, passed on
+  `main` and `development`: the first Linux build since 2026-10-21 found
+  nothing. `make gate`, run on this Windows machine, is still
   the merge gate and the only place the evaluations run. macOS is not built
   or tested anywhere. The AArch64 NEON kernels in
   `turbomemory_core/src/metrics.rs` are only type-checked

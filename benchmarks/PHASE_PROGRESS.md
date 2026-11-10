@@ -4412,8 +4412,9 @@ Rust suite, a debug build of the extension and the SDK unit suite on
 `ubuntu-latest`, on pushes to `main` / `development`, pull requests and
 manual dispatch. One job does what the Linux jobs of the workflow removed on
 2026-10-21 did, with newer action versions (`checkout@v5`,
-`setup-python@v6`) and without the Windows and macOS jobs. It had not run
-when this was written. `make gate` is still the merge gate.
+`setup-python@v6`) and without the Windows and macOS jobs. Its first runs,
+on 2026-11-10 at `0baf141`, passed every step on `main` and `development`.
+`make gate` is still the merge gate.
 
 **3. The README.** Rewritten around the judged results: the LongMemEval-S
 table of 2026-11-05 first, then what moved answers, what did not (the graph
@@ -4468,4 +4469,9 @@ each, so any of them comes back with one `git revert`; the files are at
   of them loaded it at once, racing inside transformers' lazy imports. Not
   from this cleanup: the load is now behind a lock
   (`verification/nli.py`), and the same check skips none.
-- `make gate` passed 8 of 8 on the result; the SDK suite is 215 tests.
+- `make gate` passed 8 of 8 on the result; the SDK suite is 215 tests. One
+  further gate run did not finish: it passed the format check and clippy and
+  then sat in `cargo test` until it was stopped two hours later, with no Rust
+  code changed that day. The same step took 60 to 70 seconds in the three
+  runs before and after. Whether a test hung or the machine slept is not
+  known; if it happens again, find out which test.
