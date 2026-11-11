@@ -34,7 +34,7 @@ FEATURES    ?=
 # Build flags: add --features cuda if FEATURES=cuda
 CARGO_FEATURES := $(if $(FEATURES),--features $(FEATURES),)
 
-.PHONY: build build-python build-api test test-python verify audit benchmark benchmark-gpu batch-test clippy fmt clean api-server gate dev wheel
+.PHONY: build build-python build-api test test-python verify audit benchmark clippy fmt clean api-server gate dev wheel
 
 build:
 	export PYO3_PYTHON="$(PYO3_PYTHON)" && cargo build --workspace $(CARGO_FEATURES)
@@ -71,14 +71,6 @@ audit: build-python
 benchmark: build-python
 	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
 	"$(PYTHON)" benchmarks/benchmark.py --tsm-only
-
-benchmark-gpu: build-python
-	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
-	"$(PYTHON)" benchmarks/benchmark_gpu.py
-
-batch-test: build-python
-	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
-	"$(PYTHON)" benchmarks/test_batch_search.py
 
 clippy:
 	export PYO3_PYTHON="$(PYO3_PYTHON)" && cargo clippy --workspace --all-targets $(CARGO_FEATURES) -- -D warnings

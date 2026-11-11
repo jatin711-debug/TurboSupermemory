@@ -118,7 +118,7 @@ Batch search releases the GIL and dispatches to the Rust engine.
 - **Fallback**: a store that does not fit the device memory budget, or any device error, moves searches back to the CPU path; a batch then reranks its candidates with one `sgemm`.
 - **Index Build**: on the CPU, with `usearch`. The GPU is not used to build indexes.
 
-**Testing:** The `test_batch_search.py` script validates that `search_ann_batch` produces identical results to individual `search_ann` calls, including after segment consolidation.
+**Testing:** `search_ann_batch_matches_single_query` (`engine/tests.rs`) and `batch_search_matches_single_search_on_a_tiered_store` (`tests/robustness.rs`, past the 4,096-record line) check that `search_ann_batch` returns what individual `search_ann` calls return.
 
 ---
 
