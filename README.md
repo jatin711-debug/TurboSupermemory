@@ -1,6 +1,5 @@
 # TurboSuperMemory (TSM)
 
-[![CI](https://github.com/jatin711-debug/TurboSupermemory/actions/workflows/ci.yml/badge.svg)](https://github.com/jatin711-debug/TurboSupermemory/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/rust-1.99%20(pinned)-orange.svg)](./rust-toolchain.toml)
 [![Python](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#license)
@@ -145,7 +144,7 @@ tokens of context. It measured an evaluation adapter, not `tsm.Memory`, and on
   recall figures in [`docs/core_quantization.md`](./docs/core_quantization.md)
   are approximate, and the defaults do not use them.
 - Nothing above 100,000 records has been benchmarked.
-- macOS and AArch64 are not built or tested anywhere.
+- Only Windows is built and tested. Linux, macOS and AArch64 are not.
 
 ---
 
@@ -344,10 +343,8 @@ make gate
   needs `protoc`.
 - `make gate` needs no datasets, models or keys. It is run locally before
   merging.
-- CI ([`.github/workflows/ci.yml`](./.github/workflows/ci.yml)) runs the
-  format check, clippy, the Rust suite and the SDK unit suite on Linux. It
-  runs no evaluations. Windows is covered by the local gate; the CUDA build is
-  tested by hand.
+- There is no CI. Only Windows is tested, by the local gate; the CUDA build
+  is tested by hand.
 - The evaluation harness that produced the numbers above was removed on
   2026-11-11. To rerun one, check out `e79d75f` and follow
   `benchmarks/cognitive_eval/README.md` there.

@@ -189,7 +189,7 @@ and payload filters, a store that outgrows its budget, and concurrent
 searches and writers. Without the feature they run the same engine code on
 the host backend; with it they run on the device, as does
 `batch_search_matches_single_search_on_a_tiered_store` (the batched rerank).
-The CUDA build is not part of `make gate` or CI.
+The CUDA build is not part of `make gate`.
 
 To compare a CUDA build with a CPU build from Python (results must agree;
 timings are printed for both):
