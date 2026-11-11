@@ -104,7 +104,7 @@ are closed.
 
 ## The executive prototype (2026-11-11, built, not measured)
 
-`checked_recall()`, intentions (`due()`), experience (`feedback()`,
+Intentions (`due()`), experience (`feedback()`,
 `lessons()`) and the belief ledger (`history()`, `retract()`, `forget()`),
 over in-place payload patches and payload lookups in the engine
 (`benchmarks/PHASE_PROGRESS.md`, 2026-11-11). All opt-in; unit-tested only.
@@ -118,7 +118,7 @@ kill rule written before the run:
    the sufficiency check measured 81% agreement on 315 flagged contexts
    against a 90% bar (2026-11-11), so it is out; adapters for
    MemoryAgentBench FactConsolidation, PM-Bench and one StreamBench stream.
-2. **Phase 1, the monitor: dead, to delete.** Every branch failed its rule
+2. **Phase 1, the monitor: deleted.** Every branch failed its rule
    on LongMemEval-S (2026-11-11, `benchmarks/PHASE_PROGRESS.md`):
    - The free signals fired on 66% of complete contexts and 76% of
      incomplete ones; a second look on their word lost 6 questions' evidence
@@ -130,10 +130,8 @@ kill rule written before the run:
      81% of the 315 flagged contexts (bar: 90%), and its second looks lost 4
      questions' evidence and found none.
 
-   Left to do: delete `tsm/monitor.py`, `Memory.checked_recall`, the
-   harness's `_checked` arm and `--sufficiency-model`, and their tests and
-   docs, in a commit of their own after the prototype is committed (so
-   `git show` can bring them back).
+   `tsm/monitor.py`, `Memory.checked_recall`, the harness's `_checked` arm
+   and `--sufficiency-model` are gone (`git show 940ef42:tsm/monitor.py`).
 3. **Phase 2, beliefs** on FactConsolidation and HaluMem. `forget()` now
    redacts gists and purges the caches (decided 2026-11-11); its matcher
    (`tsm/forgetting.py`) is untested on real conversations: measure how

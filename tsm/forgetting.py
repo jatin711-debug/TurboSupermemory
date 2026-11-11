@@ -28,8 +28,6 @@ errs toward removing (a cache entry removed is only paid for again).
 import re
 from typing import Iterable, List, Sequence, Set, Tuple
 
-from .monitor import _stem, salient_terms
-
 TERM_SHARE = 0.6
 MIN_TERMS = 2
 
@@ -37,6 +35,49 @@ _TOKEN = re.compile(r"[\w@.+-]+")
 _SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
 _TAG = re.compile(r"^\s*\[[^\]]*\]\s*")
 _YEAR = re.compile(r"^(?:19|20)\d\d$")
+
+# Words that say nothing about what a text is about: function words,
+# question words, and the words of time expressions. What is left are the
+# words that make a forgotten memory recognizable.
+_STOP = frozenset("""
+a about above after again against all also am an and any are as at be because been
+before being below between both but by can could did do does doing done down during each
+few for from further had has have having he her here hers herself him himself his how i
+if in into is it its itself just me more most my myself no nor not now of off on once
+only or other our ours ourselves out over own same she should so some such than that the
+their theirs them themselves then there these they this those through to too under until
+up very was we were what when where which while who whom why will with would you your
+yours yourself yourselves tell remind recall remember mentioned mention said say says
+told know think thought get got go going went many much total number times time ago
+last past ever previous previously earlier recently recent first second next again
+day days week weeks weekend month months year years today yesterday tomorrow
+monday tuesday wednesday thursday friday saturday sunday morning evening night
+january february march april may june july august september october november december
+""".split())
+
+_WORD = re.compile(r"[a-z0-9]+(?:'[a-z]+)?")
+
+
+def salient_terms(text: str) -> List[str]:
+    """The words of ``text`` that say what it is about: no function or
+    question words, no time words, at least three letters, in order, without
+    repeats."""
+    seen: List[str] = []
+    for word in _WORD.findall((text or "").lower()):
+        word = word.split("'")[0]
+        if len(word) < 3 or word in _STOP or word.isdigit() or word in seen:
+            continue
+        seen.append(word)
+    return seen
+
+
+def _stem(word: str) -> str:
+    """A crude stem, enough to match "weddings" with "wedding" and
+    "attended" with "attend"."""
+    for suffix in ("ings", "ing", "ies", "ied", "es", "ed", "s"):
+        if len(word) > len(suffix) + 2 and word.endswith(suffix):
+            return word[: -len(suffix)]
+    return word
 
 
 def _norm(text: str) -> str:

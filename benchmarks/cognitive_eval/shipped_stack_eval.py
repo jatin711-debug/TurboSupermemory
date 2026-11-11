@@ -59,13 +59,6 @@ neighbouring arms belongs to one mechanism:
     <recall arm>_dated      the same store, recall(now=the question's date): a
                             question that points at a time ("ten days ago")
                             gets the memories said then first
-    <recall arm>_checked    the same store, checked_recall(now=the question's
-                            date): the read-time monitor (tsm.monitor). With
-                            --sufficiency-model (not with --offline) a model is
-                            asked whether the context is enough when a free
-                            signal fires, and a "not enough" swaps a second
-                            look into the same budget; without it the context
-                            is _dated's
     sdk_cognitive_trunc     cognitive search results, untagged and truncated
                             like sdk_plain (cognitive search without the packer)
     sdk_cognitive_alpha1    sdk_cognitive with cognitive_alpha=1.0: the graph
@@ -172,8 +165,7 @@ DIAGNOSTIC = (("sdk_cognitive_trunc", "sdk_cognitive_alpha1", "sdk_pack_capped",
                "sdk_budget_rolling_merge", "full_context", "sdk_messages", "sdk_raw",
                "sdk_raw_plain")
               + tuple(a + "_untagged" for a in RECALL_ARMS)
-              + tuple(a + "_dated" for a in RECALL_ARMS)
-              + tuple(a + "_checked" for a in RECALL_ARMS))
+              + tuple(a + "_dated" for a in RECALL_ARMS))
 DEFAULT_ARMS = UNBOUNDED + BOUNDED
 ARMS = DEFAULT_ARMS + DIAGNOSTIC
 # (arm, baseline): each pair differs in one mechanism.
@@ -203,7 +195,6 @@ PAIRS = (
     ("sdk_cognitive", "sdk_pack_tagged"),
     ("sdk_cognitive_alpha1", "sdk_cognitive"),
     ("sdk_raw_dated", "sdk_raw"),
-    ("sdk_raw_checked", "sdk_raw_dated"),
     ("sdk_cognitive_alpha1", "sdk_pack_tagged"),
     ("sdk_belief_llm", "sdk_pack_tagged"),
     ("sdk_belief_llm", "sdk_belief_llm_exclude"),
@@ -233,7 +224,7 @@ def default_work_dir():
 
 def variants(name):
     """A recall() arm and the diagnostics served from the same store."""
-    return (name, name + "_trunc", name + "_untagged", name + "_dated", name + "_checked")
+    return (name, name + "_trunc", name + "_untagged", name + "_dated")
 
 
 class Embeddings:
@@ -742,10 +733,6 @@ def main():
     ap.add_argument("--recall-store", default="sdk_cognitive",
                     choices=["sdk_cognitive", "sdk_messages", "sdk_raw"],
                     help="the store the --recall arms read (default sdk_cognitive: the facts)")
-    ap.add_argument("--sufficiency-model", default=None, metavar="MODEL",
-                    help="the _checked arms ask this chat model whether a context is enough "
-                         "when a free signal fires (tsm.monitor.LLMSufficiencyJudge; paid). "
-                         "Without it the free signals alone decide the second look")
     ap.add_argument("--variant", choices=["oracle", "s", "m"], default=None,
                     help="read the official file of this variant for the same questions "
                          "(default: the parquet copy, which is the oracle variant)")
@@ -935,8 +922,6 @@ def main():
     # Only when used, so checkpoints written before the option resume.
     if args.recall_store != "sdk_cognitive":
         setup["recall_store"] = args.recall_store
-    if args.sufficiency_model and not args.offline:
-        setup["sufficiency_model"] = args.sufficiency_model
     done = set()
     if checkpoint and os.path.exists(checkpoint):
         with open(checkpoint, encoding="utf-8") as fh:
@@ -999,7 +984,6 @@ def main():
         opened = []  # (close, db) of everything built for this history
         retrieve = {}  # arm -> question -> [(text for the prompt, turn it is from or None)]
         asking = {}  # the question being asked: its date, for the _dated arms
-        noted = {}  # (arm, question) -> what a _checked arm adds to its task
         conv_tasks = []
         conv_stats = defaultdict(Counter)
         try:
@@ -1135,24 +1119,6 @@ def main():
                 retrieve[name + "_trunc"] = lambda q, mem=mem: truncated(
                     shown(mem.recall(q, user_id=user, top_k=args.pool_k, time_tags=False)),
                     args.token_budget)
-                if name + "_checked" in arms:
-                    if args.sufficiency_model and not args.offline:
-                        from tsm.monitor import LLMSufficiencyJudge
-
-                        mem.sufficiency_judge = LLMSufficiencyJudge(
-                            model=args.sufficiency_model,
-                            cache_dir=os.path.join(work_dir, "monitor"))
-
-                    def checked(q, mem=mem, arm=name + "_checked"):
-                        out = mem.checked_recall(q, user_id=user,
-                                                 token_budget=args.token_budget,
-                                                 now=asking.get("date") or None,
-                                                 pool_k=args.pool_k, time_tags=tag_mode)
-                        report = json.loads(json.dumps(out.report.to_dict(), default=str))
-                        noted[arm, q] = {"monitor": report}
-                        return shown(out.results)
-
-                    retrieve[name + "_checked"] = checked
 
             def rolling(mem):
                 """The history in parts, compacting after each."""
@@ -1206,8 +1172,7 @@ def main():
                         "reader": args.reader,
                         "retrieved": [text for text, _ in pairs],
                         "turns": None if arm in UNATTRIBUTED else [turn for _, turn in pairs],
-                        "evidence": sorted(evidence[asked_of.conv_id]),
-                        **noted.pop((arm, q.query_text), {})})
+                        "evidence": sorted(evidence[asked_of.conv_id])})
             # Only a history every arm handled is scored, so arms stay paired.
             with shared:
                 tasks.extend(conv_tasks)

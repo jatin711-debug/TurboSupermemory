@@ -37,7 +37,6 @@ import os
 import re
 import threading
 import time
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -54,10 +53,7 @@ from .interfaces import (  # noqa: F401  (Embedder, Extractor, Verifier: re-expo
 from .experience import ExperienceLedger
 from .forgetting import Forgotten, redact
 from .intentions import IntentionLedger, detect_closure, detect_intentions
-from .monitor import (MonitorReport, grounded_signals, reasons_for_second_look,
-                      second_look_query, swap_in)
 from .ranking import apply_role_prior, asks_what_assistant_said, packing_lam
-from .reading import in_order
 from .when import as_date, question_windows, said_on
 
 logger = logging.getLogger("tsm.memory")
@@ -199,27 +195,6 @@ _REQUIRED_ENGINE_METHODS = ("get_records", "next_insert_seq", "recovery_report")
 _EXECUTIVE_ENGINE_METHODS = ("set_payloads", "ids_where", "get_vectors",
                              "retract_supersessions")
 
-# checked_recall(): the share of the budget a second look may take over.
-SECOND_LOOK_SHARE = 0.3
-
-
-def _context_tokens(item: Dict) -> int:
-    """What a result costs against a token budget, as the packer counts it."""
-    return max(1, len(item.get("context") or item.get("text") or "") // 4)
-
-
-@dataclass
-class CheckedRecall:
-    """What ``Memory.checked_recall`` returns: the results (the same kind of
-    list ``recall()`` returns, in packing order, a second look's additions
-    last and marked ``second_look``) and the monitor's report."""
-    results: List[Dict]
-    report: MonitorReport
-
-    def contexts(self) -> List[str]:
-        """The results' ``context`` strings in the order they were said."""
-        return [p.get("context") or p.get("text") or "" for p in in_order(self.results)]
-
 # The proven conversational configuration, from the evaluation wins. Every key
 # is a MemoryEngine kwarg; explicit engine_kwargs passed to Memory() override
 # these. `defer_supersession_commit` is added by Memory depending on whether a
@@ -291,10 +266,8 @@ class Memory:
         idle_consolidation_secs: Optional[float] = None,
         intentions: bool = False,
         experience: bool = False,
-        sufficiency_judge=None,
         readiness_judge=None,
         distiller=None,
-        decision_log: Optional[str] = None,
         **engine_kwargs,
     ):
         """
@@ -388,20 +361,12 @@ class Memory:
                 own under ``db_path``; ``lessons()`` returns those that apply
                 to a task. Changes no recall result. Off by default (a
                 prototype, not yet measured).
-            sufficiency_judge: what ``checked_recall`` asks, when its free
-                signals flag a context, whether the context answers the
-                question (``tsm.monitor.LLMSufficiencyJudge``, or ``"llm"``
-                for one with its cache under ``db_path``). ``None``: the
-                signals decide alone.
             readiness_judge: what ``due()`` asks to judge its candidates
                 (``tsm.intentions.LLMReadinessJudge``, or ``"llm"``).
                 ``None``: due by time is "act", brought to mind by the
                 context is "observe".
             distiller: turns a trusted outcome without a lesson into one at
                 consolidation (``tsm.experience.LLMDistiller``, or ``"llm"``).
-            decision_log: a file every ``checked_recall`` appends its report
-                to, one JSON object a line (replayable records of what the
-                monitor saw and did).
             **engine_kwargs: forwarded to ``turbomemory.MemoryEngine``.
         """
         # Backend names are resolved here; anything else that is a string is a
@@ -410,7 +375,6 @@ class Memory:
             ("embedder", embedder, ("openai", "sentence_transformer", "local", "minilm", "gemma")),
             ("extractor", extractor, ("openai", "gliner", "passthrough", "none")),
             ("verifier", verifier, ("nli", "llm")),
-            ("sufficiency_judge", sufficiency_judge, ("llm",)),
             ("readiness_judge", readiness_judge, ("llm",)),
             ("distiller", distiller, ("llm",)),
         ):
@@ -459,10 +423,6 @@ class Memory:
             from .verification import LLMVerifier
 
             verifier = LLMVerifier(cache_dir=os.path.join(db_path, "tsm_cache"))
-        if sufficiency_judge == "llm":
-            from .monitor import LLMSufficiencyJudge
-
-            sufficiency_judge = LLMSufficiencyJudge(cache_dir=os.path.join(db_path, "tsm_cache"))
         if readiness_judge == "llm":
             from .intentions import LLMReadinessJudge
 
@@ -471,10 +431,8 @@ class Memory:
             from .experience import LLMDistiller
 
             distiller = LLMDistiller(cache_dir=os.path.join(db_path, "tsm_cache"))
-        self.sufficiency_judge = sufficiency_judge
         self.readiness_judge = readiness_judge
         self.distiller = distiller
-        self.decision_log = decision_log
         self.embedder = embedder
         self.extractor = extractor
         self.verifier = verifier
@@ -921,7 +879,7 @@ class Memory:
                      now=None, search: str = "cognitive") -> Tuple[List[Dict], List[Dict], int]:
         """``recall()``, also returning every candidate it chose from (with
         its score and ``context``) and how many time windows the question
-        pointed at: ``(results, pool, windows)``. The monitor reads both."""
+        pointed at: ``(results, pool, windows)``."""
         self._require_open()
         self._activity = time.monotonic()
         if time_tags not in (True, False, "date", "minute"):
@@ -1511,92 +1469,6 @@ class Memory:
                 "(missing: reinforce); rebuild it with 'make build-python'")
         return int(reinforce([str(mid) for mid in memory_ids]))
 
-    # executive: monitor ------------------------------------------------------------
-    def checked_recall(self, query: str, user_id: Optional[str], token_budget: int = 2000,
-                       now=None, always_judge: bool = False,
-                       second_share: float = SECOND_LOOK_SHARE,
-                       **recall_kwargs) -> CheckedRecall:
-        """``recall()`` checked by the read-time monitor (``tsm.monitor``).
-
-        The recall runs as usual; then free signals measure whether what it
-        found can answer the question (a time the question points at with
-        nothing said then, a count with strong matches from occasions left
-        out, question words no memory in the context contains, a stale
-        memory without its replacement). If one fires (or ``always_judge``)
-        and a ``sufficiency_judge`` is installed, it is asked whether the
-        context is enough and what is missing. Only its "not enough" takes a
-        second, targeted look (the left-out occasions, and a search for what
-        it says is missing), swapped into at most ``second_share`` of the
-        same ``token_budget`` by dropping the last-packed memories of the
-        first look: the budget never grows. Without a judge, or when the
-        judge fails, the signals are reported and the first look is
-        returned unchanged. The signals alone did not tell a complete
-        context from an incomplete one on LongMemEval-S (they fired on 66%
-        and 76% of them), and a second look on their word lost evidence for
-        6 questions and found it for none (``benchmarks/PHASE_PROGRESS.md``,
-        2026-11-11).
-
-        Returns a ``CheckedRecall``: ``results`` and a ``report``
-        (``MonitorReport``). The report is appended to ``decision_log`` when
-        one is set. Like ``recall()``, a
-        read: nothing is written to the memory.
-
-        A prototype: the judged comparison against plain recall and a
-        majority-of-three reader at the same number of calls is not run yet.
-        """
-        if not 0.0 < float(second_share) < 1.0:
-            raise ValueError("second_share must be between 0 and 1")
-        budget = max(1, int(token_budget))
-        chosen, pool, windows = self._recall_core(query, user_id, budget, now=now,
-                                                  **recall_kwargs)
-        signals = grounded_signals(query, chosen, pool, windows)
-        report = MonitorReport(question=query, signals=signals,
-                               reasons=reasons_for_second_look(signals))
-        judge = self.sufficiency_judge
-        if judge is not None and chosen and (report.reasons or always_judge):
-            asked_on = as_date(now) if now not in (None, False) else datetime.now().date()
-            try:
-                report.judge = judge.judge(query, [p.get("context") or "" for p in
-                                                   in_order(chosen)],
-                                           today=asked_on.isoformat() if asked_on else None)
-            except Exception as e:  # noqa: BLE001 — keep the first look, say why
-                report.judge_error = type(e).__name__
-                logger.warning("sufficiency check failed (first look kept): %s", e)
-        sufficient = report.judge.get("sufficient") if report.judge else None
-        results = list(chosen)
-        # Only a judge's "not enough" takes a second look. The free signals
-        # alone did not tell a context with its evidence from one without
-        # (LongMemEval-S, 2026-11-11: they fired on 66% of complete contexts
-        # and 76% of incomplete ones), and the second look they took gained
-        # the evidence of no question and lost it for 6.
-        if chosen and sufficient is False:
-            extra: List[Dict] = []
-            if "left_out_occasions" in report.reasons:
-                by_id = {p["id"]: p for p in pool}
-                extra += [by_id[mid] for mid in signals.left_out_ids if mid in by_id]
-            wanted = second_look_query(query, signals,
-                                       report.judge.get("missing") if report.judge else None)
-            if wanted:
-                report.second_query = wanted
-                extra += self._recall_core(wanted, user_id, max(1, int(budget * second_share)),
-                                           now=now, **recall_kwargs)[0]
-            if extra:
-                results, added, dropped = swap_in(chosen, extra, budget, second_share,
-                                                  _context_tokens)
-                marked = {p["id"] for p in added}
-                results = [dict(p, second_look=True) if p["id"] in marked else p
-                           for p in results]
-                report.added_ids = [p["id"] for p in added]
-                report.dropped_ids = [p["id"] for p in dropped]
-                report.action = "second_look" if added else "none"
-        if self.decision_log:
-            try:
-                with open(self.decision_log, "a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(report.to_dict(), default=str) + "\n")
-            except OSError as e:
-                logger.warning("decision log not written: %s", e)
-        return CheckedRecall(results=results, report=report)
-
     # executive: intentions ----------------------------------------------------------
     def _require_intentions(self) -> IntentionLedger:
         self._require_open()
@@ -1851,7 +1723,7 @@ class Memory:
         purged = 0
         if purge_caches and said:
             for backend in (self.extractor, self.embedder, self.verifier,
-                            self.sufficiency_judge, self.readiness_judge, self.distiller):
+                            self.readiness_judge, self.distiller):
                 purge = getattr(backend, "forget_texts", None)
                 if callable(purge):
                     try:
@@ -1955,7 +1827,6 @@ class Memory:
                 for backend, method in ((self.extractor, "flush_cache"),
                                         (self.embedder, "flush"),
                                         (self.verifier, "flush_cache"),
-                                        (self.sufficiency_judge, "flush_cache"),
                                         (self.readiness_judge, "flush_cache"),
                                         (self.distiller, "flush_cache")):
                     flush = getattr(backend, method, None)

@@ -133,20 +133,13 @@ with Memory("./my_db") as mem:                       # conversational profile
 Control loops around the store, from
 `reports/Cognitive architecture for TurboSuperMemory.md`. None of them changes
 what `recall()` returns. Each part still has to beat the baseline named in its
-phase of that report before it is kept.
+phase of that report before it is kept. The read-time monitor
+(`checked_recall`) did not, and was removed on 2026-11-11: no second look,
+free or judged, got evidence into a LongMemEval-S context that lacked it,
+and both lost some (`benchmarks/PHASE_PROGRESS.md`).
 
 ```python
-mem = Memory("./db", intentions=True, experience=True,
-             sufficiency_judge="llm", decision_log="./db/decisions.jsonl")
-
-# Read-time monitor: free signals first (a time with nothing said then, a
-# count with occasions left out, question words no memory has, a stale fact
-# without its replacement), then the judge; only its "not enough" swaps a
-# second look into the SAME budget. Without a judge the signals are only
-# reported: on their own they lost evidence on LongMemEval-S (2026-11-11).
-checked = mem.checked_recall("How many weddings did I go to this year?",
-                             user_id="alice", token_budget=2000)
-checked.results, checked.report.to_dict()
+mem = Memory("./db", intentions=True, experience=True)
 
 # Intentions: formed by add() from "remind me to ..." or "I need to ... by
 # Friday", closed or replaced at consolidate(), due by time or brought to

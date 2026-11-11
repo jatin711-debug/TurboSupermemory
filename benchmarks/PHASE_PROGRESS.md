@@ -4735,5 +4735,10 @@ judge is asked only where a free signal fired (315 of 470):
   context that loses evidence and gains none cannot answer more.
 
 So Phase 1 is dead on both branches: no second look, free or judged, got
-evidence into a context that lacked it, and both cost some. The monitor
-is to be deleted (see `TODO.md`).
+evidence into a context that lacked it, and both cost some. Deleted the
+same day: `tsm/monitor.py`, `Memory.checked_recall` (with the
+`sufficiency_judge` and `decision_log` arguments), the harness's `_checked`
+arm and `--sufficiency-model`, and their tests; the code is at
+`git show 940ef42:tsm/monitor.py` (and `940ef42:tsm/memory.py`). The word
+helpers `forget()` uses (`salient_terms`, `_stem`) moved to
+`tsm/forgetting.py`.

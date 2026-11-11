@@ -1,8 +1,7 @@
-"""Unit tests for the memory-side executive: the read-time monitor
-(``checked_recall``), intentions (``due``), experience (``feedback``,
-``lessons``) and the belief ledger (``retract``, ``history``, ``forget``),
-plus the engine calls they stand on (payload patches, lookups by payload,
-filtered vector search, retraction).
+"""Unit tests for the memory-side executive: intentions (``due``),
+experience (``feedback``, ``lessons``) and the belief ledger (``retract``,
+``history``, ``forget``), plus the engine calls they stand on (payload
+patches, lookups by payload, filtered vector search, retraction).
 
 Same rules as ``test_memory``: plain ``unittest``, a real engine in a temp
 directory, fake embedder / extractor / judges, no keys and no downloads.
@@ -22,186 +21,7 @@ if _ROOT not in sys.path:
 from tsm import intentions as intents
 from tsm.experience import (ExperienceLedger, lesson_block, normalize_outcome, status_for)
 from tsm.intentions import detect_closure, detect_intentions, future_window
-from tsm.monitor import (grounded_signals, parse_sufficiency,
-                         reasons_for_second_look, salient_terms, second_look_query, swap_in)
 from tsm.tests.test_memory import AcceptAllVerifier, FakeEmbedder, MemoryTestBase, _cosine
-
-
-def _item(mid, score, text="", **extra):
-    return {"id": mid, "score": score, "text": text, **extra}
-
-
-# --------------------------------------------------------------------- monitor
-class TestMonitorSignals(unittest.TestCase):
-    def test_salient_terms_drop_function_question_and_time_words(self):
-        self.assertEqual(salient_terms("How many weddings did I attend last month?"),
-                         ["weddings", "attend"])
-        self.assertEqual(salient_terms("What did my sister's dog eat 3 days ago?"),
-                         ["sister", "dog", "eat"])
-
-    def test_missing_terms_are_the_ones_no_memory_has(self):
-        chosen = [_item("a", 0.9, "I attended a wedding in Paris")]
-        signals = grounded_signals("Which weddings and bakeries did I visit?", chosen, chosen)
-        self.assertEqual(signals.missing_terms, ["bakeries", "visit"])
-        self.assertIn("missing_terms", reasons_for_second_look(signals))
-        self.assertEqual(second_look_query("q", signals), "bakeries visit")
-        self.assertEqual(second_look_query("q", signals, missing="a bakery visit"),
-                         "a bakery visit")
-
-    def test_counting_question_flags_strong_matches_from_other_occasions(self):
-        chosen = [_item("a", 0.80, "wedding one", occasion=1),
-                  _item("b", 0.70, "wedding two", occasion=2)]
-        pool = chosen + [
-            _item("c", 0.69, "wedding three", occasion=3),   # strong, new day
-            _item("d", 0.75, "wedding again", occasion=1),   # same day as a
-            _item("e", 0.20, "unrelated", occasion=4),       # weak
-        ]
-        signals = grounded_signals("How many weddings did I attend?", chosen, pool)
-        self.assertTrue(signals.counting)
-        self.assertEqual(signals.occasions_in_context, 2)
-        self.assertEqual(signals.left_out_ids, ["c"])
-        self.assertIn("left_out_occasions", reasons_for_second_look(signals))
-        # Not a counting question: no such signal.
-        plain = grounded_signals("Which wedding was in Paris?", chosen, pool)
-        self.assertEqual(plain.occasions_left_out, 0)
-
-    def test_window_and_stale_signals(self):
-        chosen = [_item("a", 0.9, "bought shoes", superseded_by="z")]
-        signals = grounded_signals("What did I buy ten days ago?", chosen, chosen, windows=1)
-        self.assertEqual(signals.window_hits, 0)
-        self.assertEqual(signals.stale_unresolved, 1)
-        self.assertEqual(reasons_for_second_look(signals)[:1], ["window_empty"])
-        chosen[0]["in_window"] = True
-        self.assertNotIn("window_empty",
-                         reasons_for_second_look(grounded_signals("x", chosen, chosen, 1)))
-
-    def test_parse_sufficiency(self):
-        self.assertEqual(parse_sufficiency("SUFFICIENT: YES\nMISSING: NONE"), (True, ""))
-        self.assertEqual(parse_sufficiency("sufficient: no\nmissing: the bakery visit"),
-                         (False, "the bakery visit"))
-        self.assertEqual(parse_sufficiency("I cannot tell"), (None, ""))
-
-    def test_swap_in_keeps_the_budget(self):
-        first = [_item(c, 0.9 - k * 0.1, context="x" * 40) for k, c in enumerate("abcd")]
-        extra = [_item("e", 0.5, context="y" * 40), _item("a", 0.9, context="x" * 40)]
-        cost = lambda item: len(item["context"]) // 4  # noqa: E731
-        results, added, dropped = swap_in(first, extra, 40, 0.3, cost)
-        self.assertEqual([i["id"] for i in added], ["e"], "an id already in is not added")
-        self.assertEqual([i["id"] for i in dropped], ["d"], "the last packed goes first")
-        self.assertEqual([i["id"] for i in results], ["a", "b", "c", "e"])
-        self.assertLessEqual(sum(cost(i) for i in results), 40)
-        # Nothing fits the share: the first look stands.
-        results, added, _ = swap_in(first, [_item("f", 0.5, context="z" * 400)], 40, 0.3, cost)
-        self.assertEqual(results, first)
-        self.assertEqual(added, [])
-
-
-class FakeJudge:
-    def __init__(self, sufficient, missing=""):
-        self.sufficient, self.missing, self.calls = sufficient, missing, []
-
-    def judge(self, question, contexts, today=None):
-        self.calls.append((question, list(contexts), today))
-        return {"sufficient": self.sufficient, "missing": self.missing, "reply": "fake"}
-
-
-class FailingJudge:
-    def judge(self, question, contexts, today=None):
-        raise RuntimeError("down")
-
-
-WEDDINGS = [f"I went to wedding number {k} with cake and dancing." for k in range(12)]
-
-
-class TestCheckedRecall(MemoryTestBase):
-    def _fill(self, **kwargs):
-        mem = self.make_memory(**kwargs)
-        for k, text in enumerate(WEDDINGS):
-            mem.add([{"role": "user", "content": text, "timestamp": f"2024-01-{k + 1:02d}"}],
-                    user_id="u")
-        # Shares no word with the questions below: only a second look finds it.
-        mem.add([{"role": "user", "content": "Sourdough loaf picked up from Rosa's shop.",
-                  "timestamp": "2024-02-01"}], user_id="u")
-        return mem
-
-    def test_without_a_signal_it_is_recall(self):
-        mem = self._fill()
-        question = "wedding cake dancing"
-        plain = mem.recall(question, user_id="u", token_budget=60, now=False)
-        checked = mem.checked_recall(question, user_id="u", token_budget=60, now=False)
-        self.assertEqual(checked.report.reasons, [])
-        self.assertEqual(checked.report.action, "none")
-        self.assertTrue(checked.report.confident)
-        self.assertEqual([p["id"] for p in checked.results], [p["id"] for p in plain])
-
-    def test_a_judge_that_finds_it_missing_swaps_a_second_look_in(self):
-        judge = FakeJudge(False, "sourdough loaf shop")
-        log = os.path.join(self.db_path, "decisions.jsonl")
-        mem = self._fill(sufficiency_judge=judge, decision_log=log)
-        question = "What did I order after the wedding cake dancing in Lisbon?"
-        first = mem.recall(question, user_id="u", token_budget=60, now=False)
-        self.assertNotIn("Sourdough", " ".join(p["text"] for p in first), "setup: missed")
-        checked = mem.checked_recall(question, user_id="u", token_budget=60, now=False)
-        report = checked.report
-        self.assertEqual(len(judge.calls), 1)
-        self.assertEqual(report.action, "second_look")
-        self.assertEqual(report.second_query, "sourdough loaf shop")
-        added = [p for p in checked.results if p.get("second_look")]
-        self.assertTrue(any("Sourdough" in p["text"] for p in added))
-        self.assertEqual({p["id"] for p in added}, set(report.added_ids))
-        used = sum(max(1, len(p["context"]) // 4) for p in checked.results)
-        self.assertLessEqual(used, 60, "the budget never grows")
-        with open(log, encoding="utf-8") as fh:
-            record = json.loads(fh.readline())
-        self.assertEqual(record["action"], "second_look")
-        self.assertFalse(record["confident"])
-
-    def test_a_judge_that_finds_it_sufficient_ends_it(self):
-        judge = FakeJudge(True)
-        mem = self._fill(sufficiency_judge=judge)
-        question = "What did I order after the wedding cake dancing in Lisbon?"
-        checked = mem.checked_recall(question, user_id="u", token_budget=60, now=False)
-        self.assertEqual(len(judge.calls), 1, "a signal fired, so it was asked")
-        self.assertEqual(checked.report.action, "none")
-        self.assertTrue(checked.report.confident)
-
-    def test_a_failed_judge_keeps_the_first_look_and_says_so(self):
-        mem = self._fill(sufficiency_judge=FailingJudge())
-        question = "What did I order after the wedding cake dancing in Lisbon?"
-        plain = mem.recall(question, user_id="u", token_budget=60, now=False)
-        with self.assertLogs("tsm.memory", "WARNING"):
-            checked = mem.checked_recall(question, user_id="u", token_budget=60, now=False)
-        self.assertEqual(checked.report.judge_error, "RuntimeError")
-        self.assertEqual(checked.report.reasons, ["missing_terms"])
-        self.assertEqual(checked.report.action, "none")
-        self.assertEqual([p["id"] for p in checked.results], [p["id"] for p in plain])
-
-    def test_without_a_judge_the_signals_are_only_reported(self):
-        # A second look on the signals' word alone lost evidence on
-        # LongMemEval-S and found none (2026-11-11).
-        mem = self._fill()
-        question = "What did I order after the wedding cake dancing in Lisbon?"
-        plain = mem.recall(question, user_id="u", token_budget=60, now=False)
-        checked = mem.checked_recall(question, user_id="u", token_budget=60, now=False)
-        self.assertEqual(checked.report.reasons, ["missing_terms"])
-        self.assertFalse(checked.report.confident)
-        self.assertEqual(checked.report.action, "none")
-        self.assertIsNone(checked.report.second_query)
-        self.assertEqual([p["id"] for p in checked.results], [p["id"] for p in plain])
-
-    def test_the_judge_is_told_the_date_of_a_date_object(self):
-        judge = FakeJudge(True)
-        mem = self._fill(sufficiency_judge=judge)
-        question = "What did I order after the wedding cake dancing in Lisbon?"
-        mem.checked_recall(question, user_id="u", token_budget=60, now=date(2024, 3, 9))
-        self.assertEqual(judge.calls[0][2], "2024-03-09")
-
-    def test_checked_recall_is_a_read(self):
-        mem = self._fill(sufficiency_judge=FakeJudge(False, "sourdough loaf"))
-        question = "What did I order after the wedding cake dancing in Lisbon?"
-        one = mem.checked_recall(question, user_id="u", token_budget=60, now=False)
-        two = mem.checked_recall(question, user_id="u", token_budget=60, now=False)
-        self.assertEqual([p["id"] for p in one.results], [p["id"] for p in two.results])
 
 
 # ------------------------------------------------------------------ intentions
@@ -533,6 +353,14 @@ class TestBeliefLedger(MemoryTestBase):
 
 
 class TestForgettingRules(unittest.TestCase):
+    def test_salient_terms_drop_function_question_and_time_words(self):
+        from tsm.forgetting import salient_terms
+
+        self.assertEqual(salient_terms("How many weddings did I attend last month?"),
+                         ["weddings", "attend"])
+        self.assertEqual(salient_terms("What did my sister's dog eat 3 days ago?"),
+                         ["sister", "dog", "eat"])
+
     def test_what_carries_forgotten_content(self):
         from tsm.forgetting import carries, distinctive_tokens
 
