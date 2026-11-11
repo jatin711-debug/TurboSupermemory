@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-TurboSuperMemory — Belief-Revision Evaluation Harness (Phase 1).
+TurboSuperMemory — synthetic belief-revision check (step 5 of `make gate`).
 
 WHY THIS EXISTS
 ---------------
-The existing `cognitive_benchmark.py` is a *wiring test*: 4 hand-built scenarios
+The old `cognitive_benchmark.py` (removed 2026-11-11) was a *wiring test*: 4 hand-built scenarios
 that prove the cognitive path is connected. The frozen baseline (benchmarks/BASELINE.md, removed 2026-10-21;
 `git show 98a17e7:benchmarks/BASELINE.md`)
 exposed its blind spot — at realistic scale it reports "3/4 won", but in every win the
@@ -44,10 +44,10 @@ THREE SCALING AXES
                        (`git show 98a17e7:benchmarks/PHASE0_GROUND_TRUTH.md`).
 
 Usage:
-    python benchmarks/cognitive_eval/belief_revision.py                 # default sweep
-    python benchmarks/cognitive_eval/belief_revision.py --mode refinement
-    python benchmarks/cognitive_eval/belief_revision.py --distractors 100 1000 10000
-    python benchmarks/cognitive_eval/belief_revision.py --probes 40 --gap 50 --quick
+    python benchmarks/belief_revision.py                 # default sweep
+    python benchmarks/belief_revision.py --mode refinement
+    python benchmarks/belief_revision.py --distractors 100 1000 10000
+    python benchmarks/belief_revision.py --probes 40 --gap 50 --quick
 """
 
 import argparse
@@ -69,12 +69,12 @@ logger = logging.getLogger("BeliefRevisionEval")
 
 
 # ---------------------------------------------------------------------------
-# Extension loading (mirrors cognitive_benchmark.py)
+# Extension loading
 # ---------------------------------------------------------------------------
 
 def setup_extension():
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(os.path.dirname(script_dir))
+    project_root = os.path.dirname(script_dir)
     ext = ".pyd" if sys.platform.startswith("win") else ".so"
     pyd = os.path.join(project_root, f"turbomemory{ext}")
     dll = os.path.join(project_root, "target", "release", "turbomemory.dll")

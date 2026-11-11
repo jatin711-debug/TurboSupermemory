@@ -15,16 +15,18 @@ Checks (each PASS/FAIL; the gate exits nonzero if any FAIL):
   4. tsm SDK unit tests                    — add/recall/consolidate/close contract,
                                              incl. behavior across a database reopen
   5. synthetic belief (refinement+contra)  — clean-data lift held, no false demotion
-  6. LongMemEval smoke (role-filtered)     — KU lift non-negative, NO edge explosion,
-                                             NO single-session collateral (Stage-A guard)
-  7. recall audit                          — ANN recall floor intact
+  6. recall audit                          — ANN recall floor intact
 
-The two eval scripts print a machine-readable `GATE_SUMMARY: {json}` line that
-this gate parses, so it never depends on the human-readable tables.
+It needs no datasets, models or keys. Until 2026-11-11 it also ran a
+role-filtered LongMemEval smoke test (belief edges must fire, but not
+explode, on real conversations); that went with the evaluation harness
+(`git show e79d75f:benchmarks/cognitive_eval/run_belief_longmemeval.py`).
 
-Usage (MUST run under Python 3.12 so the subprocess evals load turbomemory.pyd):
+`belief_revision.py` prints a machine-readable `GATE_SUMMARY: {json}` line
+that this gate parses, so it never depends on the human-readable tables.
+
+Usage (MUST run under Python 3.12 so the subprocess checks load turbomemory.pyd):
     python benchmarks/regression_gate.py            # full gate
-    python benchmarks/regression_gate.py --quick    # smaller LongMemEval limit
     python benchmarks/regression_gate.py --no-rust  # skip cargo checks (fast iter)
 """
 
@@ -39,7 +41,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "benchmarks"
-COG = BENCH / "cognitive_eval"
 PY = sys.executable
 
 # --- environment (mirrors the documented build/run setup) -------------------
@@ -48,18 +49,12 @@ os.environ.setdefault(
 )
 os.environ.setdefault("CARGO_PROFILE_DEV_DEBUG", "0")
 os.environ.setdefault("CARGO_PROFILE_TEST_DEBUG", "0")
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 # audit_recall.py imports `turbomemory` from the repo root.
 os.environ["PYTHONPATH"] = str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", "")
 
 # --- thresholds (tuned to catch REGRESSIONS, not fine noise) ----------------
 SYNTH_MIN_LIFT = 0.9          # synthetic belief lift is ~+1.00 when healthy
 SYNTH_MAX_FALSE_DEMOTION = 0.05
-LME_MIN_KU_LIFT = -0.10       # smoke n is small; assert non-regression, not exact
-LME_MIN_TYPE_LIFT = -0.15     # single-session collateral must stay bounded
-LME_EDGE_MIN = 10             # detection must actually fire (role-filtered)
-LME_EDGE_MAX = 800            # Stage-A over-firing / reverse-MNN removal blows past this
 RECALL_FLOOR_PCT = 95.0
 
 results = []  # (name, ok, detail)
@@ -94,18 +89,10 @@ def _gate_summary(text):
     return None
 
 
-def _eval_data_present():
-    """The eval datasets are downloaded, not checked in (see .gitignore)."""
-    data = COG / "data"
-    return any(data.glob("longmemeval/*.parquet")) or (
-        data / "test_longmemeval.json"
-    ).exists()
-
-
 def check_synthetic_belief():
     for mode in ("refinement", "contradiction"):
         t = time.time()
-        p = _run([PY, str(COG / "belief_revision.py"), "--mode", mode, "--quick"])
+        p = _run([PY, str(BENCH / "belief_revision.py"), "--mode", mode, "--quick"])
         s = _gate_summary(p.stdout + "\n" + p.stderr)
         if s is None:
             _record(f"synthetic belief [{mode}]", False,
@@ -117,29 +104,6 @@ def check_synthetic_belief():
                 f"lift={s['mean_lift']:+.2f} (>={SYNTH_MIN_LIFT}), "
                 f"false_dem={s['mean_false_demotion']:.2f} "
                 f"(<={SYNTH_MAX_FALSE_DEMOTION}) ({time.time() - t:.0f}s)")
-
-
-def check_longmemeval_smoke(limit):
-    t = time.time()
-    p = _run([PY, str(COG / "run_belief_longmemeval.py"),
-              "--limit", str(limit), "--role-filtered"])
-    s = _gate_summary(p.stdout + "\n" + p.stderr)
-    if s is None:
-        _record("LongMemEval smoke (role-filtered)", False,
-                f"no GATE_SUMMARY (exit={p.returncode})")
-        return
-    ku = s["ku_hit1_lift"]
-    edges = s["on_edges"]
-    worst_ss = min([v for k, v in s["type_hit1_lift"].items()
-                    if k.startswith("single-session")] or [0.0])
-    ok = (ku >= LME_MIN_KU_LIFT
-          and LME_EDGE_MIN <= edges <= LME_EDGE_MAX
-          and worst_ss >= LME_MIN_TYPE_LIFT)
-    _record("LongMemEval smoke (role-filtered)", ok,
-            f"KU_hit1_lift={ku:+.2f} (>={LME_MIN_KU_LIFT}), "
-            f"edges={edges} (in [{LME_EDGE_MIN},{LME_EDGE_MAX}]), "
-            f"worst_single_session={worst_ss:+.2f} (>={LME_MIN_TYPE_LIFT}) "
-            f"({time.time() - t:.0f}s)")
 
 
 def check_recall_audit():
@@ -158,25 +122,15 @@ def check_recall_audit():
 
 def main():
     ap = argparse.ArgumentParser(description="TurboSuperMemory regression gate (W2)")
-    ap.add_argument("--quick", action="store_true",
-                    help="smaller LongMemEval limit (faster, noisier)")
     ap.add_argument("--no-rust", action="store_true",
-                    help="skip cargo fmt/clippy/test (fast iteration on evals)")
+                    help="skip cargo fmt/clippy/test (fast iteration)")
     ap.add_argument("--no-evals", action="store_true",
-                    help="skip the python evals (Rust checks only)")
+                    help="skip the Python checks (Rust checks only)")
     args = ap.parse_args()
 
     print("=" * 78)
     print("TurboSuperMemory regression gate (W2)")
     print("=" * 78)
-
-    if not args.no_evals and not _eval_data_present():
-        # The datasets are not checked in (LoCoMo alone is ~240MB); fail fast
-        # with the download command instead of a confusing downstream error.
-        _record("eval data present", False,
-                "LongMemEval/LoCoMo data not found — run `make download-eval-data` "
-                "first (or `--no-evals` for the Rust checks only)")
-        return
 
     if not args.no_rust:
         check_cmd("cargo fmt --check", ["cargo", "fmt", "--all", "--", "--check"])
@@ -189,7 +143,6 @@ def main():
         check_cmd("tsm SDK unit tests",
                   [PY, "-m", "unittest", "discover", "-s", "tsm/tests", "-t", "."])
         check_synthetic_belief()
-        check_longmemeval_smoke(limit=20 if args.quick else 40)
         check_recall_audit()
 
     print("=" * 78)

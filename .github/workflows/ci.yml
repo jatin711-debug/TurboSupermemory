@@ -3,8 +3,9 @@
 # freshly built extension.
 #
 # `make gate`, run locally, stays the merge gate for engine and
-# cognitive-layer changes: it adds the evaluation smoke tests (LongMemEval
-# data and a cached embedding model). Windows is covered by that local gate.
+# cognitive-layer changes: it adds the synthetic belief-revision check and
+# the ANN recall floor against a release build. Windows is covered by that
+# local gate.
 # macOS, the AArch64 NEON kernels and the CUDA build are not covered here.
 name: CI
 

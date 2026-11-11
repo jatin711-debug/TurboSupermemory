@@ -31,14 +31,8 @@ ENV/
 /bench_results/
 *.csv
 *.parquet
-# Downloaded eval datasets are large. Fetch them with
-# `make download-eval-data`; never commit them.
-benchmarks/cognitive_eval/data/
 # Generated benchmark outputs (result JSON, predicted answers, scratch DBs).
 benchmarks/**/results/
-# The vendored Mem0 benchmark suite was removed on 2026-11-09. What it left
-# behind locally (results, logs, datasets, a .env with keys) stays ignored.
-benchmarks/memory_benchmarks/
 mem0_eval_db/
 # Machine-local client settings.
 .claude/settings.local.json
@@ -79,8 +73,6 @@ kimi_key.txt
 .kimi_key
 minimax_key.txt
 .minimax_key
-benchmarks/cognitive_eval/extraction/_cache/
-benchmarks/cognitive_eval/embedding/_cache/
 .cache/
 test_db_*
 claude_key*

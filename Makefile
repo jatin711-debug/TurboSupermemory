@@ -34,7 +34,7 @@ FEATURES    ?=
 # Build flags: add --features cuda if FEATURES=cuda
 CARGO_FEATURES := $(if $(FEATURES),--features $(FEATURES),)
 
-.PHONY: build build-python build-api test test-python verify audit benchmark benchmark-gpu cognitive-benchmark batch-test clippy fmt clean api-server download-eval-data gate dev wheel
+.PHONY: build build-python build-api test test-python verify audit benchmark benchmark-gpu batch-test clippy fmt clean api-server gate dev wheel
 
 build:
 	export PYO3_PYTHON="$(PYO3_PYTHON)" && cargo build --workspace $(CARGO_FEATURES)
@@ -76,10 +76,6 @@ benchmark-gpu: build-python
 	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
 	"$(PYTHON)" benchmarks/benchmark_gpu.py
 
-cognitive-benchmark: build-python
-	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
-	"$(PYTHON)" benchmarks/cognitive_benchmark.py
-
 batch-test: build-python
 	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
 	"$(PYTHON)" benchmarks/test_batch_search.py
@@ -90,10 +86,10 @@ clippy:
 fmt:
 	cargo fmt --all
 
-# W2 regression gate: fmt + clippy + Rust tests + synthetic belief + LongMemEval
-# smoke (role-filtered) + recall floor. Run before every commit that touches the
-# engine or cognitive layer. Rebuilds the extension first so the evals load the
-# current code.
+# Regression gate: fmt + clippy + Rust tests + tsm SDK tests + synthetic belief
+# + recall floor. Run before every commit that touches the engine or cognitive
+# layer. Rebuilds the extension first so the Python checks load the current
+# code. Needs no datasets, models or keys.
 gate: build-python
 	cp target/release/libturbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || cp target/release/turbomemory$(DLL_EXT) turbomemory$(PYD_EXT) 2>/dev/null || true
 	export PYO3_PYTHON="$(PYO3_PYTHON)" && "$(PYTHON)" benchmarks/regression_gate.py $(GATE_ARGS)
@@ -108,8 +104,3 @@ api-server: build-api
 	export TURBO_GRPC_ADDR=0.0.0.0:50051 && \
 	export TURBO_REST_ADDR=0.0.0.0:8080 && \
 	./target/release/turbomemory-server$(EXE_EXT)
-
-# LongMemEval data for `make gate` and the evaluation harness
-# (benchmarks/cognitive_eval/README.md says how the runners are used).
-download-eval-data:
-	"$(PYTHON)" benchmarks/cognitive_eval/benchmark_datasets/download.py
