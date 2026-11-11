@@ -5,8 +5,10 @@ retrieved from TSM's tiered vector and cognitive graph layer.
 """
 
 from typing import Optional, Sequence
-import numpy as np
 import logging
+import threading
+
+import numpy as np
 
 logger = logging.getLogger("tsm.rerankers")
 
@@ -40,6 +42,9 @@ class ColBertReranker:
 
         logger.info(f"Loading ColBERT MultiVectorEncoder '{model_name}' on {device}...")
         self.model = MultiVectorEncoder(model_name, trust_remote_code=trust_remote_code, device=device)
+        # One model may serve several threads (a server, an eval run); HF
+        # tokenizers raise "Already borrowed" when two encode at once.
+        self._lock = threading.Lock()
 
     def rerank(self, query: str, texts: Sequence[str]) -> np.ndarray:
         """Compute MaxSim late-interaction scores for candidate texts against query.
@@ -49,9 +54,10 @@ class ColBertReranker:
         if not texts:
             return np.array([], dtype=np.float32)
 
-        q_embs = self.model.encode_query([query])
-        doc_embs = self.model.encode_document(list(texts))
-        scores = self.model.similarity(q_embs, doc_embs)[0]
+        with self._lock:
+            q_embs = self.model.encode_query([query])
+            doc_embs = self.model.encode_document(list(texts))
+            scores = self.model.similarity(q_embs, doc_embs)[0]
 
         if hasattr(scores, "cpu"):
             scores = scores.cpu().numpy()
