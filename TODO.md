@@ -102,6 +102,54 @@ or `recall` likewise means "everyone". PLAN Phase C (one engine per tenant) is
 the intended answer; until then, treat a store as single-tenant unless these
 are closed.
 
+## The executive prototype (2026-11-11, built, not measured)
+
+`checked_recall()`, intentions (`due()`), experience (`feedback()`,
+`lessons()`) and the belief ledger (`history()`, `retract()`, `forget()`),
+over in-place payload patches and payload lookups in the engine
+(`benchmarks/PHASE_PROGRESS.md`, 2026-11-11). All opt-in; unit-tested only.
+Open, in the order of the report
+(`reports/Cognitive architecture for TurboSuperMemory.md`), each with its
+kill rule written before the run:
+
+1. **Phase 0, instrument.** Score the 30 abstention questions; five-read
+   agreement on saved contexts as a confidence signal (on the 207 counting
+   contexts, 178 were right on all five reads: little left to signal there);
+   the sufficiency check measured 81% agreement on 315 flagged contexts
+   against a 90% bar (2026-11-11), so it is out; adapters for
+   MemoryAgentBench FactConsolidation, PM-Bench and one StreamBench stream.
+2. **Phase 1, the monitor: dead, to delete.** Every branch failed its rule
+   on LongMemEval-S (2026-11-11, `benchmarks/PHASE_PROGRESS.md`):
+   - The free signals fired on 66% of complete contexts and 76% of
+     incomplete ones; a second look on their word lost 6 questions' evidence
+     and found none.
+   - The listing step for counting questions read level with the shipped
+     prompt (186.2 vs 185.2 of 207, five reads each), and majority-of-three
+     added nothing (186.6). Deleted.
+   - The gpt-4.1-mini sufficiency judge agreed with the evidence labels on
+     81% of the 315 flagged contexts (bar: 90%), and its second looks lost 4
+     questions' evidence and found none.
+
+   Left to do: delete `tsm/monitor.py`, `Memory.checked_recall`, the
+   harness's `_checked` arm and `--sufficiency-model`, and their tests and
+   docs, in a commit of their own after the prototype is committed (so
+   `git show` can bring them back).
+3. **Phase 2, beliefs** on FactConsolidation and HaluMem. `forget()` now
+   redacts gists and purges the caches (decided 2026-11-11); its matcher
+   (`tsm/forgetting.py`) is untested on real conversations: measure how
+   often it removes a sentence that did not carry the forgotten content.
+4. **Phase 3, intentions** on PM-Bench and ProactiveBench, against RAG over
+   the main store and a plain to-do ledger. The cue rules are English
+   regular expressions; the cosine floors (completion 0.55, replacement
+   0.80, context cue 0.50) are untuned and embedder-dependent, like the
+   belief thresholds; recurring intentions are not modelled.
+5. **Phase 4, experience** on StreamBench / Evo-Memory streams in five
+   orders, against ExpRAG (`Memory.episodes`). Nothing calls `feedback()`
+   yet; the item-match floor (0.75) is untuned.
+6. The idle worker consolidates after `feedback()` as after `add()`; none of
+   the executive reaches the gRPC/REST server (port a part to `service.rs`
+   only after it survives its phase).
+
 ## Judged on 2026-10-29 (the messages as said, the packer in the engine)
 
 `Memory` now keeps every message, in passages, next to its facts
@@ -345,7 +393,8 @@ table is in `benchmarks/PHASE_PROGRESS.md`.
   still hold such empty entries for long messages; they cannot be told apart
   from real "no facts" answers. Delete the cache to re-extract.
 - **The caches hold every message, fact and query in plaintext**
-  (`<db_path>/tsm_cache/`) and are never pruned, including after eviction.
+  (`<db_path>/tsm_cache/`). Only `forget()` prunes them; eviction and
+  compaction leave every entry.
   The embedding cache is still a pickle file, now read with an arrays-only
   loader; a plain format (npz) would be simpler.
 - **Role prior is very broad.** `tsm/ranking.py` treats a query as first-person
@@ -409,8 +458,9 @@ recall results:
     instead of 51; not run on the held-out half);
   - pairs from real conversations. The 260 are single sentences written for
     the test.
-- **No way to retract a supersession**, and a pair the verifier gives no
-  verdict for is asked again at every consolidation.
+- **A pair the verifier gives no verdict for is asked again at every
+  consolidation.** (Retracting a supersession exists since 2026-11-11:
+  `Memory.retract`, which also keeps the pair from being committed again.)
 - **The engine's own detection is unchanged** (without a verifier its
   results are now flagged, not hidden): it misses updates worded differently
   from the fact they replace, and its text gate ignores digits, short tokens
@@ -441,8 +491,10 @@ recall results:
   drop at its cut are now always kept.)
 - **Vocabulary evolution merges concepts that co-occur once** (no minimum
   support) and never lifts a hub suppression.
-- **Demotion is not reverted** when the superseding record is deleted, and the
-  temporal chain is not persisted across restarts.
+- **The temporal chain is not persisted across restarts.** (Since
+  2026-11-11 a demotion is worked out again when the record that superseded
+  it is deleted or updated; an update still drops the record's supersession
+  edges, so updating a correction un-supersedes what it corrected.)
 - **Edge decay floors at 1.0**, below an important memory's baseline weight.
 - Concept extraction is English-only in its stop words and opposition cues,
   and length-based on bytes.

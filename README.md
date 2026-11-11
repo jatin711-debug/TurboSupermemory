@@ -69,7 +69,7 @@ How to read it:
 
 | Idea | Result | Status |
 | :--- | :--- | :--- |
-| Concept-graph ("cognitive") search against plain vector search, OpenAI vectors | 357 against 360 right of 414 (p = 0.70); tied 10 / 10 on the held-out set | Still the default; adds nothing measurable here |
+| Concept-graph ("cognitive") search against plain vector search, OpenAI vectors | 357 against 360 right of 414 (p = 0.70); tied 10 / 10 on the held-out set. Evidence score level too (3 / 2 over four settings, 2026-11-11) | Still the default; adds nothing measurable on these vectors |
 | Belief revision's effect on answers | Knowledge-update questions: 10 of 18 with it, 9 without | Kept; superseded facts are demoted and flagged, never dropped |
 | A larger context: 8,000 tokens instead of 2,000 | Evidence rose from 91 to 96 of 96, right answers fell from 91 to 82 (p = 0.012) | Use about 2,000 |
 | A typed event table for counting questions | 93.6 against 95.8 of 121, five reads each | Removed 2026-11-09 |
@@ -81,8 +81,12 @@ How to read it:
 | Time of day in the tags (`time_tags="minute"`) | 84 against 90 of 115 (p = 0.07) | Not the default |
 | A second extraction pass for messages that yielded no fact | 6 more answers at 600 tokens, 8 fewer at 150; neither significant | Off by default |
 
-The graph's earlier gains were measured on MiniLM vectors only. Whether it
-earns its place with a weak local embedder is open.
+With a local embedder the graph does find more. On the evidence score
+(115 questions, messages stored, graph on against `recall(search="vector")`
+on the same store, 2026-11-11), it brought all the evidence for 12 more
+questions and 1 fewer on MiniLM vectors (p = 0.02 at 2,000 tokens over 20
+conversations), and 4 more and 1 fewer on EmbeddingGemma's. Not judged:
+whether that becomes answers is open.
 
 Unless a row says LongMemEval-S, a LongMemEval sample on this page is the
 benchmark's oracle variant, where a history holds only the sessions with

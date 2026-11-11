@@ -33,9 +33,11 @@ OpenAI-backed and read the key from ``OPENAI_API_KEY``.
 import json
 import logging
 import math
+import os
 import re
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -49,8 +51,14 @@ from .concepts import extract_concepts
 from .identity import bind_embedder
 from .interfaces import (  # noqa: F401  (Embedder, Extractor, Verifier: re-exported types)
     Embedder, Extractor, Verifier, embed_documents, embed_query, embedder_fingerprint)
+from .experience import ExperienceLedger
+from .forgetting import Forgotten, redact
+from .intentions import IntentionLedger, detect_closure, detect_intentions
+from .monitor import (MonitorReport, grounded_signals, reasons_for_second_look,
+                      second_look_query, swap_in)
 from .ranking import apply_role_prior, asks_what_assistant_said, packing_lam
-from .when import question_windows, said_on
+from .reading import in_order
+from .when import as_date, question_windows, said_on
 
 logger = logging.getLogger("tsm.memory")
 
@@ -186,6 +194,31 @@ WINDOW_LEAD_DAYS = 1
 # Engine methods this SDK cannot work without. The extension and the SDK ship
 # together; this guards against a stale locally-built turbomemory.pyd/.so.
 _REQUIRED_ENGINE_METHODS = ("get_records", "next_insert_seq", "recovery_report")
+# ... and those the executive's stores (intentions, experience), retract() and
+# forget() need: payload patches, lookups by payload, filtered vector search.
+_EXECUTIVE_ENGINE_METHODS = ("set_payloads", "ids_where", "get_vectors",
+                             "retract_supersessions")
+
+# checked_recall(): the share of the budget a second look may take over.
+SECOND_LOOK_SHARE = 0.3
+
+
+def _context_tokens(item: Dict) -> int:
+    """What a result costs against a token budget, as the packer counts it."""
+    return max(1, len(item.get("context") or item.get("text") or "") // 4)
+
+
+@dataclass
+class CheckedRecall:
+    """What ``Memory.checked_recall`` returns: the results (the same kind of
+    list ``recall()`` returns, in packing order, a second look's additions
+    last and marked ``second_look``) and the monitor's report."""
+    results: List[Dict]
+    report: MonitorReport
+
+    def contexts(self) -> List[str]:
+        """The results' ``context`` strings in the order they were said."""
+        return [p.get("context") or p.get("text") or "" for p in in_order(self.results)]
 
 # The proven conversational configuration, from the evaluation wins. Every key
 # is a MemoryEngine kwarg; explicit engine_kwargs passed to Memory() override
@@ -256,6 +289,12 @@ class Memory:
         keep_messages: Optional[bool] = None,
         allow_embedder_change: bool = False,
         idle_consolidation_secs: Optional[float] = None,
+        intentions: bool = False,
+        experience: bool = False,
+        sufficiency_judge=None,
+        readiness_judge=None,
+        distiller=None,
+        decision_log: Optional[str] = None,
         **engine_kwargs,
     ):
         """
@@ -338,6 +377,31 @@ class Memory:
                 a verifier could not finish (``verifier.unresolved``), is
                 tried again after another idle period. ``close()`` stops the
                 thread first. Default ``None``: consolidate when you call it.
+            intentions: keep what the user asks to be reminded of or commits
+                to doing at a future time (``tsm.intentions``), in an engine
+                of its own under ``db_path``: ``add()`` forms them from user
+                messages, ``consolidate()`` closes and replaces them, and
+                ``due()`` says which have come due. Changes no recall result.
+                Off by default (a prototype, not yet measured).
+            experience: keep the outcomes ``feedback()`` reports and curate
+                lessons from them (``tsm.experience``), in an engine of its
+                own under ``db_path``; ``lessons()`` returns those that apply
+                to a task. Changes no recall result. Off by default (a
+                prototype, not yet measured).
+            sufficiency_judge: what ``checked_recall`` asks, when its free
+                signals flag a context, whether the context answers the
+                question (``tsm.monitor.LLMSufficiencyJudge``, or ``"llm"``
+                for one with its cache under ``db_path``). ``None``: the
+                signals decide alone.
+            readiness_judge: what ``due()`` asks to judge its candidates
+                (``tsm.intentions.LLMReadinessJudge``, or ``"llm"``).
+                ``None``: due by time is "act", brought to mind by the
+                context is "observe".
+            distiller: turns a trusted outcome without a lesson into one at
+                consolidation (``tsm.experience.LLMDistiller``, or ``"llm"``).
+            decision_log: a file every ``checked_recall`` appends its report
+                to, one JSON object a line (replayable records of what the
+                monitor saw and did).
             **engine_kwargs: forwarded to ``turbomemory.MemoryEngine``.
         """
         # Backend names are resolved here; anything else that is a string is a
@@ -346,6 +410,9 @@ class Memory:
             ("embedder", embedder, ("openai", "sentence_transformer", "local", "minilm", "gemma")),
             ("extractor", extractor, ("openai", "gliner", "passthrough", "none")),
             ("verifier", verifier, ("nli", "llm")),
+            ("sufficiency_judge", sufficiency_judge, ("llm",)),
+            ("readiness_judge", readiness_judge, ("llm",)),
+            ("distiller", distiller, ("llm",)),
         ):
             if isinstance(value, str) and value not in known:
                 raise ValueError(
@@ -355,8 +422,6 @@ class Memory:
             embedder = None
         cache_dir = None
         if embedder is None or extractor is None or extractor == "openai":
-            import os
-
             cache_dir = os.path.join(db_path, "tsm_cache")
         if embedder is None:
             from .embedders import OpenAIEmbedder
@@ -391,11 +456,25 @@ class Memory:
 
             verifier = NLIVerifier()
         elif verifier == "llm":
-            import os
-
             from .verification import LLMVerifier
 
             verifier = LLMVerifier(cache_dir=os.path.join(db_path, "tsm_cache"))
+        if sufficiency_judge == "llm":
+            from .monitor import LLMSufficiencyJudge
+
+            sufficiency_judge = LLMSufficiencyJudge(cache_dir=os.path.join(db_path, "tsm_cache"))
+        if readiness_judge == "llm":
+            from .intentions import LLMReadinessJudge
+
+            readiness_judge = LLMReadinessJudge(cache_dir=os.path.join(db_path, "tsm_cache"))
+        if distiller == "llm":
+            from .experience import LLMDistiller
+
+            distiller = LLMDistiller(cache_dir=os.path.join(db_path, "tsm_cache"))
+        self.sufficiency_judge = sufficiency_judge
+        self.readiness_judge = readiness_judge
+        self.distiller = distiller
+        self.decision_log = decision_log
         self.embedder = embedder
         self.extractor = extractor
         self.verifier = verifier
@@ -460,6 +539,11 @@ class Memory:
         # compact() with no argument covers every user in the store).
         self._touched: set = set()
 
+        # The executive's own engines (opened below when enabled); set first
+        # so close() works whatever fails during construction.
+        self._intentions: Optional[IntentionLedger] = None
+        self._experience: Optional[ExperienceLedger] = None
+        self._experience_lock = threading.Lock()
         turbomemory = load_turbomemory()
         self.engine = turbomemory.MemoryEngine(
             db_path=db_path, dimension=self.dim, **config
@@ -469,7 +553,8 @@ class Memory:
         # interleave between threads sharing this Memory.
         self._write_lock = threading.Lock()
         required = _REQUIRED_ENGINE_METHODS + (
-            ("scope_ids", "scopes") if self.max_user_tokens is not None else ())
+            ("scope_ids", "scopes") if self.max_user_tokens is not None else ()) + (
+            _EXECUTIVE_ENGINE_METHODS if intentions or experience else ())
         missing = [m for m in required if not hasattr(self.engine, m)]
         if missing:
             self.close()
@@ -493,6 +578,22 @@ class Memory:
                     "support (set_gist_compressor); rebuild the turbomemory extension"
                 )
             set_compressor(self._compress_gist)
+
+        try:
+            # Derived records go in engines of their own: an engine's word
+            # index and concept graph are shared by its scopes, so anything
+            # stored beside the memories changes what recall returns.
+            if intentions:
+                self._intentions = IntentionLedger(
+                    turbomemory.MemoryEngine(db_path=os.path.join(db_path, "tsm_intentions"),
+                                             dimension=self.dim), self._embed_documents)
+            if experience:
+                self._experience = ExperienceLedger(
+                    turbomemory.MemoryEngine(db_path=os.path.join(db_path, "tsm_experience"),
+                                             dimension=self.dim), self._embed_documents)
+        except BaseException:
+            self.close()  # do not leave the databases locked behind the error
+            raise
 
         # Ids are `{user_id}_{n}`. Seeding n from the engine's durable insert
         # sequence (which starts at 1 and is never reused) keeps ids unique
@@ -567,6 +668,10 @@ class Memory:
             context.append(content)
 
         if not facts:
+            if self._intentions is not None:
+                with self._write_lock:
+                    self._form_intentions(messages, {}, user_id)
+                    self._pending = True
             return 0
 
         embeddings = np.ascontiguousarray(embed_documents(self.embedder, facts), dtype=np.float32)
@@ -612,9 +717,50 @@ class Memory:
             )
             if self.max_user_tokens is not None and user_id is not None:
                 self._touched.add(user_id)
+            if self._intentions is not None:
+                by_turn: Dict[int, List[str]] = {}
+                for mid, meta in zip(ids, metas):
+                    by_turn.setdefault(meta["turn"], []).append(mid)
+                self._form_intentions(messages, by_turn, user_id)
             self._pending = True
         self._activity = time.monotonic()
         return len(facts)
+
+    def _embed_documents(self, texts: List[str]) -> np.ndarray:
+        """``texts`` as document vectors, checked for shape."""
+        vectors = np.ascontiguousarray(embed_documents(self.embedder, list(texts)),
+                                       dtype=np.float32)
+        if vectors.shape != (len(texts), self.dim):
+            raise ValueError(f"embedder returned shape {vectors.shape} for {len(texts)} texts; "
+                             f"expected ({len(texts)}, {self.dim})")
+        return vectors
+
+    def _form_intentions(self, messages: List[Dict], by_turn: Dict[int, List[str]],
+                         user_id: Optional[str]) -> None:
+        """Store the intentions and closure statements in the user messages
+        of one ``add()`` (``tsm.intentions``), linked to the memories stored
+        from the same message. Called under the write lock, after the
+        memories are stored: a failure here is logged and leaves the
+        memories as they are (``add`` stores all of its facts or none, and
+        has already stored them)."""
+        for turn, msg in enumerate(messages):
+            content = (msg.get("content") or "").strip()
+            if not content or msg.get("role", "user") != "user":
+                continue
+            stamp = msg.get("timestamp")
+            said_at = stamp if as_date(stamp) else datetime.now().date().isoformat()
+            sources = by_turn.get(turn, [])
+            try:
+                drafts = detect_intentions(content, said_at)
+                if drafts:
+                    self._intentions.record(user_id, drafts, sources, said_at)
+                closure = detect_closure(content)
+                if closure:
+                    self._intentions.record_closure(user_id, closure[0], closure[1],
+                                                    sources, said_at)
+            except Exception as e:  # noqa: BLE001 — the memories are stored; see above
+                logger.warning("intentions of a message not stored: %s: %s",
+                               type(e).__name__, e)
 
     def _compress_gist(self, texts: List[str]):
         """Gist-compressor callback handed to the engine (B4).
@@ -686,6 +832,7 @@ class Memory:
         max_items: Optional[int] = None,
         time_tags: Union[bool, str] = True,
         now=None,
+        search: str = "cognitive",
     ) -> List[Dict]:
         """Search memories under ``user_id``'s scope.
 
@@ -756,11 +903,31 @@ class Memory:
         ``recall()`` is a read: asking does not change what the next call
         returns. Use ``reinforce()`` to tell the memory which results were
         actually used.
+
+        ``search`` picks the candidate search: ``"cognitive"`` (default) is
+        the engine's graph-expanded search, fused with the concept graph's
+        boost; ``"vector"`` is plain cosine search over the same store, with
+        the same supersession demotion. Everything after the search (role
+        prior, belief resolution, time windows, packing, whole replies) is
+        the same for both.
         """
+        return self._recall_core(query, user_id, token_budget, top_k, pool_k, lam,
+                                 resolve_beliefs, max_items, time_tags, now, search)[0]
+
+    def _recall_core(self, query: str, user_id: Optional[str], token_budget: Optional[int],
+                     top_k: int = 10, pool_k: int = 20, lam: Optional[float] = None,
+                     resolve_beliefs: bool = True, max_items: Optional[int] = None,
+                     time_tags: Union[bool, str] = True,
+                     now=None, search: str = "cognitive") -> Tuple[List[Dict], List[Dict], int]:
+        """``recall()``, also returning every candidate it chose from (with
+        its score and ``context``) and how many time windows the question
+        pointed at: ``(results, pool, windows)``. The monitor reads both."""
         self._require_open()
         self._activity = time.monotonic()
         if time_tags not in (True, False, "date", "minute"):
             raise ValueError("time_tags must be True, False, 'date' or 'minute'")
+        if search not in ("cognitive", "vector"):
+            raise ValueError("search must be 'cognitive' or 'vector'")
         query_embedding = np.asarray(embed_query(self.embedder, query), dtype=np.float32)
 
         if token_budget is not None:
@@ -768,14 +935,17 @@ class Memory:
             fetch_k = max(pool_k, 30, token_budget // 8)
         else:
             fetch_k = top_k
-        results = self.engine.search(
-            query_text=query,
-            query_embedding=query_embedding,
-            top_k=fetch_k,
-            scope=user_id,
-        )
+        if search == "vector":
+            results = self.engine.search_ann(query_embedding, top_k=fetch_k, scope=user_id)
+        else:
+            results = self.engine.search(
+                query_text=query,
+                query_embedding=query_embedding,
+                top_k=fetch_k,
+                scope=user_id,
+            )
         if not results:  # nothing in this scope matched
-            return []
+            return [], [], 0
 
         records = self._records([mid for mid, _ in results])
         pool = []
@@ -788,7 +958,9 @@ class Memory:
                 continue
             pool.append(self._pool_item(mid, rec, float(score)))
         if not pool:
-            return []
+            return [], [], 0
+        if search == "vector":
+            self._demote_superseded(pool)
         windows = [] if now is False else question_windows(
             query, datetime.now() if now is None else now)
         if windows:
@@ -816,7 +988,7 @@ class Memory:
         # On a tie the current belief goes before the one it replaced.
         pool.sort(key=lambda p: (-p["score"], "superseded_by" in p))
         if token_budget is None:
-            return pool[:top_k]
+            return pool[:top_k], pool, len(windows)
         budget = max(1, token_budget)
         lam = packing_lam(query, lam)
         then = [p for p in pool if p.get("in_window")][:WINDOW_POOL]
@@ -832,7 +1004,7 @@ class Memory:
                                      max_items - len(chosen) if max_items else None)
         if asks_what_assistant_said(query):
             chosen = self._whole_reply(chosen, budget)
-        return chosen
+        return chosen, pool, len(windows)
 
     def _add_window(self, pool: List[Dict], windows, query_embedding,
                     user_id: Optional[str]) -> None:
@@ -1015,6 +1187,20 @@ class Memory:
                 "passages": payload.get("passages"),
                 "occasion": occasion(rec["source_role"], payload.get("timestamp"))}
 
+    def _demote_superseded(self, pool: List[Dict]) -> None:
+        """Give a superseded memory in ``pool`` the demotion the engine's
+        cognitive search applies (``resolve_beliefs`` reports it), so a plain
+        vector search ranks it the same way apart from the graph. Under
+        ``exclude_superseded`` the engine's plain search has dropped it
+        already."""
+        resolve = getattr(self.engine, "resolve_beliefs", None)
+        if resolve is None:
+            return
+        by_id = {p["id"]: p for p in pool}
+        for res in resolve(list(by_id)):
+            if res["current_id"] != res["id"] and res["id"] in by_id:
+                by_id[res["id"]]["score"] *= float(res.get("demotion") or 1.0)
+
     def _resolve_beliefs(self, pool: List[Dict], user_id: Optional[str]) -> None:
         """Mark the superseded memories in ``pool`` and, when supersessions are
         verified, add the current belief of each one that is missing.
@@ -1111,10 +1297,41 @@ class Memory:
                             logger.warning(
                                 "memory of %r not compacted (kept as it is, will retry): %s",
                                 user, type(e).__name__)
+                self._maintain_executive()
             except BaseException:
                 self._pending = True
                 raise
         return committed
+
+    def _maintain_executive(self) -> None:
+        """The executive's share of a consolidation pass: close and replace
+        intentions, curate lessons from new outcomes. Each is one batch of
+        payload patches; a failure is logged and tried again next pass
+        (nothing is deleted)."""
+        if self._intentions is not None:
+            try:
+                with self._write_lock:
+                    done = self._intentions.maintain()
+                if done["closed"] or done["replaced"]:
+                    logger.info("intentions: %d closed, %d replaced", done["closed"],
+                                done["replaced"])
+            except Exception as e:  # noqa: BLE001 — retried on the next pass
+                self._retry = True
+                logger.warning("intention maintenance failed (will retry): %s: %s",
+                               type(e).__name__, e)
+        if self._experience is not None:
+            try:
+                # Not under the write lock (a distiller may call a model);
+                # under the lock forget() takes to patch the same episodes.
+                with self._experience_lock:
+                    done = self._experience.curate(self.distiller)
+                if done["episodes"]:
+                    logger.info("experience: %d episodes, %d lessons added, %d updated",
+                                done["episodes"], done["added"], done["updated"])
+            except Exception as e:  # noqa: BLE001 — retried on the next pass
+                self._retry = True
+                logger.warning("experience curation failed (will retry): %s: %s",
+                               type(e).__name__, e)
 
     def _idle_loop(self) -> None:
         """Background thread of ``idle_consolidation_secs``: consolidate when
@@ -1167,6 +1384,11 @@ class Memory:
         # A verifier that could not judge some pairs (a failed request) says
         # so; the idle worker then asks again later.
         self._retry = self._retry or bool(getattr(self.verifier, "unresolved", 0))
+        if accepted:
+            # A pair someone took back (retract()) stays taken back.
+            olds = self._records(sorted({pair[0] for pair in accepted}))
+            accepted = [pair for pair in accepted if pair[1] not in
+                        (olds.get(pair[0], {}).get("payload", {}).get("retracted_by") or ())]
         if not accepted:
             return 0
         committed = self.engine.commit_supersessions(accepted)
@@ -1289,10 +1511,422 @@ class Memory:
                 "(missing: reinforce); rebuild it with 'make build-python'")
         return int(reinforce([str(mid) for mid in memory_ids]))
 
+    # executive: monitor ------------------------------------------------------------
+    def checked_recall(self, query: str, user_id: Optional[str], token_budget: int = 2000,
+                       now=None, always_judge: bool = False,
+                       second_share: float = SECOND_LOOK_SHARE,
+                       **recall_kwargs) -> CheckedRecall:
+        """``recall()`` checked by the read-time monitor (``tsm.monitor``).
+
+        The recall runs as usual; then free signals measure whether what it
+        found can answer the question (a time the question points at with
+        nothing said then, a count with strong matches from occasions left
+        out, question words no memory in the context contains, a stale
+        memory without its replacement). If one fires (or ``always_judge``)
+        and a ``sufficiency_judge`` is installed, it is asked whether the
+        context is enough and what is missing. Only its "not enough" takes a
+        second, targeted look (the left-out occasions, and a search for what
+        it says is missing), swapped into at most ``second_share`` of the
+        same ``token_budget`` by dropping the last-packed memories of the
+        first look: the budget never grows. Without a judge, or when the
+        judge fails, the signals are reported and the first look is
+        returned unchanged. The signals alone did not tell a complete
+        context from an incomplete one on LongMemEval-S (they fired on 66%
+        and 76% of them), and a second look on their word lost evidence for
+        6 questions and found it for none (``benchmarks/PHASE_PROGRESS.md``,
+        2026-11-11).
+
+        Returns a ``CheckedRecall``: ``results`` and a ``report``
+        (``MonitorReport``). The report is appended to ``decision_log`` when
+        one is set. Like ``recall()``, a
+        read: nothing is written to the memory.
+
+        A prototype: the judged comparison against plain recall and a
+        majority-of-three reader at the same number of calls is not run yet.
+        """
+        if not 0.0 < float(second_share) < 1.0:
+            raise ValueError("second_share must be between 0 and 1")
+        budget = max(1, int(token_budget))
+        chosen, pool, windows = self._recall_core(query, user_id, budget, now=now,
+                                                  **recall_kwargs)
+        signals = grounded_signals(query, chosen, pool, windows)
+        report = MonitorReport(question=query, signals=signals,
+                               reasons=reasons_for_second_look(signals))
+        judge = self.sufficiency_judge
+        if judge is not None and chosen and (report.reasons or always_judge):
+            asked_on = as_date(now) if now not in (None, False) else datetime.now().date()
+            try:
+                report.judge = judge.judge(query, [p.get("context") or "" for p in
+                                                   in_order(chosen)],
+                                           today=asked_on.isoformat() if asked_on else None)
+            except Exception as e:  # noqa: BLE001 — keep the first look, say why
+                report.judge_error = type(e).__name__
+                logger.warning("sufficiency check failed (first look kept): %s", e)
+        sufficient = report.judge.get("sufficient") if report.judge else None
+        results = list(chosen)
+        # Only a judge's "not enough" takes a second look. The free signals
+        # alone did not tell a context with its evidence from one without
+        # (LongMemEval-S, 2026-11-11: they fired on 66% of complete contexts
+        # and 76% of incomplete ones), and the second look they took gained
+        # the evidence of no question and lost it for 6.
+        if chosen and sufficient is False:
+            extra: List[Dict] = []
+            if "left_out_occasions" in report.reasons:
+                by_id = {p["id"]: p for p in pool}
+                extra += [by_id[mid] for mid in signals.left_out_ids if mid in by_id]
+            wanted = second_look_query(query, signals,
+                                       report.judge.get("missing") if report.judge else None)
+            if wanted:
+                report.second_query = wanted
+                extra += self._recall_core(wanted, user_id, max(1, int(budget * second_share)),
+                                           now=now, **recall_kwargs)[0]
+            if extra:
+                results, added, dropped = swap_in(chosen, extra, budget, second_share,
+                                                  _context_tokens)
+                marked = {p["id"] for p in added}
+                results = [dict(p, second_look=True) if p["id"] in marked else p
+                           for p in results]
+                report.added_ids = [p["id"] for p in added]
+                report.dropped_ids = [p["id"] for p in dropped]
+                report.action = "second_look" if added else "none"
+        if self.decision_log:
+            try:
+                with open(self.decision_log, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(report.to_dict(), default=str) + "\n")
+            except OSError as e:
+                logger.warning("decision log not written: %s", e)
+        return CheckedRecall(results=results, report=report)
+
+    # executive: intentions ----------------------------------------------------------
+    def _require_intentions(self) -> IntentionLedger:
+        self._require_open()
+        if self._intentions is None:
+            raise RuntimeError("intentions are off: open the Memory with intentions=True")
+        return self._intentions
+
+    def intentions(self, user_id: Optional[str]) -> List[Dict]:
+        """The user's pending intentions, in the order they were formed."""
+        return self._require_intentions().pending(user_id)
+
+    def due(self, user_id: Optional[str], now=None, context: Optional[str] = None,
+            top_k: int = 8, cue_min_cosine: Optional[float] = None) -> List[Dict]:
+        """The user's pending intentions that need attention now: those
+        whose time has come (``verdict="act"``, ``overdue`` once their last
+        day has passed) and, given what is happening (``context``, any
+        text), those it brings to mind (``verdict="observe"``). At most
+        ``top_k``. With a ``readiness_judge`` each is judged again as act /
+        wait / observe / satisfied / invalidated (``judged=True``).
+
+        Each carries its ``evidence``: the stored memories of the message it
+        was formed from. A read: close an intention with
+        ``resolve_intention``. Costs no model call (one embedding with a
+        ``context``) unless a judge is installed and something is due.
+        """
+        from .intentions import CUE_MIN_COSINE
+
+        ledger = self._require_intentions()
+        when = now if now not in (None, False) else datetime.now().date()
+        vector = (np.asarray(embed_query(self.embedder, context), dtype=np.float32)
+                  if context else None)
+        items = ledger.due(user_id, when, vector,
+                           CUE_MIN_COSINE if cue_min_cosine is None else float(cue_min_cosine),
+                           top_k)
+        if items and self.readiness_judge is not None:
+            today = as_date(when)
+            try:
+                verdicts = self.readiness_judge.judge(items, context,
+                                                      today.isoformat() if today else "")
+                for k, verdict in verdicts.items():
+                    items[k]["verdict"] = verdict
+                    items[k]["judged"] = True
+            except Exception as e:  # noqa: BLE001 — the unjudged verdicts stand
+                logger.warning("readiness check failed (time and cue verdicts kept): %s", e)
+        sources = sorted({mid for item in items for mid in item.get("source_ids") or ()})
+        records = self._records(sources) if sources else {}
+        for item in items:
+            item["evidence"] = [{"id": mid, "text": records[mid]["text"],
+                                 "timestamp": records[mid]["payload"].get("timestamp")}
+                                for mid in item.get("source_ids") or () if mid in records]
+        return items
+
+    def resolve_intention(self, intention_id: str, status: str = "done",
+                          snooze_until=None) -> bool:
+        """Close an intention (``"done"``, ``"cancelled"``), or put it back
+        (``"pending"``; with ``snooze_until``, a date, it comes due then).
+        A payload patch: the intention keeps its place. Returns whether it
+        exists."""
+        if status not in ("done", "cancelled", "pending"):
+            raise ValueError("status must be 'done', 'cancelled' or 'pending'")
+        fields: Dict = {"status": status}
+        if snooze_until is not None:
+            day = as_date(snooze_until)
+            if day is None:
+                raise ValueError(f"cannot read a date from {snooze_until!r}")
+            fields.update(status="pending", due_from=day.isoformat(),
+                          due_from_day=day.toordinal())
+        ledger = self._require_intentions()
+        with self._write_lock:
+            return ledger.set_status([(intention_id, fields)]) > 0
+
+    # executive: experience ----------------------------------------------------------
+    def _require_experience(self) -> ExperienceLedger:
+        self._require_open()
+        if self._experience is None:
+            raise RuntimeError("experience is off: open the Memory with experience=True")
+        return self._experience
+
+    def feedback(self, task: str, outcome, memory_ids: Iterable[str] = (),
+                 user_id: Optional[str] = None, source: str = "user",
+                 lesson: Optional[str] = None) -> str:
+        """Report how a task went: ``outcome`` is ``"success"`` /
+        ``"failure"`` (or a bool, or a score in [0, 1]); ``memory_ids`` what
+        was in front of the reader, lesson ids from ``lessons()`` included
+        (only those are credited or blamed); ``source`` who says so
+        (``"user"``, ``"verifier"``, ``"judge"``, or ``"self"``, which is
+        kept but never learned from); ``lesson`` what to do or avoid next
+        time, in words. Stored as an episode; lessons are curated from
+        episodes in ``consolidate()`` (``tsm.experience``). Returns the
+        episode's id."""
+        ledger = self._require_experience()
+        vector = np.asarray(embed_query(self.embedder, task), dtype=np.float32)
+        with self._write_lock:
+            mid = ledger.record(task, outcome, list(memory_ids), user_id, source, lesson,
+                                at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                vector=vector)
+            self._pending = True
+        self._activity = time.monotonic()
+        return mid
+
+    def lessons(self, task: str, user_id: Optional[str] = None, k: int = 3,
+                include_probation: bool = False) -> List[Dict]:
+        """The curated lessons nearest ``task``, of ``user_id`` or global,
+        best first: ``active`` ones (and ``probation`` ones when asked). Put
+        them in front of the reader apart from the memories
+        (``tsm.experience.lesson_block``), and pass their ids back with
+        ``feedback`` so they are credited or blamed."""
+        ledger = self._require_experience()
+        return ledger.lessons(np.asarray(embed_query(self.embedder, task), dtype=np.float32),
+                              user_id, k, include_probation)
+
+    def episodes(self, task: str, user_id: Optional[str] = None, k: int = 3) -> List[Dict]:
+        """The past episodes nearest ``task``, as they were reported (the
+        plain "retrieve past experiences" baseline lessons must beat)."""
+        ledger = self._require_experience()
+        return ledger.episodes(np.asarray(embed_query(self.embedder, task), dtype=np.float32),
+                               user_id, k)
+
+    # executive: belief ledger -------------------------------------------------------
+    def retract(self, old_id: str, new_id: str) -> bool:
+        """Take back the supersession of ``old_id`` by ``new_id`` (a wrong
+        verdict, or a user who says the old fact still holds): the old fact
+        is no longer demoted or flagged, and later consolidations do not
+        commit the pair again (it is kept in the old fact's payload as
+        ``retracted_by``). Returns whether there was a supersession to take
+        back."""
+        self._require_open()
+        with self._write_lock:
+            removed = int(self.engine.retract_supersessions([(old_id, new_id)]))
+            rec = self._records([old_id]).get(old_id)
+            if rec is not None:
+                payload = dict(rec["payload"])
+                retracted = list(payload.get("retracted_by") or [])
+                if new_id not in retracted:
+                    retracted.append(new_id)
+                    payload["retracted_by"] = retracted
+                    self.engine.set_payloads([old_id], [json.dumps(payload)])
+        return removed > 0
+
+    def history(self, memory_id: str) -> List[Dict]:
+        """The supersession chain ``memory_id`` belongs to, oldest first:
+        each memory with ``valid_from`` (when it was said) and
+        ``valid_until`` (when what replaced it was said; ``None`` for the
+        current one) and ``current``."""
+        self._require_open()
+        resolved = self.engine.resolve_beliefs([memory_id])
+        chain = list(resolved[0]["chain"]) if resolved else [memory_id]
+        records = self._records(chain)
+        out = []
+        for k, mid in enumerate(chain):
+            rec = records.get(mid)
+            if rec is None:
+                continue
+            after = records.get(chain[k + 1]) if k + 1 < len(chain) else None
+            out.append({"id": mid, "text": rec["text"],
+                        "valid_from": rec["payload"].get("timestamp"),
+                        "valid_until": after["payload"].get("timestamp") if after else None,
+                        "current": k == len(chain) - 1})
+        return out
+
+    def forget(self, memory_ids: Iterable[str], user_id: Optional[str] = None,
+               cascade: bool = True, gists: str = "redact",
+               purge_caches: bool = True) -> Dict:
+        """Delete memories, and everything that still says what they said.
+
+        A forget request is a promise that the content is not served again,
+        so what was derived from the memories goes with them:
+
+        - with ``cascade`` (default), everything stored from the same message
+          (its other facts and its passages: one message, one
+          ``turn_index``) and the intentions formed from it;
+        - a gist that carries the forgotten content (``tsm.forgetting``: the
+          text itself, a code or number from it, or most of its salient
+          words) is **redacted**: its sentences that carry it are removed,
+          the rest is stored as a new gist (same span, level and role)
+          *before* the old one is deleted, and a gist left with nothing is
+          deleted. A gist is lossy already and its sources are gone, so
+          rebuilding it with a model would have nothing to rebuild from and
+          could not be checked; removing sentences can. ``gists="keep"``
+          leaves every gist as it is and lists the ones that may hold the
+          content in ``gists_may_hold``;
+        - intentions and the experience store's episodes and lessons that
+          carry it are deleted, and episodes stop listing the forgotten ids;
+        - with ``purge_caches`` (default), the backends' on-disk caches under
+          ``tsm_cache/`` (extractions, embeddings, judges' replies) lose
+          every entry that carries it, and are rewritten at once.
+
+        With ``user_id``, memories of another user are refused
+        (``skipped``) and only that user's gists, intentions and lessons are
+        looked at.
+
+        Returns ``{"forgotten", "skipped", "gists_redacted", "gists_deleted",
+        "gists_may_hold", "intentions_removed", "experience_removed",
+        "episodes_unlinked", "cache_entries_purged", "verified"}``.
+        ``verified`` says that no forgotten id is stored or found by a search
+        near its own vector, and that no redacted gist still carries the
+        content.
+        """
+        if gists not in ("redact", "keep"):
+            raise ValueError("gists must be 'redact' or 'keep'")
+        self._require_open()
+        wanted = [str(m) for m in memory_ids]
+        with self._write_lock:
+            records = self._records(wanted)
+            skipped = [m for m in wanted if m not in records]
+            targets: Dict[str, Dict] = {}
+            for mid, rec in records.items():
+                if user_id is not None and rec["scope"] not in (None, user_id):
+                    skipped.append(mid)
+                    continue
+                targets[mid] = rec
+            if cascade and targets and hasattr(self.engine, "ids_where"):
+                for rec in list(targets.values()):
+                    turn = rec["payload"].get("turn_index")
+                    if turn is None or is_gist(rec["source_role"] or ""):
+                        continue
+                    flt = json.dumps({"op": "eq", "field": "turn_index", "value": turn})
+                    for mid, sib in self._records(self.engine.ids_where(flt, rec["scope"])).items():
+                        if mid not in targets and not is_gist(sib["source_role"] or ""):
+                            targets[mid] = sib
+            ids = sorted(targets)
+            said = [t["text"] for t in targets.values()]
+            said += [t["payload"].get("original_message") for t in targets.values()
+                     if t["payload"].get("original_message")]
+            forgotten = Forgotten(said)
+            scopes = {t["scope"] for t in targets.values()}
+            vectors, found = (self.engine.get_vectors(ids)
+                              if ids and hasattr(self.engine, "get_vectors") else (None, []))
+            # Gists first: a redacted gist is stored before anything is deleted.
+            gist_report = self._forget_in_gists(targets, forgotten, scopes, redact_them=(
+                gists == "redact"))
+            for mid in ids:
+                self.engine.delete(mid)
+            intentions_removed = 0
+            if self._intentions is not None and ids:
+                doomed = set()
+                for mid in ids:
+                    doomed.update(self._intentions.engine.ids_where(json.dumps(
+                        {"op": "eq", "field": "source_ids", "value": mid})))
+                for scope in scopes:
+                    for iid, item in self._intentions._items(
+                            self._intentions.engine.ids_where(None, scope)).items():
+                        if item.get("scope") == scope and forgotten.carries(item["text"]):
+                            doomed.add(iid)
+                for iid in doomed:
+                    intentions_removed += bool(self._intentions.engine.delete(iid))
+            experience_removed = episodes_unlinked = 0
+            if self._experience is not None and ids:
+                with self._experience_lock:
+                    experience_removed = self._experience.forget_content(forgotten, list(scopes))
+                    episodes_unlinked = self._experience.forget_references(ids)
+        purged = 0
+        if purge_caches and said:
+            for backend in (self.extractor, self.embedder, self.verifier,
+                            self.sufficiency_judge, self.readiness_judge, self.distiller):
+                purge = getattr(backend, "forget_texts", None)
+                if callable(purge):
+                    try:
+                        purged += int(purge(said) or 0)
+                    except Exception as e:  # noqa: BLE001 — reported, not fatal
+                        logger.warning("cache purge failed for %s: %s",
+                                       type(backend).__name__, e)
+        verified = not any(self.engine.contains_id(mid) for mid in ids)
+        gone = set(ids)
+        for k, mid in enumerate(ids):
+            if verified and k < len(found) and found[k]:
+                hits = self.engine.search_ann(vectors[k], 5, scope=targets[mid]["scope"])
+                verified = not any(hit in gone for hit, _ in hits)
+        if verified and gist_report["redacted"]:
+            texts = self._records(gist_report["redacted"])
+            verified = not any(forgotten.carries(rec["text"]) for rec in texts.values())
+        return {"forgotten": ids, "skipped": skipped,
+                "gists_redacted": gist_report["redacted"],
+                "gists_deleted": gist_report["deleted"],
+                "gists_may_hold": gist_report["may_hold"],
+                "intentions_removed": intentions_removed,
+                "experience_removed": experience_removed,
+                "episodes_unlinked": episodes_unlinked,
+                "cache_entries_purged": purged, "verified": verified}
+
+    def _forget_in_gists(self, targets: Dict[str, Dict], forgotten: "Forgotten",
+                         scopes, redact_them: bool) -> Dict[str, List[str]]:
+        """The gists of ``scopes`` against the forgotten content: those that
+        carry it are redacted (a new gist, then the old one deleted) or, with
+        nothing left, deleted; without ``redact_them`` they are only listed.
+        A gist whose span covers a forgotten memory's day but that carries
+        nothing detectable is listed in ``may_hold``. Under the write lock."""
+        out: Dict[str, List[str]] = {"redacted": [], "deleted": [], "may_hold": []}
+        if not hasattr(self.engine, "scope_ids"):
+            return out
+        days = {said_on(t["payload"].get("timestamp")) for t in targets.values()} - {None}
+        for scope in scopes:
+            if scope is None:
+                continue
+            for mid, rec in sorted(self._records(self.engine.scope_ids(scope)).items()):
+                role = rec["source_role"] or ""
+                if mid in targets or not is_gist(role):
+                    continue
+                text = rec["text"] or ""
+                if not forgotten.carries(text):
+                    span = rec["payload"].get("span")
+                    if span and len(span) == 2:
+                        first, last = said_on(span[0]), said_on(span[1])
+                        if first and last and any(first <= d <= last for d in days):
+                            out["may_hold"].append(mid)
+                    continue
+                if not redact_them:
+                    out["may_hold"].append(mid)
+                    continue
+                kept, removed = redact(text, forgotten)
+                if kept and not forgotten.carries(kept):
+                    payload = dict(rec["payload"])
+                    payload["redacted"] = int(payload.get("redacted", 0)) + len(removed)
+                    new_id = self._next_id(scope)
+                    self.engine.insert_batch(
+                        [new_id], [kept], self._embed_documents([kept]), [1.0],
+                        [extract_concepts(kept)], [json.dumps(payload)], [scope], [role])
+                    out["redacted"].append(new_id)
+                else:
+                    out["deleted"].append(mid)
+                self.engine.delete(mid)
+        return out
+
     def flush(self) -> None:
         """Durably persist all pending writes."""
         self._require_open()
         self.engine.flush()
+        for ledger in (self._intentions, self._experience):
+            if ledger is not None:
+                ledger.engine.flush()
 
     def close(self) -> None:
         """Flush and release the engine. Idempotent.
@@ -1304,6 +1938,12 @@ class Memory:
         if not self._closed:
             self._stop_idle_worker()
             try:
+                for ledger in (self._intentions, self._experience):
+                    if ledger is not None:
+                        try:
+                            ledger.engine.close()
+                        except Exception as e:  # noqa: BLE001 — the main engine still closes
+                            logger.warning("closing a derived store failed: %s", e)
                 self.engine.close()
             finally:
                 # The engine handle is released even when its final flush
@@ -1314,7 +1954,10 @@ class Memory:
                 # hundred entries or at interpreter exit.
                 for backend, method in ((self.extractor, "flush_cache"),
                                         (self.embedder, "flush"),
-                                        (self.verifier, "flush_cache")):
+                                        (self.verifier, "flush_cache"),
+                                        (self.sufficiency_judge, "flush_cache"),
+                                        (self.readiness_judge, "flush_cache"),
+                                        (self.distiller, "flush_cache")):
                     flush = getattr(backend, method, None)
                     if callable(flush):
                         try:

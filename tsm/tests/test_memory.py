@@ -263,6 +263,61 @@ class TestSupersessionFlow(MemoryTestBase):
         self.assertNotIn(old_fact, after)
 
 
+class TestVectorSearch(MemoryTestBase):
+    """recall(search="vector"): plain cosine search, the rest of recall() as is."""
+
+    OLD = "user user user user lives in paris"
+    NEW = "user user user user lives in london"
+
+    def revised(self, **kwargs):
+        mem = self.make_memory(verifier=AcceptAllVerifier(), **kwargs)
+        mem.add([{"role": "user", "content": self.OLD + "."}], user_id="alice")
+        mem.add([{"role": "user", "content": self.NEW + "."}], user_id="alice")
+        self.assertGreaterEqual(mem.consolidate(), 1)
+        return mem
+
+    def test_scores_are_the_plain_cosines(self):
+        mem = self.make_memory()
+        mem.add([{"role": "user", "content": f} for f in (
+            "the garden has roses.", "the kitchen has a kettle.", "roses need water.")],
+            user_id="alice")
+        got = {r["id"]: r["score"] for r in mem.recall(
+            "roses garden", user_id="alice", top_k=10, search="vector")}
+        query = mem.embedder.encode_query("roses garden") if hasattr(
+            mem.embedder, "encode_query") else mem.embedder.encode("roses garden")
+        plain = dict(mem.engine.search_ann(np.asarray(query, dtype=np.float32).reshape(-1),
+                                           10, scope="alice"))
+        self.assertEqual(set(got), set(plain))
+        for mid, score in got.items():
+            self.assertAlmostEqual(score, plain[mid], places=5)
+
+    def test_a_superseded_fact_is_demoted_and_marked_as_with_the_graph(self):
+        mem = self.revised()
+        for search in ("cognitive", "vector"):
+            texts = [r["text"] for r in mem.recall("user lives", user_id="alice",
+                                                   top_k=10, search=search)]
+            self.assertLess(texts.index(self.NEW), texts.index(self.OLD), search)
+        by_text = {r["text"]: r for r in mem.recall("user lives", user_id="alice",
+                                                    top_k=10, search="vector")}
+        self.assertEqual(by_text[self.OLD]["context"], "[turn 1] " + STALE_MARK + self.OLD)
+        query = np.asarray(mem.embedder.encode("user lives"), dtype=np.float32).reshape(-1)
+        cosine = dict(mem.engine.search_ann(query, 10, scope="alice"))
+        old_id = by_text[self.OLD]["id"]
+        self.assertLess(by_text[self.OLD]["score"], cosine[old_id] * 0.9, "not demoted")
+
+    def test_exclude_superseded_drops_it_as_with_the_graph(self):
+        mem = self.revised(exclude_superseded=True)
+        texts = [r["text"] for r in mem.recall("user lives", user_id="alice",
+                                               top_k=10, search="vector")]
+        self.assertIn(self.NEW, texts)
+        self.assertNotIn(self.OLD, texts)
+
+    def test_unknown_search_is_refused(self):
+        mem = self.make_memory()
+        with self.assertRaises(ValueError):
+            mem.recall("anything", user_id="alice", search="graph")
+
+
 class _EngineWithoutResolve:
     """Proxy that hides ``resolve_beliefs``, simulating an older pyd."""
 

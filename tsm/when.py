@@ -87,6 +87,16 @@ def said_on(timestamp) -> Optional[date]:
     return None
 
 
+def as_date(value) -> Optional[date]:
+    """The calendar date of a ``date``, a ``datetime``, or anything
+    ``said_on`` reads (a stored timestamp); ``None`` otherwise."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return said_on(value)
+
+
 def _count(word: str) -> Optional[int]:
     word = word.lower()
     if word.isdigit():

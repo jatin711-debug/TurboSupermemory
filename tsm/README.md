@@ -89,6 +89,11 @@ with Memory("./my_db") as mem:                       # conversational profile
   2026-11-09.
 - `recall()` is a read: it does not change what the next call returns.
   `mem.reinforce(ids)` strengthens the memories that were actually used.
+- `recall(search="vector")` is plain cosine search instead of the graph's,
+  everything else unchanged. On the evidence score the graph was level with
+  it on OpenAI vectors and found more on local ones (MiniLM 12 more
+  questions, 1 fewer; EmbeddingGemma 4 / 1; 2026-11-11), so the graph stays
+  the default.
 - Compress instead of delete: with `max_records` set, pass
   `gist_summarizer=OpenAIGistSummarizer()` (or the model-free
   `ExtractiveGistSummarizer()`, both in `tsm.gist`) and eviction victims are
@@ -122,6 +127,72 @@ with Memory("./my_db") as mem:                       # conversational profile
 - `add()` is all-or-nothing per call and safe to call from several threads.
   Recall is scoped by the engine itself: other users' records never show up
   and never take result slots.
+
+## The executive (a prototype, opt-in, not yet measured)
+
+Control loops around the store, from
+`reports/Cognitive architecture for TurboSuperMemory.md`. None of them changes
+what `recall()` returns. Each part still has to beat the baseline named in its
+phase of that report before it is kept.
+
+```python
+mem = Memory("./db", intentions=True, experience=True,
+             sufficiency_judge="llm", decision_log="./db/decisions.jsonl")
+
+# Read-time monitor: free signals first (a time with nothing said then, a
+# count with occasions left out, question words no memory has, a stale fact
+# without its replacement), then the judge; only its "not enough" swaps a
+# second look into the SAME budget. Without a judge the signals are only
+# reported: on their own they lost evidence on LongMemEval-S (2026-11-11).
+checked = mem.checked_recall("How many weddings did I go to this year?",
+                             user_id="alice", token_budget=2000)
+checked.results, checked.report.to_dict()
+
+# Intentions: formed by add() from "remind me to ..." or "I need to ... by
+# Friday", closed or replaced at consolidate(), due by time or brought to
+# mind by the context. due() is a read.
+mem.due("alice", now="2024-03-05", context="at the passport office")
+mem.resolve_intention(intention_id, "done")
+
+# Experience: outcomes in, lessons out (curated at consolidate(), counters
+# only for lessons that were in front of the reader; "self" outcomes teach
+# nothing).
+items = mem.lessons(task, user_id="alice")
+mem.feedback(task, "failure", memory_ids=[i["id"] for i in items],
+             user_id="alice", lesson="Ask which date format the vendor uses.")
+
+# Belief ledger.
+mem.history(memory_id)        # the chain with valid_from / valid_until
+mem.retract(old_id, new_id)   # take a supersession back, for good
+mem.forget([memory_id], user_id="alice")   # cascades to the message; verified
+```
+
+Intentions and experience each keep their own engine under `db_path`
+(`tsm_intentions/`, `tsm_experience/`). Their state changes are payload
+patches (`MemoryEngine.set_payloads`), which keep a record's place, so
+nothing is embedded twice and belief ordering is untouched. The cosine floors
+they use (`tsm.intentions.COMPLETION_MIN_COSINE`, `RESCHEDULE_MIN_COSINE`,
+`CUE_MIN_COSINE`, `tsm.experience.ITEM_MATCH_COSINE`) are untuned and belong to
+an embedder's geometry.
+
+`forget()` treats a forget request as a promise that the content is not
+served again, so derived text goes too (`tsm/forgetting.py`):
+
+- A gist that carries the forgotten content is **redacted**, not rebuilt. The
+  sentences holding it are removed: the text itself, a number of three or
+  more digits from it, an address, or most of its salient words. The rest is
+  stored as a new gist *before* the old one is deleted. A gist left empty is
+  deleted.
+- Rebuilding with a model was rejected. The gist's sources are already gone,
+  so there would be nothing to rebuild from, and a rewrite cannot be checked.
+- `gists="keep"` leaves gists alone and lists the ones that may hold the
+  content (`gists_may_hold`).
+- The on-disk caches under `tsm_cache/` lose every entry that carries the
+  content and are rewritten at once (`purge_caches=True`). These are the
+  extractions, embeddings and judges' replies.
+- `verified` in the result also checks that no redacted gist still carries
+  it. The matching is rule-based and English-leaning, and errs toward
+  removing.
 
 ## When a backend misbehaves
 

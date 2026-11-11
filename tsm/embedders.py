@@ -167,6 +167,23 @@ class OpenAIEmbedder:
                 f"(pass dim= to OpenAIEmbedder for a model whose size is not known)")
         return vectors
 
+    def forget_texts(self, texts) -> int:
+        """Remove every cached entry whose text carries one of ``texts``
+        (``tsm.forgetting``), and write the cache to disk at once. Called by
+        ``Memory.forget``; returns how many entries went."""
+        from .forgetting import Forgotten
+
+        forgotten = Forgotten(texts)
+        if not forgotten:
+            return 0
+        gone = [text for text in self._cache if forgotten.carries(text)]
+        for text in gone:
+            del self._cache[text]
+        if gone:
+            self._dirty += len(gone)
+            self.flush()
+        return len(gone)
+
     def flush(self):
         if not self._dirty:
             return

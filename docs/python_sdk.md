@@ -457,6 +457,31 @@ engine.recovery_report()   # what this open had to repair; all zeros after a cle
 #  'segments_discarded': 0, 'segment_dirs_removed': 0, 'graph_nodes_pruned': 0}
 ```
 
+### Payload patches, lookups by payload, retraction
+
+```python
+import json
+
+# Replace payloads in place: same offset, insert sequence, vector and graph
+# edges (update() would move the record and re-order it against the records
+# belief revision compares it with). All payloads are checked first; unknown
+# ids are skipped; one write-ahead-log append for the batch.
+engine.set_payloads(["mem_001"], [json.dumps({"status": "done", "due_day": 739000})])
+
+# The JSON filter DSL of the REST API (eq / range / full_text / and / or / not;
+# top-level payload fields only).
+pending = json.dumps({"op": "and", "filters": [
+    {"op": "eq", "field": "status", "value": "pending"},
+    {"op": "range", "field": "due_day", "high": 739010}]})
+engine.ids_where(pending, scope="team_alpha")      # ids, in insertion order
+engine.search_ann(query_vec, top_k=5, filter=pending)
+
+# Take supersessions back; the old memory's demotion is worked out again
+# from what still supersedes it. Deleting the memory that superseded another
+# does the same.
+engine.retract_supersessions([("old_id", "new_id")])
+```
+
 ### Input rules
 
 - Vectors must have the store's dimension, be finite, and not be all zero;

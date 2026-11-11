@@ -4539,3 +4539,201 @@ store); its `--reranker` option went with the reranker.
 
 The uv lockfile (`uv.lock`) predates the `gemma` and `colbert` extras and was
 already out of step with `pyproject.toml`; it was not touched here.
+
+# A memory-side executive, built and not yet measured (2026-11-11)
+
+The research of the same day
+(`reports/Cognitive architecture for TurboSuperMemory.md`) found that
+store-side mechanisms (graph scoring, belief demotion, decay, rewrites) come
+out level with plain retrieval, here and in independent 2026 studies, and
+proposed control loops around an unchanged store instead. This entry records
+the prototype of those loops. **Nothing here has been measured**: there are
+unit tests and no evaluation, and no recall result changes with any of it
+switched off (the default).
+
+**SDK** (`tsm/`), all opt-in:
+
+- `monitor.py`, `Memory.checked_recall()`: after an ordinary budgeted recall,
+  free signals (a question's time window with nothing said then, a counting
+  question with strong candidates from occasions the context lacks, question
+  words no chosen memory contains, a stale memory without its replacement),
+  then an optional sufficiency judge, then a second look swapped into at most
+  30% of the same budget. Every decision is a replayable record
+  (`MonitorReport.to_dict()`, `decision_log=`).
+  `reading.answer_prompt(enumerate_items=True)` asks the reader to list
+  each counted instance before counting (the read-time form of the events
+  table removed on 2026-11-09). Phase 1 of the report: judge it with
+  `reread.py --reads 5` against a majority-of-three reader at the same
+  number of calls, and delete it if it does not beat that.
+- `intentions.py`, `Memory(intentions=True)`, `due()`, `resolve_intention()`:
+  reminders and dated commitments formed at `add()`, closed ("I already ...",
+  "never mind ...") and replaced ("... on Monday instead") at
+  `consolidate()`, due by time or brought to mind by the context. Its own
+  engine (`tsm_intentions/`). Phase 3: PM-Bench and ProactiveBench against
+  RAG over the main store and a plain to-do ledger.
+- `experience.py`, `Memory(experience=True)`, `feedback()`, `lessons()`,
+  `episodes()`: episodes in, lessons curated at `consolidate()` by delta
+  changes only; a lesson is credited or blamed only when it was in front of
+  the reader, and outcomes reported by the agent itself (`source="self"`)
+  teach nothing. Its own engine (`tsm_experience/`). Phase 4: StreamBench and
+  Evo-Memory streams against ExpRAG (`episodes()`).
+- Belief ledger: `Memory.history()` (the chain with `valid_from` /
+  `valid_until`), `Memory.retract()` (a supersession taken back stays taken
+  back: the pair is recorded on the old fact and never committed again), and
+  `Memory.forget()` (cascades to everything stored from the same message and
+  to the intentions formed from it, unlinks episodes, then checks that no
+  forgotten id is stored or found near its own vector). The owner left two
+  policy questions to this session, and they were decided the same day:
+  - A gist that carries a forgotten memory is **redacted**, sentence by
+    sentence (`tsm/forgetting.py`: the text, a number of three or more digits
+    from it, an address, or most of its salient words). The redacted gist is
+    stored before the old one is deleted, so the no-loss order holds.
+  - It is not rebuilt with a model: the gist's sources are already gone and
+    a rewrite cannot be checked. `gists="keep"` restores the earlier
+    behaviour (listed in `gists_may_hold`, kept).
+  - The backends' caches under `tsm_cache/` lose every entry that carries the
+    content (`forget_texts()` on the extractor, the embedder and the three
+    judges; the verifier's cache holds only hashed keys and one-word
+    verdicts).
+  - Lessons and episodes that carry the content are deleted too.
+  - None of this is measured. How often the matcher removes a sentence that
+    did not carry the content is open in `TODO.md`.
+- `_chat.py`: the one cached, retried chat request the three model-backed
+  parts share (`LLMSufficiencyJudge`, `LLMReadinessJudge`, `LLMDistiller`).
+
+**Engine** (Rust), where storage had to change for the loops to be cheap and
+correct:
+
+- `StorageEngine::set_payloads` (Python `set_payloads`): payloads replaced in
+  place, keeping the offset, insert sequence, vector and graph edges, as one
+  WAL append of a new `WalOp::SetPayload` (WAL version 3; version-1 and -2
+  logs are still read and are rewritten by the first open). Statuses and
+  counters change this way without an embedding call and without reordering
+  a record against the records belief revision compares it with, which an
+  `update` would do.
+- `StorageEngine::ids_where` (Python `ids_where`) and a `filter` for Python
+  `search_ann`: lookups in the payload and scope bitmaps. The JSON filter
+  parser moved from the API crate into storage (`Filter::from_json`, the
+  same `MAX_FILTER_DEPTH`) so the API and the binding share it.
+- `retract_supersessions_by_id` (Python `retract_supersessions`), and the
+  debt listed since the audit: deleting (or updating) a memory that
+  superseded others now works their demotion out again from what still
+  supersedes them, instead of leaving them ranked down with no edge.
+
+Checked: `cargo fmt`, clippy with `-D warnings`, the Rust suite (new tests
+for patches surviving a flush and an unclean stop, version-2 logs, filters,
+retraction, demotion after a delete), the CUDA build's storage and GPU
+tests, and the SDK suite (249 tests; 34 new in
+`tsm/tests/test_executive.py`, including one that checks that intentions
+change no recall result).
+
+# Is the cognitive layer gaining anything? The graph and the monitor's free rules (2026-11-11)
+
+The owner asked whether the cognitive parts gain anything. On judged
+answers the summary was: the graph is level on OpenAI vectors (357 vs 360
+of 414), belief revision is noise (10 vs 9 of 18), ColBERT, events and
+observations were level or worse; what gained was keeping messages, the
+reading prompt, whole replies, date tags and gists for bounded stores. Two
+free runs followed.
+
+**1. The graph, on the messages store.** The judged comparison (`sdk_raw`
+against `sdk_raw_plain`) also differed in `recall()`'s whole-reply step, so
+`recall(search="vector")` was added: plain cosine search over the same
+store, the supersession demotion applied from `resolve_beliefs`, and
+everything after the search unchanged. Arms `sdk_raw` and
+`rcl_vec` (`--recall-store sdk_raw --recall vec:search=vector`), 115
+questions, all evidence in the context, graph on / off (off gains / loses):
+
+| vectors | 600 tokens | 2,000 | 2,000, `--pool 20` | 2,000, `--pool 40` |
+|---|---|---|---|---|
+| OpenAI | 99 / 99 (2 / 2) | 114 / 114 | 109 / 108 (0 / 1) | 104 / 104 |
+| MiniLM | 83 / 79 (1 / 5) | | 93 / 86 (0 / 7, p = 0.02) | |
+| EmbeddingGemma 2 | 101 / 100 (1 / 2) | | 111 / 109 (0 / 2) | |
+
+- Over the eight settings, graph off loses 19 and gains 4. Level on OpenAI
+  vectors (3 / 2), helps MiniLM's (12 / 1) and a little EmbeddingGemma's
+  (4 / 1). It never lost evidence overall in any setting, and it changed
+  most contexts (70 to 112 of 115).
+- So it stays the default; the suggestion of this session to take it off
+  the default path is withdrawn. Its search also adds a word-match (BM25)
+  boost, so the graph and the lexical part are not separated here, and
+  nothing of this is judged.
+
+**2. The monitor's free rules.** Harness arm `sdk_raw_checked`
+(`checked_recall` with the question's date, no judge) against
+`sdk_raw_dated` on all 470 LongMemEval-S questions at 2,000 tokens
+(`runs/2026-11-11/s500_checked_free.json`; not `--offline`, so the
+second-look queries got real embeddings):
+
+- A signal fired on 315 of 470 questions: `missing_terms` 239,
+  `left_out_occasions` 132, `window_empty` 10. The second look changed 310
+  contexts, searching for words like "currently", "mode", "movie".
+- All the evidence in the context: 441 for the baseline, 435 with the
+  monitor (0 gained, 6 lost, p = 0.03).
+- The signals did not separate good contexts from bad: of the 29 contexts
+  missing evidence they fired on 22 (76%), of the 441 complete ones on 293
+  (66%). `left_out_occasions` fired more often on complete contexts (29%)
+  than on incomplete ones (21%); `window_empty` never fired on an
+  incomplete one.
+- Killed, as the plan's rule says: `checked_recall` takes a second look
+  only on a sufficiency judge's "not enough"; without a judge, or when the
+  judge fails, it reports the signals and returns the first look.
+- The count hint marks exactly the 207 questions with "how many", "how
+  much" or "total" (`is_counting_query`), by design.
+
+**3. The counting branch, judged.** The 207 counting questions of that run
+(`is_counting_query`), the `sdk_raw_dated` contexts, read five times each
+with the shipped `--reader notes` prompt and five times with
+`answer_prompt(enumerate_items=True)` (list every counted instance with its
+note and date, strike repeats, then count). gpt-4.1-mini read and judged;
+4,139 requests, 5.05M tokens in and 0.37M out, about $2.60
+(`runs/2026-11-11/counting_enum_reads.json`). Majority-of-three is computed
+from the same five reads (every triple of them):
+
+| | single read | majority of three |
+|---|---|---|
+| shipped prompt | 186.2 | 186.6 |
+| listing step | 185.2 | 185.0 |
+
+- Listing against shipped, single reads: more often right on 12, less often
+  on 12 (p = 1.00); by type it is level everywhere (multi-session 83.8 vs
+  85.8 of 101, temporal 49.6 vs 49.0 of 54, the rest within 0.4).
+- The listing step's single read against the shipped prompt's majority of
+  three: 10 / 13 (p = 0.68).
+- Majority-of-three adds nothing either (186.2 to 186.6): 178 of 207 are
+  right on every read, so the reader is stable on these contexts and what
+  it gets wrong it gets wrong every time.
+- Deleted by the rule written before the run: `ENUMERATE_STEP`,
+  `answer_prompt(enumerate_items=...)`, `MonitorReport.count_hint`, and the
+  harness / `reread.py` / judge plumbing. The monitor's counting signal
+  (`left_out_occasions`) stays, for the judge-driven second look.
+
+**4. The judge-driven second look.** The same run with
+`--sufficiency-model gpt-4.1-mini` (`runs/2026-11-11/s500_checked_judge.json`;
+resumed after a restart, with the 3 histories whose checks had failed on a
+dropped connection run again; about 315 short requests, some $0.30). The
+judge is asked only where a free signal fired (315 of 470):
+
+| judge says | all evidence in the context | some missing |
+|---|---|---|
+| not enough | 50 | 12 |
+| enough | 243 | 10 |
+| not asked | 148 | 7 |
+
+- The judge agreed with the evidence labels on 255 of 315 (81%); the plan's
+  bar for keeping a sufficiency check was 90%. Five in six of its "not
+  enough" were contexts that already had everything.
+- It took 60 second looks. All the evidence in the context: 441 for the
+  baseline, 437 with the monitor (0 gained, 4 lost, p = 0.12). The four
+  lost are counting questions ("How many musical instruments do I currently
+  own?"): the second look searched for the judge's "list of all current
+  musical instruments owned", and swapping its results into 30% of the
+  budget pushed out one of the instances being counted. The 12 incomplete
+  contexts it did look again for (orders of events, ages, totals) stayed
+  incomplete.
+- The proxy answers moved the same way (1 / 3). No rereads were bought: a
+  context that loses evidence and gains none cannot answer more.
+
+So Phase 1 is dead on both branches: no second look, free or judged, got
+evidence into a context that lacked it, and both cost some. The monitor
+is to be deleted (see `TODO.md`).

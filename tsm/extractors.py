@@ -367,6 +367,25 @@ class OpenAIExtractor:
             if self._dirty:
                 self._persist(force=True)
 
+    def forget_texts(self, texts) -> int:
+        """Remove every cached entry whose message or extracted facts carries one of ``texts``
+        (``tsm.forgetting``), and write the cache to disk at once. Called by
+        ``Memory.forget``; returns how many entries went."""
+        from .forgetting import Forgotten
+
+        forgotten = Forgotten(texts)
+        if not forgotten:
+            return 0
+        with self._lock:
+            gone = [key for key, facts in self._cache.items()
+                    if forgotten.carries(key) or any(forgotten.carries(str(f))
+                                                     for f in (facts or ()))]
+            for key in gone:
+                del self._cache[key]
+            if gone:
+                self._persist(force=True)
+        return len(gone)
+
 
 class GlinerExtractor:
     """Extracts structured atomic facts & entities using local GLiNER models.
@@ -472,6 +491,21 @@ class GlinerExtractor:
             self._dirty = 0
         except OSError as e:
             logger.warning("GLiNER extract cache write failed: %s", e)
+
+    def forget_texts(self, texts) -> int:
+        """Remove every cached entry whose message or extracted facts carries one of ``texts``
+        (``tsm.forgetting``), and write the cache to disk at once. Called by
+        ``Memory.forget``; returns how many entries went."""
+        from .forgetting import Forgotten
+
+        forgotten = Forgotten(texts)
+        gone = [key for key, facts in self._cache.items()
+                if forgotten.carries(key) or any(forgotten.carries(str(f)) for f in facts or ())]
+        for key in gone:
+            del self._cache[key]
+        if gone:
+            self._persist(force=True)
+        return len(gone)
 
     def flush_cache(self):
         self._persist(force=True)
