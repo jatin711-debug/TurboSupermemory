@@ -23,7 +23,7 @@ what it does not do, and what was measured.
 
 The SDK's models use the GPU as well, through PyTorch and independently of
 this feature: the local embedder (`SentenceTransformerEmbedder`), the GLiNER
-extractor, the NLI verifier and the ColBERT reranker all pick `cuda` when
+extractor and the NLI verifier all pick `cuda` when
 `torch.cuda.is_available()`.
 
 ## 2. GPU exact search over resident vectors

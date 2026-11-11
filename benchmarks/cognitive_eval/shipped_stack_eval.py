@@ -51,10 +51,7 @@ neighbouring arms belongs to one mechanism:
                             store read with these recall() arguments, e.g.
                             --recall lam9:lam=0.9
                             --recall-store sdk_raw makes them read sdk_raw's
-                            (or sdk_messages') store instead. rerank=true
-                            reranks with one ColBertReranker of --reranker
-                            shared by every history, e.g.
-                            --recall-store sdk_raw --recall cb:rerank=true
+                            (or sdk_messages') store instead.
 
   diagnostics (not run by default)
     <recall arm>_untagged   the same store, recall(time_tags=False): the
@@ -223,27 +220,6 @@ def default_work_dir():
     else ~/.tsm_eval/shipped_stack_eval."""
     return os.environ.get("TSM_EVAL_DIR") or os.path.join(
         os.path.expanduser("~"), ".tsm_eval", "shipped_stack_eval")
-
-
-class CachedReranker:
-    """A reranker whose scores are kept by question and candidates: the
-    --recall arms that differ only in how they fuse scores rerank the same
-    pool, and the model is the slow part."""
-
-    def __init__(self, inner):
-        self.inner = inner
-        self._scores = {}
-        self._lock = threading.Lock()
-
-    def rerank(self, query, texts):
-        key = hashlib.sha1("\x00".join([query, *texts]).encode("utf-8")).hexdigest()
-        with self._lock:
-            hit = self._scores.get(key)
-        if hit is None:
-            hit = self.inner.rerank(query, texts)
-            with self._lock:
-                self._scores[key] = hit
-        return hit
 
 
 def variants(name):
@@ -757,9 +733,6 @@ def main():
     ap.add_argument("--recall-store", default="sdk_cognitive",
                     choices=["sdk_cognitive", "sdk_messages", "sdk_raw"],
                     help="the store the --recall arms read (default sdk_cognitive: the facts)")
-    ap.add_argument("--reranker", default="LiquidAI/LFM2.5-ColBERT-350M", metavar="MODEL",
-                    help="the ColBERT model of the --recall arms that set rerank=true, loaded "
-                         "once and shared by every history")
     ap.add_argument("--variant", choices=["oracle", "s", "m"], default=None,
                     help="read the official file of this variant for the same questions "
                          "(default: the parquet copy, which is the oracle variant)")
@@ -830,14 +803,6 @@ def main():
     # the checkout: target/ went with `cargo clean` once and .cache/ with a
     # tidy-up once, each taking every saved verdict along.
     work_dir = args.work_dir or default_work_dir()
-
-    # One reranker for every history, loaded here on the main thread: recall()
-    # given rerank=True alone would load the model once per store.
-    shared_reranker = None
-    if not args.rejudge and any(how.get("rerank") for how in readings.values()):
-        from tsm.rerankers import ColBertReranker
-
-        shared_reranker = CachedReranker(ColBertReranker(args.reranker))
     os.makedirs(work_dir, exist_ok=True)
     readme = os.path.join(work_dir, "README.txt")
     if not os.path.exists(readme):
@@ -954,11 +919,9 @@ def main():
              "file_order": args.file_order, "question_date": args.question_date,
              "configs": configs, "reader": args.reader, "skip": args.skip,
              "readings": readings}
-    # Only when used, so checkpoints written before these options resume.
+    # Only when used, so checkpoints written before the option resume.
     if args.recall_store != "sdk_cognitive":
         setup["recall_store"] = args.recall_store
-    if shared_reranker is not None:
-        setup["reranker"] = args.reranker
     done = set()
     if checkpoint and os.path.exists(checkpoint):
         with open(checkpoint, encoding="utf-8") as fh:
@@ -1145,10 +1108,7 @@ def main():
                     mem.recall(q, user_id=user, token_budget=args.token_budget,
                                pool_k=args.pool_k, time_tags=False))
                 for arm in extra:
-                    how = dict(readings[arm])
-                    if how.pop("rerank", False):
-                        how["reranker"] = shared_reranker
-                    retrieve[arm] = lambda q, mem=mem, how=how: shown(
+                    retrieve[arm] = lambda q, mem=mem, how=readings[arm]: shown(
                         mem.recall(q, user_id=user, **{
                             "token_budget": args.token_budget, "pool_k": args.pool_k,
                             "time_tags": tag_mode, **how}))

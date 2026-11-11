@@ -17,8 +17,8 @@ Python 3.12 or newer (the extension is an `abi3-py312` wheel).
 The default embedder and extractor are OpenAI-backed: install the `openai`
 extra (`pip install "tsm[openai]"`) and set `OPENAI_API_KEY`. Local models
 (`embedder="local"`, `verifier="nli"`) need the `cpu` extra;
-`embedder="gemma"` (EmbeddingGemma 2) needs `gemma` and `reranker="colbert"`
-needs `colbert` (both want sentence-transformers 6 or newer).
+`embedder="gemma"` (EmbeddingGemma 2) needs `gemma` (sentence-transformers
+6.1 or newer).
 
 ## Usage
 

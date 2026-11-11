@@ -77,6 +77,7 @@ How to read it:
 | Returning source turns in place of facts | 86 against 98 of 115 at 600 tokens | Removed 2026-11-09 |
 | Writing the date after a relative time ("two weeks ago [...]") | 8 gained, 4 lost over 470 | Removed 2026-11-09 |
 | Reader tools for arithmetic and dates | 94 against 98 of 115 | Removed 2026-11-09 |
+| A ColBERT reranker (LFM2.5-ColBERT-350M) after search | Evidence score only: level on OpenAI and EmbeddingGemma vectors (5 gained, 3 lost on each), better on MiniLM's (19 / 6), where EmbeddingGemma alone did better still | Removed 2026-11-10 |
 | Time of day in the tags (`time_tags="minute"`) | 84 against 90 of 115 (p = 0.07) | Not the default |
 | A second extraction pass for messages that yielded no fact | 6 more answers at 600 tokens, 8 fewer at 150; neither significant | Off by default |
 
@@ -134,7 +135,6 @@ tokens of context. It measured an evaluation adapter, not `tsm.Memory`, and on
 
 ### Not measured
 
-- The ColBERT reranker (`reranker="colbert"`) has no judged run.
 - TurboQuant and RaBitQ quantizers are implemented and unit-tested. Their
   recall figures in [`docs/core_quantization.md`](./docs/core_quantization.md)
   are approximate, and the defaults do not use them.
@@ -278,7 +278,7 @@ Measured on an RTX 3050 Laptop (4 GB) against the CPU build on the same files:
 
 Method, limits and options are in
 [`docs/gpu_acceleration.md`](./docs/gpu_acceleration.md). The SDK's local
-models (embedder, verifier, reranker) use CUDA through PyTorch and need no
+models (embedder, verifier) use CUDA through PyTorch and need no
 special build.
 
 ---

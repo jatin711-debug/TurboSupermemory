@@ -4475,3 +4475,67 @@ each, so any of them comes back with one `git revert`; the files are at
   code changed that day. The same step took 60 to 70 seconds in the three
   runs before and after. Whether a test hung or the machine slept is not
   known; if it happens again, find out which test.
+
+# The ColBERT reranker, measured and removed (2026-11-10)
+
+`Memory(reranker="colbert")` (LiquidAI/LFM2.5-ColBERT-350M through
+sentence-transformers' `MultiVectorEncoder`) had been offered since it was
+added and never measured. Measured now on the free evidence score only: no
+model answered anything, so nothing here is about answers.
+
+**Two bugs first.** The SDK guide's example passed `reranker="colbert"` and
+never `recall(rerank=True)`, and `recall()` used the `Memory`'s reranker only
+with that flag, so the example loaded the model and never reranked. And
+`recall(rerank=True)` without a reranker loaded a new model on every call.
+Both were fixed (`cbc2f6f`) so the test measured the reranker, not the
+wiring.
+
+**The fusion.** Each candidate's score was multiplied by
+`1 + softmax(MaxSim) * N`. MaxSim scores of one pool lie close together (on
+12 oracle histories the best was about 27 and the tenth within 0.6 of it), so
+the softmax is flat: the best few were raised three- to six-fold and the rest
+stayed about where they were. Two other fusions were tried as temporary arms:
+the pool ordered by MaxSim alone, and reciprocal-rank fusion of the two
+orders, each handing the pool's scores back out in its order.
+
+**Runs.** `shipped_stack_eval.py --offline --limit 120 --arms sdk_raw
+--recall-store sdk_raw --recall cbsoft:rerank=true ...` (115 questions with
+evidence labels; the messages store, `extractor="none"`). One shared model,
+on an RTX 3050 Laptop GPU that another job was using: about 1.2 s a rerank.
+All evidence in the context, gained / lost against no reranking:
+
+| vectors | setting | none | shipped fusion | RRF | MaxSim alone |
+|---|---|---|---|---|---|
+| OpenAI | 2,000 tokens | 114 | 114 (0 / 0) | 112 (0 / 2) | 110 (0 / 4) |
+| OpenAI | 600 tokens | 99 | 99 (2 / 2) | 95 (0 / 4) | 88 (1 / 12) |
+| OpenAI | 2,000 tokens, `--pool 20` | 109 | 111 (3 / 1) | 105 (0 / 4) | 100 (1 / 10) |
+| MiniLM | 600 tokens | 83 | 89 (10 / 4) | | 89 (12 / 6) |
+| MiniLM | 2,000 tokens, `--pool 20` | 93 | 100 (9 / 2) | | 99 (10 / 4) |
+| EmbeddingGemma 2 | 600 tokens | 101 | 101 (3 / 3) | | |
+| EmbeddingGemma 2 | 2,000 tokens, `--pool 20` | 111 | 113 (2 / 0) | | |
+
+- Ranked by MaxSim alone, ColBERT found less than the search it was
+  reranking on OpenAI vectors (2 / 26 over three settings). The shipped
+  fusion only stays level there because it dilutes the ColBERT order.
+- The reranker changed what was in the context for 96 to 115 of 115
+  questions in every setting; with the shipped fusion the evidence score
+  moved by at most seven.
+- With the shipped fusion it was level on OpenAI vectors (5 / 3 in all) and
+  on EmbeddingGemma's (5 / 3), and better on MiniLM's (19 / 6, p of about
+  0.02 over the two settings).
+- The one place it helped is beaten by changing the embedder: EmbeddingGemma
+  alone found the evidence for 101 at 600 tokens and 111 with distractors,
+  against 89 and 100 for MiniLM with the reranker. EmbeddingGemma is local
+  as well, smaller (271M parameters against the reranker's 350M), and adds
+  no second to each recall.
+
+**Removed** on that basis: `tsm/rerankers.py`, `Memory(reranker=...)`,
+`recall(rerank=..., reranker=...)`, the `Reranker` protocol and the `colbert`
+extra. The fixed version is at `git show cbc2f6f:tsm/rerankers.py` (and
+`tsm/memory.py`). Not a judged result: if a reranker comes back, judge it
+with `reread.py --reads 5` against the same embedder without it. The
+harness's `--recall-store` stays (the `--recall` arms can read the messages
+store); its `--reranker` option went with the reranker.
+
+The uv lockfile (`uv.lock`) predates the `gemma` and `colbert` extras and was
+already out of step with `pyproject.toml`; it was not touched here.

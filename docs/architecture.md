@@ -98,13 +98,6 @@ Retrieval in TurboSuperMemory follows a **2-Stage Hybrid Retrieval Pipeline**:
    - Fuses semantic cosine similarity with 1-hop spreading activation across concept nodes and ACT-R power-law recency decay:
      $$\text{Score}_{\text{TSM}}(M) = \Big[ \text{Cosine}(Q, M) + (1 - \alpha) \cdot \sigma(\Delta_{\text{graph}}(M)) \Big] \cdot \Big(1 + \lambda_{\text{recency}} \cdot \frac{\text{seq}(M)}{\text{seq}_{\max}}\Big) \cdot D(M)$$
 
-2. **Stage 2 (Optional ColBERT Multi-Vector Late Interaction)**:
-   - For multi-constraint and rare-entity queries, Stage 1 passes an expanded shortlist ($K_1 = 3 \times \text{top\_k}$) to the token-level multi-vector encoder (`LiquidAI/LFM2.5-ColBERT-350M` on CUDA).
-   - Computes token-level MaxSim dot products:
-     $$\text{MaxSim}(Q, D) = \sum_{i=1}^{L_q} \max_{j=1}^{L_d} (Q_i \cdot D_j)$$
-   - Fuses the scores to rank the most relevant memories at the top:
-     $$\text{Score}_{\text{fused}}(M) = \text{Score}_{\text{TSM}}(M) \cdot \Big(1 + \text{Softmax}(\text{MaxSim}(Q, M)) \cdot N\Big)$$
-
 ```mermaid
 flowchart TD
     Q["Query Input"] --> ANN["Stage 1: Parallel Segment Search: Hot/SealedHot/Warm/Cold"]
@@ -119,10 +112,7 @@ flowchart TD
     Expand --> Pools["Strong x1.0 / Temporal x0.5 / Normal x0.3"]
     Pools --> Delta["Return PURE graph delta per candidate"]
     Delta --> Fusion["Fuse: cosine + (1 - alpha) * normalized_delta * recency * demotion"]
-    Fusion --> Stage2{"ColBERT Reranker Enabled?"}
-    Stage2 -- "No" --> TopK["Return Top K Results"]
-    Stage2 -- "Yes" --> ColBERT["Stage 2: LFM2.5-ColBERT MaxSim Late Interaction"]
-    ColBERT --> FinalSort["Fuse MaxSim & Return Top K Results"]
+    Fusion --> TopK["Return Top K Results"]
 ```
 
 ### 3.3 Full System Component Diagram

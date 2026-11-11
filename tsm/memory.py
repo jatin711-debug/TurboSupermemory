@@ -54,23 +54,6 @@ from .when import question_windows, said_on
 
 logger = logging.getLogger("tsm.memory")
 
-def fuse_rerank(pool: List[Dict], maxsim) -> None:
-    """Combine a reranker's ``maxsim`` scores (one per item of ``pool``) with
-    the pool's own ``"score"``, in place: each score is multiplied by
-    ``1 + softmax(maxsim) * len(pool)``. MaxSim scores of one pool lie close
-    together (LFM2.5-ColBERT: the best and the tenth within about 0.6 of 27),
-    so the best few are raised about three- to six-fold and the rest stay
-    near where they were. Ranking by MaxSim alone, or by reciprocal-rank
-    fusion of the two orders, lost evidence on every setting it was tried
-    on (``benchmarks/PHASE_PROGRESS.md``, 2026-11-10)."""
-    weights = np.exp(maxsim - np.max(maxsim))
-    weights = weights / np.sum(weights)
-    n = len(pool)
-    for p, m, w in zip(pool, maxsim, weights):
-        p["maxsim_score"] = float(m)
-        p["score"] = float(p["score"]) * (1.0 + float(w) * n)
-
-
 # Put in front of a superseded memory's text in a result's "context" when its
 # supersession was verified: it was true, and something newer replaced it.
 STALE_MARK = "[earlier, since changed] "
@@ -268,7 +251,6 @@ class Memory:
         extractor: Optional[Extractor] = None,
         verifier: Optional[Verifier] = None,
         gist_summarizer: Optional[Callable[[List[str]], str]] = None,
-        reranker: Optional[object] = None,
         max_user_tokens: Optional[int] = None,
         compaction: str = "refold",
         keep_messages: Optional[bool] = None,
@@ -340,15 +322,6 @@ class Memory:
                 answered 19 at 2,000 tokens of context, and 25 against 20 at
                 1,200 (``benchmarks/PHASE_PROGRESS.md``, 2026-10-29). With
                 ``extractor="none"`` it is the whole store: 26 of the 29.
-            reranker: a ``Reranker`` (``rerank(query, texts)`` -> one score
-                per text) or ``"colbert"`` (``ColBertReranker``,
-                LFM2.5-ColBERT-350M; ``pip install "tsm[colbert]"``).
-                ``recall()`` then reranks its candidates with it unless told
-                ``rerank=False``. Worth it with a local embedder, not with
-                OpenAI's: on LongMemEval it brought all the evidence of 19
-                more questions and lost 6 on MiniLM vectors, and was level
-                on OpenAI's (5 / 3), at about a second a recall on a laptop
-                GPU (``benchmarks/PHASE_PROGRESS.md``, 2026-11-10).
             allow_embedder_change: open a database with an embedder other
                 than the one that wrote it (``EmbedderMismatchError``
                 otherwise). Only for an embedder that produces the same
@@ -372,7 +345,6 @@ class Memory:
         for kind, value, known in (
             ("embedder", embedder, ("openai", "sentence_transformer", "local", "minilm", "gemma")),
             ("extractor", extractor, ("openai", "gliner", "passthrough", "none")),
-            ("reranker", reranker, ("colbert",)),
             ("verifier", verifier, ("nli", "llm")),
         ):
             if isinstance(value, str) and value not in known:
@@ -414,10 +386,6 @@ class Memory:
             from .extractors import NullExtractor
 
             extractor = NullExtractor()
-        if reranker == "colbert":
-            from .rerankers import ColBertReranker
-
-            reranker = ColBertReranker()
         if verifier == "nli":
             from .verification import NLIVerifier
 
@@ -436,7 +404,6 @@ class Memory:
         # detector also fires on facts that are both still true, "my sister
         # lives in Vancouver" / "my brother lives in Vancouver").
         self._verified = verifier is not None
-        self.reranker = reranker
 
         self.dim = int(dimension or getattr(embedder, "dimension", None) or 1536)
 
@@ -483,7 +450,6 @@ class Memory:
         # Idle consolidation: one pass at a time (also against a manual
         # consolidate()), and what decides whether the worker has work.
         self._maintenance_lock = threading.Lock()
-        self._reranker_lock = threading.Lock()  # recall(rerank=True) loads one, once
         self._activity = time.monotonic()
         self._pending = False       # written to since the last pass
         self._retry = False         # the last pass left something to try again
@@ -717,8 +683,6 @@ class Memory:
         pool_k: int = 20,
         lam: Optional[float] = None,
         resolve_beliefs: bool = True,
-        rerank: Optional[bool] = None,
-        reranker: Optional[object] = None,
         max_items: Optional[int] = None,
         time_tags: Union[bool, str] = True,
         now=None,
@@ -792,12 +756,6 @@ class Memory:
         ``recall()`` is a read: asking does not change what the next call
         returns. Use ``reinforce()`` to tell the memory which results were
         actually used.
-
-        Reranking: the candidates are scored again by ``reranker``, else by
-        the ``Memory``'s own (``Memory(reranker=...)``), and the scores are
-        combined (``fuse_rerank``) before packing. ``rerank=False`` skips
-        it; ``rerank=True`` on a ``Memory`` without a reranker loads a
-        ``ColBertReranker`` the first time and keeps it.
         """
         self._require_open()
         self._activity = time.monotonic()
@@ -805,17 +763,11 @@ class Memory:
             raise ValueError("time_tags must be True, False, 'date' or 'minute'")
         query_embedding = np.asarray(embed_query(self.embedder, query), dtype=np.float32)
 
-        active_reranker = reranker
-        if active_reranker is None and rerank is not False:
-            active_reranker = self.reranker
-            if active_reranker is None and rerank:
-                active_reranker = self._load_reranker()
-
         if token_budget is not None:
             # Enough candidates to fill the budget even with short memories.
             fetch_k = max(pool_k, 30, token_budget // 8)
         else:
-            fetch_k = top_k * 3 if active_reranker else top_k
+            fetch_k = top_k
         results = self.engine.search(
             query_text=query,
             query_embedding=query_embedding,
@@ -859,13 +811,6 @@ class Memory:
 
         apply_role_prior(pool, query)
 
-        # Stage-2 MultiVector / ColBERT Late-Interaction Precision Reranking
-        if active_reranker is not None and len(pool) > 1:
-            candidate_texts = [p["text"] or "" for p in pool]
-            rerank_scores = np.asarray(active_reranker.rerank(query, candidate_texts), dtype=np.float32)
-            if len(rerank_scores) == len(pool):
-                fuse_rerank(pool, rerank_scores)
-
         # Best first by the score that is returned (the role prior and a
         # brought-in current belief both move a memory's place).
         # On a tie the current belief goes before the one it replaced.
@@ -888,16 +833,6 @@ class Memory:
         if asks_what_assistant_said(query):
             chosen = self._whole_reply(chosen, budget)
         return chosen
-
-    def _load_reranker(self):
-        """The ColBERT reranker ``recall(rerank=True)`` uses when the
-        ``Memory`` was given none: loaded on first use, then kept."""
-        with self._reranker_lock:
-            if self.reranker is None:
-                from .rerankers import ColBertReranker
-
-                self.reranker = ColBertReranker()
-            return self.reranker
 
     def _add_window(self, pool: List[Dict], windows, query_embedding,
                     user_id: Optional[str]) -> None:

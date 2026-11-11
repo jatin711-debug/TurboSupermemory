@@ -760,7 +760,7 @@ class TestRobustness(MemoryTestBase):
         self.assertIn(TestDurability.NEW_FACT, texts)
 
     def test_backend_names_are_checked_at_construction(self):
-        for kwargs in ({"embedder": "opnai"}, {"extractor": "gpt"}, {"reranker": "bert"}):
+        for kwargs in ({"embedder": "opnai"}, {"extractor": "gpt"}):
             args = {"embedder": FakeEmbedder(), "extractor": FakeExtractor(), **kwargs}
             with self.assertRaises(ValueError) as ctx:
                 Memory(db_path=self.db_path, **args)
@@ -1461,74 +1461,6 @@ class TestRecallWindow(MemoryTestBase):
                      user_id="alice")
         self.assertEqual(self.texts(token_budget=60)[0], "Bought a slow cooker.")
         self.assertNotIn("Bought a slow cooker.", self.texts(token_budget=60, now=False))
-
-
-class LengthReranker:
-    """Scores a text by its length: an order the fake embedder never gives."""
-
-    def __init__(self):
-        self.calls = 0
-
-    def rerank(self, query, texts):
-        self.calls += 1
-        return np.array([float(len(t)) for t in texts], dtype=np.float32)
-
-
-class TestReranking(MemoryTestBase):
-    FACTS = ["I like tea.", "I keep a small garden on the balcony.",
-             "I ran a marathon in Berlin last autumn with my brother.", "I own a cat."]
-    QUESTION = "tea garden marathon cat"
-
-    def fill(self, **kwargs):
-        mem = self.make_memory(**kwargs)
-        mem.add([{"role": "user", "content": f} for f in self.FACTS], user_id="alice")
-        return mem
-
-    def test_a_memory_given_a_reranker_uses_it_without_being_asked(self):
-        # The SDK guide's example passed reranker="colbert" and never
-        # rerank=True, and so never reranked (2026-11-10).
-        reranker = LengthReranker()
-        mem = self.fill(reranker=reranker)
-        results = mem.recall(self.QUESTION, user_id="alice", top_k=10)
-        self.assertEqual(reranker.calls, 1)
-        self.assertTrue(all("maxsim_score" in r for r in results))
-        self.assertIn("marathon", results[0]["text"])
-
-    def test_rerank_false_skips_it(self):
-        reranker = LengthReranker()
-        mem = self.fill(reranker=reranker)
-        results = mem.recall(self.QUESTION, user_id="alice", top_k=10, rerank=False)
-        self.assertEqual(reranker.calls, 0)
-        self.assertFalse(any("maxsim_score" in r for r in results))
-
-    def test_rerank_true_loads_the_default_once(self):
-        import tsm.rerankers
-
-        made = []
-
-        class Fake(LengthReranker):
-            def __init__(self):
-                super().__init__()
-                made.append(self)
-
-        mem = self.fill()
-        real = tsm.rerankers.ColBertReranker
-        tsm.rerankers.ColBertReranker = Fake
-        try:
-            for _ in range(3):
-                mem.recall(self.QUESTION, user_id="alice", top_k=10, rerank=True)
-        finally:
-            tsm.rerankers.ColBertReranker = real
-        self.assertEqual(len(made), 1)
-        self.assertEqual(made[0].calls, 3)
-
-    def test_fusion_raises_the_reranker_s_best_most(self):
-        from tsm.memory import fuse_rerank
-
-        pool = [{"score": 0.50}, {"score": 0.49}, {"score": 0.48}]
-        fuse_rerank(pool, np.array([26.0, 26.1, 27.0], dtype=np.float32))
-        self.assertGreater(pool[2]["score"], pool[0]["score"])
-        self.assertGreater(pool[1]["score"] / 0.49, pool[0]["score"] / 0.50)
 
 
 if __name__ == "__main__":

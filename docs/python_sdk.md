@@ -1,7 +1,7 @@
 # Python SDK Reference (`tsm` & `turbomemory`)
 
 TurboSuperMemory provides two layers of Python interfaces:
-1. **High-Level Agent Framework Layer (`tsm`)**: Clean, turnkey API with automatic concept extraction, local/OpenAI embedders, and Stage-2 ColBERT late-interaction reranking.
+1. **High-Level Agent Framework Layer (`tsm`)**: Clean, turnkey API with automatic concept extraction, local or OpenAI embedders, belief revision and budget-aware recall.
 2. **Low-Level Native Engine Layer (`turbomemory`)**: Direct PyO3 C-extension bindings with zero-copy NumPy buffers and sub-millisecond bare-metal control.
 
 ---
@@ -15,19 +15,18 @@ The `Memory` class is the recommended entry point for AI agents, multi-agent fra
 ```python
 from tsm import Memory
 
-# 1. Initialize Memory with Stage-2 ColBERT Reranking
+# 1. Initialize Memory with a local embedder
 memory = Memory(
     db_path="./agent_memory_db",
     embedder="sentence_transformer",  # Uses local 'all-MiniLM-L6-v2' on CPU/GPU ($0.00 cost)
     extractor="passthrough",          # Store each message as-is (no LLM call on write)
-    reranker="colbert",               # Uses 'LiquidAI/LFM2.5-ColBERT-350M' on CUDA
 )
 
 # 2. Add memories (accepts string, dict, or list of dicts)
 memory.add("User's production telemetry port is 9443 on host alpha.prod.internal", user_id="alice")
 memory.add("User updated database password policy to 16 characters minimum", user_id="alice")
 
-# 3. Recall with cognitive fusion + ColBERT MaxSim reranking
+# 3. Recall with cognitive fusion
 results = memory.recall("What is the telemetry port?", user_id="alice", top_k=3)
 
 for r in results:
@@ -284,21 +283,25 @@ the same 115 questions it answered 94 against 98 (3 gained, 7 lost). It was
   API. `mem.engine.gpu_search_stats()` shows whether it is active. See
   [GPU acceleration](gpu_acceleration.md).
 
-### Supported Embedders & Rerankers
+### Supported Embedders
 
 ```python
-from tsm import Memory, SentenceTransformerEmbedder, ColBertReranker
+from tsm import Memory, SentenceTransformerEmbedder
 
-# Local open-source embedder + ColBERT on CUDA
+# Local open-source embedder on CUDA
 memory = Memory(
     db_path="./my_db",
     embedder=SentenceTransformerEmbedder(model_name="sentence-transformers/all-MiniLM-L6-v2", device="cuda"),
-    reranker=ColBertReranker(model_name="LiquidAI/LFM2.5-ColBERT-350M", device="cuda"),
 )
 
 # EmbeddingGemma 2, local and offline once cached (pip install "tsm[gemma]")
 memory = Memory("./my_db", embedder="gemma", extractor="passthrough")
 ```
+
+Of the two local embedders, EmbeddingGemma 2 finds more: on 115 LongMemEval
+questions (messages stored as said, 600 tokens of context) all the evidence
+was in the context for 101 against 83 with MiniLM, and for 99 with OpenAI's
+`text-embedding-3-small` (`benchmarks/PHASE_PROGRESS.md`, 2026-11-10).
 
 **Local Bonsai verifier.** Serve the PQ2 model with the
 [PrismML runtime](https://github.com/PrismML-Eng/llama.cpp/releases/tag/prism-b10777-e3de715)

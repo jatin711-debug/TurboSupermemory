@@ -534,8 +534,6 @@ recall results:
   configuration and raw output of the headline run (the per-question files
   are under `$TSM_EVAL_DIR/runs/`, outside the checkout), so a reader can
   check it.
-- The ColBERT reranker has never been judged. Either measure it
-  (`reread.py`, same contexts with and without) or stop offering it.
 - `docs/python_sdk.md` does not describe `keep_messages`, `extractor="none"`
   or `recall(now=...)`; the README and `tsm/README.md` do.
 

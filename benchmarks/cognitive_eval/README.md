@@ -79,8 +79,9 @@ python benchmarks/cognitive_eval/shipped_stack_eval.py --variant s --limit 500 \
 
 - The arms are listed in the script's docstring. `--config NAME:KEY=VALUE`
   adds an arm with any engine setting, `--recall NAME:KEY=VALUE` one with any
-  `recall()` argument, and `--pool N` builds each history from N
-  conversations so most of the store is distractors.
+  `recall()` argument (on the facts' store, or the one `--recall-store`
+  names), and `--pool N` builds each history from N conversations so most
+  of the store is distractors.
 - `--reader notes` asks the answering model with the SDK's prompt
   (`tsm.reading`); the default is the harness's plain prompt.
 - `--judge anthropic` reads and judges with Claude (key in `claude_key.txt`);

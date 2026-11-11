@@ -8,9 +8,8 @@ from .embedders import OpenAIEmbedder, SentenceTransformerEmbedder
 from .extractors import GlinerExtractor, OpenAIExtractor
 from .gist import ExtractiveGistSummarizer, OpenAIGistSummarizer
 from .identity import EmbedderMismatchError
-from .interfaces import AsymmetricEmbedder, Embedder, Extractor, Reranker, Verifier
+from .interfaces import AsymmetricEmbedder, Embedder, Extractor, Verifier
 from .memory import CONVERSATIONAL_PROFILE, Memory
-from .rerankers import ColBertReranker
 
 # Keep in step with `version` in pyproject.toml (checked by the unit tests).
 __version__ = "0.2.0"
@@ -26,13 +25,11 @@ __all__ = [
     "EmbedderMismatchError",
     "Extractor",
     "Verifier",
-    "Reranker",
     "OpenAIEmbedder",
     "SentenceTransformerEmbedder",
     "OpenAIExtractor",
     "GlinerExtractor",
     "OpenAIGistSummarizer",
     "ExtractiveGistSummarizer",
-    "ColBertReranker",
     "__version__",
 ]
