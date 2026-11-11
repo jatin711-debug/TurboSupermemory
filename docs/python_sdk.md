@@ -53,7 +53,7 @@ tokens. They are off because they did not pay when judged: the recovered
 memories help when recall has room for them and compete with the others
 when it does not. On 115 judged questions, 92 right against 86 with a
 600-token context, 82 against 90 with a 150-token one, neither difference
-statistically settled (`benchmarks/PHASE_PROGRESS.md`, 2026-10-12). Turn
+statistically settled (`git show e79d75f:benchmarks/PHASE_PROGRESS.md`, 2026-10-12). Turn
 them on when recall has room and nothing a user said may go unstored:
 `Memory(extractor=OpenAIExtractor(second_look=True, keep_unextracted=True))`.
 
@@ -108,7 +108,7 @@ the same 115 questions it answered 94 against 98 (3 gained, 7 lost). It was
   - `source` is the message the memory was extracted from. It is `None` for
     gists.
 - Two read-time options were measured, did not pay, and were removed on
-  2026-11-09 (`benchmarks/PHASE_PROGRESS.md`; the code is at
+  2026-11-09 (`git show e79d75f:benchmarks/PHASE_PROGRESS.md`; the code is at
   `git show 26092df:tsm/sources.py` and `git show 26092df:tsm/when.py`):
   - Source turns, `recall(..., sources="turn")`: search on the facts and
     return the turns they came from. At a 600-token budget this cost judged
@@ -129,7 +129,7 @@ the same 115 questions it answered 94 against 98 (3 gained, 7 lost). It was
   things came first, or which of two values is the newer one, has nothing
   else to go on: on 115 judged LongMemEval questions the tags gained 8
   answers and lost 1, on temporal and knowledge-update questions
-  (`benchmarks/PHASE_PROGRESS.md`, 2026-10-07). A gist is tagged with the
+  (`git show e79d75f:benchmarks/PHASE_PROGRESS.md`, 2026-10-07). A gist is tagged with the
   span of what it summarizes when that was dated (`[2023-01-05 to
   2023-03-02] ...`; added 2026-10-21, judged level 2026-10-28). The tags count against
   `token_budget`; `recall(..., time_tags=False)` leaves
@@ -194,9 +194,9 @@ the same 115 questions it answered 94 against 98 (3 gained, 7 lost). It was
     are not shown to a model. A fact it marks as superseded is ranked lower
     and flagged with `superseded_by`; its `context` is left as it is.
 
-  Measured on 127 held-out labeled pairs (`benchmarks/cognitive_eval/
-  belief_pairs_eval.py --split test`, MiniLM embeddings; details in
-  `benchmarks/PHASE_PROGRESS.md`):
+  Measured on 127 held-out labeled pairs (`belief_pairs_eval.py --split
+  test`, MiniLM embeddings; the scorer and its pairs were removed with the
+  evaluation harness on 2026-11-11, details in `git show e79d75f:benchmarks/PHASE_PROGRESS.md`):
 
   | verifier | real updates caught | still-true facts marked stale |
   |---|---|---|
@@ -211,7 +211,7 @@ the same 115 questions it answered 94 against 98 (3 gained, 7 lost). It was
   2026-10-19 with the shipped prompt, non-thinking mode, greedy decoding,
   batches of 8 and a 1,024-token output limit. It remains opt-in: catching
   more updates does not eliminate false supersessions. See the Bonsai follow-up
-  in `benchmarks/PHASE_PROGRESS.md` for the runtime and evaluation commands.
+  in `git show e79d75f:benchmarks/PHASE_PROGRESS.md` for the runtime and evaluation commands.
   The 9B model (same settings, MiniLM embeddings) caught fewer updates than
   the 4B and marked more true facts stale. It also failed the reply format on
   1 to 6 pairs per run. It needs about 3.2 GB of GPU memory with
@@ -248,7 +248,7 @@ the same 115 questions it answered 94 against 98 (3 gained, 7 lost). It was
   when compacted once and 0.411 when compacted four times as the
   conversation arrived, against 0.348 for Mem0 at the same allowance, 0.098
   for keeping only the newest facts, and 0.59 for the unbounded store
-  (`benchmarks/PHASE_PROGRESS.md`, 2026-10-07).
+  (`git show e79d75f:benchmarks/PHASE_PROGRESS.md`, 2026-10-07).
 - The engine's own cap is a different thing: `Memory(db, max_records=500,
   gist_summarizer=...)` is one count for the whole store. It keeps whatever
   was used or written most recently, whoever said it, and folds eviction
@@ -301,7 +301,7 @@ memory = Memory("./my_db", embedder="gemma", extractor="passthrough")
 Of the two local embedders, EmbeddingGemma 2 finds more: on 115 LongMemEval
 questions (messages stored as said, 600 tokens of context) all the evidence
 was in the context for 101 against 83 with MiniLM, and for 99 with OpenAI's
-`text-embedding-3-small` (`benchmarks/PHASE_PROGRESS.md`, 2026-11-10).
+`text-embedding-3-small` (`git show e79d75f:benchmarks/PHASE_PROGRESS.md`, 2026-11-10).
 
 **Local Bonsai verifier.** Serve the PQ2 model with the
 [PrismML runtime](https://github.com/PrismML-Eng/llama.cpp/releases/tag/prism-b10777-e3de715)
@@ -355,10 +355,9 @@ still-true facts stale (8 of 58 on MiniLM) and cost 10 of 77 questions their
 evidence at one history (p = 0.012). An embedder can declare `engine_defaults`, which
 `Memory` applies under the conversational profile and below anything passed to
 `Memory(...)`; EmbeddingGemma 2 declares 0.92 / 0.86, which on the held-out pairs
-marks 7 of 58 stale and costs 1 question (`benchmarks/PHASE_PROGRESS.md`,
-2026-10-19). Give any other new embedder the same check
-(`benchmarks/cognitive_eval/belief_pairs_eval.py --embed-model ...`) before trusting
-the profile with it.
+marks 7 of 58 stale and costs 1 question (`git show e79d75f:benchmarks/PHASE_PROGRESS.md`,
+2026-10-19). Any other embedder needs its own thresholds; the check that set
+these is at `git show e79d75f:benchmarks/cognitive_eval/belief_pairs_eval.py`.
 `truncate_dim=512` (also 256, 128) keeps the leading dimensions of a Matryoshka
 model and re-normalizes; `query_prompt_name="QuestionAnswering"` picks another of
 the model's prompts. Vectors are unit length, and the model is called under a lock

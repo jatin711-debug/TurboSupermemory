@@ -40,8 +40,8 @@ Status (2026-11-11): a prototype with unit tests, not yet measured. The cue
 rules are English and rule-based; the cosine floors for completion and
 replacement (``COMPLETION_MIN_COSINE``, ``RESCHEDULE_MIN_COSINE``) belong to an
 embedder's geometry and were not tuned on any. Its evaluation (PM-Bench,
-ProactiveBench; kill it if it does not beat a plain to-do ledger) is Phase 3
-of ``reports/Cognitive architecture for TurboSuperMemory.md``.
+ProactiveBench; kill it if it does not beat a plain to-do ledger) was never
+run (``LEARNINGS.md``).
 """
 
 import json

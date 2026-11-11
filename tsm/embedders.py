@@ -215,7 +215,7 @@ _MODEL_DEFAULTS = {
         # tuned on other embedders' vectors. On this one's, detection without a
         # verifier marks 30 of 58 still-true facts stale (8 of 58 on MiniLM) and
         # cost 10 of 77 questions their evidence at one history (p = 0.012); at
-        # 0.92 / 0.86 it costs 1 (benchmarks/PHASE_PROGRESS.md, 2026-10-19).
+        # 0.92 / 0.86 it costs 1 (e79d75f:benchmarks/PHASE_PROGRESS.md, 2026-10-19).
         "engine_defaults": {
             "refinement_cosine_threshold": 0.92,
             "contradiction_cosine_threshold": 0.86,

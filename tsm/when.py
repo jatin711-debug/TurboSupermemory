@@ -13,7 +13,7 @@ Until 2026-11-09 this module also wrote the date a relative time points to
 after it in a memory's text (``annotate``, ``recall(event_dates=True)``:
 "two weeks ago [week of 2023-05-08]"). Judged over 470 questions that came
 out level (8 gained, 4 lost) and it was removed
-(``benchmarks/PHASE_PROGRESS.md``, 2026-11-09).
+(``e79d75f:benchmarks/PHASE_PROGRESS.md``, 2026-11-09).
 """
 
 import math

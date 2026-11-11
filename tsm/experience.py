@@ -37,8 +37,8 @@ the memories' engine is untouched and no recall changes.
 
 Status (2026-11-11): a prototype with unit tests, not yet measured. Its
 evaluation (StreamBench, MemoryAgentBench test-time learning, Evo-Memory, five
-stream orders; kill it if it does not beat ExpRAG) is Phase 4 of
-``reports/Cognitive architecture for TurboSuperMemory.md``.
+stream orders; kill it if it does not beat ExpRAG) was never run
+(``LEARNINGS.md``).
 """
 
 import json

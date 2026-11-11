@@ -57,7 +57,7 @@ with Memory("./my_db") as mem:                       # conversational profile
   `time_tags="minute"` adds the time of day.
 - Each result also carries `source`, the message the fact was taken from.
   Two read-time options built on it were measured and removed on 2026-11-09
-  (`benchmarks/PHASE_PROGRESS.md`):
+  (`git show e79d75f:benchmarks/PHASE_PROGRESS.md`):
   - `sources="turn"` returned those messages in place of the facts. At a
     600-token budget it lost judged answers, because fewer turns than facts
     fit.
@@ -83,7 +83,7 @@ with Memory("./my_db") as mem:                       # conversational profile
   and date arithmetic wrong with the facts in front of it. On 355 judged
   LongMemEval questions that none of this was tuned on, this prompt at 600
   tokens answered 296 where the plain prompt at 150 answered 259
-  (`benchmarks/PHASE_PROGRESS.md`, 2026-10-21).
+  (`git show e79d75f:benchmarks/PHASE_PROGRESS.md`, 2026-10-21).
   A variant that gave the model tools for arithmetic, dates and counting
   (`tsm.answering`) answered 94 of 115 against 98 and was removed on
   2026-11-09.
@@ -130,13 +130,13 @@ with Memory("./my_db") as mem:                       # conversational profile
 
 ## The executive (a prototype, opt-in, not yet measured)
 
-Control loops around the store, from
-`reports/Cognitive architecture for TurboSuperMemory.md`. None of them changes
-what `recall()` returns. Each part still has to beat the baseline named in its
-phase of that report before it is kept. The read-time monitor
+Control loops around the store. None of them changes what `recall()`
+returns. None was measured: intentions were to be judged against a plain
+to-do ledger and lessons against retrieving the raw past episodes
+([LEARNINGS.md](../LEARNINGS.md)). The read-time monitor
 (`checked_recall`) did not, and was removed on 2026-11-11: no second look,
 free or judged, got evidence into a LongMemEval-S context that lacked it,
-and both lost some (`benchmarks/PHASE_PROGRESS.md`).
+and both lost some (`git show e79d75f:benchmarks/PHASE_PROGRESS.md`).
 
 ```python
 mem = Memory("./db", intentions=True, experience=True)
@@ -209,7 +209,7 @@ served again, so derived text goes too (`tsm/forgetting.py`):
   recall: with a 600-token context it answered more questions (92 of 115
   against 86), with a 150-token one fewer (82 against 90), because the
   recovered memories compete for the same few slots. Neither difference is
-  statistically settled (`benchmarks/PHASE_PROGRESS.md`, 2026-10-12), which
+  statistically settled (`git show e79d75f:benchmarks/PHASE_PROGRESS.md`, 2026-10-12), which
   is why the default stores only the first prompt's facts.
 - Only well-formed replies are cached, under a key that includes the prompt.
 - `OpenAIEmbedder(dim=512)` asks the API for 512-dimensional vectors

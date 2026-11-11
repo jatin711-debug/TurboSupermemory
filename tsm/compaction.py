@@ -4,7 +4,8 @@ When a user's memories no longer fit the budget, the newest facts are kept as
 they are (what the user said first, then what the assistant said) and
 everything older is folded into a few short gists: forget detail, keep gist.
 This is the policy the bounded-storage evaluations measured
-(``benchmarks/cognitive_eval/bounded_head_to_head.py``), and it is rolling: on
+(``e79d75f:benchmarks/PHASE_PROGRESS.md``; the runner, ``bounded_head_to_head.py``,
+was removed on 2026-11-11), and it is rolling: on
 a later pass the earlier gists are folded again together with the facts that
 have aged out since, so the store stays within its budget however long the
 history grows.
@@ -133,7 +134,7 @@ def plan_compaction(
     - ``"refold"`` (default): every earlier gist is summarized again with
       what ages out, on every pass. A fact is rewritten once per pass, and
       compacting four times as a conversation arrived scored 0.411 where
-      compacting once scored 0.464 (``benchmarks/PHASE_PROGRESS.md``).
+      compacting once scored 0.464 (``e79d75f:benchmarks/PHASE_PROGRESS.md``).
     - ``"merge_oldest"``: earlier gists stay as they are. What ages out
       becomes new gists, and only while the gists exceed their share are the
       two oldest gists of one role and of the lowest level merged into one

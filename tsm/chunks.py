@@ -3,7 +3,7 @@
 Extraction is lossy. On LongMemEval the extractor stores nothing from about a
 third of user messages, and on the 355 held-out questions every one whose
 evidence missed the context had an evidence turn with no fact taken from it
-(``benchmarks/cognitive_eval/evidence_rank_report.py``, 2026-10-28). Systems
+(the harness's ``evidence_rank_report.py``, 2026-10-28). Systems
 that keep the raw log next to what they derive from it lose less (Scroll,
 arXiv 2608.21690; Eywa, 2605.30771), and from a few hundred tokens of context
 up, raw text read back beats consolidated text (Retain or Consolidate,

@@ -18,10 +18,12 @@ that answers.
   search.
 - **`turbomemory-server`**: the same engine behind gRPC and REST.
 
-Beta, one maintainer. Every number on this page comes from this repository's
-own runs. Each has a dated entry with its command, sample size and caveats in
-[`benchmarks/PHASE_PROGRESS.md`](./benchmarks/PHASE_PROGRESS.md), including the
-experiments that failed.
+Built to learn how a memory layer for agents works, by one maintainer.
+Every number on this page comes from this repository's own runs. What they
+taught, layer by layer, is in [`LEARNINGS.md`](./LEARNINGS.md). The lab
+notebook, with each run's command, sample size and caveats (including the
+experiments that failed), and the evaluation harness were removed once the
+questions were answered: `git show e79d75f:benchmarks/PHASE_PROGRESS.md`.
 
 ---
 
@@ -333,27 +335,29 @@ cargo test --workspace --exclude turbomemory_python
 make build-python
 make test-python
 
-# All of the above plus the evaluation smoke tests: the merge gate
+# All of the above plus a synthetic belief-revision check and the ANN
+# recall floor, against a release build: the merge gate
 make gate
 ```
 
 - The toolchain is pinned in `rust-toolchain.toml`. Building the API crate
   needs `protoc`.
-- `make gate` needs the LongMemEval data (`make download-eval-data`) and a
-  cached `all-MiniLM-L6-v2` model. It is run locally before merging.
+- `make gate` needs no datasets, models or keys. It is run locally before
+  merging.
 - CI ([`.github/workflows/ci.yml`](./.github/workflows/ci.yml)) runs the
   format check, clippy, the Rust suite and the SDK unit suite on Linux. It
   runs no evaluations. Windows is covered by the local gate; the CUDA build is
   tested by hand.
-- The evaluation harness and how to reproduce the numbers above:
-  [`benchmarks/cognitive_eval/README.md`](./benchmarks/cognitive_eval/README.md).
+- The evaluation harness that produced the numbers above was removed on
+  2026-11-11. To rerun one, check out `e79d75f` and follow
+  `benchmarks/cognitive_eval/README.md` there.
 
 ---
 
 ## Known limits
 
-The open work is listed in [`TODO.md`](./TODO.md). The ones a user should know
-first:
+The questions left open are at the end of [`LEARNINGS.md`](./LEARNINGS.md).
+The limits a user should know first:
 
 - **Treat a store as single-tenant.** Scopes bound search, but the eviction
   cap, importance normalization and concept vocabulary are shared, and the

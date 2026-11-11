@@ -19,7 +19,7 @@ measured. Two steps recover such a message, and both are off by default.
 ``second_look`` asks about it again with a second prompt, which asks what
 the speaker reveals; ``keep_unextracted`` stores its statements as they were
 said when the model still finds nothing. They are off because they did not
-pay when judged (``benchmarks/PHASE_PROGRESS.md``, 2026-10-12): with a
+pay when judged (``e79d75f:benchmarks/PHASE_PROGRESS.md``, 2026-10-12): with a
 600-token context and the ``tsm.reading`` prompt the recovered memories
 changed 11 answers of 115, 6 for the better and 5 for the worse, and with a
 150-token context they scored lower, because they compete with the other

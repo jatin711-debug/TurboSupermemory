@@ -332,7 +332,7 @@ class Memory:
                 (compaction does not fold passages yet). On LongMemEval-S
                 (29 questions, judged) it answered 27 where the facts alone
                 answered 19 at 2,000 tokens of context, and 25 against 20 at
-                1,200 (``benchmarks/PHASE_PROGRESS.md``, 2026-10-29). With
+                1,200 (``e79d75f:benchmarks/PHASE_PROGRESS.md``, 2026-10-29). With
                 ``extractor="none"`` it is the whole store: 26 of the 29.
             allow_embedder_change: open a database with an embedder other
                 than the one that wrote it (``EmbedderMismatchError``
@@ -856,7 +856,7 @@ class Memory:
         question is not being asked today (a replayed conversation, a
         benchmark): on LongMemEval-S it brought all the evidence of 3 more of
         127 temporal questions into a 2,000-token context and lost none
-        (``benchmarks/PHASE_PROGRESS.md``, 2026-11-06).
+        (``e79d75f:benchmarks/PHASE_PROGRESS.md``, 2026-11-06).
 
         ``recall()`` is a read: asking does not change what the next call
         returns. Use ``reinforce()`` to tell the memory which results were

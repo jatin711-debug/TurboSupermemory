@@ -46,8 +46,8 @@ This keeps write latency low while optimizing search speeds for old/cold memorie
 
 ### 2.3 Adaptive Prompt Budget Saliency (Submodular MMR)
 For agent prompt generation under tight token limits (150, 300, 1000+ tokens):
-* **The token budget bounds the set**: selection continues until the budget is full, from a candidate pool that grows with the budget. An optional `max_items` limits the count as well. (An earlier fixed cap, `min(10, max(4, token_budget // 35))`, used about half of the budget with short memories and cost judged accuracy; see `benchmarks/PHASE_PROGRESS.md`, 2026-10-07.)
-* **Semantic Redundancy Gate (`red > 0.95`)**: Skips a memory that says the same thing as one already chosen; anything less alike is only penalized. (The gate was `0.72` once. Memories that read alike are often different instances a question needs together, and that cutoff dropped them; see `benchmarks/PHASE_PROGRESS.md`.)
+* **The token budget bounds the set**: selection continues until the budget is full, from a candidate pool that grows with the budget. An optional `max_items` limits the count as well. (An earlier fixed cap, `min(10, max(4, token_budget // 35))`, used about half of the budget with short memories and cost judged accuracy; see `git show e79d75f:benchmarks/PHASE_PROGRESS.md`, 2026-10-07.)
+* **Semantic Redundancy Gate (`red > 0.95`)**: Skips a memory that says the same thing as one already chosen; anything less alike is only penalized. (The gate was `0.72` once. Memories that read alike are often different instances a question needs together, and that cutoff dropped them; see [LEARNINGS.md](../LEARNINGS.md).)
 * **Cross-Turn Coverage Bonus (`+0.20`)**: Rewards facts from distinct temporal sessions to excel at multi-session reasoning.
 
 ### 2.4 The Split-Persistence Model (WAL + redb)
@@ -259,25 +259,8 @@ For in-depth explanations of specific features, browse the detailed sub-document
 
 ---
 
-## 5. Roadmap and Development Status
+## 5. Status
 
-The development of TurboSuperMemory follows a structured progression outlined in [TODO.md](file:///d:/personal-projects/TurboSuperMemory/TODO.md):
-
-* **Stage 1: Cognitive Deepening (Completed 2026-06-21)**
-  * [x] **C1: Contradiction Detection** (Belief revision, weakening outdated records).
-  * [x] **C2: Automatic Importance Scoring** (Salience-based moving averages, edge weight re-scaling).
-  * [x] **C3: Online Concept Vocabulary Evolution** (Alias co-occurrence merging, hub suppression).
-  * [x] **C4: Per-Agent Memory Scoping** (Bitmap-based multi-tenant namespace isolation).
-  * [x] **C5: Real-Embedding Cognitive Scale Benchmark** (768-dim clustered GMM testing with 1000+ distractors).
-  * [x] **C6: Pluggable LLM Working Memory Compressor** (Bridge PyO3 custom callbacks).
-  * [x] **C7: Graph Introspection API** (Stats, concept degrees, refinements, contradictions).
-  * [x] **C8: Automated Concept Extraction** (TF ranking, length bonuses, alias mapping).
-* **Stage 1.5: GPU Acceleration (Completed 2026-06-21)**
-  * [x] **G1: GPU Backend Trait** (`GpuBackend` with `CudaBackend` + `CpuFallback`).
-  * [x] **G2: cuBLAS Batched Distance** (cuBLAS `sgemv` for exact scan and rerank).
-  * [x] **G3: CUDA HNSW Build** (removed 2026-10-06: the graph it built was never searched and doubled sealing time).
-  * [x] **G4: GPU Integration** (Storage engine integration, Python `gpu_accelerated` property).
-* **Stage 2: Structural Scaling (In Progress / Next)**
-  * [ ] **S1: Collection Sharding** (Distribute partitions).
-  * [ ] **S2: Asynchronous index builds** (Improve SealedHot build performance).
-  * [ ] **S3: Memory-mapped indices** (Scale storage bounds).
+TSM was built to learn how a memory layer for agents works, and that work is
+done. What the experiments showed, the open questions, and where removed code
+lives are in [LEARNINGS.md](../LEARNINGS.md).
