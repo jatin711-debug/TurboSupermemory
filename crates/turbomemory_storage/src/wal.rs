@@ -23,7 +23,12 @@ pub const WAL_FILE: &str = "wal_meta.bin";
 const WAL_MAGIC: &[u8; 4] = b"TMSW";
 /// Version 1 logged inserts without a vector checksum and had no `Replace`.
 const WAL_VERSION_1: u32 = 1;
-const WAL_VERSION: u32 = 2;
+/// Version 2 had no `SetPayload`. Its frames decode as the current `WalOp`
+/// (the new operation was added last, so the variant numbers are the same);
+/// the version is bumped so that an older build refuses a log it cannot read
+/// instead of cutting it off at the first `SetPayload` as a corrupt tail.
+const WAL_VERSION_2: u32 = 2;
+const WAL_VERSION: u32 = 3;
 pub const WAL_HEADER_SIZE: usize = 8;
 /// Bytes of framing around each payload (length prefix + checksum).
 const FRAME_OVERHEAD: u64 = 8;
@@ -55,6 +60,14 @@ pub enum WalOp {
         seq: u64,
         meta: MetaRecord,
         vector_crc: u32,
+    },
+    /// Replace the payload of the record at `offset`, in place: same offset,
+    /// same insert sequence, same vector. Logs a whole new payload, never a
+    /// difference, so replaying it twice is harmless. Added in version 3;
+    /// keep it the last variant.
+    SetPayload {
+        offset: PointOffset,
+        payload: Option<String>,
     },
 }
 
@@ -138,7 +151,7 @@ impl Wal {
                 ));
             }
             let version = u32::from_ne_bytes([header[4], header[5], header[6], header[7]]);
-            if version != WAL_VERSION && version != WAL_VERSION_1 {
+            if !matches!(version, WAL_VERSION | WAL_VERSION_2 | WAL_VERSION_1) {
                 return Err(crate::StorageError::InvalidArgument(format!(
                     "WAL version {version} not supported"
                 )));
@@ -501,5 +514,58 @@ mod tests {
         assert!(!wal.needs_upgrade());
         wal.append(&insert(1, "a")).unwrap();
         assert_eq!(read_all(&wal).0.len(), 1);
+    }
+
+    /// A version-2 log decodes as the current operation set (`SetPayload`
+    /// was added last) and is upgraded by `clear`, like version 1.
+    #[test]
+    fn version_2_log_is_readable_and_upgraded_on_clear() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(WAL_FILE);
+        let payload = bincode::serialize(&insert(7, "v2")).unwrap();
+        let mut bytes = header_bytes(WAL_VERSION_2).to_vec();
+        bytes.write_u32::<BigEndian>(payload.len() as u32).unwrap();
+        bytes.extend_from_slice(&payload);
+        bytes
+            .write_u32::<BigEndian>(crc32fast::hash(&payload))
+            .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut wal = Wal::open(tmp.path()).unwrap();
+        assert!(wal.needs_upgrade());
+        let (ops, _, _) = read_all(&wal);
+        assert!(matches!(&ops[..], [WalOp::Insert { offset: 7, .. }]));
+        wal.clear().unwrap();
+        assert!(!wal.needs_upgrade());
+    }
+
+    #[test]
+    fn set_payload_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(tmp.path()).unwrap();
+        wal.append(&WalOp::SetPayload {
+            offset: 3,
+            payload: Some(r#"{"status":"done"}"#.into()),
+        })
+        .unwrap();
+        wal.append(&WalOp::SetPayload {
+            offset: 4,
+            payload: None,
+        })
+        .unwrap();
+        let (ops, _, _) = read_all(&wal);
+        assert!(matches!(
+            &ops[..],
+            [
+                WalOp::SetPayload {
+                    offset: 3,
+                    payload: Some(_)
+                },
+                WalOp::SetPayload {
+                    offset: 4,
+                    payload: None
+                }
+            ]
+        ));
     }
 }

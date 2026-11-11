@@ -40,7 +40,94 @@ pub enum Filter {
     Not(Box<Filter>),
 }
 
+/// How deeply `Filter::from_json` lets filters nest. A filter is caller input
+/// (REST, Python) and is parsed recursively; the cap keeps a hostile one from
+/// exhausting the stack.
+pub const MAX_FILTER_DEPTH: usize = 32;
+
 impl Filter {
+    /// Parse the JSON filter DSL shared by the REST API and the Python
+    /// binding:
+    ///
+    /// - `{"op": "eq", "field": "<name>", "value": <json>}`
+    /// - `{"op": "range", "field": "<name>", "low": <number>, "high": <number>,
+    ///   "low_inclusive": bool, "high_inclusive": bool}` (either bound may be
+    ///   left out; both are inclusive unless said otherwise)
+    /// - `{"op": "full_text", "field": "<name>", "query": "<text>"}`
+    /// - `{"op": "and" | "or", "filters": [ ... ]}`
+    /// - `{"op": "not", "filter": { ... }}`
+    ///
+    /// Nesting deeper than [`MAX_FILTER_DEPTH`] is rejected. The error is a
+    /// message for the caller.
+    pub fn from_json(value: &Value) -> Result<Filter, String> {
+        Self::from_json_at(value, 0)
+    }
+
+    fn from_json_at(value: &Value, depth: usize) -> Result<Filter, String> {
+        if depth >= MAX_FILTER_DEPTH {
+            return Err(format!(
+                "filter nesting exceeds the maximum depth of {MAX_FILTER_DEPTH}"
+            ));
+        }
+        let obj = value
+            .as_object()
+            .ok_or_else(|| "filter must be a JSON object".to_string())?;
+        let op = obj
+            .get("op")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "filter missing op".to_string())?;
+        let field = |what: &str| -> Result<String, String> {
+            obj.get("field")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| format!("{what} missing field"))
+        };
+        let list = |what: &str| -> Result<Vec<Filter>, String> {
+            obj.get("filters")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| format!("{what} missing filters"))?
+                .iter()
+                .map(|v| Self::from_json_at(v, depth + 1))
+                .collect()
+        };
+        let bound = |value: &str, inclusive: &str| -> Bound<f64> {
+            match obj.get(value).and_then(|v| v.as_f64()) {
+                None => Bound::Unbounded,
+                Some(v) if obj.get(inclusive).and_then(|b| b.as_bool()).unwrap_or(true) => {
+                    Bound::Included(v)
+                }
+                Some(v) => Bound::Excluded(v),
+            }
+        };
+        Ok(match op {
+            "eq" => Filter::Eq {
+                field: field("eq")?,
+                value: obj.get("value").cloned().unwrap_or(Value::Null),
+            },
+            "range" => Filter::Range {
+                field: field("range")?,
+                low: bound("low", "low_inclusive"),
+                high: bound("high", "high_inclusive"),
+            },
+            "full_text" => Filter::FullText {
+                field: field("full_text")?,
+                query: obj
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "full_text missing query".to_string())?
+                    .to_string(),
+            },
+            "and" => Filter::And(list("and")?),
+            "or" => Filter::Or(list("or")?),
+            "not" => Filter::Not(Box::new(Self::from_json_at(
+                obj.get("filter")
+                    .ok_or_else(|| "not missing filter".to_string())?,
+                depth + 1,
+            )?)),
+            other => return Err(format!("unknown op: {other}")),
+        })
+    }
+
     /// Returns true if this filter (recursively) contains a full-text query.
     pub fn uses_full_text(&self) -> bool {
         match self {
@@ -330,6 +417,42 @@ mod tests {
 
     fn payload(json: &str) -> Option<&str> {
         Some(json)
+    }
+
+    #[test]
+    fn json_filters_parse_and_match() {
+        let mut idx = PayloadIndex::new();
+        idx.add(1, payload(r#"{"status":"pending","due":5}"#))
+            .unwrap();
+        idx.add(2, payload(r#"{"status":"pending","due":50}"#))
+            .unwrap();
+        idx.add(3, payload(r#"{"status":"done","due":1}"#)).unwrap();
+        let parse = |s: &str| Filter::from_json(&serde_json::from_str(s).unwrap());
+        let due_pending = parse(
+            r#"{"op":"and","filters":[
+                {"op":"eq","field":"status","value":"pending"},
+                {"op":"range","field":"due","high":10}]}"#,
+        )
+        .unwrap();
+        assert_eq!(idx.query(&due_pending).iter().collect::<Vec<_>>(), vec![1]);
+        let open_low =
+            parse(r#"{"op":"range","field":"due","low":5,"low_inclusive":false}"#).unwrap();
+        assert_eq!(idx.query(&open_low).iter().collect::<Vec<_>>(), vec![2]);
+        let not_done =
+            parse(r#"{"op":"not","filter":{"op":"eq","field":"status","value":"done"}}"#).unwrap();
+        assert_eq!(idx.query(&not_done).iter().collect::<Vec<_>>(), vec![1, 2]);
+
+        assert!(parse(r#"{"field":"x"}"#).unwrap_err().contains("op"));
+        assert!(parse(r#"{"op":"eq"}"#).unwrap_err().contains("field"));
+        assert!(parse(r#"{"op":"nope"}"#)
+            .unwrap_err()
+            .contains("unknown op"));
+        assert!(parse("[1]").is_err());
+        let mut deep = serde_json::json!({"op": "eq", "field": "f", "value": 1});
+        for _ in 0..MAX_FILTER_DEPTH {
+            deep = serde_json::json!({"op": "not", "filter": deep});
+        }
+        assert!(Filter::from_json(&deep).unwrap_err().contains("depth"));
     }
 
     #[test]

@@ -867,6 +867,27 @@ impl StorageEngine {
         })
     }
 
+    /// The ids of the live records a payload filter and/or scope match, in
+    /// insertion order (by offset). No vector work and no access counting:
+    /// this is a lookup in the payload and scope indexes, for maintenance
+    /// that has to find records by what their payload says (a status, a
+    /// source, a due date). With neither a filter nor a scope it lists
+    /// every record.
+    pub fn ids_where(
+        &self,
+        filter: Option<&Filter>,
+        scope: Option<&str>,
+    ) -> crate::Result<Vec<String>> {
+        let allowed = match self.allowed_offsets(filter, scope)? {
+            Some(bitmap) => bitmap,
+            None => self.payload_index.read().all_offsets().clone(),
+        };
+        Ok(allowed
+            .iter()
+            .filter_map(|offset| self.meta.id_of(offset as PointOffset))
+            .collect())
+    }
+
     /// The stored embeddings of `ids`, one row of `dimension` values each,
     /// flattened, and whether each id was found. The row of an id that is
     /// not live is all zeros.

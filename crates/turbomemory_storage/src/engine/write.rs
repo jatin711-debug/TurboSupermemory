@@ -415,7 +415,18 @@ impl StorageEngine {
         }
         self.meta.remove(offset)?;
         self.id_index.write().remove(id);
-        self.graph.write().remove_memory(id);
+        // The memories this one superseded lose that edge with it, so their
+        // demotion has to be worked out again: a fact must not stay ranked
+        // down for a replacement that no longer exists.
+        let replaced = {
+            let mut graph = self.graph.write();
+            let replaced = graph.graph().superseded_by_memory(id);
+            graph.remove_memory(id);
+            replaced
+        };
+        for old_id in replaced {
+            self.recompute_demotion(&old_id);
+        }
         Ok(())
     }
 
@@ -509,5 +520,74 @@ impl StorageEngine {
         self.remove_from_indexes(id, old_offset)?;
         self.update_worker.submit_and_wait(vec![(offset, record)])?;
         Ok(true)
+    }
+
+    /// Replace the payloads of existing records in place, keeping each
+    /// record's offset, insert sequence, vector, concepts and graph edges.
+    ///
+    /// This is the write for state that changes after a record is stored (a
+    /// status, a counter, a validity date). `update` would re-embed nothing
+    /// here but would still move the record to a new offset with a new
+    /// insert sequence, which reorders it against the records belief
+    /// revision compares it with, and drops its graph edges.
+    ///
+    /// Every payload is checked before anything changes (all-or-nothing, like
+    /// a batch insert); ids that do not exist are skipped. The whole batch is
+    /// one WAL append. Returns how many records were changed.
+    pub fn set_payloads(&self, patches: &[(String, Option<String>)]) -> crate::Result<usize> {
+        for (id, payload) in patches {
+            if id.is_empty() {
+                return Err(StorageError::InvalidArgument("id must not be empty".into()));
+            }
+            if let Some(payload) = payload.as_deref() {
+                serde_json::from_str::<serde::de::IgnoredAny>(payload).map_err(|e| {
+                    StorageError::InvalidArgument(format!("invalid payload JSON: {e}"))
+                })?;
+            }
+        }
+        let _flush_guard = self.flush_barrier.read();
+        let _write_guard = self.write_lock.lock();
+        // The last patch of an id wins, as it would applied one by one.
+        let mut targets: Vec<(PointOffset, MetaRecord, Option<String>)> = Vec::new();
+        {
+            let id_index = self.id_index.read();
+            let mut position: std::collections::HashMap<PointOffset, usize> =
+                std::collections::HashMap::new();
+            for (id, payload) in patches {
+                let Some(&offset) = id_index.get(id.as_str()) else {
+                    continue;
+                };
+                let Some(rec) = self.meta.get(offset)? else {
+                    continue;
+                };
+                match position.get(&offset) {
+                    Some(&k) => targets[k].2 = payload.clone(),
+                    None => {
+                        position.insert(offset, targets.len());
+                        targets.push((offset, rec, payload.clone()));
+                    }
+                }
+            }
+        }
+        if targets.is_empty() {
+            return Ok(0);
+        }
+        let ops: Vec<WalOp> = targets
+            .iter()
+            .map(|(offset, _, payload)| WalOp::SetPayload {
+                offset: *offset,
+                payload: payload.clone(),
+            })
+            .collect();
+        self.log(&ops)?;
+        let mut payload_index = self.payload_index.write();
+        for (offset, mut rec, payload) in targets.iter().cloned() {
+            payload_index.remove(offset, rec.payload.as_deref());
+            // Validated above, so indexing cannot fail on the JSON.
+            payload_index.add(offset, payload.as_deref())?;
+            rec.payload = payload;
+            self.meta.put_meta(offset, &rec)?;
+        }
+        Ok(targets.len())
     }
 }

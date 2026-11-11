@@ -304,6 +304,19 @@ impl StorageEngine {
                     report.wal_ops_replayed += 1;
                     replayed = true;
                 }
+                WalOp::SetPayload { offset, payload } => {
+                    // A whole payload, not a difference: applying it to a
+                    // record the snapshot already has in its final state is
+                    // harmless. A record gone since (a later delete in this
+                    // log, or a vector that never reached the file) is
+                    // skipped.
+                    if let Some(mut rec) = meta.get(offset)? {
+                        rec.payload = payload;
+                        meta.put_meta(offset, &rec)?;
+                        report.wal_ops_replayed += 1;
+                        replayed = true;
+                    }
+                }
                 WalOp::Flush { .. } => {}
             }
         }

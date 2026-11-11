@@ -3035,3 +3035,216 @@ fn pack_under_budget_uses_stored_vectors() {
         .pack_under_budget(&ids, &[0.9], &[five], &[], &params)
         .is_err());
 }
+
+// ---------------------------------------------------- payload patches, ledger
+
+fn insert_status(engine: &StorageEngine, id: &str, idx: usize, status: &str, scope: &str) {
+    engine
+        .insert_with_payload(
+            id,
+            &format!("record {id}"),
+            &make_vec(8, idx),
+            1.0,
+            &[],
+            Some(format!(r#"{{"status":"{status}","due":{idx}}}"#)),
+            Some(scope.to_string()),
+        )
+        .unwrap();
+}
+
+fn status_filter(status: &str) -> Filter {
+    Filter::Eq {
+        field: "status".into(),
+        value: serde_json::json!(status),
+    }
+}
+
+#[test]
+fn set_payloads_patches_in_place_and_reindexes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+    insert_status(&engine, "a", 0, "pending", "u1");
+    insert_status(&engine, "b", 1, "pending", "u1");
+    insert_status(&engine, "c", 2, "pending", "u2");
+    let before = engine.find_meta_by_id("a").unwrap();
+    let offset = *engine.id_index.read().get("a").unwrap();
+
+    let changed = engine
+        .set_payloads(&[
+            ("a".into(), Some(r#"{"status":"done","due":0}"#.into())),
+            ("missing".into(), Some("{}".into())),
+        ])
+        .unwrap();
+    assert_eq!(changed, 1, "unknown ids are skipped");
+
+    let after = engine.find_meta_by_id("a").unwrap();
+    assert_eq!(after.insert_seq, before.insert_seq, "same insert sequence");
+    assert_eq!(
+        *engine.id_index.read().get("a").unwrap(),
+        offset,
+        "same offset"
+    );
+    assert_eq!(
+        after.payload.as_deref(),
+        Some(r#"{"status":"done","due":0}"#)
+    );
+    assert_eq!(
+        engine
+            .ids_where(Some(&status_filter("pending")), None)
+            .unwrap(),
+        vec!["b".to_string(), "c".to_string()]
+    );
+    assert_eq!(
+        engine
+            .ids_where(Some(&status_filter("done")), None)
+            .unwrap(),
+        vec!["a".to_string()]
+    );
+    assert_eq!(
+        engine
+            .ids_where(Some(&status_filter("pending")), Some("u1"))
+            .unwrap(),
+        vec!["b".to_string()]
+    );
+    let due = Filter::Range {
+        field: "due".into(),
+        low: std::ops::Bound::Unbounded,
+        high: std::ops::Bound::Included(1.0),
+    };
+    assert_eq!(
+        engine.ids_where(Some(&due), None).unwrap(),
+        vec!["a".to_string(), "b".to_string()]
+    );
+    assert_eq!(engine.ids_where(None, None).unwrap().len(), 3);
+
+    // The last patch of an id in one batch wins; a bad payload rejects all.
+    engine
+        .set_payloads(&[
+            ("b".into(), Some(r#"{"status":"x"}"#.into())),
+            ("b".into(), Some(r#"{"status":"y"}"#.into())),
+        ])
+        .unwrap();
+    assert_eq!(
+        engine.ids_where(Some(&status_filter("y")), None).unwrap(),
+        vec!["b".to_string()]
+    );
+    assert!(engine
+        .ids_where(Some(&status_filter("x")), None)
+        .unwrap()
+        .is_empty());
+    assert!(engine
+        .set_payloads(&[
+            ("c".into(), Some(r#"{"status":"z"}"#.into())),
+            ("a".into(), Some("{not json".into())),
+        ])
+        .is_err());
+    assert!(engine
+        .ids_where(Some(&status_filter("z")), None)
+        .unwrap()
+        .is_empty());
+    // Search sees the record as before.
+    let hits = engine.search_ann(&make_vec(8, 0), 1).unwrap();
+    assert_eq!(hits[0].0, "a");
+}
+
+#[test]
+fn set_payloads_survive_flush_and_unclean_stop() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+        insert_status(&engine, "a", 0, "pending", "u1");
+        insert_status(&engine, "b", 1, "pending", "u1");
+        engine
+            .set_payloads(&[("a".into(), Some(r#"{"status":"flushed"}"#.into()))])
+            .unwrap();
+        engine.flush().unwrap();
+        // After the flush: only the log has these, and no flush follows.
+        engine
+            .set_payloads(&[
+                ("b".into(), Some(r#"{"status":"logged"}"#.into())),
+                ("a".into(), None),
+            ])
+            .unwrap();
+    }
+    let engine = StorageEngine::open(tmp.path(), small_config(8)).unwrap();
+    assert!(engine.recovery_report().wal_ops_replayed >= 2);
+    assert_eq!(engine.find_meta_by_id("a").unwrap().payload, None);
+    assert_eq!(
+        engine
+            .ids_where(Some(&status_filter("logged")), None)
+            .unwrap(),
+        vec!["b".to_string()]
+    );
+    assert!(engine
+        .ids_where(Some(&status_filter("flushed")), None)
+        .unwrap()
+        .is_empty());
+}
+
+fn supersession_pair(engine: &StorageEngine) {
+    engine
+        .insert("old", "lives in Paris", &make_vec(8, 0), 1.0, &[])
+        .unwrap();
+    engine
+        .insert("new", "lives in Lisbon", &make_vec(8, 1), 1.0, &[])
+        .unwrap();
+    let pairs = [(
+        "old".to_string(),
+        "new".to_string(),
+        SupersessionKind::Contradiction,
+    )];
+    assert_eq!(engine.commit_supersessions_by_id(&pairs).unwrap(), 1);
+}
+
+fn demotion_of(engine: &StorageEngine, id: &str) -> f32 {
+    let offset = *engine.id_index.read().get(id).unwrap();
+    engine.meta.demotion_factor(offset)
+}
+
+#[test]
+fn retracting_a_supersession_restores_the_old_fact() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = small_config(8);
+    config.tier.supersession_demotion_factor = 0.4;
+    {
+        let engine = StorageEngine::open(tmp.path(), config.clone()).unwrap();
+        supersession_pair(&engine);
+        assert!((demotion_of(&engine, "old") - 0.4).abs() < 1e-6);
+        assert!(engine.resolve_beliefs(&["old".into()])[0].superseded);
+
+        let pairs = [("old".to_string(), "new".to_string())];
+        assert_eq!(engine.retract_supersessions_by_id(&pairs).unwrap(), 1);
+        assert_eq!(engine.retract_supersessions_by_id(&pairs).unwrap(), 0);
+        assert_eq!(demotion_of(&engine, "old"), 1.0);
+        assert!(!engine.resolve_beliefs(&["old".into()])[0].superseded);
+        engine.flush().unwrap();
+    }
+    let engine = StorageEngine::open(tmp.path(), config).unwrap();
+    assert_eq!(demotion_of(&engine, "old"), 1.0, "persisted");
+    assert!(!engine.resolve_beliefs(&["old".into()])[0].superseded);
+}
+
+#[test]
+fn deleting_the_replacement_reverts_the_demotion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = small_config(8);
+    config.tier.supersession_demotion_factor = 0.4;
+    let engine = StorageEngine::open(tmp.path(), config).unwrap();
+    supersession_pair(&engine);
+    engine
+        .insert("newer", "lives in Porto", &make_vec(8, 2), 1.0, &[])
+        .unwrap();
+    let pairs = [(
+        "old".to_string(),
+        "newer".to_string(),
+        SupersessionKind::Refinement,
+    )];
+    engine.commit_supersessions_by_id(&pairs).unwrap();
+    assert!((demotion_of(&engine, "old") - 0.3).abs() < 1e-6, "floored");
+
+    assert!(engine.delete_by_id("new").unwrap());
+    assert!((demotion_of(&engine, "old") - 0.4).abs() < 1e-6, "one left");
+    assert!(engine.delete_by_id("newer").unwrap());
+    assert_eq!(demotion_of(&engine, "old"), 1.0, "nothing replaces it now");
+    assert!(!engine.resolve_beliefs(&["old".into()])[0].superseded);
+}

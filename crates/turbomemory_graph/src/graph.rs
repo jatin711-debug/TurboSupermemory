@@ -1566,6 +1566,80 @@ impl MemoryGraph {
             .unwrap_or_default()
     }
 
+    /// The memories `id` has superseded: the sources of `Refines` /
+    /// `Contradicts` edges that point at `id`. One pass over the edges (the
+    /// adjacency index is outgoing-only).
+    pub fn superseded_by_memory(&self, id: &str) -> Vec<String> {
+        let key = NodeId::memory(id).as_str();
+        let Some(nid) = self.get_node_id(&key) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = Vec::new();
+        for e in &self.int_edges {
+            if e.target != nid || !matches!(e.kind, EdgeKind::Refines | EdgeKind::Contradicts) {
+                continue;
+            }
+            if let Some(src) = self.interner.get(e.source) {
+                if matches!(src.kind, NodeKind::Memory) && !out.contains(&src.external_id) {
+                    out.push(src.external_id.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// How many live memories supersede `id` directly (its outgoing
+    /// `Refines` / `Contradicts` edges to memory nodes).
+    pub fn supersession_out_degree(&self, id: &str) -> usize {
+        let key = NodeId::memory(id).as_str();
+        match self.get_node_id(&key) {
+            Some(nid) => self.supersession_successors(nid).len(),
+            None => 0,
+        }
+    }
+
+    /// Take back the supersession of `old_id` by `new_id`: remove the
+    /// `Refines` and `Contradicts` edges from one to the other. Where a
+    /// `Contradicts` edge goes, the weakening it applied to `old_id`'s
+    /// association and temporal edges is undone (`weaken_factor` is the one
+    /// it was committed with). Returns `true` when an edge was removed.
+    pub fn remove_supersession(&mut self, old_id: &str, new_id: &str, weaken_factor: f32) -> bool {
+        let old_key = NodeId::memory(old_id).as_str();
+        let new_key = NodeId::memory(new_id).as_str();
+        let (Some(old_nid), Some(new_nid)) =
+            (self.get_node_id(&old_key), self.get_node_id(&new_key))
+        else {
+            return false;
+        };
+        let is_pair = |e: &InternalEdge| {
+            e.source == old_nid
+                && e.target == new_nid
+                && matches!(e.kind, EdgeKind::Refines | EdgeKind::Contradicts)
+        };
+        let contradictions = self
+            .int_edges
+            .iter()
+            .filter(|e| is_pair(e) && e.kind == EdgeKind::Contradicts)
+            .count();
+        let before = self.int_edges.len();
+        self.int_edges.retain(|e| !is_pair(e));
+        if self.int_edges.len() == before {
+            return false;
+        }
+        if contradictions > 0 && weaken_factor > 0.0 && weaken_factor.is_finite() {
+            let restore = weaken_factor.powi(contradictions as i32).recip();
+            for edge in self.int_edges.iter_mut() {
+                if edge.source == old_nid
+                    && matches!(edge.kind, EdgeKind::Association | EdgeKind::Temporal)
+                {
+                    edge.weight *= restore;
+                }
+            }
+        }
+        self.int_adjacency.rebuild(&self.int_edges);
+        true
+    }
+
     pub fn to_json(&self) -> String {
         let mut sorted = self.clone();
         sorted.compact();
@@ -2190,6 +2264,40 @@ mod tests {
             g.belief_lineage("old"),
             vec!["old".to_string(), "new".to_string()]
         );
+    }
+
+    #[test]
+    fn removing_a_supersession_restores_the_old_belief() {
+        let mut g = MemoryGraph::new();
+        g.add_memory("old", "a", &["c".into()]);
+        g.add_memory("new", "b", &["c".into()]);
+        g.add_memory("other", "d", &["c".into()]);
+        let old_key = NodeId::memory("old").as_str();
+        let weights = |g: &MemoryGraph| -> Vec<f32> {
+            g.neighbors(&old_key)
+                .iter()
+                .filter(|e| matches!(e.kind, EdgeKind::Association | EdgeKind::Temporal))
+                .map(|e| e.weight)
+                .collect()
+        };
+        let before = weights(&g);
+        g.add_contradiction("old", "new", 0.8, 0.5);
+        g.add_refinement("old", "other", 0.8);
+        assert_eq!(g.superseded_by_memory("new"), vec!["old".to_string()]);
+        assert_eq!(g.supersession_out_degree("old"), 2);
+
+        assert!(g.remove_supersession("old", "new", 0.5));
+        assert!(!g.remove_supersession("old", "new", 0.5), "already gone");
+        assert_eq!(g.supersession_out_degree("old"), 1);
+        assert!(g.superseded_by_memory("new").is_empty());
+        assert_eq!(g.belief_head("old"), "other");
+        for (a, b) in before.iter().zip(weights(&g)) {
+            assert!((a - b).abs() < 1e-6, "weakening undone: {a} vs {b}");
+        }
+
+        assert!(g.remove_supersession("old", "other", 0.5));
+        assert_eq!(g.belief_head("old"), "old");
+        assert!(!g.remove_supersession("old", "missing", 0.5));
     }
 
     #[test]

@@ -10,7 +10,8 @@ use turbomemory_storage::engine::StorageEngine;
 use turbomemory_storage::payload_index::Filter as StorageFilter;
 
 /// Maximum nesting depth accepted by the JSON filter DSL (`and`/`or`/`not`).
-pub const MAX_FILTER_DEPTH: usize = 32;
+/// The JSON and protobuf filter parsers share the storage engine's cap.
+pub use turbomemory_storage::payload_index::MAX_FILTER_DEPTH;
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -372,118 +373,9 @@ pub fn json_filter_to_storage(value: serde_json::Value) -> Result<Option<Storage
     if value.is_null() {
         return Ok(None);
     }
-    Ok(Some(convert_json_filter(value, 0)?))
-}
-
-fn convert_json_filter(value: serde_json::Value, depth: usize) -> Result<StorageFilter, ApiError> {
-    if depth >= MAX_FILTER_DEPTH {
-        return Err(ApiError::InvalidFilter(format!(
-            "filter nesting exceeds the maximum depth of {MAX_FILTER_DEPTH}"
-        )));
-    }
-    let obj = value
-        .as_object()
-        .ok_or_else(|| ApiError::InvalidFilter("filter must be a JSON object".into()))?;
-    let op = obj
-        .get("op")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ApiError::InvalidFilter("filter missing op".into()))?;
-    Ok(match op {
-        "eq" => {
-            let field = obj
-                .get("field")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| ApiError::InvalidFilter("eq missing field".into()))?;
-            let val = obj.get("value").cloned().unwrap_or(serde_json::Value::Null);
-            StorageFilter::Eq {
-                field: field.into(),
-                value: val,
-            }
-        }
-        "range" => {
-            let field = obj
-                .get("field")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| ApiError::InvalidFilter("range missing field".into()))?;
-            let low = obj.get("low").and_then(|v| v.as_f64());
-            let high = obj.get("high").and_then(|v| v.as_f64());
-            let low_inclusive = obj
-                .get("low_inclusive")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            let high_inclusive = obj
-                .get("high_inclusive")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            StorageFilter::Range {
-                field: field.into(),
-                low: low
-                    .map(|v| {
-                        if low_inclusive {
-                            Bound::Included(v)
-                        } else {
-                            Bound::Excluded(v)
-                        }
-                    })
-                    .unwrap_or(Bound::Unbounded),
-                high: high
-                    .map(|v| {
-                        if high_inclusive {
-                            Bound::Included(v)
-                        } else {
-                            Bound::Excluded(v)
-                        }
-                    })
-                    .unwrap_or(Bound::Unbounded),
-            }
-        }
-        "full_text" => {
-            let field = obj
-                .get("field")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| ApiError::InvalidFilter("full_text missing field".into()))?;
-            let query = obj
-                .get("query")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| ApiError::InvalidFilter("full_text missing query".into()))?;
-            StorageFilter::FullText {
-                field: field.into(),
-                query: query.into(),
-            }
-        }
-        "and" => {
-            let arr = obj
-                .get("filters")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| ApiError::InvalidFilter("and missing filters".into()))?;
-            StorageFilter::And(
-                arr.iter()
-                    .cloned()
-                    .map(|v| convert_json_filter(v, depth + 1))
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
-        }
-        "or" => {
-            let arr = obj
-                .get("filters")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| ApiError::InvalidFilter("or missing filters".into()))?;
-            StorageFilter::Or(
-                arr.iter()
-                    .cloned()
-                    .map(|v| convert_json_filter(v, depth + 1))
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
-        }
-        "not" => {
-            let inner = obj
-                .get("filter")
-                .cloned()
-                .ok_or_else(|| ApiError::InvalidFilter("not missing filter".into()))?;
-            StorageFilter::Not(Box::new(convert_json_filter(inner, depth + 1)?))
-        }
-        other => return Err(ApiError::InvalidFilter(format!("unknown op: {other}"))),
-    })
+    StorageFilter::from_json(&value)
+        .map(Some)
+        .map_err(ApiError::InvalidFilter)
 }
 
 #[cfg(test)]

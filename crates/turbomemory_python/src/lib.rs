@@ -12,6 +12,7 @@ use std::time::Duration;
 use turbomemory_graph::{CognitiveCompressor, CompressedCognitiveState, DeterministicCompressor};
 use turbomemory_storage::config::{QuantizerKind, StoreConfig};
 use turbomemory_storage::engine::{GistCompressor, StorageEngine, SupersessionKind};
+use turbomemory_storage::payload_index::Filter;
 
 /// Map storage errors to specific Python exception types.
 fn storage_err(e: turbomemory_storage::StorageError) -> PyErr {
@@ -206,6 +207,22 @@ fn parse_payload(payload: Option<String>) -> PyResult<Option<String>> {
         }
         _ => Ok(None),
     }
+}
+
+/// Parse an optional filter in the JSON filter DSL
+/// (`turbomemory_storage::payload_index::Filter::from_json`).
+fn parse_filter(filter: Option<String>) -> PyResult<Option<Filter>> {
+    let Some(text) = filter else {
+        return Ok(None);
+    };
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| PyValueError::new_err(format!("invalid filter JSON: {e}")))?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    Filter::from_json(&value)
+        .map(Some)
+        .map_err(|e| PyValueError::new_err(format!("invalid filter: {e}")))
 }
 
 #[pyclass(name = "MemoryEngine")]
@@ -827,7 +844,10 @@ impl PyMemoryEngine {
         })
     }
 
-    #[pyo3(signature = (query_embedding, top_k, search_list_size=None, scope=None))]
+    /// Nearest records by vector alone. `filter` (a JSON string in the
+    /// filter DSL, see `ids_where`) and `scope` restrict which records can
+    /// be returned.
+    #[pyo3(signature = (query_embedding, top_k, search_list_size=None, scope=None, filter=None))]
     fn search_ann(
         &self,
         py: Python<'_>,
@@ -835,14 +855,95 @@ impl PyMemoryEngine {
         top_k: usize,
         search_list_size: Option<usize>,
         scope: Option<String>,
+        filter: Option<String>,
     ) -> PyResult<Vec<(String, f32)>> {
         let engine = self.engine()?;
         let q_input = extract_f32_input(query_embedding)?;
         let q = q_input.as_slice();
         let scope_ref = scope.as_deref();
+        let filter = parse_filter(filter)?;
+        py.allow_threads(|| match filter.as_ref() {
+            None => engine
+                .search_ann_scoped(q, top_k, search_list_size, scope_ref)
+                .map_err(storage_err),
+            Some(f) => engine
+                .search_ann_candidates_filtered_with_ef(
+                    q,
+                    top_k,
+                    Some(f),
+                    search_list_size,
+                    scope_ref,
+                )
+                .map_err(storage_err),
+        })
+    }
+
+    /// Ids of the live records a payload filter and/or scope match, in the
+    /// order they were stored. `filter` is a JSON string:
+    /// `{"op": "eq", "field": "status", "value": "pending"}`,
+    /// `{"op": "range", "field": "due", "high": 1700000000}` (bounds optional,
+    /// inclusive unless `low_inclusive` / `high_inclusive` is false),
+    /// `{"op": "and" | "or", "filters": [...]}`, `{"op": "not", "filter": ...}`.
+    /// Only top-level payload fields are indexed. No vectors are read and no
+    /// access is counted. With neither argument, every record.
+    #[pyo3(signature = (filter=None, scope=None))]
+    fn ids_where(
+        &self,
+        py: Python<'_>,
+        filter: Option<String>,
+        scope: Option<String>,
+    ) -> PyResult<Vec<String>> {
+        let engine = self.engine()?;
+        let filter = parse_filter(filter)?;
         py.allow_threads(|| {
             engine
-                .search_ann_scoped(q, top_k, search_list_size, scope_ref)
+                .ids_where(filter.as_ref(), scope.as_deref())
+                .map_err(storage_err)
+        })
+    }
+
+    /// Replace the payloads of existing records in place: the same offset,
+    /// insert sequence, vector and graph edges, so nothing is embedded again
+    /// and belief revision's order of old and new is kept (unlike `update`).
+    /// `ids` and `payloads` are parallel; a payload of `None` removes it.
+    /// Every payload is checked before anything changes (`ValueError`);
+    /// unknown ids are skipped. One write-ahead-log append for the batch.
+    /// Returns how many records were changed.
+    fn set_payloads(
+        &self,
+        py: Python<'_>,
+        ids: Vec<String>,
+        payloads: Vec<Option<String>>,
+    ) -> PyResult<usize> {
+        if ids.len() != payloads.len() {
+            return Err(PyValueError::new_err(format!(
+                "ids and payloads must be the same length ({} vs {})",
+                ids.len(),
+                payloads.len()
+            )));
+        }
+        let engine = self.engine()?;
+        let patches: Vec<(String, Option<String>)> = ids
+            .into_iter()
+            .zip(payloads)
+            .map(|(id, p)| parse_payload(p).map(|p| (id, p)))
+            .collect::<PyResult<_>>()?;
+        py.allow_threads(|| engine.set_payloads(&patches).map_err(storage_err))
+    }
+
+    /// Take back supersessions: `pairs` is a list of `(old_id, new_id)`. The
+    /// edge between them is removed and the old memory's demotion is worked
+    /// out again from what still supersedes it. Pairs without an edge are
+    /// skipped. Returns how many were removed.
+    fn retract_supersessions(
+        &self,
+        py: Python<'_>,
+        pairs: Vec<(String, String)>,
+    ) -> PyResult<usize> {
+        let engine = self.engine()?;
+        py.allow_threads(|| {
+            engine
+                .retract_supersessions_by_id(&pairs)
                 .map_err(storage_err)
         })
     }

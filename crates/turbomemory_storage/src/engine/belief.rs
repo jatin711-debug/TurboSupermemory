@@ -266,6 +266,55 @@ impl StorageEngine {
         self.commit_supersessions(&props)
     }
 
+    /// Take back supersessions, given as `(old_id, new_id)`: the edge from
+    /// one to the other is removed and the old memory's demotion is worked
+    /// out again from the supersessions it still has (none: no demotion).
+    /// A contradiction's weakening of the old memory's edges is undone too.
+    /// Pairs with no edge between them are skipped. Returns how many
+    /// supersessions were removed.
+    ///
+    /// This is how a supersession a verifier or a user later rejects is
+    /// undone. Committing the pair again re-creates it.
+    pub fn retract_supersessions_by_id(&self, pairs: &[(String, String)]) -> crate::Result<usize> {
+        let weaken_factor = self.config.tier.contradiction_weaken_factor;
+        let mut removed = 0usize;
+        for (old_id, new_id) in pairs {
+            let gone =
+                self.graph
+                    .write()
+                    .graph_mut()
+                    .remove_supersession(old_id, new_id, weaken_factor);
+            if gone {
+                removed += 1;
+                self.recompute_demotion(old_id);
+            }
+        }
+        if removed > 0 {
+            self.save_graph()?;
+        }
+        Ok(removed)
+    }
+
+    /// Set `id`'s demotion from the supersessions it has now: one
+    /// `supersession_demotion_factor` per memory that supersedes it, never
+    /// below the floor, and none when nothing does. The same value
+    /// `commit_supersessions` arrives at one edge at a time.
+    pub(super) fn recompute_demotion(&self, id: &str) {
+        let Some(offset) = self.id_index.read().get(id).copied() else {
+            return;
+        };
+        let edges = self.graph.read().graph().supersession_out_degree(id);
+        let factor = if edges == 0 {
+            crate::metadata_store::NO_DEMOTION
+        } else {
+            let per_edge = self.config.tier.supersession_demotion_factor;
+            per_edge
+                .powi(edges.min(i32::MAX as usize) as i32)
+                .max(SUPERSESSION_DEMOTION_FLOOR)
+        };
+        self.meta.set_demotion_factor(offset, factor);
+    }
+
     /// Resolve each id against the supersession graph: "what is true NOW" in
     /// place of that memory, plus its lineage. One graph read-lock for the
     /// whole batch. Usable without enabling any cognitive config flags — the
