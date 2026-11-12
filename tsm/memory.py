@@ -268,6 +268,7 @@ class Memory:
         experience: bool = False,
         readiness_judge=None,
         distiller=None,
+        topics=None,
         **engine_kwargs,
     ):
         """
@@ -367,6 +368,12 @@ class Memory:
                 context is "observe".
             distiller: turns a trusted outcome without a lesson into one at
                 consolidation (``tsm.experience.LLMDistiller``, or ``"llm"``).
+            topics: also offer the verifier facts that give a value for the
+                same property (``user.residence``), however differently they
+                are worded (``tsm.topics.LLMTopicKeyer``, or ``"llm"``). Needs
+                a verifier that judges meaning (``verifier="llm"``). Facts are
+                keyed at ``consolidate()``, about 10 to a request, once each.
+                Off by default (not yet judged on answers).
             **engine_kwargs: forwarded to ``turbomemory.MemoryEngine``.
         """
         # Backend names are resolved here; anything else that is a string is a
@@ -377,6 +384,7 @@ class Memory:
             ("verifier", verifier, ("nli", "llm")),
             ("readiness_judge", readiness_judge, ("llm",)),
             ("distiller", distiller, ("llm",)),
+            ("topics", topics, ("llm",)),
         ):
             if isinstance(value, str) and value not in known:
                 raise ValueError(
@@ -431,6 +439,18 @@ class Memory:
             from .experience import LLMDistiller
 
             distiller = LLMDistiller(cache_dir=os.path.join(db_path, "tsm_cache"))
+        if topics is not None and getattr(verifier, "candidate_min_cosine", None) is None:
+            # The keys only propose; a verifier that cannot judge meaning
+            # would be handed whatever two facts share a key.
+            raise ValueError('topics needs a verifier that judges meaning (verifier="llm")')
+        if topics == "llm":
+            from .topics import LLMTopicKeyer
+
+            topics = LLMTopicKeyer(cache_dir=os.path.join(db_path, "tsm_cache"))
+        self.topic_keyer = topics
+        # Scopes with facts not yet keyed (None: every scope, on the first
+        # pass after opening).
+        self._topic_scopes: Optional[set] = None
         self.readiness_judge = readiness_judge
         self.distiller = distiller
         self.embedder = embedder
@@ -512,7 +532,9 @@ class Memory:
         self._write_lock = threading.Lock()
         required = _REQUIRED_ENGINE_METHODS + (
             ("scope_ids", "scopes") if self.max_user_tokens is not None else ()) + (
-            _EXECUTIVE_ENGINE_METHODS if intentions or experience else ())
+            _EXECUTIVE_ENGINE_METHODS if intentions or experience else ()) + (
+            ("set_payloads", "get_vectors", "scope_ids", "scopes", "superseded_ids")
+            if self.topic_keyer is not None else ())
         missing = [m for m in required if not hasattr(self.engine, m)]
         if missing:
             self.close()
@@ -675,6 +697,8 @@ class Memory:
             )
             if self.max_user_tokens is not None and user_id is not None:
                 self._touched.add(user_id)
+            if self._topic_scopes is not None and user_id is not None:
+                self._topic_scopes.add(user_id)
             if self._intentions is not None:
                 by_turn: Dict[int, List[str]] = {}
                 for mid, meta in zip(ids, metas):
@@ -1334,6 +1358,9 @@ class Memory:
                             getattr(self.verifier, "candidate_margin", 0.1))
         else:
             proposed = self.engine.propose_supersessions()  # (old, new, kind, cosine)
+        if self.topic_keyer is not None:
+            seen = {(pair[0], pair[1]) for pair in proposed}
+            proposed = list(proposed) + self._topic_candidates(seen)
         if not proposed:
             return 0
         pair_ids = sorted({mid for old, new, *_ in proposed for mid in (old, new)})
@@ -1353,6 +1380,81 @@ class Memory:
         logger.info("verified supersession: proposed=%d accepted=%d committed=%d",
                     len(proposed), len(accepted), committed)
         return committed
+
+    def _topic_candidates(self, seen) -> List[Tuple[str, str, str, float]]:
+        """Pairs of current facts that give a value for the same
+        single-valued property (``tsm.topics``), after keying the facts of
+        the scopes written to since the last pass. Proposals only: the
+        verifier decides. A keying failure is logged and those scopes are
+        keyed again on the next pass; facts keyed earlier still pair."""
+        from .topics import topic_pairs
+
+        scopes = self._topic_scopes
+        if scopes is None:
+            scopes = set(self.engine.scopes())
+        self._topic_scopes = set()  # writes from here on are keyed next pass
+        roles = self.engine_config.get("belief_source_roles")
+        records: List[Dict] = []
+        for scope in sorted(s for s in scopes if s is not None):
+            for rec in self._records(self.engine.scope_ids(scope)).values():
+                if roles is None or rec.get("source_role") in roles:
+                    records.append(rec)
+        unkeyed = sorted((r for r in records if "topic" not in r["payload"]),
+                         key=lambda r: int(r["insert_seq"]))
+        if unkeyed:
+            counts: Dict[str, int] = {}
+            for rec in records:
+                key = rec["payload"].get("topic")
+                if key:
+                    counts[key] = counts.get(key, 0) + 1
+            known = sorted(counts, key=lambda k: -counts[k])
+            try:
+                answers = self.topic_keyer.topics([r["text"] or "" for r in unkeyed], known)
+            except Exception as e:  # noqa: BLE001 — retried on the next pass
+                logger.warning("topic keying failed (will retry): %s: %s", type(e).__name__, e)
+                answers = [None] * len(unkeyed)
+            keyed = {}
+            for rec, answer in zip(unkeyed, answers):
+                if answer is None:
+                    self._retry = True
+                    self._topic_scopes.add(rec.get("scope"))
+                    continue
+                keyed[rec["id"]] = (answer[0], bool(answer[1]))
+                rec["payload"]["topic"], rec["payload"]["topic_one"] = keyed[rec["id"]]
+            if keyed:
+                with self._write_lock:
+                    # Read again under the lock: another patch (retract,
+                    # forget) may have changed a payload since.
+                    ids, payloads = [], []
+                    for mid, rec in self._records(sorted(keyed)).items():
+                        rec["payload"]["topic"], rec["payload"]["topic_one"] = keyed[mid]
+                        ids.append(mid)
+                        payloads.append(json.dumps(rec["payload"]))
+                    if ids:
+                        self.engine.set_payloads(ids, payloads)
+            flush = getattr(self.topic_keyer, "flush_cache", None)
+            if callable(flush):
+                flush()
+        superseded = set(self.engine.superseded_ids())
+        current = [r for r in records if r["id"] not in superseded]
+        per_record = int(getattr(self.topic_keyer, "per_record", 1))
+        pairs = [pair for pair in topic_pairs(current, per_record) if pair not in seen]
+        if not pairs:
+            return []
+        ids = sorted({mid for pair in pairs for mid in pair})
+        vectors, found = self.engine.get_vectors(ids)
+        vectors = np.asarray(vectors, dtype=np.float32)
+        norms = np.linalg.norm(vectors, axis=1)
+        row = {mid: k for k, mid in enumerate(ids) if found[k] and norms[k] > 0}
+        out = []
+        for old, new in pairs:
+            if old in row and new in row:
+                a, b = row[old], row[new]
+                cosine = float(vectors[a] @ vectors[b] / (norms[a] * norms[b]))
+                out.append((old, new, "contradiction", cosine))
+        logger.info("topic candidates: %d pairs (%d facts keyed this pass)",
+                    len(out), len(unkeyed))
+        return out
 
     def compact(self, user_id: Optional[str] = None) -> int:
         """Bring one user's memory (or, with no argument, every user's) back
@@ -1723,7 +1825,7 @@ class Memory:
         purged = 0
         if purge_caches and said:
             for backend in (self.extractor, self.embedder, self.verifier,
-                            self.readiness_judge, self.distiller):
+                            self.readiness_judge, self.distiller, self.topic_keyer):
                 purge = getattr(backend, "forget_texts", None)
                 if callable(purge):
                     try:
@@ -1828,7 +1930,8 @@ class Memory:
                                         (self.embedder, "flush"),
                                         (self.verifier, "flush_cache"),
                                         (self.readiness_judge, "flush_cache"),
-                                        (self.distiller, "flush_cache")):
+                                        (self.distiller, "flush_cache"),
+                                        (self.topic_keyer, "flush_cache")):
                     flush = getattr(backend, method, None)
                     if callable(flush):
                         try:

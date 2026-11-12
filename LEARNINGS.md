@@ -176,6 +176,38 @@ of step 4.
     answers about the past.
   - Knowledge-update questions: 10 of 18 with it, 9 without.
 
+- **Keys for what a fact is about (`topics`, 2026-11-12, opt-in).** The
+  verifier only sees pairs at least 0.45 similar, so an update worded unlike
+  the old fact never reaches it ("I'm 29", then "I just celebrated my
+  thirtieth birthday"). OpenAI vectors miss more of these than MiniLM:
+  habit reversals ("I smoke a pack a day", then "I quit smoking for good")
+  sit far apart. `tsm.topics` keys each fact with the property it gives a
+  current value for (`user.residence`) and pairs facts of the same
+  single-valued key whatever their cosine. Held-out labeled pairs, gpt-4o-mini
+  verifier:
+
+  | | own store: updates / wrong | one store: updates / wrong / newer replaced |
+  | :--- | :--- | :--- |
+  | MiniLM | 48 / 3 | 49 / 7 / 1 |
+  | MiniLM + keys | 49 / 3 | 50 / 11 / 7 |
+  | OpenAI | 46 / 3 | 47 / 7 / 1 |
+  | OpenAI + keys | 49 / 3 | 48 / 11 / 7 |
+
+  Out of 54 updates and 58 still-true pairs. On the tuning half the keys
+  took OpenAI from 50 to 55 of 56 with no new errors. Lessons:
+  - gpt-4o-mini cannot key: in batches it copied the format's literal `N`,
+    wrote values where the cardinality went, forced statements under keys it
+    had already used (an electricity switch and a piano recital both
+    `user.subscription`) and keyed past periods as current values.
+    gpt-4.1-mini, ten facts a request, with "past" as an answer of its own,
+    keyed cleanly.
+  - The verifier is the weak link once it is shown distant pairs: it
+    accepted "my favourite band" replaced by a TV series and "I take
+    metformin" by "I started eating meat again". Its errors were rare only
+    because cosine candidates are near neighbours. A store holding many
+    facts per key (one person over years) is where this would hurt, so the
+    keys stay off until the verifier is better on such pairs.
+
 ### Forgetting under a budget
 
 - **Keeping what is used beats first-in-first-out.** Under a 10-record cap,

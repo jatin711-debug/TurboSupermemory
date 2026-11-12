@@ -112,6 +112,15 @@ with Memory("./my_db") as mem:                       # conversational profile
   verifier, `recall()` also marks it in the result's `context`
   (`[earlier, since changed] ...`) and serves the fact that replaced it with
   it. `exclude_superseded=True` drops replaced facts instead.
+- `Memory(verifier="llm", topics="llm")` (off by default) also offers the
+  verifier facts that give a value for the same property (`user.residence`)
+  however they are worded (`tsm.topics`: gpt-4.1-mini keys each fact once at
+  `consolidate()`, ten to a request). On the labeled pairs
+  (`benchmarks/cognitive_eval/belief_pairs_eval.py --split test`, 2026-11-12)
+  it caught more updates with each pair in its own store (49 against 46 of
+  54 on OpenAI vectors, the same 3 of 58 still-true facts wrongly replaced),
+  but with all pairs in one store it wrongly replaced more (11 against 7,
+  and 7 newer facts against 1). It stays off until that is fixed.
 - A token budget per user: `Memory(db, max_user_tokens=256,
   gist_summarizer=...)` keeps the newest facts as they are and folds
   everything older into a few short gists at `consolidate()`, again and
