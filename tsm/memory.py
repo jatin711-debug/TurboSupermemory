@@ -37,6 +37,7 @@ import os
 import re
 import threading
 import time
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -269,6 +270,7 @@ class Memory:
         readiness_judge=None,
         distiller=None,
         topics=None,
+        intention_tracker=None,
         **engine_kwargs,
     ):
         """
@@ -374,6 +376,15 @@ class Memory:
                 a verifier that judges meaning (``verifier="llm"``). Facts are
                 keyed at ``consolidate()``, about 10 to a request, once each.
                 Off by default (not yet judged on answers).
+            intention_tracker: with ``intentions``, form, close and
+                reschedule intentions with a chat model instead of the
+                rules (``tsm.intentions.LLMIntentionTracker``, or
+                ``"llm"``): ``add()`` keeps each user message in the
+                intentions store and ``consolidate()`` reads the new ones
+                with the user's open intentions, about 8 messages to a
+                request. Held out it found 34 of 53 due items against 6
+                for the rules, but with 13 wrong against 8 for plain
+                ``recall()`` read by a model (``LEARNINGS.md``).
             **engine_kwargs: forwarded to ``turbomemory.MemoryEngine``.
         """
         # Backend names are resolved here; anything else that is a string is a
@@ -385,6 +396,7 @@ class Memory:
             ("readiness_judge", readiness_judge, ("llm",)),
             ("distiller", distiller, ("llm",)),
             ("topics", topics, ("llm",)),
+            ("intention_tracker", intention_tracker, ("llm",)),
         ):
             if isinstance(value, str) and value not in known:
                 raise ValueError(
@@ -448,6 +460,13 @@ class Memory:
 
             topics = LLMTopicKeyer(cache_dir=os.path.join(db_path, "tsm_cache"))
         self.topic_keyer = topics
+        if intention_tracker is not None and not intentions:
+            raise ValueError("intention_tracker needs intentions=True")
+        if intention_tracker == "llm":
+            from .intentions import LLMIntentionTracker
+
+            intention_tracker = LLMIntentionTracker(cache_dir=os.path.join(db_path, "tsm_cache"))
+        self.intention_tracker = intention_tracker
         # Scopes with facts not yet keyed (None: every scope, on the first
         # pass after opening).
         self._topic_scopes: Optional[set] = None
@@ -733,6 +752,10 @@ class Memory:
             said_at = stamp if as_date(stamp) else datetime.now().date().isoformat()
             sources = by_turn.get(turn, [])
             try:
+                if self.intention_tracker is not None:
+                    # Read by the tracker at consolidation, never here.
+                    self._intentions.record_inbox(user_id, content, sources, said_at)
+                    continue
                 drafts = detect_intentions(content, said_at)
                 if drafts:
                     self._intentions.record(user_id, drafts, sources, said_at)
@@ -1290,7 +1313,9 @@ class Memory:
         intentions, curate lessons from new outcomes. Each is one batch of
         payload patches; a failure is logged and tried again next pass
         (nothing is deleted)."""
-        if self._intentions is not None:
+        if self._intentions is not None and self.intention_tracker is not None:
+            self._track_intentions()
+        elif self._intentions is not None:
             try:
                 with self._write_lock:
                     done = self._intentions.maintain()
@@ -1314,6 +1339,38 @@ class Memory:
                 self._retry = True
                 logger.warning("experience curation failed (will retry): %s: %s",
                                type(e).__name__, e)
+
+    def _track_intentions(self) -> None:
+        """The tracker's pass: each user's unread messages, a batch at a
+        time with the user's open intentions, outside the write lock (a
+        model is asked); each batch's changes are applied under it in one
+        insert and one batch of payload patches. A failed batch stays
+        unread and is tried on the next pass."""
+        tracker = self.intention_tracker
+        size = max(1, int(getattr(tracker, "batch_size", 8)))
+        totals = Counter()
+        for user, messages in self._intentions.inbox().items():
+            for start in range(0, len(messages), size):
+                chunk = messages[start:start + size]
+                open_items = self._intentions.open_items(user)
+                shown = open_items[-int(getattr(tracker, "max_open", 60)):]
+                try:
+                    ops = tracker.track(shown, [{"text": m["text"], "said_on": m.get("said_on")}
+                                                for m in chunk])
+                    with self._write_lock:
+                        totals.update(self._intentions.apply_track(
+                            user, chunk, ops, [item["id"] for item in shown]))
+                except Exception as e:  # noqa: BLE001 — unread; retried on the next pass
+                    self._retry = True
+                    logger.warning("intention tracking failed (will retry): %s: %s",
+                                   type(e).__name__, e)
+                    break  # later messages wait: they may close what these create
+        flush = getattr(tracker, "flush_cache", None)
+        if callable(flush):
+            flush()
+        if any(totals.values()):
+            logger.info("intentions: %d created, %d closed, %d rescheduled",
+                        totals["created"], totals["closed"], totals["rescheduled"])
 
     def _idle_loop(self) -> None:
         """Background thread of ``idle_consolidation_secs``: consolidate when
@@ -1361,6 +1418,7 @@ class Memory:
         if self.topic_keyer is not None:
             seen = {(pair[0], pair[1]) for pair in proposed}
             proposed = list(proposed) + self._topic_candidates(seen)
+        proposed = self._drop_affirmed(proposed)
         if not proposed:
             return 0
         pair_ids = sorted({mid for old, new, *_ in proposed for mid in (old, new)})
@@ -1369,17 +1427,40 @@ class Memory:
         # A verifier that could not judge some pairs (a failed request) says
         # so; the idle worker then asks again later.
         self._retry = self._retry or bool(getattr(self.verifier, "unresolved", 0))
-        if accepted:
-            # A pair someone took back (retract()) stays taken back.
-            olds = self._records(sorted({pair[0] for pair in accepted}))
-            accepted = [pair for pair in accepted if pair[1] not in
-                        (olds.get(pair[0], {}).get("payload", {}).get("retracted_by") or ())]
         if not accepted:
             return 0
         committed = self.engine.commit_supersessions(accepted)
         logger.info("verified supersession: proposed=%d accepted=%d committed=%d",
                     len(proposed), len(accepted), committed)
         return committed
+
+    def _drop_affirmed(self, pairs):
+        """Candidate pairs without those ``retract`` ruled out: a fact someone
+        said still holds is not replaced by a pair they took back
+        (``retracted_by``), nor by anything said before they said so
+        (``affirmed_seq``: a retraction answers "does it still hold?" for
+        everything said up to then). Something said later still can."""
+        if not pairs:
+            return pairs
+        olds = self._records(sorted({pair[0] for pair in pairs}))
+        guarded = {mid: rec["payload"] for mid, rec in olds.items()
+                   if rec["payload"].get("retracted_by") or
+                   rec["payload"].get("affirmed_seq") is not None}
+        if not guarded:
+            return pairs
+        news = sorted({pair[1] for pair in pairs if pair[0] in guarded})
+        seqs = {r["id"]: r.get("insert_seq") for r in self.engine.get_records(news) if r}
+        kept = []
+        for pair in pairs:
+            payload = guarded.get(pair[0])
+            if payload is not None:
+                if pair[1] in (payload.get("retracted_by") or ()):
+                    continue
+                affirmed, seq = payload.get("affirmed_seq"), seqs.get(pair[1])
+                if affirmed is not None and seq is not None and int(seq) < int(affirmed):
+                    continue
+            kept.append(pair)
+        return kept
 
     def _topic_candidates(self, seen) -> List[Tuple[str, str, str, float]]:
         """Pairs of current facts that give a value for the same
@@ -1588,7 +1669,9 @@ class Memory:
         whose time has come (``verdict="act"``, ``overdue`` once their last
         day has passed) and, given what is happening (``context``, any
         text), those it brings to mind (``verdict="observe"``). At most
-        ``top_k``. With a ``readiness_judge`` each is judged again as act /
+        ``top_k``. ``cue_min_cosine``: how close the context must be (the
+        embedder's ``cue_min_cosine`` if it has one, else
+        ``tsm.intentions.CUE_MIN_COSINE``). With a ``readiness_judge`` each is judged again as act /
         wait / observe / satisfied / invalidated (``judged=True``).
 
         Each carries its ``evidence``: the stored memories of the message it
@@ -1602,9 +1685,10 @@ class Memory:
         when = now if now not in (None, False) else datetime.now().date()
         vector = (np.asarray(embed_query(self.embedder, context), dtype=np.float32)
                   if context else None)
-        items = ledger.due(user_id, when, vector,
-                           CUE_MIN_COSINE if cue_min_cosine is None else float(cue_min_cosine),
-                           top_k)
+        if cue_min_cosine is None:
+            # A cosine floor belongs to the embedder's geometry.
+            cue_min_cosine = getattr(self.embedder, "cue_min_cosine", None) or CUE_MIN_COSINE
+        items = ledger.due(user_id, when, vector, float(cue_min_cosine), top_k)
         if items and self.readiness_judge is not None:
             today = as_date(when)
             try:
@@ -1695,8 +1779,9 @@ class Memory:
         verdict, or a user who says the old fact still holds): the old fact
         is no longer demoted or flagged, and later consolidations do not
         commit the pair again (it is kept in the old fact's payload as
-        ``retracted_by``). Returns whether there was a supersession to take
-        back."""
+        ``retracted_by``), nor replace the old fact with anything else said
+        before the retraction (``affirmed_seq``); what is said later still
+        can. Returns whether there was a supersession to take back."""
         self._require_open()
         with self._write_lock:
             removed = int(self.engine.retract_supersessions([(old_id, new_id)]))
@@ -1706,8 +1791,9 @@ class Memory:
                 retracted = list(payload.get("retracted_by") or [])
                 if new_id not in retracted:
                     retracted.append(new_id)
-                    payload["retracted_by"] = retracted
-                    self.engine.set_payloads([old_id], [json.dumps(payload)])
+                payload["retracted_by"] = retracted
+                payload["affirmed_seq"] = int(self.engine.next_insert_seq())
+                self.engine.set_payloads([old_id], [json.dumps(payload)])
         return removed > 0
 
     def history(self, memory_id: str) -> List[Dict]:
@@ -1731,9 +1817,9 @@ class Memory:
                         "current": k == len(chain) - 1})
         return out
 
-    def forget(self, memory_ids: Iterable[str], user_id: Optional[str] = None,
+    def forget(self, memory_ids: Iterable[str] = (), user_id: Optional[str] = None,
                cascade: bool = True, gists: str = "redact",
-               purge_caches: bool = True) -> Dict:
+               purge_caches: bool = True, texts: Iterable[str] = ()) -> Dict:
         """Delete memories, and everything that still says what they said.
 
         A forget request is a promise that the content is not served again,
@@ -1762,6 +1848,13 @@ class Memory:
         (``skipped``) and only that user's gists, intentions and lessons are
         looked at.
 
+        ``texts`` (needs ``user_id``): more content to forget, for what no
+        stored memory holds any more but something derived still may (a fact
+        folded into a gist, or dropped by it, whose intention or lesson
+        remains): the user's gists, intentions, lessons and the caches are
+        swept for it as for a forgotten memory. Memories themselves are only
+        deleted by id (find them with ``recall``).
+
         Returns ``{"forgotten", "skipped", "gists_redacted", "gists_deleted",
         "gists_may_hold", "intentions_removed", "experience_removed",
         "episodes_unlinked", "cache_entries_purged", "verified"}``.
@@ -1771,6 +1864,9 @@ class Memory:
         """
         if gists not in ("redact", "keep"):
             raise ValueError("gists must be 'redact' or 'keep'")
+        extra = [str(t) for t in texts if t and str(t).strip()]
+        if extra and user_id is None:
+            raise ValueError("forget(texts=...) needs a user_id")
         self._require_open()
         wanted = [str(m) for m in memory_ids]
         with self._write_lock:
@@ -1795,8 +1891,11 @@ class Memory:
             said = [t["text"] for t in targets.values()]
             said += [t["payload"].get("original_message") for t in targets.values()
                      if t["payload"].get("original_message")]
-            forgotten = Forgotten(said)
+            forgotten = Forgotten(said, phrases=extra)
             scopes = {t["scope"] for t in targets.values()}
+            if extra:
+                scopes.add(user_id)
+            sweep = bool(ids) or bool(extra)
             vectors, found = (self.engine.get_vectors(ids)
                               if ids and hasattr(self.engine, "get_vectors") else (None, []))
             # Gists first: a redacted gist is stored before anything is deleted.
@@ -1805,7 +1904,7 @@ class Memory:
             for mid in ids:
                 self.engine.delete(mid)
             intentions_removed = 0
-            if self._intentions is not None and ids:
+            if self._intentions is not None and sweep:
                 doomed = set()
                 for mid in ids:
                     doomed.update(self._intentions.engine.ids_where(json.dumps(
@@ -1818,18 +1917,19 @@ class Memory:
                 for iid in doomed:
                     intentions_removed += bool(self._intentions.engine.delete(iid))
             experience_removed = episodes_unlinked = 0
-            if self._experience is not None and ids:
+            if self._experience is not None and sweep:
                 with self._experience_lock:
                     experience_removed = self._experience.forget_content(forgotten, list(scopes))
                     episodes_unlinked = self._experience.forget_references(ids)
         purged = 0
-        if purge_caches and said:
+        if purge_caches and forgotten:
             for backend in (self.extractor, self.embedder, self.verifier,
-                            self.readiness_judge, self.distiller, self.topic_keyer):
+                            self.readiness_judge, self.distiller, self.topic_keyer,
+                            self.intention_tracker):
                 purge = getattr(backend, "forget_texts", None)
                 if callable(purge):
                     try:
-                        purged += int(purge(said) or 0)
+                        purged += int(purge(forgotten) or 0)
                     except Exception as e:  # noqa: BLE001 — reported, not fatal
                         logger.warning("cache purge failed for %s: %s",
                                        type(backend).__name__, e)
@@ -1931,7 +2031,8 @@ class Memory:
                                         (self.verifier, "flush_cache"),
                                         (self.readiness_judge, "flush_cache"),
                                         (self.distiller, "flush_cache"),
-                                        (self.topic_keyer, "flush_cache")):
+                                        (self.topic_keyer, "flush_cache"),
+                                        (self.intention_tracker, "flush_cache")):
                     flush = getattr(backend, method, None)
                     if callable(flush):
                         try:

@@ -221,17 +221,72 @@ of step 4.
 - **ACT-R-style activation tied plain access counts** on this workload. It
   has no spaced repetition for the spacing effect to show up in.
 
-### The executive: built, never measured
+- **A lower candidate floor for OpenAI vectors does not pay (2026-11-12).**
+  The updates the verifier never sees on OpenAI vectors sit at cosine
+  0.31-0.44, so the floor was tried at 0.40 / 0.35 / 0.30 on the tuning half.
+  Each pair in its own store it caught 51 / 54 / 56 of 56 against 50 with no
+  errors; in one shared store 51 / 54 / 54 with 4 / 6 / 7 still-true facts
+  wrongly replaced against 2, all by another pair's statement. Same lesson
+  as the keys: candidates are not the bottleneck, the verifier on distant
+  pairs is. 0.45 stays; the held-out half was not spent.
 
-Opt-in prototypes with unit tests, each in its own engine so they cannot
-change recall:
+### The executive: measured 2026-11-12
 
-- intentions (`due`);
-- lessons from outcomes (`feedback` / `lessons`);
-- `history` / `retract` / `forget`.
+Opt-in prototypes, each in its own engine so they cannot change recall.
 
-`forget()` redacts gists sentence by sentence and purges caches. The plan to
-measure them lived in a research report kept outside the repository.
+**Intentions (`due`).** Scored on 40 scenarios written blind to the code
+(`benchmarks/executive/intentions_scenarios.json`, `intentions_eval.py`:
+messages over weeks, then checks "on this day, in this situation, what
+should come up"), OpenAI vectors, tuned on 20 and quoted on the other 20:
+
+| held-out, 53 due items | found | wrong (done, too early, invented) |
+| :--- | :--- | :--- |
+| shipped rules | 6 | 25 |
+| model tracker (`intention_tracker="llm"`) | 34 | 13 |
+| no intention store: `recall()` read by gpt-4.1-mini | 33 | 8 |
+
+- The rules are not usable on real wording. They found the intention in 21
+  of 87 messages that held one and the closure in 2 of 49 ("Priya has the
+  slides now", "bloods done"). A readiness judge on top did not help (6 of
+  54 on the tuning half).
+- The tracker (gpt-4.1-mini reads new messages with the open items at
+  `consolidate()` and creates, closes or reschedules) finds as many as
+  recall + a model, but surfaces more that were done or not yet due. It
+  failed the bar it was set (beat recall + LLM without more wrong), so it
+  stays opt-in. What it has for it: one request per eight messages, where
+  the baseline costs one per check.
+- The context cue's cosine floor belongs to the embedder: 0.50 found 30 of
+  54 on the tuning half, 0.35 found 38 for one more wrong.
+  `OpenAIEmbedder.cue_min_cosine` is 0.35 for text-embedding-3-small. The
+  scenarios rarely have many unrelated items open at once, so the noise of a
+  low floor is under-tested.
+- A cached empty reply (from a counting run with a stub client) answered
+  the first real run with nothing. `CachedChat` no longer stores empty
+  replies.
+
+**`forget`.** `benchmarks/executive/forget_audit.py` plants a secret in a
+5,000-message store, forgets it, and probes recall, intentions, lessons and
+every file on disk, before and after a restart. The API served nothing after
+forget. Two leaks were found and fixed:
+- the concept graph kept every word a deleted memory brought in (orphan
+  concepts and co-occurrence pairs, saved with the graph). `remove_memory`
+  now drops concepts no live memory holds;
+- a fact folded away by compaction left its intention and lesson with no id
+  to forget them by. `forget(texts=[...], user_id=...)` takes the person's
+  words and sweeps gists, intentions, lessons and caches for them.
+
+Left: deleted bytes stay in freed database pages until reused (no vacuum).
+
+**`retract` / `history`.** Retracting every wrong replacement in the shared
+store of labeled pairs (`belief_pairs_eval.py --retract-wrong`): all were
+undone and `history()` agreed with the engine for every memory, but one in
+three came back at the next consolidation, replaced by a *different*
+statement. A retraction now also affirms the old fact against everything
+said before it (`affirmed_seq`); after that 3 of 3 (tuning) and 8 of 8
+(held-out) stayed retracted.
+
+**Lessons (`feedback` / `lessons`).** Not measured: it needs a task loop with
+real outcomes, which none of the datasets has.
 
 ## How to measure without fooling yourself
 
@@ -276,15 +331,17 @@ measure them lived in a research report kept outside the repository.
 
 - Does the graph's extra evidence on local embedders turn into answers? That
   needs a judged run.
-- The executive's parts were never measured against their baselines:
-  - intentions against a plain to-do list;
-  - lessons against retrieving raw past episodes.
+- Lessons were never measured against retrieving raw past episodes
+  (`episodes()`); that needs tasks with real outcomes.
+- An intention tracker that beats recall + a model on wrong items: the
+  tracker's extra errors are items surfaced too early and ones it failed to
+  close.
 - Can a different store, budget or reader recover the third of user messages
   that extraction drops? Storing the messages as said is the current answer.
 - `compaction="merge_oldest"` scored 57 against 50 for the default (p =
   0.23). A held-out run would decide it.
 - Engine limits that remain:
-  - no vacuum;
+  - no vacuum (forgotten bytes can stay in freed pages);
   - no store-wide format version;
   - `sync_writes` never tested against a real power cut;
   - a store is single-tenant in practice;

@@ -341,6 +341,165 @@ class LLMReadinessJudge:
         self._chat.flush_cache()
 
 
+# -- the model-backed tracker ----------------------------------------------------
+# The rules above miss most of how people say these things: on a test set
+# written blind to them they found the intention in 21 of 87 messages that
+# held one and the closure in 2 of 49 ("Priya has the slides now", "bloods
+# done"). The tracker reads a user's new messages with their open intentions
+# and says what changes. Held out (benchmarks/executive/intentions_eval.py)
+# it found 34 of 53 due items with 13 wrong; recall() read by a model, with
+# no intention store, 33 with 8 wrong. It stays opt-in.
+
+TRACK_SYSTEM = """You keep one person's ledger of intentions: things THEY \
+themselves still have to do, attend or remember at a future time or in a \
+future situation (appointments, deadlines, commitments, errands, reminders \
+they ask for, to-dos with or without a date).
+
+You get the OPEN items of the ledger (each with an id and its dates) and NEW \
+MESSAGES the person wrote, numbered, in order, each with the date it was \
+written. Return what the new messages change, as one JSON object:
+{"ops": [
+ {"op": "create", "message": 2, "what": "send Priya the offsite slides", \
+"due_from": "2024-03-05", "due_until": "2024-03-05", "situation": null},
+ {"op": "close", "id": "P1", "as": "done", "message": 3},
+ {"op": "close", "id": "P2", "as": "cancelled", "message": 4},
+ {"op": "reschedule", "id": "P3", "due_from": "2024-03-21", \
+"due_until": "2024-03-21", "message": 5}
+]}
+in the order of the messages, or {"ops": []} when nothing changes.
+
+create: only the person's own intention that is still ahead of them. Not \
+something already done, not someone else's task, not a wish, hypothetical \
+or open question, not a habit they simply keep, not a suggestion they did \
+not take up. "what": the action in a few self-contained words, no date. An \
+item created here can be closed or rescheduled by a later message as "N1", \
+"N2" ... in the order of creation.
+
+Dates are YYYY-MM-DD, worked out from the date of the message. Something on \
+a given day: that day for both. "by Friday": from two days before until \
+Friday. "this weekend": Saturday to Sunday. "next week": its Monday to \
+Friday. "end of the month": its last three days. No time given: both null.
+
+situation: the place, person or occasion the intention is tied to ("at the \
+hardware store", "when I see Tom"), or null.
+
+close: a message says an open item was done, happened, or is no longer \
+needed ("cancelled"), also when it says so indirectly ("Priya has the \
+slides now", "bloods done", "they cancelled on me"). Booking an appointment \
+closes "book it" and creates the appointment itself.
+
+reschedule: the date of an open item moved; give its new dates.
+
+A message that only repeats an open item changes nothing."""
+
+TRACK_OPS = ("create", "close", "reschedule")
+
+
+def _iso(value) -> Optional[str]:
+    day = as_date(value) if value else None
+    return day.isoformat() if day else None
+
+
+def parse_track(reply: Optional[str], open_ids: Sequence[str], n_messages: int) -> List[Dict]:
+    """The operations in a tracker reply, checked: dates readable, ids that
+    exist (``P<n>`` an open item, ``N<n>`` one created earlier in the same
+    reply), messages in range. Anything else is dropped."""
+    try:
+        start, end = (reply or "").index("{"), (reply or "").rindex("}") + 1
+        ops = json.loads(reply[start:end]).get("ops")
+    except (ValueError, AttributeError):
+        return []
+    out: List[Dict] = []
+    created = 0
+    for op in ops if isinstance(ops, list) else []:
+        if not isinstance(op, dict) or op.get("op") not in TRACK_OPS:
+            continue
+        message = op.get("message")
+        if not isinstance(message, int) or not 1 <= message <= n_messages:
+            continue
+        if op["op"] == "create":
+            what = " ".join(str(op.get("what") or "").split())
+            if not what:
+                continue
+            created += 1
+            situation = op.get("situation")
+            out.append({"op": "create", "message": message, "what": what,
+                        "due_from": _iso(op.get("due_from")),
+                        "due_until": _iso(op.get("due_until")) or _iso(op.get("due_from")),
+                        "situation": " ".join(str(situation).split()) if situation else None})
+            continue
+        ref = str(op.get("id") or "")
+        if ref[:1] == "P" and ref[1:].isdigit() and 1 <= int(ref[1:]) <= len(open_ids):
+            target = ("open", open_ids[int(ref[1:]) - 1])
+        elif ref[:1] == "N" and ref[1:].isdigit() and 1 <= int(ref[1:]) <= created:
+            target = ("new", int(ref[1:]))
+        else:
+            continue
+        if op["op"] == "close":
+            out.append({"op": "close", "message": message, "target": target,
+                        "as": "cancelled" if op.get("as") == "cancelled" else "done"})
+        else:
+            first = _iso(op.get("due_from"))
+            if first is None:
+                continue
+            out.append({"op": "reschedule", "message": message, "target": target,
+                        "due_from": first, "due_until": _iso(op.get("due_until")) or first})
+    return out
+
+
+class LLMIntentionTracker:
+    """Reads a user's new messages with their open intentions and returns
+    what changes (``parse_track``), one request per ``batch_size``
+    messages, cached on disk by request."""
+
+    def __init__(self, model: str = "gpt-4.1-mini", client=None,
+                 base_url: Optional[str] = None, api_key: Optional[str] = None,
+                 cache_dir: Optional[str] = None, batch_size: int = 8,
+                 max_open: int = 60, **chat_kwargs):
+        from ._chat import CachedChat
+
+        kwargs = dict(chat_kwargs)
+        kwargs.setdefault("max_tokens", 900)
+        kwargs.setdefault("request_kwargs", {"response_format": {"type": "json_object"}})
+        self._chat = CachedChat(TRACK_SYSTEM, model=model, client=client, base_url=base_url,
+                                api_key=api_key, cache_dir=cache_dir,
+                                cache_name="intention_tracker", what="intention tracking",
+                                **kwargs)
+        self.model = model
+        self.batch_size = max(1, int(batch_size))
+        self.max_open = int(max_open)
+
+    @property
+    def calls(self) -> int:
+        return self._chat.calls
+
+    def track(self, open_items: Sequence[Dict], messages: Sequence[Dict]) -> List[Dict]:
+        """``open_items``: ``{"id", "text", "due_from", "due_until", "situation"}``,
+        the most recent last; ``messages``: ``{"text", "said_on"}`` in order.
+        A failed request raises."""
+        shown = list(open_items)[-self.max_open:]
+        lines = []
+        for k, item in enumerate(shown):
+            when = item.get("due_from") or "no date"
+            if item.get("due_until") and item.get("due_until") != item.get("due_from"):
+                when += f" to {item['due_until']}"
+            extra = f"; when: {item['situation']}" if item.get("situation") else ""
+            lines.append(f"P{k + 1}. {item['text']} ({when}{extra})")
+        listed = "\n".join(lines) or "(none)"
+        new = "\n".join(f"{k + 1}. [{m.get('said_on') or 'date unknown'}] "
+                        f"{' '.join((m.get('text') or '').split())}"
+                        for k, m in enumerate(messages))
+        reply = self._chat.ask(f"OPEN ITEMS:\n{listed}\n\nNEW MESSAGES:\n{new}")
+        ops = parse_track(reply, [item["id"] for item in shown], len(messages))
+        return ops
+
+    def forget_texts(self, texts) -> int:
+        return self._chat.forget_texts(texts)
+
+    def flush_cache(self) -> None:
+        self._chat.flush_cache()
+
+
 def _filter(*parts: Dict) -> str:
     return json.dumps(parts[0] if len(parts) == 1 else {"op": "and", "filters": list(parts)})
 
@@ -535,6 +694,93 @@ class IntentionLedger:
         changed = self.set_status(_merge(updates)) if updates else 0
         return {"closed": closed, "replaced": replaced, "patched": changed}
 
+
+    # -- the tracker's inbox (LLMIntentionTracker) ---------------------------------
+    def record_inbox(self, user_id: Optional[str], text: str, source_ids: Sequence[str],
+                     said_at) -> List[str]:
+        """Keep a user message for the tracker to read at consolidation."""
+        said = as_date(said_at)
+        payload = {"kind": "inbox", "status": "new", "user_id": user_id,
+                   "source_ids": list(source_ids),
+                   "said_on": said.isoformat() if said else None,
+                   "seq": int(self.engine.next_insert_seq())}
+        return self._insert(user_id, [text], [json.dumps(payload)], "inbox")
+
+    def inbox(self) -> Dict[Optional[str], List[Dict]]:
+        """Messages the tracker has not read yet, by user, oldest first."""
+        items = self._items(self.engine.ids_where(
+            _filter(_eq("kind", "inbox"), _eq("status", "new"))))
+        by_user: Dict[Optional[str], List[Dict]] = {}
+        for item in sorted(items.values(), key=lambda i: i.get("seq", 0)):
+            by_user.setdefault(item.get("scope"), []).append(item)
+        return by_user
+
+    def open_items(self, user_id: Optional[str]) -> List[Dict]:
+        """Pending intentions, oldest first (what the tracker is shown)."""
+        return sorted(self.pending(user_id), key=lambda i: i.get("seq", 0))
+
+    def apply_track(self, user_id: Optional[str], messages: Sequence[Dict],
+                    ops: Sequence[Dict], open_ids: Sequence[str]) -> Dict[str, int]:
+        """Apply a tracker's operations on ``messages`` (inbox items, in the
+        order they were shown) in one insert and one batch of payload
+        patches, and mark the messages read. ``open_ids``: the open items
+        as shown (an op's ``("open", id)`` must be one of them)."""
+        creates = [op for op in ops if op["op"] == "create"]
+        created: List[str] = []
+        if creates:
+            texts, payloads = [], []
+            seq = int(self.engine.next_insert_seq())
+            for k, op in enumerate(creates):
+                source = messages[op["message"] - 1]
+                payload = {"kind": "intention", "status": "pending", "cue": "tracked",
+                           "user_id": user_id,
+                           "source_ids": list(source.get("source_ids") or []),
+                           "said_on": source.get("said_on"), "seq": seq + k,
+                           "checked": "yes", "situation": op.get("situation"),
+                           "formed_by": source["id"]}
+                first = op.get("due_from") or op.get("due_until")
+                if first:
+                    start = date.fromisoformat(first)
+                    end = date.fromisoformat(op.get("due_until") or first)
+                    end = max(start, end)
+                    payload.update(due_from=start.isoformat(), due_until=end.isoformat(),
+                                   due_from_day=start.toordinal(), due_until_day=end.toordinal())
+                # The situation is part of the text, so a context that
+                # describes it brings the intention to mind.
+                texts.append(op["what"] + (f" ({op['situation']})" if op.get("situation")
+                                           else ""))
+                payloads.append(json.dumps(payload))
+            created = self._insert(user_id, texts, payloads, "intention")
+        updates: List[Tuple[str, Dict]] = []
+        closed = rescheduled = 0
+        allowed = set(open_ids)
+        for op in ops:
+            if op["op"] == "create":
+                continue
+            kind, ref = op["target"]
+            if kind == "open":
+                target = ref if ref in allowed else None
+            else:
+                target = created[ref - 1] if ref - 1 < len(created) else None
+            if target is None:
+                continue
+            source = messages[op["message"] - 1]
+            if op["op"] == "close":
+                updates.append((target, {"status": op["as"], "closed_by": source["id"],
+                                         "closed_on": source.get("said_on")}))
+                closed += 1
+            else:
+                start = date.fromisoformat(op["due_from"])
+                end = max(start, date.fromisoformat(op["due_until"]))
+                updates.append((target, {"due_from": start.isoformat(),
+                                         "due_until": end.isoformat(),
+                                         "due_from_day": start.toordinal(),
+                                         "due_until_day": end.toordinal(),
+                                         "rescheduled_by": source["id"]}))
+                rescheduled += 1
+        updates.extend((m["id"], {"status": "read"}) for m in messages)
+        self.set_status(_merge(updates))
+        return {"created": len(created), "closed": closed, "rescheduled": rescheduled}
 
 def _merge(updates: Sequence[Tuple[str, Dict]]) -> List[Tuple[str, Dict]]:
     """One patch per id, later fields over earlier ones, in first-seen order."""

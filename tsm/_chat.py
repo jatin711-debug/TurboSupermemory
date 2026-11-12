@@ -67,7 +67,9 @@ class CachedChat:
                 with open(self._cache_path, encoding="utf-8") as fh:
                     loaded = json.load(fh)
                 if isinstance(loaded, dict):
-                    self._cache = {k: v for k, v in loaded.items() if isinstance(v, str)}
+                    # Empty replies written by an older version are not answers.
+                    self._cache = {k: v for k, v in loaded.items()
+                                   if isinstance(v, str) and v.strip()}
             except (OSError, ValueError):
                 self._cache = {}
 
@@ -97,18 +99,22 @@ class CachedChat:
             return resp.choices[0].message.content or ""
 
         reply = call_with_retries(request, self._what, self.max_retries, logger)
-        with self._lock:
-            self._cache[key] = reply
-            self._dirty = True
+        # An empty reply says nothing about the request (a stub client, a
+        # provider hiccup); caching it would answer the request with nothing
+        # for good, so it is returned but asked again next time.
+        if reply.strip():
+            with self._lock:
+                self._cache[key] = reply
+                self._dirty = True
         return reply
 
     def forget_texts(self, texts) -> int:
         """Remove every cached reply that carries one of ``texts``
         (``tsm.forgetting``; the requests are only kept as hashes) and write
         the cache at once. Returns how many went."""
-        from .forgetting import Forgotten
+        from .forgetting import as_forgotten
 
-        forgotten = Forgotten(texts)
+        forgotten = as_forgotten(texts)
         if not forgotten:
             return 0
         with self._lock:

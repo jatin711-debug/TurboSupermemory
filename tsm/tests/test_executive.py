@@ -319,6 +319,23 @@ class TestBeliefLedger(MemoryTestBase):
         by_text = {r["text"]: r for r in mem.recall("user lives", user_id="u")}
         self.assertNotIn("superseded_by", by_text[OLD_FACT], "stays retracted")
 
+    def test_retract_affirms_the_old_fact_against_what_was_said_before(self):
+        mem = self._superseded()
+        mem.add([{"role": "user", "content": "I adopted a cat.", "timestamp": "2024-02-02"}],
+                user_id="u")
+        before = next(mid for mid in mem.engine.ids_where(None, "u")
+                      if mem.engine.get_records([mid])[0]["text"] == "I adopted a cat")
+        mem.retract("u_1", "u_2")
+        mem.add([{"role": "user", "content": "I moved to Rome.", "timestamp": "2024-03-01"}],
+                user_id="u")
+        later = next(mid for mid in mem.engine.ids_where(None, "u")
+                     if mem.engine.get_records([mid])[0]["text"] == "I moved to Rome")
+        pairs = [("u_1", "u_2", "update", 0.9), ("u_1", before, "update", 0.6),
+                 ("u_1", later, "update", 0.6), (before, later, "update", 0.5)]
+        self.assertEqual(mem._drop_affirmed(pairs),
+                         [("u_1", later, "update", 0.6), (before, later, "update", 0.5)],
+                         "only what was said after the retraction can replace it")
+
     def test_deleting_the_replacement_restores_the_old_fact(self):
         mem = self._superseded()
         mem.engine.delete("u_2")
@@ -479,6 +496,31 @@ class TestForgetDerived(MemoryTestBase):
         self.assertEqual(report["experience_removed"], 2, "the lesson and its episode")
         (left,) = mem.lessons("open the locker", "u", include_probation=True) or [None]
         self.assertTrue(left is None or "4512" not in left["content"])
+
+    def test_texts_reach_what_no_memory_holds_any_more(self):
+        # The fact was folded away, but its intention, its lesson and a gist
+        # sentence still say it: there is no memory id left to forget.
+        mem = self._store(experience=True, intentions=True)
+        mem.add([{"role": "user", "content": "Remind me to move the quokkaberry pot on Friday.",
+                  "timestamp": "2024-03-01"}], user_id="u")
+        mem.feedback("water the plants", "success", user_id="u",
+                     lesson="The spare key is under the quokkaberry pot.")
+        mem.feedback("make tea", "success", user_id="u", lesson="Green tea at 80 degrees.")
+        mem.consolidate()
+        for mid in mem.engine.ids_where(None, "u"):
+            if "quokkaberry" in (mem.engine.get_records([mid])[0]["text"] or ""):
+                mem.engine.delete(mid)
+        self.assertEqual(len(mem.intentions("u")), 1)
+        with self.assertRaises(ValueError):
+            mem.forget(texts=["quokkaberry pot"])
+        report = mem.forget(texts=["Quokkaberry pot"], user_id="u")
+        self.assertEqual(report["forgotten"], [])
+        self.assertEqual(report["intentions_removed"], 1)
+        self.assertEqual(report["experience_removed"], 2, "the lesson and its episode")
+        self.assertEqual(mem.intentions("u"), [])
+        tea = mem.lessons("make tea", "u", include_probation=True)
+        self.assertTrue(tea and "Green tea" in tea[0]["content"], "the rest stays")
+        self.assertTrue(mem.engine.contains_id("u_gist"), "a gist without it is untouched")
 
 
 # ------------------------------------------------------------ engine primitives

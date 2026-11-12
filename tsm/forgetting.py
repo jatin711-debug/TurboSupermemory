@@ -99,12 +99,28 @@ def distinctive_tokens(text: str) -> Set[str]:
 
 
 class Forgotten:
-    """The forgotten texts, prepared once for many ``carries`` checks."""
+    """The forgotten texts, prepared once for many ``carries`` checks.
 
-    def __init__(self, texts: Iterable[str]):
+    ``phrases``: words a person asked to forget ("my locker code", "Ana"),
+    carried by any text that contains one as whole words, however short.
+    (A forgotten *text* under four words is only carried as the whole text,
+    so that forgetting "Yes." does not touch every "yes".)
+
+    Iterating gives the texts and phrases as given, so a backend written
+    for a list of texts can be handed one."""
+
+    def __init__(self, texts: Iterable[str], phrases: Iterable[str] = ()):
+        texts = [t for t in texts if t]
+        self._given: List[str] = list(texts)
         self.texts: List[str] = []
         self.tokens: Set[str] = set()
         self.term_sets: List[List[str]] = []
+        self.phrases: List[re.Pattern] = []
+        for phrase in phrases:
+            norm = _norm(_TAG.sub("", phrase or ""))
+            if norm:
+                self._given.append(phrase)
+                self.phrases.append(re.compile(r"(?<!\w)" + re.escape(norm) + r"(?!\w)"))
         for text in texts:
             text = _TAG.sub("", text or "").strip()
             if not text:
@@ -116,12 +132,17 @@ class Forgotten:
                 self.term_sets.append(terms)
 
     def __bool__(self) -> bool:
-        return bool(self.texts)
+        return bool(self.texts or self.phrases)
+
+    def __iter__(self):
+        return iter(self._given)
 
     def carries(self, text: str) -> bool:
         if not text or not self:
             return False
         norm = _norm(text)
+        if any(p.search(norm) for p in self.phrases):
+            return True
         # Verbatim: anywhere for a text of four words or more; a shorter one
         # ("yes.", "ok, thanks") only as the whole text.
         if any(t in norm if len(t.split()) >= 4 else t == norm for t in self.texts):
@@ -131,6 +152,11 @@ class Forgotten:
         words = {_stem(w) for w in re.findall(r"[a-z0-9]+", norm)}
         return any(sum(t in words for t in terms) >= TERM_SHARE * len(terms)
                    for terms in self.term_sets)
+
+
+def as_forgotten(texts) -> "Forgotten":
+    """``texts`` as a ``Forgotten`` (one passed in is used as it is)."""
+    return texts if isinstance(texts, Forgotten) else Forgotten(texts)
 
 
 def carries(text: str, forgotten: Sequence[str]) -> bool:

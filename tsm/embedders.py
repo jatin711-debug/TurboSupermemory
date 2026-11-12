@@ -92,6 +92,13 @@ class OpenAIEmbedder:
         self._request_dim = self._dim if (shortens and dim and dim != native) else None
         self.batch = batch
         self.max_retries = max_retries
+        # ``Memory.due``: how close a context must be to a pending intention
+        # to bring it to mind. Measured for text-embedding-3-small at its own
+        # size only (benchmarks/executive/intentions_eval.py, dev split:
+        # 38 of 54 due items at 0.35 against 30 at the generic 0.50, wrong
+        # 11 against 10); any other model keeps the generic value.
+        self.cue_min_cosine = (0.35 if model == "text-embedding-3-small"
+                               and self._request_dim is None else None)
         self.calls = 0
         self._cache = {}
         self._dirty = 0
@@ -171,9 +178,9 @@ class OpenAIEmbedder:
         """Remove every cached entry whose text carries one of ``texts``
         (``tsm.forgetting``), and write the cache to disk at once. Called by
         ``Memory.forget``; returns how many entries went."""
-        from .forgetting import Forgotten
+        from .forgetting import as_forgotten
 
-        forgotten = Forgotten(texts)
+        forgotten = as_forgotten(texts)
         if not forgotten:
             return 0
         gone = [text for text in self._cache if forgotten.carries(text)]

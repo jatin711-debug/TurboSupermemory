@@ -108,8 +108,11 @@ def parse_overrides(items):
     return out
 
 
-def run(pairs, layout, verifier, overrides, embedder, rounds=1, topics=None):
-    """Store the pairs, consolidate, and return per-pair outcomes."""
+def run(pairs, layout, verifier, overrides, embedder, rounds=1, topics=None, retract_wrong=False):
+    """Store the pairs, consolidate, and return per-pair outcomes. With
+    ``retract_wrong``, every wrong replacement is then taken back with
+    ``Memory.retract`` (as a person correcting it would) and the store is
+    consolidated again: the outcomes are those after that."""
     from tsm import Memory
 
     db = tempfile.mkdtemp(prefix="tsm_belief_pairs_")
@@ -134,6 +137,8 @@ def run(pairs, layout, verifier, overrides, embedder, rounds=1, topics=None):
 
         committed = sum(memory.consolidate() for _ in range(rounds))
         resolved = {r["id"]: r["current_id"] for r in memory.engine.resolve_beliefs(old_ids + new_ids)}
+        if retract_wrong:
+            resolved = retract_and_recheck(memory, pairs, old_ids, new_ids, resolved)
         outcomes = []
         for i, pair in enumerate(pairs):
             current = resolved[old_ids[i]]
@@ -150,6 +155,45 @@ def run(pairs, layout, verifier, overrides, embedder, rounds=1, topics=None):
     finally:
         memory.close()
         shutil.rmtree(db, ignore_errors=True)
+
+
+def _successor(memory, mid):
+    """The memory that directly replaced ``mid`` (from ``Memory.history``)."""
+    chain = [c["id"] for c in memory.history(mid)]
+    k = chain.index(mid) if mid in chain else -1
+    return chain[k + 1] if 0 <= k < len(chain) - 1 else None
+
+
+def retract_and_recheck(memory, pairs, old_ids, new_ids, resolved):
+    """Retract every wrong replacement, consolidate again, check that
+    ``history`` agrees with the engine, and report what came back."""
+    wrong = []
+    for i, pair in enumerate(pairs):
+        if pair["label"] == "coexist" and resolved[old_ids[i]] != old_ids[i]:
+            wrong.append(old_ids[i])
+        if pair["label"] != "same" and resolved[new_ids[i]] != new_ids[i]:
+            wrong.append(new_ids[i])
+    taken_back = 0
+    for mid in wrong:
+        succ = _successor(memory, mid)
+        if succ is not None and memory.retract(mid, succ):
+            taken_back += 1
+    after_retract = {r["id"]: r["current_id"]
+                     for r in memory.engine.resolve_beliefs(old_ids + new_ids)}
+    still = sum(after_retract[m] != m for m in wrong)
+    memory.consolidate()
+    out = {r["id"]: r["current_id"] for r in memory.engine.resolve_beliefs(old_ids + new_ids)}
+    again = sum(out[m] != m for m in wrong)
+    mismatched = 0
+    for mid in old_ids + new_ids:
+        chain = memory.history(mid)
+        current = [c["id"] for c in chain if c["current"]]
+        if chain and current != [out[mid]]:
+            mismatched += 1
+    print(f"  retract: {len(wrong)} wrong, {taken_back} taken back, {still} still hidden "
+          f"right after; after another consolidation {again} hidden again; "
+          f"history disagrees with the engine for {mismatched} memories")
+    return out
 
 
 def report(outcomes, title):
@@ -240,6 +284,8 @@ def main():
     ap.add_argument("--offline", action="store_true",
                     help="never call the chat model: pairs without a cached verdict stay "
                          "unjudged, and the requests a real run would make are counted")
+    ap.add_argument("--retract-wrong", action="store_true",
+                    help="retract every wrong replacement, consolidate again, score after")
     ap.add_argument("--json", help="write the summary here")
     args = ap.parse_args()
 
@@ -312,7 +358,7 @@ def main():
                                   base_url=args.llm_base_url,
                                   cache_dir=os.path.join(EVAL_DIR, "topics_pairs"))
         outcomes, committed = run(pairs, layout, verifier, overrides, embedder, args.rounds,
-                                  topics=keyer)
+                                  topics=keyer, retract_wrong=args.retract_wrong)
         if keyer is not None:
             print(f"\n  [topic keying: {keyer.calls} requests to {args.topic_model} "
                   f"in this layout]")

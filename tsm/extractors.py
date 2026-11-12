@@ -371,9 +371,9 @@ class OpenAIExtractor:
         """Remove every cached entry whose message or extracted facts carries one of ``texts``
         (``tsm.forgetting``), and write the cache to disk at once. Called by
         ``Memory.forget``; returns how many entries went."""
-        from .forgetting import Forgotten
+        from .forgetting import as_forgotten
 
-        forgotten = Forgotten(texts)
+        forgotten = as_forgotten(texts)
         if not forgotten:
             return 0
         with self._lock:
@@ -496,9 +496,9 @@ class GlinerExtractor:
         """Remove every cached entry whose message or extracted facts carries one of ``texts``
         (``tsm.forgetting``), and write the cache to disk at once. Called by
         ``Memory.forget``; returns how many entries went."""
-        from .forgetting import Forgotten
+        from .forgetting import as_forgotten
 
-        forgotten = Forgotten(texts)
+        forgotten = as_forgotten(texts)
         gone = [key for key, facts in self._cache.items()
                 if forgotten.carries(key) or any(forgotten.carries(str(f)) for f in facts or ())]
         for key in gone:

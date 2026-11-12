@@ -137,12 +137,21 @@ with Memory("./my_db") as mem:                       # conversational profile
   Recall is scoped by the engine itself: other users' records never show up
   and never take result slots.
 
-## The executive (a prototype, opt-in, not yet measured)
+## The executive (prototypes, opt-in)
 
 Control loops around the store. None of them changes what `recall()`
-returns. None was measured: intentions were to be judged against a plain
-to-do ledger and lessons against retrieving the raw past episodes
-([LEARNINGS.md](../LEARNINGS.md)). The read-time monitor
+returns. Measured on 2026-11-12 ([LEARNINGS.md](../LEARNINGS.md)):
+
+- **Intentions.** On held-out scenarios the rules below found 6 of 53 due
+  items. The model tracker (`intention_tracker="llm"`) found 34 with 13
+  wrong. Using no intention store at all, and having a model read `recall()`,
+  found 33 with 8 wrong. Neither intention store beats that yet; use the rules
+  for explicit "remind me to ..." only.
+- **`forget`, `retract`, `history`.** These were checked from outside, and
+  the leaks found were fixed.
+- **Lessons.** Not measured: that needs tasks with real outcomes.
+
+The read-time monitor
 (`checked_recall`) did not, and was removed on 2026-11-11: no second look,
 free or judged, got evidence into a LongMemEval-S context that lacked it,
 and both lost some (`git show e79d75f:benchmarks/PHASE_PROGRESS.md`).
@@ -152,7 +161,8 @@ mem = Memory("./db", intentions=True, experience=True)
 
 # Intentions: formed by add() from "remind me to ..." or "I need to ... by
 # Friday", closed or replaced at consolidate(), due by time or brought to
-# mind by the context. due() is a read.
+# mind by the context. due() is a read. With intention_tracker="llm" a model
+# reads the user's messages at consolidate() instead of the rules.
 mem.due("alice", now="2024-03-05", context="at the passport office")
 mem.resolve_intention(intention_id, "done")
 
@@ -165,8 +175,9 @@ mem.feedback(task, "failure", memory_ids=[i["id"] for i in items],
 
 # Belief ledger.
 mem.history(memory_id)        # the chain with valid_from / valid_until
-mem.retract(old_id, new_id)   # take a supersession back, for good
+mem.retract(old_id, new_id)   # take it back; nothing said before replaces it
 mem.forget([memory_id], user_id="alice")   # cascades to the message; verified
+mem.forget(texts=["locker code"], user_id="alice")  # what no memory holds any more
 ```
 
 Intentions and experience each keep their own engine under `db_path`
@@ -174,8 +185,9 @@ Intentions and experience each keep their own engine under `db_path`
 patches (`MemoryEngine.set_payloads`), which keep a record's place, so
 nothing is embedded twice and belief ordering is untouched. The cosine floors
 they use (`tsm.intentions.COMPLETION_MIN_COSINE`, `RESCHEDULE_MIN_COSINE`,
-`CUE_MIN_COSINE`, `tsm.experience.ITEM_MATCH_COSINE`) are untuned and belong to
-an embedder's geometry.
+`CUE_MIN_COSINE`, `tsm.experience.ITEM_MATCH_COSINE`) belong to an embedder's
+geometry. Only the context cue is tuned, and only for `OpenAIEmbedder`
+(`cue_min_cosine`, 0.35); the rest are untuned.
 
 `forget()` treats a forget request as a promise that the content is not
 served again, so derived text goes too (`tsm/forgetting.py`):
@@ -192,6 +204,11 @@ served again, so derived text goes too (`tsm/forgetting.py`):
 - The on-disk caches under `tsm_cache/` lose every entry that carries the
   content and are rewritten at once (`purge_caches=True`). These are the
   extractions, embeddings and judges' replies.
+- `texts=` (with `user_id`) adds the person's own words. Any gist sentence,
+  intention, lesson or cache entry that contains one as whole words goes.
+  Memories themselves are deleted only by id.
+- Deleting a memory also removes the words only it brought into the concept
+  graph. Bytes can still sit in the database's freed pages until reused.
 - `verified` in the result also checks that no redacted gist still carries
   it. The matching is rule-based and English-leaning, and errs toward
   removing.

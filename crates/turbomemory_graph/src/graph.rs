@@ -543,16 +543,98 @@ impl MemoryGraph {
         true
     }
 
+    /// Remove a memory, its edges, and every word that only it brought in.
+    ///
+    /// A deleted memory must not leave its words behind: a concept no other
+    /// memory is attached to is removed with it (and any abstraction named
+    /// after it), and the memory's concept pairs are taken out of the
+    /// co-occurrence counts, which would otherwise keep the words in every
+    /// snapshot (and could re-create the concept in `build_abstractions`).
     pub fn remove_memory(&mut self, id: &str) {
         let mem_key = NodeId::memory(id).as_str();
         let Some(mem_id) = self.get_node_id(&mem_key) else {
             return;
         };
+        let mut concepts: Vec<(u32, String)> = self
+            .int_adjacency
+            .get(mem_id)
+            .map(|idxs| {
+                idxs.iter()
+                    .filter(|&&i| self.int_edges[i].kind == EdgeKind::Association)
+                    .filter_map(|&i| {
+                        let target = self.int_edges[i].target;
+                        let node = self.interner.get(target)?;
+                        (matches!(node.kind, NodeKind::Concept) && !node.external_id.contains('+'))
+                            .then(|| (target, node.external_id.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        concepts.sort_by(|a, b| a.1.cmp(&b.1));
+        concepts.dedup_by(|a, b| a.0 == b.0);
         // Remove the node from interner (mark as removed by clearing key map)
         self.interner.key_to_id.remove(&mem_key);
         // Remove edges connected to this node
         self.int_edges
             .retain(|e| e.source != mem_id && e.target != mem_id);
+
+        // Its concept pairs no longer co-occur in it.
+        for i in 0..concepts.len() {
+            for j in (i + 1)..concepts.len() {
+                let key = format!("concept:{}\0concept:{}", concepts[i].1, concepts[j].1);
+                if let Some(count) = self.co_occurrence.get_mut(&key) {
+                    if *count > 1 {
+                        *count -= 1;
+                    } else if *count == 1 {
+                        self.co_occurrence.remove(&key);
+                    }
+                }
+            }
+        }
+
+        // Concepts no live memory is attached to any more go too.
+        let is_memory = |interner: &NodeInterner, nid: u32| {
+            interner
+                .get(nid)
+                .is_some_and(|n| matches!(n.kind, NodeKind::Memory))
+        };
+        let attached: HashSet<u32> = self
+            .int_edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Association && is_memory(&self.interner, e.source))
+            .map(|e| e.target)
+            .collect();
+        let orphans: HashSet<String> = concepts
+            .iter()
+            .filter(|(cid, _)| !attached.contains(cid))
+            .map(|(_, name)| name.clone())
+            .collect();
+        if !orphans.is_empty() {
+            let doomed: HashSet<u32> = self
+                .interner
+                .iter()
+                .filter(|(_, _, n)| {
+                    matches!(n.kind, NodeKind::Concept)
+                        && n.external_id.split('+').any(|part| orphans.contains(part))
+                })
+                .map(|(nid, _, _)| nid)
+                .collect();
+            let keys: Vec<String> = self
+                .interner
+                .iter()
+                .filter(|(nid, _, _)| doomed.contains(nid))
+                .map(|(_, key, _)| key.clone())
+                .collect();
+            for key in keys {
+                self.interner.key_to_id.remove(&key);
+            }
+            self.int_edges
+                .retain(|e| !doomed.contains(&e.source) && !doomed.contains(&e.target));
+            self.co_occurrence.retain(|key, _| {
+                !key.split('\0')
+                    .any(|part| orphans.contains(part.strip_prefix("concept:").unwrap_or(part)))
+            });
+        }
         self.int_adjacency.rebuild(&self.int_edges);
     }
 
@@ -2041,6 +2123,51 @@ mod tests {
             restored.abstraction_count() >= 1,
             "abstraction nodes should survive roundtrip"
         );
+    }
+
+    #[test]
+    fn removing_a_memory_removes_the_words_only_it_brought() {
+        let mut g = MemoryGraph::new();
+        g.add_memory(
+            "m1",
+            "locker code",
+            &["locker".into(), "quokkaberry".into()],
+        );
+        g.add_memory("m2", "locker room", &["locker".into(), "room".into()]);
+        g.add_memory("m3", "pot in the room", &["room".into(), "pot".into()]);
+        g.build_abstractions(1);
+        let before = g.to_snapshot_bytes().expect("save");
+        assert!(before.windows(11).any(|w| w == b"quokkaberry"));
+
+        g.remove_memory("m1");
+        let concepts: Vec<String> = g
+            .nodes()
+            .values()
+            .filter_map(|n| match &n.id {
+                NodeId::Concept(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !concepts.iter().any(|c| c.contains("quokkaberry")),
+            "an orphaned concept and its abstraction go: {concepts:?}"
+        );
+        assert!(concepts.contains(&"locker".to_string()), "m2 still has it");
+        assert!(concepts.contains(&"room".to_string()));
+        assert!(!g.co_occurrence.keys().any(|k| k.contains("quokkaberry")));
+        let after = g.to_snapshot_bytes().expect("save");
+        assert!(
+            !after.windows(11).any(|w| w == b"quokkaberry"),
+            "the snapshot no longer holds the word"
+        );
+        // The rest of the graph is intact and still searchable by its words.
+        assert_eq!(g.concept_degree("locker"), 1);
+        assert_eq!(g.concept_degree("room"), 2);
+        g.build_abstractions(1);
+        assert!(!g
+            .nodes()
+            .values()
+            .any(|n| matches!(&n.id, NodeId::Concept(c) if c.contains("quokkaberry"))));
     }
 
     #[test]

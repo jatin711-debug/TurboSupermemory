@@ -1,0 +1,7041 @@
+[
+ {
+  "id": "s01",
+  "split": "dev",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2024-03-04T09:12:00",
+    "content": "Morning. Big week. I promised Priya I'd send her the slides from the offsite tomorrow, and the quarterly expense report is due Friday.",
+    "creates": [
+     "i1",
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "assistant",
+    "timestamp": "2024-03-04T09:13:00",
+    "content": "Sounds busy! Want me to help you outline the expense report?",
+    "decoy": true
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2024-03-04T09:20:00",
+    "content": "nah I'm fine. my manager Duc has to sign off the whole budget by the 15th though, so that's his headache not mine",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2024-03-05T17:40:00",
+    "content": "Priya has the slides now, she said thanks. Also dentist on Thursday at 3, almost forgot about that one",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2024-03-06T08:05:00",
+    "content": "Dentist rang, they need to move me. It's now the 21st, same time.",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i3",
+      "due_from": "2024-03-21",
+      "due_until": "2024-03-21"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2024-03-08T16:30:00",
+    "content": "expense report submitted, finally",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2024-03-11T12:00:00",
+    "content": "I need to fix the bike's brakes at some point, they squeal like mad every time I stop",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2024-03-11T12:02:00",
+    "content": "If I had more time I'd do a proper bike maintenance course, honestly",
+    "decoy": true
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "send Priya the slides from the offsite",
+    "due_from": "2024-03-05",
+    "due_until": "2024-03-05",
+    "situation": null,
+    "kind": "commitment"
+   },
+   "i2": {
+    "what": "submit the quarterly expense report",
+    "due_from": "2024-03-06",
+    "due_until": "2024-03-08",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i3": {
+    "what": "dentist appointment at 3pm",
+    "due_from": "2024-03-07",
+    "due_until": "2024-03-07",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i4": {
+    "what": "fix the bike's brakes",
+    "due_from": null,
+    "due_until": null,
+    "situation": null,
+    "kind": "todo"
+   }
+  },
+  "checks": [
+   {
+    "now": "2024-03-06",
+    "context": null,
+    "should_surface": [
+     "i2"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i3"
+    ],
+    "note": "i1 done 2024-03-05; i2 due; i3 not due until 2024-03-21"
+   },
+   {
+    "now": "2024-03-12",
+    "context": "I'm at the bike shop picking up a new inner tube",
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2024-03-05; i2 done 2024-03-08; i3 not due until 2024-03-21; i4 brought to mind by context"
+   },
+   {
+    "now": "2024-03-21",
+    "context": null,
+    "should_surface": [
+     "i3"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 done 2024-03-05; i2 done 2024-03-08; i3 due"
+   }
+  ]
+ },
+ {
+  "id": "s02",
+  "split": "test",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2024-06-10T19:45:00",
+    "content": "told mum I'd drop off her prescription tomorrow after work. also the council tax direct debit form has to go back by the 14th",
+    "creates": [
+     "i1",
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "assistant",
+    "timestamp": "2024-06-10T19:46:00",
+    "content": "Would you like me to set up a weekly reminder for your mum's prescriptions?",
+    "decoy": true
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2024-06-10T19:50:00",
+    "content": "no its a one off. my brother's meant to be sorting out the care rota for her by July, fingers crossed he actually does",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2024-06-11T20:10:00",
+    "content": "Mum's got her tablets, all good. Optician on Friday at 10:30 btw",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2024-06-13T09:00:00",
+    "content": "optician moved me to wednesday the 26th, they're short staffed",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i3",
+      "due_from": "2024-06-26",
+      "due_until": "2024-06-26"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2024-06-14T13:15:00",
+    "content": "posted the council tax form this morning",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2024-06-17T18:30:00",
+    "content": "gutter over the back door is leaking again, need to get someone round to look at it eventually",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2024-06-17T18:32:00",
+    "content": "would love a conservatory one day but that's a pipe dream on my salary",
+    "decoy": true
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "drop off Mum's prescription after work",
+    "due_from": "2024-06-11",
+    "due_until": "2024-06-11",
+    "situation": null,
+    "kind": "commitment"
+   },
+   "i2": {
+    "what": "send back the council tax direct debit form",
+    "due_from": "2024-06-12",
+    "due_until": "2024-06-14",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i3": {
+    "what": "optician appointment at 10:30",
+    "due_from": "2024-06-14",
+    "due_until": "2024-06-14",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i4": {
+    "what": "get someone to look at the leaking gutter",
+    "due_from": null,
+    "due_until": null,
+    "situation": null,
+    "kind": "todo"
+   }
+  },
+  "checks": [
+   {
+    "now": "2024-06-13",
+    "context": null,
+    "should_surface": [
+     "i2"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i3"
+    ],
+    "note": "i1 done 2024-06-11; i2 due; i3 not due until 2024-06-26"
+   },
+   {
+    "now": "2024-06-18",
+    "context": "on the phone with a roofer getting a quote for the garage roof",
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2024-06-11; i2 done 2024-06-14; i3 not due until 2024-06-26; i4 brought to mind by context"
+   },
+   {
+    "now": "2024-06-27",
+    "context": null,
+    "should_surface": [
+     "i3"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 done 2024-06-11; i2 done 2024-06-14; i3 overdue since 2024-06-26"
+   }
+  ]
+ },
+ {
+  "id": "s03",
+  "split": "dev",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2024-04-06T10:20:00",
+    "content": "Next time I'm at the hardware store I need picture hooks and a tube of grout.",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2024-04-06T10:22:00",
+    "content": "Also remind me to book a table at Lantern & Pike for Ellie's birthday dinner. Her birthday's the 19th so I should book by Wednesday",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "assistant",
+    "timestamp": "2024-04-06T10:23:00",
+    "content": "Will do. Lantern & Pike gets busy on Fridays, so you could also look at Osteria Vela as a backup?",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2024-04-08T21:00:00",
+    "content": "When I see Tom at five-a-side on Thursday I have to ask about borrowing his drill",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2024-04-09T12:30:00",
+    "content": "No need to book the restaurant after all, Ellie's partner is doing a surprise thing at their flat",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "cancelled"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2024-04-11T22:40:00",
+    "content": "Tom wasn't at football tonight. so the drill question is still hanging",
+    "decoy": false
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2024-04-13T11:00:00",
+    "content": "I used to go to the hardware store every single weekend when we were doing up the old place",
+    "decoy": true
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2024-04-13T15:10:00",
+    "content": "Got the hooks and the grout at Brennan's Hardware, finally",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "buy picture hooks and a tube of grout",
+    "due_from": null,
+    "due_until": null,
+    "situation": "at the hardware store",
+    "kind": "todo"
+   },
+   "i2": {
+    "what": "book a table at Lantern & Pike for Ellie's birthday dinner",
+    "due_from": "2024-04-08",
+    "due_until": "2024-04-10",
+    "situation": null,
+    "kind": "reminder"
+   },
+   "i3": {
+    "what": "ask Tom about borrowing his drill",
+    "due_from": "2024-04-11",
+    "due_until": "2024-04-11",
+    "situation": "when seeing Tom (five-a-side football)",
+    "kind": "todo"
+   }
+  },
+  "checks": [
+   {
+    "now": "2024-04-09",
+    "context": "I'm at Brennan's Hardware on Elm Street",
+    "should_surface": [
+     "i1"
+    ],
+    "must_not_surface": [
+     "i2"
+    ],
+    "note": "i1 brought to mind by context; i2 cancelled 2024-04-09"
+   },
+   {
+    "now": "2024-04-12",
+    "context": null,
+    "should_surface": [
+     "i3"
+    ],
+    "must_not_surface": [
+     "i2"
+    ],
+    "note": "i2 cancelled 2024-04-09; i3 overdue since 2024-04-11"
+   },
+   {
+    "now": "2024-04-15",
+    "context": "just bumped into Tom at the corner shop",
+    "should_surface": [
+     "i3"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 done 2024-04-13; i2 cancelled 2024-04-09; i3 brought to mind by context"
+   }
+  ]
+ },
+ {
+  "id": "s04",
+  "split": "test",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2025-02-01T09:40:00",
+    "content": "when I'm next at the pet shop I have to pick up the grain-free kibble for Biscuit, vet says we should switch",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2025-02-01T09:42:00",
+    "content": "can you remind me to book Biscuit's booster jab? needs doing by the 10th",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "assistant",
+    "timestamp": "2025-02-01T09:43:00",
+    "content": "Sure. Many vets offer a discount if you book the annual check-up at the same time, worth asking?",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2025-02-03T18:20:00",
+    "content": "Need to give Jana back her cat carrier when I see her at book club on Thursday",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2025-02-05T08:15:00",
+    "content": "ok scrap the booster booking, the vet rang me and booked Biscuit in themselves. It's the 12th at 5:40",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "cancelled"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2025-02-06T22:00:00",
+    "content": "book club got called off so Jana still has no carrier lol",
+    "decoy": false
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2025-02-08T10:00:00",
+    "content": "my neighbour has to take her dog to obedience classes every Saturday, rather her than me",
+    "decoy": true
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2025-02-09T14:30:00",
+    "content": "picked up the new kibble at PetPal today, Biscuit is deeply suspicious of it",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "buy grain-free kibble for Biscuit",
+    "due_from": null,
+    "due_until": null,
+    "situation": "at the pet shop",
+    "kind": "todo"
+   },
+   "i2": {
+    "what": "book Biscuit's booster jab",
+    "due_from": "2025-02-08",
+    "due_until": "2025-02-10",
+    "situation": null,
+    "kind": "reminder"
+   },
+   "i3": {
+    "what": "give Jana back her cat carrier",
+    "due_from": "2025-02-06",
+    "due_until": "2025-02-06",
+    "situation": "when seeing Jana at book club",
+    "kind": "todo"
+   },
+   "i4": {
+    "what": "take Biscuit to the vet for the booster at 5:40",
+    "due_from": "2025-02-12",
+    "due_until": "2025-02-12",
+    "situation": null,
+    "kind": "appointment"
+   }
+  },
+  "checks": [
+   {
+    "now": "2025-02-05",
+    "context": "walking into PetPal on the high street",
+    "should_surface": [
+     "i1"
+    ],
+    "must_not_surface": [
+     "i2",
+     "i4"
+    ],
+    "note": "i1 brought to mind by context; i2 cancelled 2025-02-05; i4 not due until 2025-02-12"
+   },
+   {
+    "now": "2025-02-07",
+    "context": null,
+    "should_surface": [
+     "i3"
+    ],
+    "must_not_surface": [
+     "i2",
+     "i4"
+    ],
+    "note": "i2 cancelled 2025-02-05; i3 overdue since 2025-02-06; i4 not due until 2025-02-12"
+   },
+   {
+    "now": "2025-02-12",
+    "context": "texting Jana about the rescheduled book club",
+    "should_surface": [
+     "i3",
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 done 2025-02-09; i2 cancelled 2025-02-05; i3 brought to mind by context; i4 due"
+   }
+  ]
+ },
+ {
+  "id": "s05",
+  "split": "dev",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2024-09-02T08:30:00",
+    "content": "Right, the surgery finally texted. Blood test on the 11th at 8:40, fasting from midnight, ugh",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2024-09-02T08:32:00",
+    "content": "and I really should ring the physio this week to book the follow-up for my knee",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "assistant",
+    "timestamp": "2024-09-02T08:33:00",
+    "content": "Fasting bloods usually still allow water. You might double-check with the surgery.",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2024-09-04T12:10:00",
+    "content": "booked the physio for the 18th at 4",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2024-09-09T19:00:00",
+    "content": "blood test got bumped to the 16th, the nurse is off sick",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i1",
+      "due_from": "2024-09-16",
+      "due_until": "2024-09-16"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2024-09-09T19:02:00",
+    "content": "did a 10k on Sunday btw, knee held up fine",
+    "decoy": true
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2024-09-13T07:50:00",
+    "content": "physio needs to move me AGAIN. now the 25th",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i3",
+      "due_from": "2024-09-25",
+      "due_until": "2024-09-25"
+     }
+    ]
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2024-09-16T10:05:00",
+    "content": "bloods done, results in a week",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2024-09-16T10:07:00",
+    "content": "my husband keeps saying he'll get his eyes tested, he never does",
+    "decoy": true
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "fasting blood test at 8:40",
+    "due_from": "2024-09-11",
+    "due_until": "2024-09-11",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i2": {
+    "what": "ring the physio to book the knee follow-up",
+    "due_from": "2024-09-02",
+    "due_until": "2024-09-08",
+    "situation": null,
+    "kind": "todo"
+   },
+   "i3": {
+    "what": "physio follow-up for the knee at 4pm",
+    "due_from": "2024-09-18",
+    "due_until": "2024-09-18",
+    "situation": null,
+    "kind": "appointment"
+   }
+  },
+  "checks": [
+   {
+    "now": "2024-09-03",
+    "context": null,
+    "should_surface": [
+     "i2"
+    ],
+    "must_not_surface": [
+     "i1"
+    ],
+    "note": "i1 not due until 2024-09-11; i2 due"
+   },
+   {
+    "now": "2024-09-14",
+    "context": "at the cinema with friends",
+    "should_surface": [],
+    "must_not_surface": [
+     "i2",
+     "i3"
+    ],
+    "note": "i2 done 2024-09-04; i3 not due until 2024-09-25"
+   },
+   {
+    "now": "2024-09-16",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2024-09-16; i2 done 2024-09-04; i3 not due until 2024-09-25"
+   },
+   {
+    "now": "2024-09-26",
+    "context": null,
+    "should_surface": [
+     "i3"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 done 2024-09-16; i2 done 2024-09-04; i3 overdue since 2024-09-25"
+   }
+  ]
+ },
+ {
+  "id": "s06",
+  "split": "test",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2025-03-03T13:00:00",
+    "content": "dentist cleaning is on the 12th at 2pm. also gotta renew my car registration this week, the DMV notice says it lapses Friday",
+    "creates": [
+     "i1",
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "assistant",
+    "timestamp": "2025-03-03T13:01:00",
+    "content": "You can usually renew registration online in about 10 minutes. Want me to walk you through it?",
+    "decoy": true
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2025-03-05T09:20:00",
+    "content": "registration renewed online, sticker's in the mail",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2025-03-05T09:22:00",
+    "content": "I also need to call the insurance company about the windshield claim before the 20th",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2025-03-10T17:00:00",
+    "content": "dental office called, they're moving my cleaning to the 19th",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i1",
+      "due_from": "2025-03-19",
+      "due_until": "2025-03-19"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2025-03-10T17:02:00",
+    "content": "my roommate renewed her license last week and it took her three hours in line lol",
+    "decoy": true
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2025-03-14T11:00:00",
+    "content": "insurance guy said the claim deadline is actually the 31st, so I have more time",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i3",
+      "due_from": "2025-03-29",
+      "due_until": "2025-03-31"
+     }
+    ]
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2025-03-19T16:30:00",
+    "content": "teeth are clean, dentist says I need to floss more. shocker",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "dental cleaning at 2pm",
+    "due_from": "2025-03-12",
+    "due_until": "2025-03-12",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i2": {
+    "what": "renew the car registration",
+    "due_from": "2025-03-05",
+    "due_until": "2025-03-07",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i3": {
+    "what": "call the insurance company about the windshield claim",
+    "due_from": "2025-03-18",
+    "due_until": "2025-03-20",
+    "situation": null,
+    "kind": "deadline"
+   }
+  },
+  "checks": [
+   {
+    "now": "2025-03-04",
+    "context": "logging into the DMV website to check my address",
+    "should_surface": [
+     "i2"
+    ],
+    "must_not_surface": [
+     "i1"
+    ],
+    "note": "i1 not due until 2025-03-12; i2 brought to mind by context"
+   },
+   {
+    "now": "2025-03-15",
+    "context": "at the hardware store buying light bulbs",
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 not due until 2025-03-19; i2 done 2025-03-05; i3 not due until 2025-03-29"
+   },
+   {
+    "now": "2025-03-19",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2025-03-19; i2 done 2025-03-05; i3 not due until 2025-03-29"
+   },
+   {
+    "now": "2025-03-30",
+    "context": null,
+    "should_surface": [
+     "i3"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 done 2025-03-19; i2 done 2025-03-05; i3 due"
+   }
+  ]
+ },
+ {
+  "id": "s07",
+  "split": "dev",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2024-07-01T20:15:00",
+    "content": "Flights to Porto booked for the 26th!! Need to sort travel insurance before we go, and I have to get the passport renewal in this week, mine expires in September and they want six months left",
+    "creates": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "assistant",
+    "timestamp": "2024-07-01T20:16:00",
+    "content": "Exciting! If you like wine, a day trip to the Douro valley is well worth it.",
+    "decoy": true
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2024-07-01T20:20:00",
+    "content": "if we had more days I'd do the Douro thing but we really don't",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2024-07-04T18:00:00",
+    "content": "Passport application sent off, paid for the fast track",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2024-07-10T08:30:00",
+    "content": "Need to get the hallway light fixed at some point too, the bulb holder keeps flickering",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2024-07-15T12:00:00",
+    "content": "new passport arrived already!! that was quick",
+    "decoy": true
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2024-07-22T21:00:00",
+    "content": "insurance is sorted, turns out the bank account package covers us so no separate policy needed",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2024-07-22T21:05:00",
+    "content": "my sister has to get her ESTA before her New York trip, she's left it late as usual",
+    "decoy": true
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "sort travel insurance before the Porto trip",
+    "due_from": "2024-07-23",
+    "due_until": "2024-07-25",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i2": {
+    "what": "send off the passport renewal",
+    "due_from": "2024-07-01",
+    "due_until": "2024-07-07",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i3": {
+    "what": "fly to Porto",
+    "due_from": "2024-07-26",
+    "due_until": "2024-07-26",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i4": {
+    "what": "get the flickering hallway light fixed",
+    "due_from": null,
+    "due_until": null,
+    "situation": null,
+    "kind": "todo"
+   }
+  },
+  "checks": [
+   {
+    "now": "2024-07-02",
+    "context": null,
+    "should_surface": [
+     "i2"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i3"
+    ],
+    "note": "i1 not due until 2024-07-23; i2 due; i3 not due until 2024-07-26"
+   },
+   {
+    "now": "2024-07-23",
+    "context": "standing in the lighting aisle at Fenwick's picking up bulbs",
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2024-07-22; i2 done 2024-07-04; i3 not due until 2024-07-26; i4 brought to mind by context"
+   },
+   {
+    "now": "2024-07-26",
+    "context": null,
+    "should_surface": [
+     "i3"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 done 2024-07-22; i2 done 2024-07-04; i3 due"
+   }
+  ]
+ },
+ {
+  "id": "s08",
+  "split": "test",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2025-04-07T19:30:00",
+    "content": "We're off to Ljubljana on May 2nd!! I need to book airport parking before we go, and get the cat sitter confirmed this week",
+    "creates": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "assistant",
+    "timestamp": "2025-04-07T19:31:00",
+    "content": "Lovely. Lake Bled is an easy day trip from Ljubljana if you want ideas.",
+    "decoy": true
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2025-04-07T19:35:00",
+    "content": "we did Bled years ago, it was gorgeous",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2025-04-10T08:45:00",
+    "content": "Marta's confirmed for the cats, she's done it before so no stress",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i3",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2025-04-14T13:00:00",
+    "content": "I really need to replace the broken suitcase wheel sometime",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2025-04-20T10:00:00",
+    "content": "airline changed our flight, we now go on the 4th. so I'll book the parking from the 4th instead, by the 3rd at the latest",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i1",
+      "due_from": "2025-05-04",
+      "due_until": "2025-05-04"
+     },
+     {
+      "intention": "i2",
+      "due_from": "2025-05-01",
+      "due_until": "2025-05-03"
+     }
+    ]
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2025-04-20T10:02:00",
+    "content": "my parents are off to Crete in June, Dad's already packing lol",
+    "decoy": true
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2025-04-30T20:30:00",
+    "content": "parking booked. £42 for the week, outrageous",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "fly to Ljubljana",
+    "due_from": "2025-05-02",
+    "due_until": "2025-05-02",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i2": {
+    "what": "book airport parking",
+    "due_from": "2025-04-29",
+    "due_until": "2025-05-01",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i3": {
+    "what": "confirm the cat sitter",
+    "due_from": "2025-04-07",
+    "due_until": "2025-04-13",
+    "situation": null,
+    "kind": "todo"
+   },
+   "i4": {
+    "what": "replace the broken suitcase wheel",
+    "due_from": null,
+    "due_until": null,
+    "situation": null,
+    "kind": "todo"
+   }
+  },
+  "checks": [
+   {
+    "now": "2025-04-08",
+    "context": null,
+    "should_surface": [
+     "i3"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 not due until 2025-05-02; i2 not due until 2025-04-29; i3 due"
+   },
+   {
+    "now": "2025-04-21",
+    "context": "browsing luggage in a department store",
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 not due until 2025-05-04; i2 not due until 2025-05-01; i3 done 2025-04-10; i4 brought to mind by context"
+   },
+   {
+    "now": "2025-05-01",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 not due until 2025-05-04; i2 done 2025-04-30; i3 done 2025-04-10"
+   },
+   {
+    "now": "2025-05-04",
+    "context": null,
+    "should_surface": [
+     "i1"
+    ],
+    "must_not_surface": [
+     "i2",
+     "i3"
+    ],
+    "note": "i1 due; i2 done 2025-04-30; i3 done 2025-04-10"
+   }
+  ]
+ },
+ {
+  "id": "s09",
+  "split": "dev",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2024-10-07T23:10:00",
+    "content": "essay for Hendricks due fri 18th, havent started lol",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2024-10-07T23:11:00",
+    "content": "also said id help Amara move flats on saturday",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "assistant",
+    "timestamp": "2024-10-07T23:12:00",
+    "content": "Want me to help you break the essay into a writing schedule?",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2024-10-07T23:15:00",
+    "content": "no thx. my flatmate has 3 exams next week poor guy",
+    "decoy": true
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2024-10-11T18:00:00",
+    "content": "amaras move is off, landlord delayed the keys",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "cancelled"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2024-10-11T18:05:00",
+    "content": "need to return the library books at some point, theyre probably overdue already",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2024-10-14T09:00:00",
+    "content": "Hendricks gave everyone an extension, essay now due the 25th",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i1",
+      "due_from": "2024-10-23",
+      "due_until": "2024-10-25"
+     }
+    ]
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2024-10-14T09:02:00",
+    "content": "remind me I've got a meeting with my tutor tuesday 22nd at 11",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2024-10-24T22:45:00",
+    "content": "essay submitted!!! sleeping for a week",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m10",
+    "role": "user",
+    "timestamp": "2024-10-24T22:47:00",
+    "content": "if id started earlier i wouldnt be this dead",
+    "decoy": true
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "write and submit the essay for Hendricks",
+    "due_from": "2024-10-16",
+    "due_until": "2024-10-18",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i2": {
+    "what": "help Amara move flats",
+    "due_from": "2024-10-12",
+    "due_until": "2024-10-12",
+    "situation": null,
+    "kind": "commitment"
+   },
+   "i3": {
+    "what": "return the library books",
+    "due_from": null,
+    "due_until": null,
+    "situation": null,
+    "kind": "todo"
+   },
+   "i4": {
+    "what": "meeting with tutor at 11",
+    "due_from": "2024-10-22",
+    "due_until": "2024-10-22",
+    "situation": null,
+    "kind": "reminder"
+   }
+  },
+  "checks": [
+   {
+    "now": "2024-10-12",
+    "context": "walking past the university library",
+    "should_surface": [
+     "i3"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 not due until 2024-10-16; i2 cancelled 2024-10-11; i3 brought to mind by context"
+   },
+   {
+    "now": "2024-10-17",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i4"
+    ],
+    "note": "i1 not due until 2024-10-23; i2 cancelled 2024-10-11; i4 not due until 2024-10-22"
+   },
+   {
+    "now": "2024-10-22",
+    "context": null,
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i2"
+    ],
+    "note": "i2 cancelled 2024-10-11; i4 due"
+   },
+   {
+    "now": "2024-10-25",
+    "context": null,
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 done 2024-10-24; i2 cancelled 2024-10-11; i4 overdue since 2024-10-22"
+   }
+  ]
+ },
+ {
+  "id": "s10",
+  "split": "test",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2025-01-13T21:00:00",
+    "content": "Statistics problem set is due Thursday the 23rd. And I told my study group I'd write up question 4 for them by Monday",
+    "creates": [
+     "i1",
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "assistant",
+    "timestamp": "2025-01-13T21:01:00",
+    "content": "Would it help if I explained regression diagnostics for question 4?",
+    "decoy": true
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2025-01-13T21:05:00",
+    "content": "maybe later. Leon has to present his dissertation proposal on Friday, he's panicking",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2025-01-16T10:30:00",
+    "content": "the study group fell apart, everyone's doing their own write-ups so I don't need to do q4 for them anymore",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "cancelled"
+     }
+    ]
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2025-01-16T10:32:00",
+    "content": "and I have office hours with Dr Okafor on Wednesday 22nd",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2025-01-17T14:00:00",
+    "content": "I should really sort out my reading list for next term eventually",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2025-01-20T08:00:00",
+    "content": "Problem set deadline pushed to the 30th because the submission portal crashed",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i1",
+      "due_from": "2025-01-28",
+      "due_until": "2025-01-30"
+     }
+    ]
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2025-01-22T15:40:00",
+    "content": "Okafor cancelled office hours, she's ill",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i3",
+      "as": "cancelled"
+     }
+    ]
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2025-01-22T15:42:00",
+    "content": "I used to love stats in school, now it's just misery",
+    "decoy": true
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "submit the statistics problem set",
+    "due_from": "2025-01-21",
+    "due_until": "2025-01-23",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i2": {
+    "what": "write up question 4 for the study group",
+    "due_from": "2025-01-18",
+    "due_until": "2025-01-20",
+    "situation": null,
+    "kind": "commitment"
+   },
+   "i3": {
+    "what": "office hours with Dr Okafor",
+    "due_from": "2025-01-22",
+    "due_until": "2025-01-22",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i4": {
+    "what": "sort out the reading list for next term",
+    "due_from": null,
+    "due_until": null,
+    "situation": null,
+    "kind": "todo"
+   }
+  },
+  "checks": [
+   {
+    "now": "2025-01-17",
+    "context": "in the campus bookshop",
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 not due until 2025-01-21; i2 cancelled 2025-01-16; i3 not due until 2025-01-22; i4 brought to mind by context"
+   },
+   {
+    "now": "2025-01-21",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 not due until 2025-01-28; i2 cancelled 2025-01-16"
+   },
+   {
+    "now": "2025-01-23",
+    "context": "in the gym changing room",
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 not due until 2025-01-28; i2 cancelled 2025-01-16; i3 cancelled 2025-01-22"
+   },
+   {
+    "now": "2025-01-29",
+    "context": null,
+    "should_surface": [
+     "i1"
+    ],
+    "must_not_surface": [
+     "i2",
+     "i3"
+    ],
+    "note": "i1 due; i2 cancelled 2025-01-16; i3 cancelled 2025-01-22"
+   }
+  ]
+ },
+ {
+  "id": "s11",
+  "split": "dev",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2024-11-04T07:45:00",
+    "content": "Self-assessment tax return. I keep putting it off. It's not due till 31 Jan but I want it done before Christmas",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2024-11-04T07:47:00",
+    "content": "more urgent: the gas bill is overdue, pay it today",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2024-11-04T07:50:00",
+    "content": "should I switch banks? Northvale keeps adding fees",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "assistant",
+    "timestamp": "2024-11-04T07:51:00",
+    "content": "Switching could save you money. Harbourline Bank has no monthly fees. Want a comparison?",
+    "decoy": true
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2024-11-04T18:20:00",
+    "content": "gas bill paid",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2024-11-11T12:00:00",
+    "content": "Don't let me forget to transfer Jamal the £60 for the concert tickets by Friday",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2024-11-11T12:02:00",
+    "content": "I put £200 a month into savings, standing order on the 1st",
+    "decoy": true
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2024-11-14T20:00:00",
+    "content": "Jamal's been paid back",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i3",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2024-11-20T09:00:00",
+    "content": "accountant mate says do the tax return early January instead, once the pension paperwork's in, so let's say by the 10th",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i1",
+      "due_from": "2025-01-08",
+      "due_until": "2025-01-10"
+     }
+    ]
+   },
+   {
+    "id": "m10",
+    "role": "user",
+    "timestamp": "2024-11-20T09:03:00",
+    "content": "I want to cancel the gym membership I never use at some point",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "do the self-assessment tax return",
+    "due_from": "2024-12-22",
+    "due_until": "2024-12-24",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i2": {
+    "what": "pay the overdue gas bill",
+    "due_from": "2024-11-04",
+    "due_until": "2024-11-04",
+    "situation": null,
+    "kind": "todo"
+   },
+   "i3": {
+    "what": "transfer Jamal £60 for the concert tickets",
+    "due_from": "2024-11-13",
+    "due_until": "2024-11-15",
+    "situation": null,
+    "kind": "reminder"
+   },
+   "i4": {
+    "what": "cancel the unused gym membership",
+    "due_from": null,
+    "due_until": null,
+    "situation": null,
+    "kind": "todo"
+   }
+  },
+  "checks": [
+   {
+    "now": "2024-11-12",
+    "context": "at the cashpoint outside Northvale bank",
+    "should_surface": [
+     "i3"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 not due until 2024-12-22; i2 done 2024-11-04; i3 brought to mind by context"
+   },
+   {
+    "now": "2024-11-15",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 not due until 2024-12-22; i2 done 2024-11-04; i3 done 2024-11-14"
+   },
+   {
+    "now": "2024-12-23",
+    "context": "at the leisure centre for a swim",
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 not due until 2025-01-08; i2 done 2024-11-04; i3 done 2024-11-14; i4 brought to mind by context"
+   },
+   {
+    "now": "2025-01-09",
+    "context": null,
+    "should_surface": [
+     "i1"
+    ],
+    "must_not_surface": [
+     "i2",
+     "i3"
+    ],
+    "note": "i1 due; i2 done 2024-11-04; i3 done 2024-11-14"
+   }
+  ]
+ },
+ {
+  "id": "s12",
+  "split": "test",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2025-05-05T08:00:00",
+    "content": "Rent's due on the 1st as always",
+    "decoy": true
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2025-05-05T08:02:00",
+    "content": "but this month I also need to pay the security deposit for the new place by the 15th. don't let me forget the deposit",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2025-05-05T08:03:00",
+    "content": "and the electric bill is overdue, need to pay it today",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m4",
+    "role": "assistant",
+    "timestamp": "2025-05-05T08:04:00",
+    "content": "Want me to suggest how to set up autopay for your utilities?",
+    "decoy": true
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2025-05-05T19:00:00",
+    "content": "electric paid. ugh $140",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2025-05-08T12:30:00",
+    "content": "I owe Dana $35 for brunch, gotta venmo her this weekend",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2025-05-08T12:32:00",
+    "content": "should I get a credit card with travel points?",
+    "decoy": true
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2025-05-12T09:00:00",
+    "content": "landlord says the deposit can wait till the 22nd, he's not back from vacation",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i1",
+      "due_from": "2025-05-20",
+      "due_until": "2025-05-22"
+     }
+    ]
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2025-05-12T09:05:00",
+    "content": "and Dana got her money",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i3",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m10",
+    "role": "user",
+    "timestamp": "2025-05-12T09:07:00",
+    "content": "need to look into opening an IRA someday",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "pay the security deposit for the new place",
+    "due_from": "2025-05-13",
+    "due_until": "2025-05-15",
+    "situation": null,
+    "kind": "reminder"
+   },
+   "i2": {
+    "what": "pay the overdue electric bill",
+    "due_from": "2025-05-05",
+    "due_until": "2025-05-05",
+    "situation": null,
+    "kind": "todo"
+   },
+   "i3": {
+    "what": "venmo Dana $35 for brunch",
+    "due_from": "2025-05-10",
+    "due_until": "2025-05-11",
+    "situation": null,
+    "kind": "commitment"
+   },
+   "i4": {
+    "what": "look into opening an IRA",
+    "due_from": null,
+    "due_until": null,
+    "situation": null,
+    "kind": "todo"
+   }
+  },
+  "checks": [
+   {
+    "now": "2025-05-09",
+    "context": "just got a text from Dana about weekend plans",
+    "should_surface": [
+     "i3"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 not due until 2025-05-13; i2 done 2025-05-05; i3 brought to mind by context"
+   },
+   {
+    "now": "2025-05-11",
+    "context": null,
+    "should_surface": [
+     "i3"
+    ],
+    "must_not_surface": [
+     "i2"
+    ],
+    "note": "i2 done 2025-05-05; i3 due"
+   },
+   {
+    "now": "2025-05-14",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 not due until 2025-05-20; i2 done 2025-05-05; i3 done 2025-05-12"
+   },
+   {
+    "now": "2025-05-23",
+    "context": null,
+    "should_surface": [
+     "i1"
+    ],
+    "must_not_surface": [
+     "i2",
+     "i3"
+    ],
+    "note": "i1 overdue since 2025-05-22; i2 done 2025-05-05; i3 done 2025-05-12"
+   }
+  ]
+ },
+ {
+  "id": "s13",
+  "split": "dev",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2024-02-14T21:30:00",
+    "content": "should really call Gran this weekend, haven't spoken to her since her birthday",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2024-02-14T21:32:00",
+    "content": "remind me on Monday to order the photo book for Mum and Dad's anniversary, it's on 2 March",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "assistant",
+    "timestamp": "2024-02-14T21:33:00",
+    "content": "Lovely idea. Photo books usually take 5 to 7 working days to arrive.",
+    "decoy": false
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2024-02-18T17:00:00",
+    "content": "Rang Gran. She's thriving, joined a choir apparently",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2024-02-18T17:02:00",
+    "content": "my cousin Rhys is meant to be organising the anniversary meal, not me thank god",
+    "decoy": true
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2024-02-19T20:30:00",
+    "content": "photo book ordered",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2024-02-19T20:32:00",
+    "content": "also need an anniversary card, I'll get one when I'm in town next",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2024-02-24T11:00:00",
+    "content": "I take the kids swimming every Saturday morning, it's chaos",
+    "decoy": true
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2024-02-24T11:05:00",
+    "content": "and parents' evening is Tuesday 5th March at 6:15",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "call Gran",
+    "due_from": "2024-02-17",
+    "due_until": "2024-02-18",
+    "situation": null,
+    "kind": "todo"
+   },
+   "i2": {
+    "what": "order the anniversary photo book for Mum and Dad",
+    "due_from": "2024-02-19",
+    "due_until": "2024-02-19",
+    "situation": null,
+    "kind": "reminder"
+   },
+   "i3": {
+    "what": "buy an anniversary card",
+    "due_from": null,
+    "due_until": null,
+    "situation": "in town",
+    "kind": "todo"
+   },
+   "i4": {
+    "what": "parents' evening at 6:15",
+    "due_from": "2024-03-05",
+    "due_until": "2024-03-05",
+    "situation": null,
+    "kind": "appointment"
+   }
+  },
+  "checks": [
+   {
+    "now": "2024-02-17",
+    "context": null,
+    "should_surface": [
+     "i1"
+    ],
+    "must_not_surface": [],
+    "note": "i1 due"
+   },
+   {
+    "now": "2024-02-20",
+    "context": "parking up in the town centre to run some errands",
+    "should_surface": [
+     "i3"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 done 2024-02-18; i2 done 2024-02-19; i3 brought to mind by context"
+   },
+   {
+    "now": "2024-03-02",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i4"
+    ],
+    "note": "i1 done 2024-02-18; i2 done 2024-02-19; i4 not due until 2024-03-05"
+   },
+   {
+    "now": "2024-03-05",
+    "context": null,
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 done 2024-02-18; i2 done 2024-02-19; i4 due"
+   }
+  ]
+ },
+ {
+  "id": "s14",
+  "split": "test",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2024-08-21T08:10:00",
+    "content": "need to ring Uncle Desmond this weekend, it's been ages and he's not been well",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2024-08-21T08:12:00",
+    "content": "can you remind me on Monday to send in Zara's school uniform order? needs to be in before term starts on 4 Sept",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "assistant",
+    "timestamp": "2024-08-21T08:13:00",
+    "content": "Many schools let you order uniform online. Want me to find out how?",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2024-08-25T19:30:00",
+    "content": "had a long chat with Des, he sounds much better",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2024-08-26T07:40:00",
+    "content": "Uniform order went in last night actually, did it before bed",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2024-08-26T07:42:00",
+    "content": "Zara's best friend's mum is supposed to be organising the leaving party, not my problem",
+    "decoy": true
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2024-08-26T07:45:00",
+    "content": "next time I'm at the supermarket I need name labels and a new lunchbox",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2024-08-28T13:00:00",
+    "content": "Zara's dentist is Friday 6th Sept at 4",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2024-08-28T13:02:00",
+    "content": "I used to dread back-to-school as a kid",
+    "decoy": true
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "ring Uncle Desmond",
+    "due_from": "2024-08-24",
+    "due_until": "2024-08-25",
+    "situation": null,
+    "kind": "todo"
+   },
+   "i2": {
+    "what": "send in Zara's school uniform order",
+    "due_from": "2024-08-26",
+    "due_until": "2024-08-26",
+    "situation": null,
+    "kind": "reminder"
+   },
+   "i3": {
+    "what": "buy name labels and a lunchbox",
+    "due_from": null,
+    "due_until": null,
+    "situation": "at the supermarket",
+    "kind": "todo"
+   },
+   "i4": {
+    "what": "Zara's dentist appointment at 4",
+    "due_from": "2024-09-06",
+    "due_until": "2024-09-06",
+    "situation": null,
+    "kind": "appointment"
+   }
+  },
+  "checks": [
+   {
+    "now": "2024-08-24",
+    "context": null,
+    "should_surface": [
+     "i1"
+    ],
+    "must_not_surface": [],
+    "note": "i1 due"
+   },
+   {
+    "now": "2024-08-27",
+    "context": "in the queue at Greenway supermarket",
+    "should_surface": [
+     "i3"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 done 2024-08-25; i2 done 2024-08-26; i3 brought to mind by context"
+   },
+   {
+    "now": "2024-09-03",
+    "context": "filling up at the petrol station",
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i4"
+    ],
+    "note": "i1 done 2024-08-25; i2 done 2024-08-26; i4 not due until 2024-09-06"
+   },
+   {
+    "now": "2024-09-06",
+    "context": null,
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 done 2024-08-25; i2 done 2024-08-26; i4 due"
+   }
+  ]
+ },
+ {
+  "id": "s15",
+  "split": "dev",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2024-05-13T08:55:00",
+    "content": "Monday chaos. Need to get the vendor contract over to legal by Wednesday, and prep the deck for the board review on the 23rd",
+    "creates": [
+     "i1",
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2024-05-13T08:57:00",
+    "content": "I promised Felix I'd look over his promo doc this week too",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "assistant",
+    "timestamp": "2024-05-13T08:58:00",
+    "content": "Happy to draft an agenda for the board review if that's useful.",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2024-05-15T16:00:00",
+    "content": "contract's with legal",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2024-05-16T11:00:00",
+    "content": "Board review moved to 30 May, the chair is travelling",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i2",
+      "due_from": "2024-05-28",
+      "due_until": "2024-05-30"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2024-05-16T11:02:00",
+    "content": "Felix pulled out of the promo cycle so I don't need to review his doc",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i3",
+      "as": "cancelled"
+     }
+    ]
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2024-05-16T11:05:00",
+    "content": "my boss has to finalise the headcount plan by June, glad that's on her plate",
+    "decoy": true
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2024-05-20T09:30:00",
+    "content": "I really need to clean up my inbox at some point. 4000 unread",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2024-05-20T09:32:00",
+    "content": "if I were in charge I'd scrap the Friday stand-ups entirely",
+    "decoy": true
+   },
+   {
+    "id": "m10",
+    "role": "user",
+    "timestamp": "2024-05-29T18:00:00",
+    "content": "board deck finished and sent to the chair",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "send the vendor contract to legal",
+    "due_from": "2024-05-13",
+    "due_until": "2024-05-15",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i2": {
+    "what": "prepare the deck for the board review",
+    "due_from": "2024-05-21",
+    "due_until": "2024-05-23",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i3": {
+    "what": "review Felix's promotion document",
+    "due_from": "2024-05-13",
+    "due_until": "2024-05-19",
+    "situation": null,
+    "kind": "commitment"
+   },
+   "i4": {
+    "what": "clean up the email inbox",
+    "due_from": null,
+    "due_until": null,
+    "situation": null,
+    "kind": "todo"
+   }
+  },
+  "checks": [
+   {
+    "now": "2024-05-14",
+    "context": null,
+    "should_surface": [
+     "i1",
+     "i3"
+    ],
+    "must_not_surface": [
+     "i2"
+    ],
+    "note": "i1 due; i2 not due until 2024-05-21; i3 due"
+   },
+   {
+    "now": "2024-05-17",
+    "context": "making dinner at home",
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2024-05-15; i2 not due until 2024-05-28; i3 cancelled 2024-05-16"
+   },
+   {
+    "now": "2024-05-28",
+    "context": null,
+    "should_surface": [
+     "i2"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i3"
+    ],
+    "note": "i1 done 2024-05-15; i2 due; i3 cancelled 2024-05-16"
+   },
+   {
+    "now": "2024-05-30",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2024-05-15; i2 done 2024-05-29; i3 cancelled 2024-05-16"
+   }
+  ]
+ },
+ {
+  "id": "s16",
+  "split": "test",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2025-06-02T09:10:00",
+    "content": "ok week plan: send the Q2 numbers to finance by Thursday, and prep for the Ridgeway Foods pitch on the 17th",
+    "creates": [
+     "i1",
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2025-06-02T09:12:00",
+    "content": "plus remind me to review Marcus's PR by Friday, I promised him",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "assistant",
+    "timestamp": "2025-06-02T09:13:00",
+    "content": "Want me to draft some pitch talking points for Ridgeway?",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2025-06-04T17:20:00",
+    "content": "finance has the Q2 numbers. Marcus merged without my review, whatever",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     },
+     {
+      "intention": "i3",
+      "as": "cancelled"
+     }
+    ]
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2025-06-09T10:00:00",
+    "content": "Ridgeway pushed the pitch to the 24th",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i2",
+      "due_from": "2025-06-22",
+      "due_until": "2025-06-24"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2025-06-09T10:02:00",
+    "content": "my coworker Jess has to redo the whole onboarding deck, poor thing",
+    "decoy": true
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2025-06-10T08:30:00",
+    "content": "need to update my LinkedIn at some point, the photo is from 2019",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2025-06-10T08:32:00",
+    "content": "should we push for a four-day week? discuss",
+    "decoy": true
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2025-06-23T19:00:00",
+    "content": "pitch deck is done, rehearsed it twice",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "send the Q2 numbers to finance",
+    "due_from": "2025-06-03",
+    "due_until": "2025-06-05",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i2": {
+    "what": "prepare for the Ridgeway Foods pitch",
+    "due_from": "2025-06-15",
+    "due_until": "2025-06-17",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i3": {
+    "what": "review Marcus's pull request",
+    "due_from": "2025-06-04",
+    "due_until": "2025-06-06",
+    "situation": null,
+    "kind": "reminder"
+   },
+   "i4": {
+    "what": "update LinkedIn profile",
+    "due_from": null,
+    "due_until": null,
+    "situation": null,
+    "kind": "todo"
+   }
+  },
+  "checks": [
+   {
+    "now": "2025-06-03",
+    "context": null,
+    "should_surface": [
+     "i1"
+    ],
+    "must_not_surface": [
+     "i2"
+    ],
+    "note": "i1 due; i2 not due until 2025-06-15"
+   },
+   {
+    "now": "2025-06-05",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2025-06-04; i2 not due until 2025-06-15; i3 cancelled 2025-06-04"
+   },
+   {
+    "now": "2025-06-16",
+    "context": "swapping my profile photo on the company intranet",
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2025-06-04; i2 not due until 2025-06-22; i3 cancelled 2025-06-04; i4 brought to mind by context"
+   },
+   {
+    "now": "2025-06-22",
+    "context": null,
+    "should_surface": [
+     "i2"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i3"
+    ],
+    "note": "i1 done 2025-06-04; i2 due; i3 cancelled 2025-06-04"
+   }
+  ]
+ },
+ {
+  "id": "s17",
+  "split": "dev",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2024-03-23T10:00:00",
+    "content": "garden centre trip later, need compost and slug pellets while I'm there",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2024-03-23T10:02:00",
+    "content": "and next time I'm at Mum's I have to fetch the lawnmower back",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "assistant",
+    "timestamp": "2024-03-23T10:03:00",
+    "content": "If slugs are a problem, copper tape is a pet-safe alternative to pellets.",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2024-03-23T16:30:00",
+    "content": "Garden centre was rammed but I got the compost and the pellets",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2024-03-25T19:00:00",
+    "content": "boiler service is booked for 4 April, someone has to be in 8 till 12",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2024-03-25T19:02:00",
+    "content": "I mow the lawn every other Sunday from April",
+    "decoy": true
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2024-03-30T12:00:00",
+    "content": "Got the mower back from Mum's today",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2024-03-30T12:05:00",
+    "content": "I'd love to redo the patio one day",
+    "decoy": true
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2024-04-02T09:00:00",
+    "content": "Boiler engineer cancelled, they'll ring to rebook some other time",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i3",
+      "as": "cancelled"
+     }
+    ]
+   },
+   {
+    "id": "m10",
+    "role": "user",
+    "timestamp": "2024-04-02T09:05:00",
+    "content": "Also the shed door needs a new hinge at some point",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "buy compost and slug pellets",
+    "due_from": "2024-03-23",
+    "due_until": "2024-03-23",
+    "situation": "at the garden centre",
+    "kind": "todo"
+   },
+   "i2": {
+    "what": "fetch the lawnmower back",
+    "due_from": null,
+    "due_until": null,
+    "situation": "at Mum's",
+    "kind": "todo"
+   },
+   "i3": {
+    "what": "be home 8-12 for the boiler service",
+    "due_from": "2024-04-04",
+    "due_until": "2024-04-04",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i4": {
+    "what": "fit a new hinge on the shed door",
+    "due_from": null,
+    "due_until": null,
+    "situation": null,
+    "kind": "todo"
+   }
+  },
+  "checks": [
+   {
+    "now": "2024-03-26",
+    "context": "just pulled up outside Mum's house",
+    "should_surface": [
+     "i2"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i3"
+    ],
+    "note": "i1 done 2024-03-23; i2 brought to mind by context; i3 not due until 2024-04-04"
+   },
+   {
+    "now": "2024-04-01",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2024-03-23; i2 done 2024-03-30; i3 not due until 2024-04-04"
+   },
+   {
+    "now": "2024-04-04",
+    "context": "browsing screws and hinges in Brennan's Hardware",
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2024-03-23; i2 done 2024-03-30; i3 cancelled 2024-04-02; i4 brought to mind by context"
+   }
+  ]
+ },
+ {
+  "id": "s18",
+  "split": "test",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2025-03-22T09:30:00",
+    "content": "heading to IKEA this afternoon, need to grab the replacement shelf pins while I'm there",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2025-03-22T09:32:00",
+    "content": "and when I'm next at Callum's I have to pick up the ladder I lent him",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "assistant",
+    "timestamp": "2025-03-22T09:33:00",
+    "content": "The spare parts desk can often give you shelf pins for free.",
+    "decoy": false
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2025-03-22T18:00:00",
+    "content": "IKEA was hell but I got the shelf pins",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2025-03-24T20:15:00",
+    "content": "window cleaner is coming Thursday 3rd April, need to leave the side gate unlocked",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2025-03-24T20:17:00",
+    "content": "Callum's moving to Leeds in the summer, he has to sell his flat first",
+    "decoy": true
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2025-03-29T11:00:00",
+    "content": "grabbed the ladder from Callum's after the match",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2025-04-01T08:00:00",
+    "content": "window cleaner moved to the 10th",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i3",
+      "due_from": "2025-04-10",
+      "due_until": "2025-04-10"
+     }
+    ]
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2025-04-01T08:02:00",
+    "content": "the bathroom extractor fan needs replacing eventually, it sounds like a jet engine",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "get replacement shelf pins",
+    "due_from": "2025-03-22",
+    "due_until": "2025-03-22",
+    "situation": "at IKEA",
+    "kind": "todo"
+   },
+   "i2": {
+    "what": "pick up the ladder lent to Callum",
+    "due_from": null,
+    "due_until": null,
+    "situation": "at Callum's",
+    "kind": "todo"
+   },
+   "i3": {
+    "what": "leave the side gate unlocked for the window cleaner",
+    "due_from": "2025-04-03",
+    "due_until": "2025-04-03",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i4": {
+    "what": "replace the bathroom extractor fan",
+    "due_from": null,
+    "due_until": null,
+    "situation": null,
+    "kind": "todo"
+   }
+  },
+  "checks": [
+   {
+    "now": "2025-03-25",
+    "context": "on my way to watch the match at Callum's",
+    "should_surface": [
+     "i2"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i3"
+    ],
+    "note": "i1 done 2025-03-22; i2 brought to mind by context; i3 not due until 2025-04-03"
+   },
+   {
+    "now": "2025-04-02",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2025-03-22; i2 done 2025-03-29; i3 not due until 2025-04-10"
+   },
+   {
+    "now": "2025-04-10",
+    "context": "in the electrical aisle at the DIY shop",
+    "should_surface": [
+     "i3",
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 done 2025-03-22; i2 done 2025-03-29; i3 due; i4 brought to mind by context"
+   }
+  ]
+ },
+ {
+  "id": "s19",
+  "split": "dev",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2024-12-02T18:00:00",
+    "content": "Remind me to give Pepper her flea treatment on the 5th",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2024-12-02T18:02:00",
+    "content": "and Pepper's vet appointment for her teeth is the 16th at 9:20",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2024-12-02T18:04:00",
+    "content": "I walk her twice a day, she's very spoiled",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "assistant",
+    "timestamp": "2024-12-02T18:05:00",
+    "content": "Dental chews between cleanings can help. Want some suggestions?",
+    "decoy": true
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2024-12-05T08:00:00",
+    "content": "Flea stuff done",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2024-12-08T15:00:00",
+    "content": "I signed up for the pottery taster at Kiln Lane on Saturday 14th, need to bring an apron",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2024-12-08T15:02:00",
+    "content": "I've always fancied learning the cello, but who has the time",
+    "decoy": true
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2024-12-12T09:00:00",
+    "content": "pottery class cancelled, the kiln broke lol",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i3",
+      "as": "cancelled"
+     }
+    ]
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2024-12-12T09:02:00",
+    "content": "Remind me to get Pepper's insurance renewed before the end of the month",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m10",
+    "role": "user",
+    "timestamp": "2024-12-14T11:00:00",
+    "content": "Vet moved Pepper to 2 Jan",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i2",
+      "due_from": "2025-01-02",
+      "due_until": "2025-01-02"
+     }
+    ]
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "give Pepper her flea treatment",
+    "due_from": "2024-12-05",
+    "due_until": "2024-12-05",
+    "situation": null,
+    "kind": "reminder"
+   },
+   "i2": {
+    "what": "Pepper's dental vet appointment at 9:20",
+    "due_from": "2024-12-16",
+    "due_until": "2024-12-16",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i3": {
+    "what": "pottery taster at Kiln Lane (bring an apron)",
+    "due_from": "2024-12-14",
+    "due_until": "2024-12-14",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i4": {
+    "what": "renew Pepper's pet insurance",
+    "due_from": "2024-12-29",
+    "due_until": "2024-12-31",
+    "situation": null,
+    "kind": "reminder"
+   }
+  },
+  "checks": [
+   {
+    "now": "2024-12-04",
+    "context": "just bought a tick comb for Pepper at the pet shop",
+    "should_surface": [
+     "i1"
+    ],
+    "must_not_surface": [
+     "i2"
+    ],
+    "note": "i1 brought to mind by context; i2 not due until 2024-12-16"
+   },
+   {
+    "now": "2024-12-13",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3",
+     "i4"
+    ],
+    "note": "i1 done 2024-12-05; i2 not due until 2024-12-16; i3 cancelled 2024-12-12; i4 not due until 2024-12-29"
+   },
+   {
+    "now": "2024-12-16",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3",
+     "i4"
+    ],
+    "note": "i1 done 2024-12-05; i2 not due until 2025-01-02; i3 cancelled 2024-12-12; i4 not due until 2024-12-29"
+   },
+   {
+    "now": "2024-12-30",
+    "context": null,
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2024-12-05; i2 not due until 2025-01-02; i3 cancelled 2024-12-12; i4 due"
+   }
+  ]
+ },
+ {
+  "id": "s20",
+  "split": "test",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2025-02-17T19:00:00",
+    "content": "please remind me to renew my climbing wall membership on the 20th, it runs out that day",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2025-02-17T19:02:00",
+    "content": "I climb Tuesdays and Thursdays",
+    "decoy": true
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2025-02-17T19:05:00",
+    "content": "also signed up for the bouldering comp on Saturday 1 March, need to register my category by the 25th",
+    "creates": [
+     "i2",
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m4",
+    "role": "assistant",
+    "timestamp": "2025-02-17T19:06:00",
+    "content": "If you'd like, I could put together a training plan for the comp.",
+    "decoy": true
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2025-02-20T21:00:00",
+    "content": "membership renewed for another year",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2025-02-22T10:00:00",
+    "content": "category registration done, going for intermediate",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i3",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2025-02-22T10:02:00",
+    "content": "my mate Oskar is supposed to be setting new routes for it",
+    "decoy": true
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2025-02-26T12:00:00",
+    "content": "comp postponed to 15 March because of roof repairs at the wall",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i2",
+      "due_from": "2025-03-15",
+      "due_until": "2025-03-15"
+     }
+    ]
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2025-02-26T12:02:00",
+    "content": "need to get my climbing shoes resoled at some point, toes are through",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "renew climbing wall membership",
+    "due_from": "2025-02-20",
+    "due_until": "2025-02-20",
+    "situation": null,
+    "kind": "reminder"
+   },
+   "i2": {
+    "what": "bouldering competition",
+    "due_from": "2025-03-01",
+    "due_until": "2025-03-01",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i3": {
+    "what": "register category for the bouldering comp",
+    "due_from": "2025-02-23",
+    "due_until": "2025-02-25",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i4": {
+    "what": "get climbing shoes resoled",
+    "due_from": null,
+    "due_until": null,
+    "situation": null,
+    "kind": "todo"
+   }
+  },
+  "checks": [
+   {
+    "now": "2025-02-19",
+    "context": "checking my membership card in the climbing wall app",
+    "should_surface": [
+     "i1"
+    ],
+    "must_not_surface": [
+     "i2",
+     "i3"
+    ],
+    "note": "i1 brought to mind by context; i2 not due until 2025-03-01; i3 not due until 2025-02-23"
+   },
+   {
+    "now": "2025-02-23",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2025-02-20; i2 not due until 2025-03-01; i3 done 2025-02-22"
+   },
+   {
+    "now": "2025-02-27",
+    "context": "in the outdoor shop looking at chalk bags",
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2025-02-20; i2 not due until 2025-03-15; i3 done 2025-02-22; i4 brought to mind by context"
+   },
+   {
+    "now": "2025-03-15",
+    "context": null,
+    "should_surface": [
+     "i2"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i3"
+    ],
+    "note": "i1 done 2025-02-20; i2 due; i3 done 2025-02-22"
+   }
+  ]
+ },
+ {
+  "id": "s21",
+  "split": "dev",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2024-01-08T10:00:00",
+    "content": "The visa form for the Canada trip is due end of month. Also need two passport photos for it, there's a booth at Halden station I can use when I'm passing through",
+    "creates": [
+     "i1",
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "assistant",
+    "timestamp": "2024-01-08T10:01:00",
+    "content": "The online application usually takes about an hour. Would you like a checklist?",
+    "decoy": true
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2024-01-08T10:05:00",
+    "content": "No thanks, my partner did hers last week and says it's straightforward",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2024-01-15T08:20:00",
+    "content": "photos done at the station booth this morning, I look like a mugshot",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2024-01-15T08:22:00",
+    "content": "please remind me to ring the council about the parking permit on Thursday",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2024-01-18T13:00:00",
+    "content": "council permit sorted, they were surprisingly helpful",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i3",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2024-01-22T19:00:00",
+    "content": "Visa centre says the deadline is now 14 Feb because of a system upgrade",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i1",
+      "due_from": "2024-02-12",
+      "due_until": "2024-02-14"
+     }
+    ]
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2024-01-22T19:02:00",
+    "content": "should I just get a 10-year passport while I'm at it?",
+    "decoy": true
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2024-02-05T09:00:00",
+    "content": "need to book the airport transfer for 1 March sometime in the next couple of weeks",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m10",
+    "role": "user",
+    "timestamp": "2024-02-13T21:00:00",
+    "content": "visa application submitted, fingers crossed",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "submit the Canada visa form",
+    "due_from": "2024-01-29",
+    "due_until": "2024-01-31",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i2": {
+    "what": "get two passport photos",
+    "due_from": null,
+    "due_until": null,
+    "situation": "at Halden station",
+    "kind": "todo"
+   },
+   "i3": {
+    "what": "ring the council about the parking permit",
+    "due_from": "2024-01-18",
+    "due_until": "2024-01-18",
+    "situation": null,
+    "kind": "reminder"
+   },
+   "i4": {
+    "what": "book the airport transfer for 1 March",
+    "due_from": "2024-02-05",
+    "due_until": "2024-02-19",
+    "situation": null,
+    "kind": "todo"
+   }
+  },
+  "checks": [
+   {
+    "now": "2024-01-10",
+    "context": "waiting for a train at Halden station",
+    "should_surface": [
+     "i2"
+    ],
+    "must_not_surface": [
+     "i1"
+    ],
+    "note": "i1 not due until 2024-01-29; i2 brought to mind by context"
+   },
+   {
+    "now": "2024-01-30",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 not due until 2024-02-12; i2 done 2024-01-15; i3 done 2024-01-18"
+   },
+   {
+    "now": "2024-02-13",
+    "context": null,
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2024-02-13; i2 done 2024-01-15; i3 done 2024-01-18; i4 due"
+   }
+  ]
+ },
+ {
+  "id": "s22",
+  "split": "test",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2025-04-01T09:00:00",
+    "content": "my driving licence photo expires this year so I need to renew it. form says by end of April",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2025-04-01T09:02:00",
+    "content": "the post office does the photo and ID check, I'll do that when I'm next in there",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "assistant",
+    "timestamp": "2025-04-01T09:03:00",
+    "content": "You can also renew online if your photo is recent enough, which might save you a trip.",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2025-04-01T09:05:00",
+    "content": "my dad renewed his last year and it took forever",
+    "decoy": true
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2025-04-07T12:30:00",
+    "content": "did the ID check at the post office at lunch",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2025-04-07T12:32:00",
+    "content": "and remind me to post the signed mandate back to the bank on Wednesday",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2025-04-09T17:45:00",
+    "content": "mandate posted",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i3",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2025-04-14T10:00:00",
+    "content": "need to call the council about my electoral roll registration at some point, they've still got my old address",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2025-04-22T08:30:00",
+    "content": "agency emailed: licence renewal deadline extended to 31 May",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i1",
+      "due_from": "2025-05-29",
+      "due_until": "2025-05-31"
+     }
+    ]
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "renew the driving licence",
+    "due_from": "2025-04-28",
+    "due_until": "2025-04-30",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i2": {
+    "what": "do the photo and ID check for the licence",
+    "due_from": null,
+    "due_until": null,
+    "situation": "at the post office",
+    "kind": "todo"
+   },
+   "i3": {
+    "what": "post the signed mandate back to the bank",
+    "due_from": "2025-04-09",
+    "due_until": "2025-04-09",
+    "situation": null,
+    "kind": "reminder"
+   },
+   "i4": {
+    "what": "call the council about electoral roll registration",
+    "due_from": null,
+    "due_until": null,
+    "situation": null,
+    "kind": "todo"
+   }
+  },
+  "checks": [
+   {
+    "now": "2025-04-03",
+    "context": "queuing at the post office to send a parcel",
+    "should_surface": [
+     "i2"
+    ],
+    "must_not_surface": [
+     "i1"
+    ],
+    "note": "i1 not due until 2025-04-28; i2 brought to mind by context"
+   },
+   {
+    "now": "2025-04-29",
+    "context": "on hold with the council about missed bin collections",
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 not due until 2025-05-29; i2 done 2025-04-07; i3 done 2025-04-09; i4 brought to mind by context"
+   },
+   {
+    "now": "2025-05-30",
+    "context": null,
+    "should_surface": [
+     "i1"
+    ],
+    "must_not_surface": [
+     "i2",
+     "i3"
+    ],
+    "note": "i1 due; i2 done 2025-04-07; i3 done 2025-04-09"
+   }
+  ]
+ },
+ {
+  "id": "s23",
+  "split": "dev",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2024-06-03T07:30:00",
+    "content": "Dermatologist on the 12th at 11:15, finally",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2024-06-03T07:32:00",
+    "content": "and I have to get my repeat prescription request in by Friday or I'll run out",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2024-06-03T07:34:00",
+    "content": "should I get a second opinion on the mole thing?",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "assistant",
+    "timestamp": "2024-06-03T07:36:00",
+    "content": "A second opinion is reasonable if you're unsure. Your GP can refer you.",
+    "decoy": true
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2024-06-05T18:00:00",
+    "content": "prescription request is in, pharmacy says it'll be ready to collect Thursday",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2024-06-06T19:00:00",
+    "content": "picked up the meds",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i3",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2024-06-10T09:00:00",
+    "content": "forget the dermatologist, they cancelled. clinic's closing for a refurb and I'm back on the waiting list",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "cancelled"
+     }
+    ]
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2024-06-10T09:02:00",
+    "content": "my flatmate goes to yoga every Wednesday, keeps trying to drag me along",
+    "decoy": true
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2024-06-10T09:05:00",
+    "content": "I've agreed to go with her on Wednesday the 19th though, 7pm at Greenhaus Studio",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "dermatologist appointment at 11:15",
+    "due_from": "2024-06-12",
+    "due_until": "2024-06-12",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i2": {
+    "what": "put in the repeat prescription request",
+    "due_from": "2024-06-05",
+    "due_until": "2024-06-07",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i3": {
+    "what": "collect the prescription from the pharmacy",
+    "due_from": "2024-06-06",
+    "due_until": "2024-06-06",
+    "situation": null,
+    "kind": "todo"
+   },
+   "i4": {
+    "what": "yoga class with flatmate at Greenhaus Studio, 7pm",
+    "due_from": "2024-06-19",
+    "due_until": "2024-06-19",
+    "situation": null,
+    "kind": "commitment"
+   }
+  },
+  "checks": [
+   {
+    "now": "2024-06-05",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 not due until 2024-06-12; i2 done 2024-06-05"
+   },
+   {
+    "now": "2024-06-11",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3",
+     "i4"
+    ],
+    "note": "i1 cancelled 2024-06-10; i2 done 2024-06-05; i3 done 2024-06-06; i4 not due until 2024-06-19"
+   },
+   {
+    "now": "2024-06-19",
+    "context": null,
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 cancelled 2024-06-10; i2 done 2024-06-05; i3 done 2024-06-06; i4 due"
+   }
+  ]
+ },
+ {
+  "id": "s24",
+  "split": "test",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2025-01-06T08:00:00",
+    "content": "eye test booked, Tuesday 14th at 9",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2025-01-06T08:02:00",
+    "content": "remind me to get the flu jab before the end of next week too, the pharmacy does walk-ins",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "assistant",
+    "timestamp": "2025-01-06T08:03:00",
+    "content": "Some pharmacies also offer other vaccines at the same visit if you're eligible.",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2025-01-06T08:05:00",
+    "content": "my mum had hers back in October",
+    "decoy": true
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2025-01-10T12:00:00",
+    "content": "had the flu jab at Linden Pharmacy on my lunch break, arm's dead",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2025-01-13T19:00:00",
+    "content": "eye test cancelled, the optician's off sick. no new date yet",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "cancelled"
+     }
+    ]
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2025-01-13T19:02:00",
+    "content": "I need to book a hearing check at some point too, everything's getting muffled",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2025-01-20T10:00:00",
+    "content": "booked the hearing test for 3 Feb",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i3",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2025-01-20T10:02:00",
+    "content": "I walk 10k steps a day, mostly",
+    "decoy": true
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "eye test at 9am",
+    "due_from": "2025-01-14",
+    "due_until": "2025-01-14",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i2": {
+    "what": "get the flu jab",
+    "due_from": "2025-01-15",
+    "due_until": "2025-01-17",
+    "situation": null,
+    "kind": "reminder"
+   },
+   "i3": {
+    "what": "book a hearing check",
+    "due_from": null,
+    "due_until": null,
+    "situation": null,
+    "kind": "todo"
+   },
+   "i4": {
+    "what": "hearing test",
+    "due_from": "2025-02-03",
+    "due_until": "2025-02-03",
+    "situation": null,
+    "kind": "appointment"
+   }
+  },
+  "checks": [
+   {
+    "now": "2025-01-08",
+    "context": "walking past Linden Pharmacy on the way to work",
+    "should_surface": [
+     "i2"
+    ],
+    "must_not_surface": [
+     "i1"
+    ],
+    "note": "i1 not due until 2025-01-14; i2 brought to mind by context"
+   },
+   {
+    "now": "2025-01-14",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 cancelled 2025-01-13; i2 done 2025-01-10"
+   },
+   {
+    "now": "2025-01-31",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3",
+     "i4"
+    ],
+    "note": "i1 cancelled 2025-01-13; i2 done 2025-01-10; i3 done 2025-01-20; i4 not due until 2025-02-03"
+   },
+   {
+    "now": "2025-02-03",
+    "context": null,
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 cancelled 2025-01-13; i2 done 2025-01-10; i3 done 2025-01-20; i4 due"
+   }
+  ]
+ },
+ {
+  "id": "s25",
+  "split": "dev",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2024-09-16T09:00:00",
+    "content": "todo: invoice Kestrel Media for August (already late)",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2024-09-16T09:01:00",
+    "content": "call w/ Ines thurs 2pm re: rebrand",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2024-09-16T09:02:00",
+    "content": "promised Ines mood boards ready for that call",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m4",
+    "role": "assistant",
+    "timestamp": "2024-09-16T09:03:00",
+    "content": "Want help structuring the mood boards?",
+    "decoy": true
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2024-09-18T22:00:00",
+    "content": "mood boards done",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i3",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2024-09-19T15:00:00",
+    "content": "good call w/ Ines. she wants a second round by 1 Oct",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2024-09-19T15:02:00",
+    "content": "kestrel still not invoiced. keep forgetting",
+    "decoy": false
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2024-09-19T15:04:00",
+    "content": "accountant's supposed to file my VAT return by Nov",
+    "decoy": true
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2024-09-27T11:00:00",
+    "content": "Ines: no rush on round two, mid-Oct fine, say the 15th",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i4",
+      "due_from": "2024-10-13",
+      "due_until": "2024-10-15"
+     }
+    ]
+   },
+   {
+    "id": "m10",
+    "role": "user",
+    "timestamp": "2024-09-27T11:05:00",
+    "content": "kestrel invoice finally sent",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "invoice Kestrel Media for August",
+    "due_from": "2024-09-16",
+    "due_until": "2024-09-16",
+    "situation": null,
+    "kind": "todo"
+   },
+   "i2": {
+    "what": "call with Ines about the rebrand, 2pm",
+    "due_from": "2024-09-19",
+    "due_until": "2024-09-19",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i3": {
+    "what": "have mood boards ready for Ines",
+    "due_from": "2024-09-17",
+    "due_until": "2024-09-19",
+    "situation": null,
+    "kind": "commitment"
+   },
+   "i4": {
+    "what": "deliver second round of rebrand designs to Ines",
+    "due_from": "2024-09-29",
+    "due_until": "2024-10-01",
+    "situation": null,
+    "kind": "deadline"
+   }
+  },
+  "checks": [
+   {
+    "now": "2024-09-17",
+    "context": null,
+    "should_surface": [
+     "i1",
+     "i3"
+    ],
+    "must_not_surface": [],
+    "note": "i1 overdue since 2024-09-16; i3 due"
+   },
+   {
+    "now": "2024-09-20",
+    "context": null,
+    "should_surface": [
+     "i1"
+    ],
+    "must_not_surface": [
+     "i2",
+     "i3",
+     "i4"
+    ],
+    "note": "i1 overdue since 2024-09-16; i2 done 2024-09-19; i3 done 2024-09-18; i4 not due until 2024-09-29"
+   },
+   {
+    "now": "2024-09-30",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3",
+     "i4"
+    ],
+    "note": "i1 done 2024-09-27; i2 done 2024-09-19; i3 done 2024-09-18; i4 not due until 2024-10-13"
+   }
+  ]
+ },
+ {
+  "id": "s26",
+  "split": "test",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2025-03-10T08:45:00",
+    "content": "need to chase the Halvorsen invoice, it was due last week",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2025-03-10T08:47:00",
+    "content": "and the retro with the design team is Wednesday 10am",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2025-03-10T08:49:00",
+    "content": "I said I'd circulate the retro notes the day after",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m4",
+    "role": "assistant",
+    "timestamp": "2025-03-10T08:50:00",
+    "content": "I can draft a retro template if you'd like.",
+    "decoy": true
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2025-03-12T11:30:00",
+    "content": "retro done, decent session actually",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2025-03-13T16:00:00",
+    "content": "notes are out, everyone's got them",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i3",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2025-03-13T16:02:00",
+    "content": "Halvorsen payment still outstanding btw",
+    "decoy": false
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2025-03-13T16:04:00",
+    "content": "my team lead has to write all our reviews by April, glad that's not me",
+    "decoy": true
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2025-03-17T09:00:00",
+    "content": "I'm presenting at the all-hands on 2 April, need the slides done the week before",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m10",
+    "role": "user",
+    "timestamp": "2025-03-20T15:00:00",
+    "content": "Halvorsen paid! no more chasing",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "chase the overdue Halvorsen invoice",
+    "due_from": "2025-03-10",
+    "due_until": "2025-03-10",
+    "situation": null,
+    "kind": "todo"
+   },
+   "i2": {
+    "what": "design team retro at 10am",
+    "due_from": "2025-03-12",
+    "due_until": "2025-03-12",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i3": {
+    "what": "circulate the retro notes",
+    "due_from": "2025-03-13",
+    "due_until": "2025-03-13",
+    "situation": null,
+    "kind": "commitment"
+   },
+   "i4": {
+    "what": "finish slides for the all-hands presentation",
+    "due_from": "2025-03-24",
+    "due_until": "2025-03-28",
+    "situation": null,
+    "kind": "deadline"
+   }
+  },
+  "checks": [
+   {
+    "now": "2025-03-11",
+    "context": null,
+    "should_surface": [
+     "i1"
+    ],
+    "must_not_surface": [],
+    "note": "i1 overdue since 2025-03-10"
+   },
+   {
+    "now": "2025-03-14",
+    "context": null,
+    "should_surface": [
+     "i1"
+    ],
+    "must_not_surface": [
+     "i2",
+     "i3"
+    ],
+    "note": "i1 overdue since 2025-03-10; i2 done 2025-03-12; i3 done 2025-03-13"
+   },
+   {
+    "now": "2025-03-21",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3",
+     "i4"
+    ],
+    "note": "i1 done 2025-03-20; i2 done 2025-03-12; i3 done 2025-03-13; i4 not due until 2025-03-24"
+   },
+   {
+    "now": "2025-03-25",
+    "context": null,
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2025-03-20; i2 done 2025-03-12; i3 done 2025-03-13; i4 due"
+   }
+  ]
+ },
+ {
+  "id": "s27",
+  "split": "dev",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2024-10-19T11:00:00",
+    "content": "Brunch with Saoirse tomorrow at 11 at The Copper Kettle, and I still have her book so I must bring it",
+    "creates": [
+     "i1",
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "assistant",
+    "timestamp": "2024-10-19T11:01:00",
+    "content": "Sounds fun! The Copper Kettle does great pancakes.",
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2024-10-20T14:00:00",
+    "content": "brunch was lovely and Saoirse has her book back at last",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     },
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2024-10-20T14:02:00",
+    "content": "she's running the Dublin marathon next weekend, mad woman",
+    "decoy": true
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2024-10-22T09:00:00",
+    "content": "next time I'm at the chemist I need more contact lens solution",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2024-10-22T09:02:00",
+    "content": "and Kofi's birthday is the 2nd, I should order him something by the 31st so it arrives in time",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2024-10-22T09:04:00",
+    "content": "if I were richer I'd fly us all to Lisbon for it",
+    "decoy": true
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2024-10-30T13:00:00",
+    "content": "Kofi's present ordered, a fancy coffee grinder",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i4",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2024-10-30T13:05:00",
+    "content": "and we're going to his party on the 2nd at 8",
+    "creates": [
+     "i5"
+    ],
+    "decoy": false
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "brunch with Saoirse at The Copper Kettle, 11am",
+    "due_from": "2024-10-20",
+    "due_until": "2024-10-20",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i2": {
+    "what": "give Saoirse her book back",
+    "due_from": "2024-10-20",
+    "due_until": "2024-10-20",
+    "situation": "when meeting Saoirse",
+    "kind": "commitment"
+   },
+   "i3": {
+    "what": "buy contact lens solution",
+    "due_from": null,
+    "due_until": null,
+    "situation": "at the chemist",
+    "kind": "todo"
+   },
+   "i4": {
+    "what": "order Kofi's birthday present",
+    "due_from": "2024-10-29",
+    "due_until": "2024-10-31",
+    "situation": null,
+    "kind": "todo"
+   },
+   "i5": {
+    "what": "Kofi's birthday party at 8pm",
+    "due_from": "2024-11-02",
+    "due_until": "2024-11-02",
+    "situation": null,
+    "kind": "appointment"
+   }
+  },
+  "checks": [
+   {
+    "now": "2024-10-19",
+    "context": "just texted Saoirse to confirm brunch",
+    "should_surface": [
+     "i1",
+     "i2"
+    ],
+    "must_not_surface": [],
+    "note": "i1 brought to mind by context; i2 brought to mind by context"
+   },
+   {
+    "now": "2024-10-24",
+    "context": "in the chemist on Market Street",
+    "should_surface": [
+     "i3"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i4"
+    ],
+    "note": "i1 done 2024-10-20; i2 done 2024-10-20; i3 brought to mind by context; i4 not due until 2024-10-29"
+   },
+   {
+    "now": "2024-10-31",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i4"
+    ],
+    "note": "i1 done 2024-10-20; i2 done 2024-10-20; i4 done 2024-10-30"
+   },
+   {
+    "now": "2024-11-02",
+    "context": null,
+    "should_surface": [
+     "i5"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i4"
+    ],
+    "note": "i1 done 2024-10-20; i2 done 2024-10-20; i4 done 2024-10-30; i5 due"
+   }
+  ]
+ },
+ {
+  "id": "s28",
+  "split": "test",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2025-05-17T10:30:00",
+    "content": "dinner at Hamid's tonight at 7, and I said I'd finally give him back his camping stove",
+    "creates": [
+     "i1",
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2025-05-18T09:00:00",
+    "content": "great night. Hamid's got his stove back",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     },
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2025-05-18T09:02:00",
+    "content": "he's training for a triathlon, rather him than me",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2025-05-19T08:30:00",
+    "content": "whenever I'm next at the shoe repair place I need to get my boots resoled",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2025-05-19T08:32:00",
+    "content": "Lena's leaving drinks are on the 30th, need to chip in for her gift by the 27th",
+    "creates": [
+     "i4",
+     "i5"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m6",
+    "role": "assistant",
+    "timestamp": "2025-05-19T08:33:00",
+    "content": "Want me to suggest some leaving-gift ideas?",
+    "decoy": true
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2025-05-26T12:00:00",
+    "content": "chipped in £15 for Lena's present",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i4",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2025-05-28T18:00:00",
+    "content": "Lena's drinks moved to Friday 6 June, half the team's off next week",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i5",
+      "due_from": "2025-06-06",
+      "due_until": "2025-06-06"
+     }
+    ]
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "dinner at Hamid's at 7pm",
+    "due_from": "2025-05-17",
+    "due_until": "2025-05-17",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i2": {
+    "what": "give Hamid back his camping stove",
+    "due_from": "2025-05-17",
+    "due_until": "2025-05-17",
+    "situation": "at Hamid's",
+    "kind": "commitment"
+   },
+   "i3": {
+    "what": "get boots resoled",
+    "due_from": null,
+    "due_until": null,
+    "situation": "at the shoe repair shop",
+    "kind": "todo"
+   },
+   "i4": {
+    "what": "chip in for Lena's leaving gift",
+    "due_from": "2025-05-25",
+    "due_until": "2025-05-27",
+    "situation": null,
+    "kind": "commitment"
+   },
+   "i5": {
+    "what": "Lena's leaving drinks",
+    "due_from": "2025-05-30",
+    "due_until": "2025-05-30",
+    "situation": null,
+    "kind": "appointment"
+   }
+  },
+  "checks": [
+   {
+    "now": "2025-05-17",
+    "context": null,
+    "should_surface": [
+     "i1",
+     "i2"
+    ],
+    "must_not_surface": [],
+    "note": "i1 due; i2 due"
+   },
+   {
+    "now": "2025-05-21",
+    "context": "walking past Hartley's shoe repairs on the way to the bus",
+    "should_surface": [
+     "i3"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i4",
+     "i5"
+    ],
+    "note": "i1 done 2025-05-18; i2 done 2025-05-18; i3 brought to mind by context; i4 not due until 2025-05-25; i5 not due until 2025-05-30"
+   },
+   {
+    "now": "2025-05-29",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i4",
+     "i5"
+    ],
+    "note": "i1 done 2025-05-18; i2 done 2025-05-18; i4 done 2025-05-26; i5 not due until 2025-06-06"
+   },
+   {
+    "now": "2025-06-06",
+    "context": null,
+    "should_surface": [
+     "i5"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i4"
+    ],
+    "note": "i1 done 2025-05-18; i2 done 2025-05-18; i4 done 2025-05-26; i5 due"
+   }
+  ]
+ },
+ {
+  "id": "s29",
+  "split": "dev",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2024-04-15T20:00:00",
+    "content": "remind me tomorrow evening to practise the Chopin piece. recital is on the 27th",
+    "creates": [
+     "i1",
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2024-04-15T20:02:00",
+    "content": "remind me to pay the piano teacher on Friday too",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2024-04-15T20:04:00",
+    "content": "I do scales every morning anyway",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "assistant",
+    "timestamp": "2024-04-15T20:05:00",
+    "content": "For recital nerves, recording yourself playing it through can really help.",
+    "decoy": true
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2024-04-16T21:00:00",
+    "content": "practised for an hour, the middle section is still dodgy",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2024-04-19T17:00:00",
+    "content": "paid Mrs Abernathy for April",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i3",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2024-04-22T10:00:00",
+    "content": "the recital's been postponed to 11 May, the hall flooded",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i2",
+      "due_from": "2024-05-11",
+      "due_until": "2024-05-11"
+     }
+    ]
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2024-04-22T10:02:00",
+    "content": "please remind me to buy new guitar strings next time I'm at the music shop",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2024-04-22T10:04:00",
+    "content": "I'd love to learn jazz piano someday",
+    "decoy": true
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "practise the Chopin piece",
+    "due_from": "2024-04-16",
+    "due_until": "2024-04-16",
+    "situation": null,
+    "kind": "reminder"
+   },
+   "i2": {
+    "what": "piano recital",
+    "due_from": "2024-04-27",
+    "due_until": "2024-04-27",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i3": {
+    "what": "pay the piano teacher",
+    "due_from": "2024-04-19",
+    "due_until": "2024-04-19",
+    "situation": null,
+    "kind": "reminder"
+   },
+   "i4": {
+    "what": "buy new guitar strings",
+    "due_from": null,
+    "due_until": null,
+    "situation": "at the music shop",
+    "kind": "reminder"
+   }
+  },
+  "checks": [
+   {
+    "now": "2024-04-17",
+    "context": "at the supermarket buying bread",
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 done 2024-04-16; i2 not due until 2024-04-27"
+   },
+   {
+    "now": "2024-04-24",
+    "context": "browsing sheet music at Crotchet & Quaver music shop",
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2024-04-16; i2 not due until 2024-05-11; i3 done 2024-04-19; i4 brought to mind by context"
+   },
+   {
+    "now": "2024-05-11",
+    "context": null,
+    "should_surface": [
+     "i2"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i3"
+    ],
+    "note": "i1 done 2024-04-16; i2 due; i3 done 2024-04-19"
+   }
+  ]
+ },
+ {
+  "id": "s30",
+  "split": "test",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2025-01-27T07:15:00",
+    "content": "remind me Wednesday to submit my timesheet",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2025-01-27T07:17:00",
+    "content": "and remind me to call the plumber back about the quote tomorrow afternoon",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2025-01-27T07:19:00",
+    "content": "I meal prep every Sunday, saves my sanity",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2025-01-28T15:00:00",
+    "content": "called the plumber, he's coming 5 Feb at 8",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2025-01-29T17:30:00",
+    "content": "timesheet in",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2025-01-29T17:32:00",
+    "content": "remind me to pick up the dry cleaning when I'm next on the high street",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m7",
+    "role": "assistant",
+    "timestamp": "2025-01-29T17:33:00",
+    "content": "Would you like me to remind you about the plumber the day before?",
+    "decoy": true
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2025-02-03T12:00:00",
+    "content": "plumber's cancelled, I fixed the leak myself with a YouTube video",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i3",
+      "as": "cancelled"
+     }
+    ]
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2025-02-03T12:02:00",
+    "content": "my landlord should really pay for that but whatever",
+    "decoy": true
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "submit timesheet",
+    "due_from": "2025-01-29",
+    "due_until": "2025-01-29",
+    "situation": null,
+    "kind": "reminder"
+   },
+   "i2": {
+    "what": "call the plumber back about the quote",
+    "due_from": "2025-01-28",
+    "due_until": "2025-01-28",
+    "situation": null,
+    "kind": "reminder"
+   },
+   "i3": {
+    "what": "plumber visit at 8am",
+    "due_from": "2025-02-05",
+    "due_until": "2025-02-05",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i4": {
+    "what": "pick up the dry cleaning",
+    "due_from": null,
+    "due_until": null,
+    "situation": "on the high street",
+    "kind": "reminder"
+   }
+  },
+  "checks": [
+   {
+    "now": "2025-01-28",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i2",
+     "i3"
+    ],
+    "note": "i2 done 2025-01-28; i3 not due until 2025-02-05"
+   },
+   {
+    "now": "2025-01-31",
+    "context": "walking down the high street to the bank",
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2025-01-29; i2 done 2025-01-28; i3 not due until 2025-02-05; i4 brought to mind by context"
+   },
+   {
+    "now": "2025-02-04",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2025-01-29; i2 done 2025-01-28; i3 cancelled 2025-02-03"
+   }
+  ]
+ },
+ {
+  "id": "s31",
+  "split": "dev",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2024-08-01T19:00:00",
+    "content": "We get the keys to the new flat on 30 August!!",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2024-08-01T19:02:00",
+    "content": "Before then I need to give notice on this place, has to be in by the 9th, and book a van",
+    "creates": [
+     "i2",
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "assistant",
+    "timestamp": "2024-08-01T19:03:00",
+    "content": "Removal vans get booked up at the end of the month, so it's worth booking early.",
+    "decoy": false
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2024-08-06T12:00:00",
+    "content": "notice handed in to the letting agent",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2024-08-12T20:00:00",
+    "content": "van booked for the 31st, 8am pickup from Van-Go Hire",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i3",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2024-08-12T20:02:00",
+    "content": "my brother moved last year and lost half his stuff",
+    "decoy": true
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2024-08-19T09:00:00",
+    "content": "need to set up broadband for the new place. the provider wants two weeks' notice so I should do it this week",
+    "creates": [
+     "i5"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2024-08-21T18:00:00",
+    "content": "keys moved to the 31st, the vendor's solicitor is slow",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i1",
+      "due_from": "2024-08-31",
+      "due_until": "2024-08-31"
+     }
+    ]
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2024-08-21T18:02:00",
+    "content": "so I'll shift the van to 1 Sept",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i4",
+      "due_from": "2024-09-01",
+      "due_until": "2024-09-01"
+     }
+    ]
+   },
+   {
+    "id": "m10",
+    "role": "user",
+    "timestamp": "2024-08-23T11:00:00",
+    "content": "broadband ordered, installation is 3 Sept",
+    "creates": [
+     "i6"
+    ],
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i5",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m11",
+    "role": "user",
+    "timestamp": "2024-08-23T11:02:00",
+    "content": "would be nice to have a garden one day",
+    "decoy": true
+   },
+   {
+    "id": "m12",
+    "role": "user",
+    "timestamp": "2024-09-01T20:00:00",
+    "content": "Got the keys yesterday, moved everything today with the van, I'm wrecked",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     },
+     {
+      "intention": "i4",
+      "as": "done"
+     }
+    ]
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "collect the keys to the new flat",
+    "due_from": "2024-08-30",
+    "due_until": "2024-08-30",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i2": {
+    "what": "give notice on the current flat",
+    "due_from": "2024-08-07",
+    "due_until": "2024-08-09",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i3": {
+    "what": "book a removal van",
+    "due_from": null,
+    "due_until": null,
+    "situation": null,
+    "kind": "todo"
+   },
+   "i4": {
+    "what": "pick up the hire van at 8am",
+    "due_from": "2024-08-31",
+    "due_until": "2024-08-31",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i5": {
+    "what": "order broadband for the new flat",
+    "due_from": "2024-08-19",
+    "due_until": "2024-08-25",
+    "situation": null,
+    "kind": "todo"
+   },
+   "i6": {
+    "what": "broadband installation",
+    "due_from": "2024-09-03",
+    "due_until": "2024-09-03",
+    "situation": null,
+    "kind": "appointment"
+   }
+  },
+  "checks": [
+   {
+    "now": "2024-08-08",
+    "context": "browsing Van-Go Hire's website",
+    "should_surface": [
+     "i3"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 not due until 2024-08-30; i2 done 2024-08-06; i3 brought to mind by context"
+   },
+   {
+    "now": "2024-08-20",
+    "context": null,
+    "should_surface": [
+     "i5"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3",
+     "i4"
+    ],
+    "note": "i1 not due until 2024-08-30; i2 done 2024-08-06; i3 done 2024-08-12; i4 not due until 2024-08-31; i5 due"
+   },
+   {
+    "now": "2024-08-31",
+    "context": null,
+    "should_surface": [
+     "i1"
+    ],
+    "must_not_surface": [
+     "i2",
+     "i3",
+     "i5",
+     "i6"
+    ],
+    "note": "i1 due; i2 done 2024-08-06; i3 done 2024-08-12; i5 done 2024-08-23; i6 not due until 2024-09-03"
+   },
+   {
+    "now": "2024-09-04",
+    "context": null,
+    "should_surface": [
+     "i6"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3",
+     "i4",
+     "i5"
+    ],
+    "note": "i1 done 2024-09-01; i2 done 2024-08-06; i3 done 2024-08-12; i4 done 2024-09-01; i5 done 2024-08-23; i6 overdue since 2024-09-03"
+   }
+  ]
+ },
+ {
+  "id": "s32",
+  "split": "test",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2025-03-31T20:00:00",
+    "content": "Jo and Ade's wedding is 10 May. I need to RSVP by 15 April and sort out a suit",
+    "creates": [
+     "i1",
+     "i2",
+     "i4"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2025-03-31T20:02:00",
+    "content": "I'm also doing a reading, so I need to pick one and send it to Jo by the end of April",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "assistant",
+    "timestamp": "2025-03-31T20:03:00",
+    "content": "Popular choices include a passage from Corinthians, or a modern poem. I can suggest a few if you like.",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2025-04-08T19:00:00",
+    "content": "RSVP'd yes, chicken option",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2025-04-08T19:02:00",
+    "content": "my flatmate has to find a plus-one, not my problem",
+    "decoy": true
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2025-04-22T18:00:00",
+    "content": "Jo said the reading can wait until the week before, so by 3 May",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i3",
+      "due_from": "2025-05-01",
+      "due_until": "2025-05-03"
+     }
+    ]
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2025-04-26T15:00:00",
+    "content": "suit bought! navy, very dapper",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2025-04-26T15:02:00",
+    "content": "should I get a haircut the day before or is that too risky?",
+    "decoy": true
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2025-05-02T21:00:00",
+    "content": "sent Jo the reading, went with a poem in the end",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i3",
+      "as": "done"
+     }
+    ]
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "RSVP to Jo and Ade's wedding",
+    "due_from": "2025-04-13",
+    "due_until": "2025-04-15",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i2": {
+    "what": "sort out a suit for the wedding",
+    "due_from": null,
+    "due_until": null,
+    "situation": null,
+    "kind": "todo"
+   },
+   "i3": {
+    "what": "choose a reading and send it to Jo",
+    "due_from": "2025-04-28",
+    "due_until": "2025-04-30",
+    "situation": null,
+    "kind": "commitment"
+   },
+   "i4": {
+    "what": "Jo and Ade's wedding",
+    "due_from": "2025-05-10",
+    "due_until": "2025-05-10",
+    "situation": null,
+    "kind": "appointment"
+   }
+  },
+  "checks": [
+   {
+    "now": "2025-04-01",
+    "context": "trying on jackets in a menswear shop",
+    "should_surface": [
+     "i2"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i3",
+     "i4"
+    ],
+    "note": "i1 not due until 2025-04-13; i2 brought to mind by context; i3 not due until 2025-04-28; i4 not due until 2025-05-10"
+   },
+   {
+    "now": "2025-04-29",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i4"
+    ],
+    "note": "i1 done 2025-04-08; i2 done 2025-04-26; i4 not due until 2025-05-10"
+   },
+   {
+    "now": "2025-05-10",
+    "context": null,
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2025-04-08; i2 done 2025-04-26; i3 done 2025-05-02; i4 due"
+   }
+  ]
+ },
+ {
+  "id": "s33",
+  "split": "dev",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2024-07-08T08:00:00",
+    "content": "remind me to book Mochi in for her spay, she has to be done before 6 months so by the 26th",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2024-07-08T08:02:00",
+    "content": "and puppy training class starts Thursday at 7pm",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "assistant",
+    "timestamp": "2024-07-08T08:03:00",
+    "content": "Puppy classes are great. You might also look into crate training resources.",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2024-07-10T19:00:00",
+    "content": "training class cancelled, the trainer has covid, they'll refund us",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "cancelled"
+     }
+    ]
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2024-07-10T19:05:00",
+    "content": "need to buy her a bigger harness at some point, she's growing like mad",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2024-07-15T10:00:00",
+    "content": "vet says not until she's 7 months now, new guidance, so by the end of August",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i1",
+      "due_from": "2024-08-29",
+      "due_until": "2024-08-31"
+     }
+    ]
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2024-07-15T10:02:00",
+    "content": "my neighbour walks his greyhound at 6am every day, no idea how",
+    "decoy": true
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2024-07-15T10:05:00",
+    "content": "and I told my sister I'd dog-sit her spaniel the weekend of the 27th",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2024-07-25T20:00:00",
+    "content": "sister's cancelled her trip so no dog-sitting",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i4",
+      "as": "cancelled"
+     }
+    ]
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "book Mochi's spay",
+    "due_from": "2024-07-24",
+    "due_until": "2024-07-26",
+    "situation": null,
+    "kind": "reminder"
+   },
+   "i2": {
+    "what": "puppy training class at 7pm",
+    "due_from": "2024-07-11",
+    "due_until": "2024-07-11",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i3": {
+    "what": "buy Mochi a bigger harness",
+    "due_from": null,
+    "due_until": null,
+    "situation": null,
+    "kind": "todo"
+   },
+   "i4": {
+    "what": "dog-sit sister's spaniel",
+    "due_from": "2024-07-27",
+    "due_until": "2024-07-28",
+    "situation": null,
+    "kind": "commitment"
+   }
+  },
+  "checks": [
+   {
+    "now": "2024-07-11",
+    "context": "in Paws & Claws looking at chew toys",
+    "should_surface": [
+     "i3"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 not due until 2024-07-24; i2 cancelled 2024-07-10; i3 brought to mind by context"
+   },
+   {
+    "now": "2024-07-24",
+    "context": "at the garden centre buying compost",
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i4"
+    ],
+    "note": "i1 not due until 2024-08-29; i2 cancelled 2024-07-10; i4 not due until 2024-07-27"
+   },
+   {
+    "now": "2024-07-27",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i4"
+    ],
+    "note": "i1 not due until 2024-08-29; i2 cancelled 2024-07-10; i4 cancelled 2024-07-25"
+   },
+   {
+    "now": "2024-08-30",
+    "context": null,
+    "should_surface": [
+     "i1"
+    ],
+    "must_not_surface": [
+     "i2",
+     "i4"
+    ],
+    "note": "i1 due; i2 cancelled 2024-07-10; i4 cancelled 2024-07-25"
+   }
+  ]
+ },
+ {
+  "id": "s34",
+  "split": "test",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2025-05-06T12:00:00",
+    "content": "booked a table at Fennel & Fig for Mum's birthday, Saturday 17th at 7",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2025-05-06T12:02:00",
+    "content": "I promised Dad I'd pick up the cake on the day",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2025-05-06T12:03:00",
+    "content": "and I need to order flowers by the 14th",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m4",
+    "role": "assistant",
+    "timestamp": "2025-05-06T12:04:00",
+    "content": "Florists often charge extra for weekend delivery, so ordering for Friday might be cheaper.",
+    "decoy": true
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2025-05-12T09:00:00",
+    "content": "Mum's not well, so we've cancelled the birthday dinner and are doing it at home instead",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "cancelled"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2025-05-12T09:02:00",
+    "content": "Dad says he'll get the cake himself now",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "cancelled"
+     }
+    ]
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2025-05-13T18:00:00",
+    "content": "flowers ordered for Saturday",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i3",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2025-05-13T18:02:00",
+    "content": "my sister always forgets birthdays, she'll send a text at 11pm",
+    "decoy": true
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2025-05-13T18:05:00",
+    "content": "I need to sort out the family photo albums one of these days",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "Mum's birthday dinner at Fennel & Fig, 7pm",
+    "due_from": "2025-05-17",
+    "due_until": "2025-05-17",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i2": {
+    "what": "pick up Mum's birthday cake",
+    "due_from": "2025-05-17",
+    "due_until": "2025-05-17",
+    "situation": null,
+    "kind": "commitment"
+   },
+   "i3": {
+    "what": "order flowers for Mum's birthday",
+    "due_from": "2025-05-12",
+    "due_until": "2025-05-14",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i4": {
+    "what": "sort out the family photo albums",
+    "due_from": null,
+    "due_until": null,
+    "situation": null,
+    "kind": "todo"
+   }
+  },
+  "checks": [
+   {
+    "now": "2025-05-08",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 not due until 2025-05-17; i2 not due until 2025-05-17; i3 not due until 2025-05-12"
+   },
+   {
+    "now": "2025-05-13",
+    "context": "clearing out boxes in the loft",
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 cancelled 2025-05-12; i2 cancelled 2025-05-12; i3 done 2025-05-13; i4 brought to mind by context"
+   },
+   {
+    "now": "2025-05-17",
+    "context": "sitting in the hairdresser's waiting for a trim",
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 cancelled 2025-05-12; i2 cancelled 2025-05-12; i3 done 2025-05-13"
+   }
+  ]
+ },
+ {
+  "id": "s35",
+  "split": "dev",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2024-11-18T07:30:00",
+    "content": "when i see Tom at work i gotta ask him about borrowing the drill for the weekend",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2024-11-18T07:32:00",
+    "content": "also big grocery run wed for thanksgiving, and remind me to order the turkey by tomorrow",
+    "creates": [
+     "i2",
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "assistant",
+    "timestamp": "2024-11-18T07:33:00",
+    "content": "Want a printable Thanksgiving shopping list?",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "user",
+    "timestamp": "2024-11-19T17:00:00",
+    "content": "turkey ordered from Hollins farm",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i3",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2024-11-19T17:02:00",
+    "content": "tom said sure, i can grab the drill friday",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2024-11-19T17:04:00",
+    "content": "my in-laws are bringing the pies thank god",
+    "decoy": true
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2024-11-20T20:00:00",
+    "content": "grocery run done, store was a zoo",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2024-11-22T18:30:00",
+    "content": "got the drill",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i4",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2024-11-25T10:00:00",
+    "content": "need to give tom his drill back when i see him next",
+    "creates": [
+     "i5"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m10",
+    "role": "user",
+    "timestamp": "2024-11-25T10:02:00",
+    "content": "if i had a garage id just buy my own tools",
+    "decoy": true
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "ask Tom about borrowing his drill",
+    "due_from": null,
+    "due_until": null,
+    "situation": "when seeing Tom at work",
+    "kind": "todo"
+   },
+   "i2": {
+    "what": "big Thanksgiving grocery run",
+    "due_from": "2024-11-20",
+    "due_until": "2024-11-20",
+    "situation": null,
+    "kind": "todo"
+   },
+   "i3": {
+    "what": "order the turkey",
+    "due_from": "2024-11-19",
+    "due_until": "2024-11-19",
+    "situation": null,
+    "kind": "reminder"
+   },
+   "i4": {
+    "what": "collect the drill from Tom",
+    "due_from": "2024-11-22",
+    "due_until": "2024-11-22",
+    "situation": null,
+    "kind": "todo"
+   },
+   "i5": {
+    "what": "give Tom his drill back",
+    "due_from": null,
+    "due_until": null,
+    "situation": "when seeing Tom",
+    "kind": "todo"
+   }
+  },
+  "checks": [
+   {
+    "now": "2024-11-18",
+    "context": "Tom just walked into the break room",
+    "should_surface": [
+     "i1"
+    ],
+    "must_not_surface": [],
+    "note": "i1 brought to mind by context"
+   },
+   {
+    "now": "2024-11-21",
+    "context": "just got off a call with Tom about the budget",
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2024-11-19; i2 done 2024-11-20; i3 done 2024-11-19; i4 brought to mind by context"
+   },
+   {
+    "now": "2024-11-26",
+    "context": "Tom stopped by my desk to talk about the holiday party",
+    "should_surface": [
+     "i5"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3",
+     "i4"
+    ],
+    "note": "i1 done 2024-11-19; i2 done 2024-11-20; i3 done 2024-11-19; i4 done 2024-11-22; i5 brought to mind by context"
+   },
+   {
+    "now": "2024-11-27",
+    "context": "standing in line at the grocery store",
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3",
+     "i4"
+    ],
+    "note": "i1 done 2024-11-19; i2 done 2024-11-20; i3 done 2024-11-19; i4 done 2024-11-22"
+   }
+  ]
+ },
+ {
+  "id": "s36",
+  "split": "test",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2025-02-24T08:15:00",
+    "content": "when I see Nadia at choir on Wednesday I've got to give her the sheet music back",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2025-02-24T08:17:00",
+    "content": "and next time I'm at the library I need to renew my card",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2025-02-24T08:19:00",
+    "content": "choir every Wednesday is my happy place tbh",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "assistant",
+    "timestamp": "2025-02-24T08:20:00",
+    "content": "You could also renew your library card online.",
+    "decoy": true
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2025-02-26T21:30:00",
+    "content": "gave Nadia her music back",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2025-02-27T12:00:00",
+    "content": "dentist wants me in on 12 March at 2:30",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2025-03-03T09:00:00",
+    "content": "renewed the library card, did it online in the end",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2025-03-03T09:02:00",
+    "content": "next time I'm at the garage I should ask about the rattle in the exhaust",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2025-03-10T09:00:00",
+    "content": "dentist moved me to 19 March",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i3",
+      "due_from": "2025-03-19",
+      "due_until": "2025-03-19"
+     }
+    ]
+   },
+   {
+    "id": "m10",
+    "role": "user",
+    "timestamp": "2025-03-10T09:02:00",
+    "content": "my partner needs a filling and she's dreading it",
+    "decoy": true
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "give Nadia back her sheet music",
+    "due_from": "2025-02-26",
+    "due_until": "2025-02-26",
+    "situation": "at choir / when seeing Nadia",
+    "kind": "commitment"
+   },
+   "i2": {
+    "what": "renew library card",
+    "due_from": null,
+    "due_until": null,
+    "situation": "at the library",
+    "kind": "todo"
+   },
+   "i3": {
+    "what": "dentist appointment at 2:30",
+    "due_from": "2025-03-12",
+    "due_until": "2025-03-12",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i4": {
+    "what": "ask about the rattle in the exhaust",
+    "due_from": null,
+    "due_until": null,
+    "situation": "at the garage",
+    "kind": "todo"
+   }
+  },
+  "checks": [
+   {
+    "now": "2025-02-25",
+    "context": "on the bus to the central library",
+    "should_surface": [
+     "i2"
+    ],
+    "must_not_surface": [],
+    "note": "i2 brought to mind by context"
+   },
+   {
+    "now": "2025-02-27",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i3"
+    ],
+    "note": "i1 done 2025-02-26; i3 not due until 2025-03-12"
+   },
+   {
+    "now": "2025-03-11",
+    "context": "dropping the car off at the garage for its MOT",
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2025-02-26; i2 done 2025-03-03; i3 not due until 2025-03-19; i4 brought to mind by context"
+   },
+   {
+    "now": "2025-03-19",
+    "context": null,
+    "should_surface": [
+     "i3"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 done 2025-02-26; i2 done 2025-03-03; i3 due"
+   }
+  ]
+ },
+ {
+  "id": "s37",
+  "split": "dev",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2024-02-05T13:00:00",
+    "content": "Got feedback on my thesis chapter, revised version is due in two weeks",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2024-02-05T13:02:00",
+    "content": "and I promised my supervisor I'd email her the ethics form by Wednesday",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2024-02-05T13:04:00",
+    "content": "should I switch to LaTeX for the thesis?",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "assistant",
+    "timestamp": "2024-02-05T13:05:00",
+    "content": "LaTeX is great for long documents with lots of references. An online editor makes it easy to start.",
+    "decoy": true
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2024-02-07T11:00:00",
+    "content": "ethics form is with my supervisor",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2024-02-12T09:30:00",
+    "content": "Supervisor's away so the chapter deadline is pushed back a week",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i1",
+      "due_from": "2024-02-24",
+      "due_until": "2024-02-26"
+     }
+    ]
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2024-02-12T09:32:00",
+    "content": "remind me the conference abstract is due 1 March",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2024-02-12T09:34:00",
+    "content": "my labmate has to defend in April and she's weirdly calm about it",
+    "decoy": true
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2024-02-12T09:35:00",
+    "content": "need to get my laptop battery replaced at some point, it dies in an hour",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m10",
+    "role": "user",
+    "timestamp": "2024-02-25T23:00:00",
+    "content": "chapter sent!",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "send the revised thesis chapter",
+    "due_from": "2024-02-17",
+    "due_until": "2024-02-19",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i2": {
+    "what": "email the ethics form to the supervisor",
+    "due_from": "2024-02-05",
+    "due_until": "2024-02-07",
+    "situation": null,
+    "kind": "commitment"
+   },
+   "i3": {
+    "what": "submit the conference abstract",
+    "due_from": "2024-02-28",
+    "due_until": "2024-03-01",
+    "situation": null,
+    "kind": "reminder"
+   },
+   "i4": {
+    "what": "get the laptop battery replaced",
+    "due_from": null,
+    "due_until": null,
+    "situation": null,
+    "kind": "todo"
+   }
+  },
+  "checks": [
+   {
+    "now": "2024-02-06",
+    "context": null,
+    "should_surface": [
+     "i2"
+    ],
+    "must_not_surface": [
+     "i1"
+    ],
+    "note": "i1 not due until 2024-02-17; i2 due"
+   },
+   {
+    "now": "2024-02-18",
+    "context": "at the computer repair shop picking up my partner's phone",
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 not due until 2024-02-24; i2 done 2024-02-07; i3 not due until 2024-02-28; i4 brought to mind by context"
+   },
+   {
+    "now": "2024-02-28",
+    "context": null,
+    "should_surface": [
+     "i3"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 done 2024-02-25; i2 done 2024-02-07; i3 due"
+   }
+  ]
+ },
+ {
+  "id": "s38",
+  "split": "test",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2025-04-14T10:00:00",
+    "content": "lab report due in two weeks",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2025-04-14T10:02:00",
+    "content": "and I said I'd send Bao my notes from Thursday's lecture by tomorrow",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2025-04-14T10:04:00",
+    "content": "is it worth doing the summer module or nah",
+    "decoy": true
+   },
+   {
+    "id": "m4",
+    "role": "assistant",
+    "timestamp": "2025-04-14T10:05:00",
+    "content": "The summer module could lighten your autumn load quite a bit.",
+    "decoy": true
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2025-04-15T20:00:00",
+    "content": "Bao has my notes",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2025-04-18T14:00:00",
+    "content": "lab report extended to 5 May",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i1",
+      "due_from": "2025-05-03",
+      "due_until": "2025-05-05"
+     }
+    ]
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2025-04-18T14:02:00",
+    "content": "need to sort my student loan reapplication at some point",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2025-04-18T14:05:00",
+    "content": "and I've got a careers advice appointment on the 24th at 1",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2025-04-18T14:07:00",
+    "content": "my housemate has to move out by June",
+    "decoy": true
+   },
+   {
+    "id": "m10",
+    "role": "user",
+    "timestamp": "2025-04-24T15:00:00",
+    "content": "careers meeting was actually useful",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i4",
+      "as": "done"
+     }
+    ]
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "submit the lab report",
+    "due_from": "2025-04-26",
+    "due_until": "2025-04-28",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i2": {
+    "what": "send Bao the lecture notes",
+    "due_from": "2025-04-15",
+    "due_until": "2025-04-15",
+    "situation": null,
+    "kind": "commitment"
+   },
+   "i3": {
+    "what": "sort out the student loan reapplication",
+    "due_from": null,
+    "due_until": null,
+    "situation": null,
+    "kind": "todo"
+   },
+   "i4": {
+    "what": "careers advice appointment at 1pm",
+    "due_from": "2025-04-24",
+    "due_until": "2025-04-24",
+    "situation": null,
+    "kind": "appointment"
+   }
+  },
+  "checks": [
+   {
+    "now": "2025-04-15",
+    "context": null,
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 not due until 2025-04-26; i2 done 2025-04-15"
+   },
+   {
+    "now": "2025-04-23",
+    "context": "logging into the student finance portal",
+    "should_surface": [
+     "i3"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 not due until 2025-05-03; i2 done 2025-04-15; i3 brought to mind by context"
+   },
+   {
+    "now": "2025-05-03",
+    "context": null,
+    "should_surface": [
+     "i1"
+    ],
+    "must_not_surface": [
+     "i2",
+     "i4"
+    ],
+    "note": "i1 due; i2 done 2025-04-15; i4 done 2025-04-24"
+   }
+  ]
+ },
+ {
+  "id": "s39",
+  "split": "dev",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2024-05-27T09:00:00",
+    "content": "I water the plants every Sunday and do the bins Thursday nights",
+    "decoy": true
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2024-05-27T09:02:00",
+    "content": "but this Thursday I need to put the garden waste out too, it's the last collection before they start charging",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2024-05-27T09:04:00",
+    "content": "Also got to get the car's MOT done before the 14th",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m4",
+    "role": "assistant",
+    "timestamp": "2024-05-27T09:05:00",
+    "content": "You can book an MOT up to a month early and keep the same renewal date.",
+    "decoy": true
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2024-05-30T21:00:00",
+    "content": "garden waste out",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2024-06-03T12:00:00",
+    "content": "MOT booked at Pellow's Garage for the 11th",
+    "decoy": false
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2024-06-03T12:05:00",
+    "content": "need to repaint the back fence at some point",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2024-06-11T16:00:00",
+    "content": "finally got the MOT sorted, passed first time",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2024-06-11T16:02:00",
+    "content": "the neighbours' fence is falling down, they need to sort it",
+    "decoy": true
+   },
+   {
+    "id": "m10",
+    "role": "user",
+    "timestamp": "2024-06-11T16:10:00",
+    "content": "remind me to take the recycling to the tip on Saturday, too much for the bin",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "put the garden waste bin out",
+    "due_from": "2024-05-30",
+    "due_until": "2024-05-30",
+    "situation": null,
+    "kind": "todo"
+   },
+   "i2": {
+    "what": "get the car's MOT done",
+    "due_from": "2024-06-11",
+    "due_until": "2024-06-13",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i3": {
+    "what": "repaint the back fence",
+    "due_from": null,
+    "due_until": null,
+    "situation": null,
+    "kind": "todo"
+   },
+   "i4": {
+    "what": "take the recycling to the tip",
+    "due_from": "2024-06-15",
+    "due_until": "2024-06-15",
+    "situation": null,
+    "kind": "reminder"
+   }
+  },
+  "checks": [
+   {
+    "now": "2024-05-28",
+    "context": "just wheeled the bins round to the side",
+    "should_surface": [
+     "i1"
+    ],
+    "must_not_surface": [
+     "i2"
+    ],
+    "note": "i1 brought to mind by context; i2 not due until 2024-06-11"
+   },
+   {
+    "now": "2024-06-12",
+    "context": "in the paint section of the DIY store",
+    "should_surface": [
+     "i3"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i4"
+    ],
+    "note": "i1 done 2024-05-30; i2 done 2024-06-11; i3 brought to mind by context; i4 not due until 2024-06-15"
+   },
+   {
+    "now": "2024-06-15",
+    "context": null,
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2"
+    ],
+    "note": "i1 done 2024-05-30; i2 done 2024-06-11; i4 due"
+   }
+  ]
+ },
+ {
+  "id": "s40",
+  "split": "test",
+  "messages": [
+   {
+    "id": "m1",
+    "role": "user",
+    "timestamp": "2025-06-09T08:00:00",
+    "content": "I clean the fish tank every other Saturday",
+    "decoy": true
+   },
+   {
+    "id": "m2",
+    "role": "user",
+    "timestamp": "2025-06-09T08:02:00",
+    "content": "but I need to replace the filter this weekend, it's making a racket",
+    "creates": [
+     "i1"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m3",
+    "role": "user",
+    "timestamp": "2025-06-09T08:04:00",
+    "content": "and the boiler's annual service is due before the end of June, need to book it",
+    "creates": [
+     "i2"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m4",
+    "role": "assistant",
+    "timestamp": "2025-06-09T08:05:00",
+    "content": "Some energy suppliers include a free boiler check with certain tariffs.",
+    "decoy": true
+   },
+   {
+    "id": "m5",
+    "role": "user",
+    "timestamp": "2025-06-15T18:00:00",
+    "content": "new filter in, the tank's silent",
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i1",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m6",
+    "role": "user",
+    "timestamp": "2025-06-16T12:00:00",
+    "content": "boiler company can't come till July, so I've booked them for 8 July, they said that's fine",
+    "creates": [
+     "i3"
+    ],
+    "decoy": false,
+    "closes": [
+     {
+      "intention": "i2",
+      "as": "done"
+     }
+    ]
+   },
+   {
+    "id": "m7",
+    "role": "user",
+    "timestamp": "2025-06-16T12:05:00",
+    "content": "need to bleed the radiators at some point before winter",
+    "creates": [
+     "i4"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m8",
+    "role": "user",
+    "timestamp": "2025-06-16T12:07:00",
+    "content": "my landlord is supposed to fix the damp in the bathroom, been months",
+    "decoy": true
+   },
+   {
+    "id": "m9",
+    "role": "user",
+    "timestamp": "2025-07-03T09:00:00",
+    "content": "please remind me to put the bins out Wednesday night, there's a bulky collection Thursday",
+    "creates": [
+     "i5"
+    ],
+    "decoy": false
+   },
+   {
+    "id": "m10",
+    "role": "user",
+    "timestamp": "2025-07-07T19:00:00",
+    "content": "boiler engineer rang, moving to the 15th",
+    "decoy": false,
+    "reschedules": [
+     {
+      "intention": "i3",
+      "due_from": "2025-07-15",
+      "due_until": "2025-07-15"
+     }
+    ]
+   }
+  ],
+  "intentions": {
+   "i1": {
+    "what": "replace the fish tank filter",
+    "due_from": "2025-06-14",
+    "due_until": "2025-06-15",
+    "situation": null,
+    "kind": "todo"
+   },
+   "i2": {
+    "what": "book the boiler's annual service",
+    "due_from": "2025-06-28",
+    "due_until": "2025-06-30",
+    "situation": null,
+    "kind": "deadline"
+   },
+   "i3": {
+    "what": "boiler service visit",
+    "due_from": "2025-07-08",
+    "due_until": "2025-07-08",
+    "situation": null,
+    "kind": "appointment"
+   },
+   "i4": {
+    "what": "bleed the radiators",
+    "due_from": null,
+    "due_until": null,
+    "situation": null,
+    "kind": "todo"
+   },
+   "i5": {
+    "what": "put the bins out for the bulky collection",
+    "due_from": "2025-07-09",
+    "due_until": "2025-07-09",
+    "situation": null,
+    "kind": "reminder"
+   }
+  },
+  "checks": [
+   {
+    "now": "2025-06-14",
+    "context": null,
+    "should_surface": [
+     "i1"
+    ],
+    "must_not_surface": [
+     "i2"
+    ],
+    "note": "i1 due; i2 not due until 2025-06-28"
+   },
+   {
+    "now": "2025-06-17",
+    "context": "looking for the radiator key in the kitchen drawer",
+    "should_surface": [
+     "i4"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2025-06-15; i2 done 2025-06-16; i3 not due until 2025-07-08; i4 brought to mind by context"
+   },
+   {
+    "now": "2025-07-08",
+    "context": "at the pet shop buying fish food",
+    "should_surface": [],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2025-06-15; i2 done 2025-06-16; i3 not due until 2025-07-15"
+   },
+   {
+    "now": "2025-07-10",
+    "context": null,
+    "should_surface": [
+     "i5"
+    ],
+    "must_not_surface": [
+     "i1",
+     "i2",
+     "i3"
+    ],
+    "note": "i1 done 2025-06-15; i2 done 2025-06-16; i3 not due until 2025-07-15; i5 overdue since 2025-07-09"
+   }
+  ]
+ }
+]
