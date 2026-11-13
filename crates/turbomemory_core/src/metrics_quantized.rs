@@ -824,12 +824,6 @@ pub fn turbo_quant_prod_score_batch_byte_weights(
     scores
 }
 
-/// Batched cosine similarity between a query and a slice of full-precision
-/// vectors.  All vectors must be the same length as `query`.
-pub fn batched_cosine_similarity(query: &[f32], vectors: &[&[f32]]) -> Vec<f32> {
-    crate::cosine_similarity_batch(query, vectors)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

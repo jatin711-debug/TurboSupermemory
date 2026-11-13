@@ -456,16 +456,6 @@ impl BackgroundOptimizer {
         *guard = still_pending;
     }
 
-    /// Request a fast Hot-seal swap.
-    pub fn request_seal(&self) {
-        let _ = self.tx.send(OptimizerMsg::Seal);
-    }
-
-    /// Request an immediate consolidation + flush cycle.
-    pub fn request_consolidation(&self) {
-        let _ = self.tx.send(OptimizerMsg::Consolidate);
-    }
-
     /// Stop the optimizer thread and wait for it to finish. Idempotent.
     ///
     /// The worker holds a strong engine reference for the duration of a cycle,

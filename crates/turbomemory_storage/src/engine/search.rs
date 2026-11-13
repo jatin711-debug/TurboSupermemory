@@ -110,15 +110,6 @@ impl StorageEngine {
         self.search_ann_candidates_filtered(query_embedding, top_k, None)
     }
 
-    pub fn search_ann_candidates_with_ef(
-        &self,
-        query_embedding: &[f32],
-        top_k: usize,
-        ef: Option<usize>,
-    ) -> crate::Result<Vec<(String, f32)>> {
-        self.search_ann_candidates_filtered_with_ef(query_embedding, top_k, None, ef, None)
-    }
-
     /// Filtered ANN candidate search.
     ///
     /// `filter` is evaluated against the payload index; the resulting offset

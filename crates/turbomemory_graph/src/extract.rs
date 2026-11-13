@@ -312,11 +312,6 @@ impl ConceptVocabulary {
         current
     }
 
-    /// Returns true if `concept` has a known canonical alias.
-    pub fn is_alias(&self, concept: &str) -> bool {
-        self.aliases.contains_key(&concept.to_lowercase())
-    }
-
     /// Iterate over known aliases.
     pub fn aliases(&self) -> &HashMap<String, String> {
         &self.aliases

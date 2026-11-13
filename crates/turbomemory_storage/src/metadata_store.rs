@@ -536,18 +536,6 @@ impl MetadataStore {
         Self::load_meta(&self.db, "last_applied_seq").and_then(|s| s.parse().ok())
     }
 
-    pub fn save_sequences(&self) -> crate::Result<()> {
-        self.save_meta(
-            "next_offset",
-            &self.next_offset.load(Ordering::SeqCst).to_string(),
-        )?;
-        self.save_meta(
-            "next_seq",
-            &self.next_seq.load(Ordering::SeqCst).to_string(),
-        )?;
-        Ok(())
-    }
-
     /// Returns a flusher closure that persists sequence counters.
     pub fn flusher(&self) -> Flusher {
         let next_offset = self.next_offset();

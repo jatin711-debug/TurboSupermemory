@@ -1017,10 +1017,6 @@ impl MemoryGraph {
         self.suppressed_concepts.contains(&concept.to_lowercase())
     }
 
-    pub fn suppressed_concept_count(&self) -> usize {
-        self.suppressed_concepts.len()
-    }
-
     pub fn evolve_vocabulary(
         &mut self,
         overlap_threshold: f32,

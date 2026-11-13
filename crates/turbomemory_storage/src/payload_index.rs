@@ -16,7 +16,7 @@ use ahash::AHashMap;
 use ordered_float::NotNan;
 use roaring::RoaringBitmap;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ops::Bound;
 
 /// A filter predicate that can be evaluated against the payload index.
@@ -157,11 +157,6 @@ pub struct PayloadIndex {
 impl PayloadIndex {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Build an index from a snapshot of metadata records.
-    pub fn from_meta_records(records: &HashMap<PointOffset, crate::record::MetaRecord>) -> Self {
-        Self::from_meta_records_iter(records.iter().map(|(o, m)| (*o, m)))
     }
 
     /// Build an index from an iterator of `(offset, record)` pairs.

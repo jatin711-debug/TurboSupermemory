@@ -671,15 +671,6 @@ impl StoreConfig {
         ef.max(self.max_edges * 2)
     }
 
-    /// Effective HNSW level-0 connectivity.
-    pub fn m0(&self) -> usize {
-        if self.level0_factor == 0 {
-            self.max_edges * 2
-        } else {
-            self.max_edges * self.level0_factor
-        }
-    }
-
     /// Sensible defaults scaled for the given vector dimension.
     pub fn default_for_dimension(dimension: usize) -> Self {
         // HNSW build parameters scale with dimension. At low dimension a sparse

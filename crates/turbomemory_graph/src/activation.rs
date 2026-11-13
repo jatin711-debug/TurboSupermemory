@@ -651,10 +651,6 @@ impl SpreadingActivation {
     pub fn graph_mut(&mut self) -> &mut MemoryGraph {
         &mut self.graph
     }
-
-    pub fn into_graph(self) -> MemoryGraph {
-        self.graph
-    }
 }
 
 #[cfg(test)]
