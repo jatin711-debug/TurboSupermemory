@@ -230,7 +230,7 @@ of step 4.
   as the keys: candidates are not the bottleneck, the verifier on distant
   pairs is. 0.45 stays; the held-out half was not spent.
 
-### The executive: measured 2026-11-12
+### The executive: measured 2026-11-12 and 2026-11-13
 
 Opt-in prototypes, each in its own engine so they cannot change recall.
 
@@ -265,8 +265,8 @@ should come up"), OpenAI vectors, tuned on 20 and quoted on the other 20:
   replies.
 
 **`forget`.** `benchmarks/executive/forget_audit.py` plants a secret in a
-5,000-message store, forgets it, and probes recall, intentions, lessons and
-every file on disk, before and after a restart. The API served nothing after
+5,000-message store, forgets it, and probes recall, intentions, episodes
+(lessons, then) and every file on disk, before and after a restart. The API served nothing after
 forget. Two leaks were found and fixed:
 - the concept graph kept every word a deleted memory brought in (orphan
   concepts and co-occurrence pairs, saved with the graph). `remove_memory`
@@ -285,8 +285,47 @@ statement. A retraction now also affirms the old fact against everything
 said before it (`affirmed_seq`); after that 3 of 3 (tuning) and 8 of 8
 (held-out) stayed retracted.
 
-**Lessons (`feedback` / `lessons`).** Not measured: it needs a task loop with
-real outcomes, which none of the datasets has.
+**Experience (`feedback` / `episodes`; lessons removed 2026-11-13).** Scored
+on a task world written blind to the code (`benchmarks/executive/
+lessons_world.py`, a kitchen-equipment wholesaler, every answer checked by
+code): 6 families with a house rule a default model gets wrong (a date format,
+kg rounded up, a refund threshold and its approver, a flat quote fee, an
+order-reference format, a shipping cut-off), 2 controls where carrying a rule
+over makes the answer wrong, 1 rule that changes mid-stream. After each task
+the user reports the outcome, with a one-line correction when it was wrong.
+`lessons_eval.py`, tuning half, 2 orders x 108 tasks, gpt-4.1-mini reading,
+200-token cap:
+
+| Arm | All | Second half | Rule tasks, 2nd half | Controls | After the change |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| Nothing | 53 / 216 | 30 / 108 | 3 / 66 | 48 / 48 | 0 / 15 |
+| Past attempts (`episodes`) | 155 / 216 | 79 / 108 | 45 / 66 | 47 / 48 | 7 / 15 |
+| Curated lessons | 62 / 216 | 38 / 108 | 11 / 66 | 48 / 48 | 0 / 15 |
+| Lessons, probation too | 81 / 216 | 47 / 108 | 20 / 66 | 48 / 48 | 0 / 15 |
+| Rules stated | 207 / 216 | 103 / 108 | 65 / 66 | 43 / 48 | 15 / 15 |
+
+The lessons (a model, gpt-4o-mini, distilled each trusted episode into a
+lesson; helpful / harmful counters moved it from probation to active or
+deprecated) were removed, and the held-out half was not spent on them:
+- The distiller wrote general advice in place of the rule. "Dates are written
+  05-MAR-2026" became "Always confirm the specific date format required for
+  invoices". The one family where it kept the rule (kg, rounded up) is the one
+  it helped (8 helped / 0 harmed). Its prompt asked for something general that
+  does not restate the task, which is exactly what drops the rule.
+- The counters credited every lesson that was in the context when a task went
+  right, relevant or not: a vague date lesson stood at 20 helped / 19 harmed
+  and active. Counting needs to know whether a lesson was used, which nothing
+  here can tell.
+- Even fixed, a lesson can at best restate the correction an episode shows
+  word for word. The past attempts are the ceiling a summary of them chases.
+
+What stays: `feedback(answer=, note=)` stores the answer and the user's words,
+`episodes()` returns the nearest, `episode_block` shows them. Also seen:
+episodes hurt one family (shipping cut-off, 0 / 24 against 5 / 24 with
+nothing: earlier corrections about other days misled), and even rules stated
+outright cost 5 of 48 controls (the reader carries a stated rule over). The
+held-out half of the task world is unspent. Spent: 1,371 requests, about
+$0.40.
 
 ## How to measure without fooling yourself
 
@@ -323,6 +362,7 @@ real outcomes, which none of the datasets has.
 | Evaluation harness, datasets loader, judges | 2026-11-11 | `git show e79d75f:benchmarks/cognitive_eval/<path>` |
 | Lab notebook, open-work list, original plan | 2026-11-11 | `git show e79d75f:benchmarks/PHASE_PROGRESS.md`, `e79d75f:TODO.md`, `e79d75f:PLAN.md` |
 | One-off scripts (leak repro, quantizer audits, batch test, GPU benchmark) | 2026-11-11 | `git show e79d75f:benchmarks/<name>` |
+| Curated lessons (`Memory.lessons`, `LLMDistiller`, counters) | 2026-11-13 | `git show 6825fd5:tsm/experience.py` |
 | Read-time monitor (`checked_recall`) | 2026-11-11 | `git show 940ef42:tsm/monitor.py` |
 | ColBERT reranker | 2026-11-10 | `git show cbc2f6f:tsm/rerankers.py` |
 | Event table, observations, `sources="turn"`, event dates, reader tools | 2026-11-09 | `git show 26092df:tsm/<events, observe, sources, answering>.py` |
@@ -331,8 +371,10 @@ real outcomes, which none of the datasets has.
 
 - Does the graph's extra evidence on local embedders turn into answers? That
   needs a judged run.
-- Lessons were never measured against retrieving raw past episodes
-  (`episodes()`); that needs tasks with real outcomes.
+- A way of learning from outcomes that beats showing the past attempts
+  (`lessons_eval.py`; episodes 45 of 66 on rule tasks, rules stated 65).
+  Picking which episodes to show (the cut-off family was misled by
+  neighbours) is the gap that is left.
 - An intention tracker that beats recall + a model on wrong items: the
   tracker's extra errors are items surfaced too early and ones it failed to
   close.

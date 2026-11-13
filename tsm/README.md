@@ -149,7 +149,10 @@ returns. Measured on 2026-11-12 ([LEARNINGS.md](../LEARNINGS.md)):
   for explicit "remind me to ..." only.
 - **`forget`, `retract`, `history`.** These were checked from outside, and
   the leaks found were fixed.
-- **Lessons.** Not measured: that needs tasks with real outcomes.
+- **Experience.** On a stream of tasks with house rules the reader did not
+  know (checked by code), showing the three nearest past attempts with the
+  user's corrections took the second half from 3 to 45 of 66 right. Curated
+  lessons distilled from them got 11 and were removed on 2026-11-13.
 
 The read-time monitor
 (`checked_recall`) did not, and was removed on 2026-11-11: no second look,
@@ -166,12 +169,11 @@ mem = Memory("./db", intentions=True, experience=True)
 mem.due("alice", now="2024-03-05", context="at the passport office")
 mem.resolve_intention(intention_id, "done")
 
-# Experience: outcomes in, lessons out (curated at consolidate(), counters
-# only for lessons that were in front of the reader; "self" outcomes teach
-# nothing).
-items = mem.lessons(task, user_id="alice")
-mem.feedback(task, "failure", memory_ids=[i["id"] for i in items],
-             user_id="alice", lesson="Ask which date format the vendor uses.")
+# Experience: how earlier tasks went, shown word for word to the reader.
+from tsm.experience import episode_block
+notes = episode_block(mem.episodes(task, user_id="alice"))   # put in the prompt
+mem.feedback(task, "failure", user_id="alice", answer="2026-03-05",
+             note="No - our invoices say 05-MAR-2026.")
 
 # Belief ledger.
 mem.history(memory_id)        # the chain with valid_from / valid_until
@@ -185,7 +187,7 @@ Intentions and experience each keep their own engine under `db_path`
 patches (`MemoryEngine.set_payloads`), which keep a record's place, so
 nothing is embedded twice and belief ordering is untouched. The cosine floors
 they use (`tsm.intentions.COMPLETION_MIN_COSINE`, `RESCHEDULE_MIN_COSINE`,
-`CUE_MIN_COSINE`, `tsm.experience.ITEM_MATCH_COSINE`) belong to an embedder's
+`CUE_MIN_COSINE`) belong to an embedder's
 geometry. Only the context cue is tuned, and only for `OpenAIEmbedder`
 (`cue_min_cosine`, 0.35); the rest are untuned.
 
@@ -205,7 +207,7 @@ served again, so derived text goes too (`tsm/forgetting.py`):
   content and are rewritten at once (`purge_caches=True`). These are the
   extractions, embeddings and judges' replies.
 - `texts=` (with `user_id`) adds the person's own words. Any gist sentence,
-  intention, lesson or cache entry that contains one as whole words goes.
+  intention, episode or cache entry that contains one as whole words goes.
   Memories themselves are deleted only by id.
 - Deleting a memory also removes the words only it brought into the concept
   graph. Bytes can still sit in the database's freed pages until reused.

@@ -268,7 +268,6 @@ class Memory:
         intentions: bool = False,
         experience: bool = False,
         readiness_judge=None,
-        distiller=None,
         topics=None,
         intention_tracker=None,
         **engine_kwargs,
@@ -359,17 +358,15 @@ class Memory:
                 messages, ``consolidate()`` closes and replaces them, and
                 ``due()`` says which have come due. Changes no recall result.
                 Off by default (a prototype, not yet measured).
-            experience: keep the outcomes ``feedback()`` reports and curate
-                lessons from them (``tsm.experience``), in an engine of its
-                own under ``db_path``; ``lessons()`` returns those that apply
-                to a task. Changes no recall result. Off by default (a
-                prototype, not yet measured).
+            experience: keep the outcomes ``feedback()`` reports, with the
+                answer given and the user's correction (``tsm.experience``),
+                in an engine of its own under ``db_path``; ``episodes()``
+                returns the ones nearest a task. Changes no recall result.
+                Off by default.
             readiness_judge: what ``due()`` asks to judge its candidates
                 (``tsm.intentions.LLMReadinessJudge``, or ``"llm"``).
                 ``None``: due by time is "act", brought to mind by the
                 context is "observe".
-            distiller: turns a trusted outcome without a lesson into one at
-                consolidation (``tsm.experience.LLMDistiller``, or ``"llm"``).
             topics: also offer the verifier facts that give a value for the
                 same property (``user.residence``), however differently they
                 are worded (``tsm.topics.LLMTopicKeyer``, or ``"llm"``). Needs
@@ -394,7 +391,6 @@ class Memory:
             ("extractor", extractor, ("openai", "gliner", "passthrough", "none")),
             ("verifier", verifier, ("nli", "llm")),
             ("readiness_judge", readiness_judge, ("llm",)),
-            ("distiller", distiller, ("llm",)),
             ("topics", topics, ("llm",)),
             ("intention_tracker", intention_tracker, ("llm",)),
         ):
@@ -447,10 +443,6 @@ class Memory:
             from .intentions import LLMReadinessJudge
 
             readiness_judge = LLMReadinessJudge(cache_dir=os.path.join(db_path, "tsm_cache"))
-        if distiller == "llm":
-            from .experience import LLMDistiller
-
-            distiller = LLMDistiller(cache_dir=os.path.join(db_path, "tsm_cache"))
         if topics is not None and getattr(verifier, "candidate_min_cosine", None) is None:
             # The keys only propose; a verifier that cannot judge meaning
             # would be handed whatever two facts share a key.
@@ -471,7 +463,6 @@ class Memory:
         # pass after opening).
         self._topic_scopes: Optional[set] = None
         self.readiness_judge = readiness_judge
-        self.distiller = distiller
         self.embedder = embedder
         self.extractor = extractor
         self.verifier = verifier
@@ -1310,9 +1301,8 @@ class Memory:
 
     def _maintain_executive(self) -> None:
         """The executive's share of a consolidation pass: close and replace
-        intentions, curate lessons from new outcomes. Each is one batch of
-        payload patches; a failure is logged and tried again next pass
-        (nothing is deleted)."""
+        intentions, in one batch of payload patches; a failure is logged and
+        tried again next pass (nothing is deleted)."""
         if self._intentions is not None and self.intention_tracker is not None:
             self._track_intentions()
         elif self._intentions is not None:
@@ -1325,19 +1315,6 @@ class Memory:
             except Exception as e:  # noqa: BLE001 — retried on the next pass
                 self._retry = True
                 logger.warning("intention maintenance failed (will retry): %s: %s",
-                               type(e).__name__, e)
-        if self._experience is not None:
-            try:
-                # Not under the write lock (a distiller may call a model);
-                # under the lock forget() takes to patch the same episodes.
-                with self._experience_lock:
-                    done = self._experience.curate(self.distiller)
-                if done["episodes"]:
-                    logger.info("experience: %d episodes, %d lessons added, %d updated",
-                                done["episodes"], done["added"], done["updated"])
-            except Exception as e:  # noqa: BLE001 — retried on the next pass
-                self._retry = True
-                logger.warning("experience curation failed (will retry): %s: %s",
                                type(e).__name__, e)
 
     def _track_intentions(self) -> None:
@@ -1735,40 +1712,30 @@ class Memory:
 
     def feedback(self, task: str, outcome, memory_ids: Iterable[str] = (),
                  user_id: Optional[str] = None, source: str = "user",
-                 lesson: Optional[str] = None) -> str:
+                 answer: Optional[str] = None, note: Optional[str] = None) -> str:
         """Report how a task went: ``outcome`` is ``"success"`` /
-        ``"failure"`` (or a bool, or a score in [0, 1]); ``memory_ids`` what
-        was in front of the reader, lesson ids from ``lessons()`` included
-        (only those are credited or blamed); ``source`` who says so
-        (``"user"``, ``"verifier"``, ``"judge"``, or ``"self"``, which is
-        kept but never learned from); ``lesson`` what to do or avoid next
-        time, in words. Stored as an episode; lessons are curated from
-        episodes in ``consolidate()`` (``tsm.experience``). Returns the
-        episode's id."""
+        ``"failure"`` (or a bool, or a score in [0, 1]); ``answer`` what was
+        answered; ``note`` what the user said about it (a correction, in
+        their words); ``memory_ids`` what was in front of the reader;
+        ``source`` who says so (``"user"``, ``"verifier"``, ``"judge"``, or
+        ``"self"``, which ``episode_block`` marks as self-reported). Stored as
+        an episode (``tsm.experience``); ``episodes()`` returns it for
+        similar tasks. Returns the episode's id."""
         ledger = self._require_experience()
         vector = np.asarray(embed_query(self.embedder, task), dtype=np.float32)
         with self._write_lock:
-            mid = ledger.record(task, outcome, list(memory_ids), user_id, source, lesson,
+            mid = ledger.record(task, outcome, list(memory_ids), user_id, source,
                                 at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                                vector=vector)
-            self._pending = True
+                                vector=vector, answer=answer, note=note)
         self._activity = time.monotonic()
         return mid
 
-    def lessons(self, task: str, user_id: Optional[str] = None, k: int = 3,
-                include_probation: bool = False) -> List[Dict]:
-        """The curated lessons nearest ``task``, of ``user_id`` or global,
-        best first: ``active`` ones (and ``probation`` ones when asked). Put
-        them in front of the reader apart from the memories
-        (``tsm.experience.lesson_block``), and pass their ids back with
-        ``feedback`` so they are credited or blamed."""
-        ledger = self._require_experience()
-        return ledger.lessons(np.asarray(embed_query(self.embedder, task), dtype=np.float32),
-                              user_id, k, include_probation)
-
     def episodes(self, task: str, user_id: Optional[str] = None, k: int = 3) -> List[Dict]:
-        """The past episodes nearest ``task``, as they were reported (the
-        plain "retrieve past experiences" baseline lessons must beat)."""
+        """The past episodes nearest ``task``, of ``user_id`` or global,
+        best first, as they were reported. Put them in front of the reader
+        apart from the memories (``tsm.experience.episode_block``): shown
+        with the user's corrections, they took tasks with an unstated house
+        rule from 3 to 45 of 66 right (``LEARNINGS.md``, 2026-11-13)."""
         ledger = self._require_experience()
         return ledger.episodes(np.asarray(embed_query(self.embedder, task), dtype=np.float32),
                                user_id, k)
@@ -1838,20 +1805,20 @@ class Memory:
           could not be checked; removing sentences can. ``gists="keep"``
           leaves every gist as it is and lists the ones that may hold the
           content in ``gists_may_hold``;
-        - intentions and the experience store's episodes and lessons that
-          carry it are deleted, and episodes stop listing the forgotten ids;
+        - intentions and the experience store's episodes that carry it are
+          deleted, and episodes stop listing the forgotten ids;
         - with ``purge_caches`` (default), the backends' on-disk caches under
           ``tsm_cache/`` (extractions, embeddings, judges' replies) lose
           every entry that carries it, and are rewritten at once.
 
         With ``user_id``, memories of another user are refused
-        (``skipped``) and only that user's gists, intentions and lessons are
+        (``skipped``) and only that user's gists, intentions and episodes are
         looked at.
 
         ``texts`` (needs ``user_id``): more content to forget, for what no
         stored memory holds any more but something derived still may (a fact
-        folded into a gist, or dropped by it, whose intention or lesson
-        remains): the user's gists, intentions, lessons and the caches are
+        folded into a gist, or dropped by it, whose intention or episode
+        remains): the user's gists, intentions, episodes and the caches are
         swept for it as for a forgotten memory. Memories themselves are only
         deleted by id (find them with ``recall``).
 
@@ -1924,7 +1891,7 @@ class Memory:
         purged = 0
         if purge_caches and forgotten:
             for backend in (self.extractor, self.embedder, self.verifier,
-                            self.readiness_judge, self.distiller, self.topic_keyer,
+                            self.readiness_judge, self.topic_keyer,
                             self.intention_tracker):
                 purge = getattr(backend, "forget_texts", None)
                 if callable(purge):
@@ -2030,7 +1997,6 @@ class Memory:
                                         (self.embedder, "flush"),
                                         (self.verifier, "flush_cache"),
                                         (self.readiness_judge, "flush_cache"),
-                                        (self.distiller, "flush_cache"),
                                         (self.topic_keyer, "flush_cache"),
                                         (self.intention_tracker, "flush_cache")):
                     flush = getattr(backend, method, None)

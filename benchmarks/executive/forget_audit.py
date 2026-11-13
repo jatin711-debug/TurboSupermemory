@@ -1,17 +1,17 @@
 """Does ``Memory.forget`` leave the forgotten content anywhere?
 
 ``forget`` promises that the content is not served again: the memories,
-what was stored from the same message, the intentions and lessons formed
+what was stored from the same message, the intentions and episodes formed
 from it, the gists that carry it (redacted), and the backends' cache
 entries. Its tests check each of those through the API. This audit checks
 the promise from the outside, on a store large enough to be tiered:
 
 The forget call passes what recall finds of the secret by id and the
 person's own words for it (``texts``), which reach what no memory holds any
-more (a fact folded into a gist, or dropped by it, whose intention or lesson
+more (a fact folded into a gist, or dropped by it, whose intention or episode
 remains).
 
-1. Recall, ``due``, ``lessons`` and ``episodes`` probed with the secret's own
+1. Recall, ``due`` and ``episodes`` probed with the secret's own
    words, before and after a restart (the write-ahead log must not bring it
    back).
 2. Every file under ``db_path`` scanned for the secret's bytes, after
@@ -43,7 +43,7 @@ from tsm.tests.test_memory import FakeEmbedder, FakeExtractor  # noqa: E402
 # Words that occur nowhere else, so a byte match is the secret and nothing else.
 SECRET = "My gym locker code is 409173 and the spare key is under the quokkaberry pot."
 TOKENS = ["quokkaberry", "409173"]
-LESSON = "Locker 409173 opens with the quokkaberry key."
+NOTE = "Locker 409173 opens with the quokkaberry key."
 OTHER = "I like green tea in the morning."
 FORGET_WORDS = ["gym locker code", "quokkaberry"]
 
@@ -112,12 +112,9 @@ def probe(mem):
     for item in mem.intentions("u"):
         if any(t in item["text"] for t in TOKENS):
             out.append(("intention", item.get("status"), item["text"][:80]))
-    for item in mem.lessons("open the gym locker", user_id="u", k=10, include_probation=True):
-        if any(t in json.dumps(item) for t in TOKENS):
-            out.append(("lesson", "", item.get("text", "")[:80]))
     for item in mem.episodes("open the gym locker", user_id="u", k=10):
         if any(t in json.dumps(item) for t in TOKENS):
-            out.append(("episode", "", str(item.get("task", ""))[:80]))
+            out.append(("episode", "", str(item.get("text", ""))[:80]))
     return sorted(set(out))
 
 
@@ -145,7 +142,7 @@ def run(config, fillers, keep):
     mem.add([{"role": "user", "content": OTHER, "timestamp": "2024-03-02"}], user_id="u")
     secret_ids = [r["id"] for r in mem.recall(SECRET, user_id="u", top_k=20)
                   if "409173" in r["text"] and not r["role"].startswith("summary")]
-    mem.feedback("open the gym locker", "success", secret_ids[:1], user_id="u", lesson=LESSON)
+    mem.feedback("open the gym locker", "success", secret_ids[:1], user_id="u", note=NOTE)
     mem.consolidate()
     if config == "gists":
         # The secret may have been folded into a gist already: forget what is left of it.

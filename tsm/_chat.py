@@ -1,7 +1,7 @@
 """One cached chat request, shared by the executive's model-backed parts.
 
-The readiness judge (``tsm.intentions``) and the lesson distiller
-(``tsm.experience``) each ask a chat model one short question and read one
+The readiness judge and the intention tracker (``tsm.intentions``) and
+the topic keyer (``tsm.topics``) each ask a chat model one short question and read one
 short reply. They share this
 client: any OpenAI-compatible endpoint (OpenAI by default, a local server
 through ``base_url``), the retry policy of ``tsm._retry`` (transient errors

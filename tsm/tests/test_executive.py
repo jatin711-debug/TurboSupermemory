@@ -1,5 +1,5 @@
 """Unit tests for the memory-side executive: intentions (``due``),
-experience (``feedback``, ``lessons``) and the belief ledger (``retract``,
+experience (``feedback``, ``episodes``) and the belief ledger (``retract``,
 ``history``, ``forget``), plus the engine calls they stand on (payload
 patches, lookups by payload, filtered vector search, retraction).
 
@@ -19,7 +19,7 @@ if _ROOT not in sys.path:
 
 
 from tsm import intentions as intents
-from tsm.experience import (ExperienceLedger, lesson_block, normalize_outcome, status_for)
+from tsm.experience import ExperienceLedger, episode_block, normalize_outcome
 from tsm.intentions import detect_closure, detect_intentions, future_window
 from tsm.tests.test_memory import AcceptAllVerifier, FakeEmbedder, MemoryTestBase, _cosine
 
@@ -190,98 +190,59 @@ class TestIntentions(MemoryTestBase):
 
 # ------------------------------------------------------------------ experience
 class TestExperienceRules(unittest.TestCase):
-    def test_outcomes_and_statuses(self):
+    def test_outcomes(self):
         self.assertEqual(normalize_outcome(True), "success")
         self.assertEqual(normalize_outcome(0.2), "failure")
         self.assertEqual(normalize_outcome("Wrong"), "failure")
         with self.assertRaises(ValueError):
             normalize_outcome("meh")
-        self.assertEqual(status_for(2, 0, "probation"), "active")
-        self.assertEqual(status_for(1, 0, "probation"), "probation")
-        self.assertEqual(status_for(1, 2, "active"), "deprecated")
-        self.assertEqual(status_for(5, 0, "deprecated"), "deprecated")
-        block = lesson_block([{"content": "a" * 40}, {"content": "b" * 400}], token_cap=20)
-        self.assertEqual(block, "Lessons from earlier tasks:\n- " + "a" * 40)
-        self.assertEqual(lesson_block([]), "")
+
+    def test_episode_block(self):
+        eps = [{"text": "date the invoice", "answer": "2026-03-05", "outcome": "failure",
+                "note": "We write 05-MAR-2026.", "source": "user"},
+               {"text": "x" * 2000, "outcome": "success", "source": "user"}]
+        block = episode_block(eps)
+        self.assertEqual(block, "Earlier attempts at similar tasks:\n- Task: date the invoice\n"
+                                "  Answer given: 2026-03-05\n  Outcome: failure\n"
+                                "  Feedback: We write 05-MAR-2026.")
+        self.assertIn("(self-reported)", episode_block([dict(eps[0], source="self")]))
+        self.assertEqual(episode_block([]), "")
+        self.assertEqual(episode_block(eps, token_cap=5), "")
 
 
 class TestExperience(MemoryTestBase):
     TASK = "convert the invoice dates to ISO format"
 
-    def test_a_lesson_is_learned_and_promoted_by_use(self):
+    def test_an_episode_comes_back_as_it_was_reported(self):
         mem = self.make_memory(experience=True)
-        mem.feedback(self.TASK, "success", user_id="u",
-                     lesson="Read day-first dates when the vendor is European.")
-        self.assertEqual(mem.lessons(self.TASK, "u", include_probation=True), [],
-                         "curated at consolidation, not on feedback")
-        mem.consolidate()
-        (item,) = mem.lessons(self.TASK, "u", include_probation=True)
-        self.assertEqual((item["status"], item["helpful"], item["harmful"]),
-                         ("probation", 1, 0))
-        self.assertEqual(mem.lessons(self.TASK, "u"), [], "not active yet")
-        self.assertEqual(mem.lessons(self.TASK, "other user", include_probation=True), [])
-        mem.feedback(self.TASK, True, memory_ids=[item["id"]], user_id="u")
-        mem.consolidate()
-        (item,) = mem.lessons(self.TASK, "u")
-        self.assertEqual((item["status"], item["helpful"]), ("active", 2))
-        self.assertEqual(len(item["provenance"]), 2)
+        mem.feedback(self.TASK, "failure", user_id="u", answer="2026-03-05",
+                     note="No - we write 05.03.2026 here.")
+        mem.feedback("make tea", True, user_id="u")
+        (episode, *_) = mem.episodes(self.TASK, "u")
+        self.assertEqual((episode["text"], episode["outcome"], episode["answer"],
+                          episode["note"], episode["source"]),
+                         (self.TASK, "failure", "2026-03-05", "No - we write 05.03.2026 here.",
+                          "user"))
+        self.assertEqual(mem.episodes(self.TASK, "other user"), [])
+        self.assertEqual(len(mem.episodes(self.TASK, "u", k=5)), 2)
 
-    def test_a_used_lesson_that_fails_is_deprecated(self):
+    def test_feedback_changes_no_recall_and_needs_no_consolidation(self):
         mem = self.make_memory(experience=True)
-        mem.feedback(self.TASK, "success", user_id="u", lesson="Assume US dates.")
-        mem.consolidate()
-        (item,) = mem.lessons(self.TASK, "u", include_probation=True)
-        for _ in range(2):
-            mem.feedback(self.TASK, "failure", memory_ids=[item["id"]], user_id="u")
-        mem.consolidate()
-        self.assertEqual(mem.lessons(self.TASK, "u", include_probation=True), [])
-        stored = mem._experience._items([item["id"]])[item["id"]]
-        self.assertEqual((stored["status"], stored["harmful"]), ("deprecated", 2))
+        mem.add([{"role": "user", "content": "I drink green tea."}], user_id="u")
+        before = [r["id"] for r in mem.recall("tea", user_id="u")]
+        mem.feedback("make tea", "success", user_id="u", note="Perfect.")
+        self.assertEqual([r["id"] for r in mem.recall("tea", user_id="u")], before)
+        self.assertEqual(len(mem.episodes("make tea", "u")), 1)
 
-    def test_an_unused_lesson_is_not_blamed(self):
+    def test_sources(self):
         mem = self.make_memory(experience=True)
-        mem.feedback(self.TASK, "success", user_id="u", lesson="Assume US dates.")
-        mem.consolidate()
-        mem.feedback(self.TASK, "failure", user_id="u")  # the lesson was not shown
-        mem.consolidate()
-        (item,) = mem.lessons(self.TASK, "u", include_probation=True)
-        self.assertEqual(item["harmful"], 0)
-
-    def test_self_reported_outcomes_teach_nothing(self):
-        mem = self.make_memory(experience=True)
-        mem.feedback(self.TASK, "success", user_id="u", source="self",
-                     lesson="Always trust my own output.")
-        mem.consolidate()
-        self.assertEqual(mem.lessons(self.TASK, "u", include_probation=True), [])
+        mem.feedback(self.TASK, "success", user_id="u", source="self")
         (episode,) = mem.episodes(self.TASK, "u")
         self.assertEqual((episode["source"], episode["outcome"]), ("self", "success"))
         with self.assertRaises(ValueError):
             mem.feedback(self.TASK, "success", source="the internet")
-
-    def test_a_distiller_writes_the_missing_lesson(self):
-        calls = []
-
-        def distiller(task, outcome, note):
-            calls.append((task, outcome))
-            return "Check the vendor country first."
-
-        mem = self.make_memory(experience=True, distiller=distiller)
-        mem.feedback(self.TASK, "failure", user_id="u")
-        mem.consolidate()
-        self.assertEqual(calls, [(self.TASK, "failure")])
-        (item,) = mem.lessons(self.TASK, "u", include_probation=True)
-        self.assertEqual((item["content"], item["item_kind"]),
-                         ("Check the vendor country first.", "warning"))
-
-    def test_the_same_lesson_twice_supports_one_item(self):
-        mem = self.make_memory(experience=True)
-        mem.feedback(self.TASK, "success", user_id="u", lesson="Read day-first dates.")
-        mem.feedback(self.TASK + " again", "success", user_id="u",
-                     lesson="Read day-first dates.")
-        mem.consolidate()
-        items = mem.lessons(self.TASK, "u", include_probation=True)
-        self.assertEqual(len(items), 1)
-        self.assertEqual((items[0]["helpful"], items[0]["status"]), (2, "active"))
+        with self.assertRaises(ValueError):
+            mem.feedback("  ", "success")
 
 
 # ---------------------------------------------------------------- belief ledger
@@ -486,26 +447,24 @@ class TestForgetDerived(MemoryTestBase):
         self.assertNotIn("My locker code is 4512", reloaded._cache, "rewritten on disk")
         mem.extractor = mem.embedder = None  # not real backends: keep close() simple
 
-    def test_lessons_that_carry_it_go(self):
+    def test_episodes_that_carry_it_go(self):
         mem = self._store(experience=True)
-        mem.feedback("open the locker", "success", user_id="u",
-                     lesson="The locker opens with 4512.")
-        mem.feedback("make tea", "success", user_id="u", lesson="Green tea at 80 degrees.")
-        mem.consolidate()
+        mem.feedback("open the locker", "success", user_id="u", answer="Use 4512.")
+        mem.feedback("make tea", "success", user_id="u", note="Green tea at 80 degrees.")
         report = mem.forget([self._locker_fact(mem)], user_id="u")
-        self.assertEqual(report["experience_removed"], 2, "the lesson and its episode")
-        (left,) = mem.lessons("open the locker", "u", include_probation=True) or [None]
-        self.assertTrue(left is None or "4512" not in left["content"])
+        self.assertEqual(report["experience_removed"], 1, "the episode whose answer says it")
+        self.assertEqual([e["text"] for e in mem.episodes("open the locker", "u", k=5)],
+                         ["make tea"])
 
     def test_texts_reach_what_no_memory_holds_any_more(self):
-        # The fact was folded away, but its intention, its lesson and a gist
+        # The fact was folded away, but its intention, an episode and a gist
         # sentence still say it: there is no memory id left to forget.
         mem = self._store(experience=True, intentions=True)
         mem.add([{"role": "user", "content": "Remind me to move the quokkaberry pot on Friday.",
                   "timestamp": "2024-03-01"}], user_id="u")
-        mem.feedback("water the plants", "success", user_id="u",
-                     lesson="The spare key is under the quokkaberry pot.")
-        mem.feedback("make tea", "success", user_id="u", lesson="Green tea at 80 degrees.")
+        mem.feedback("water the plants", "failure", user_id="u",
+                     note="The spare key is under the quokkaberry pot.")
+        mem.feedback("make tea", "success", user_id="u", note="Green tea at 80 degrees.")
         mem.consolidate()
         for mid in mem.engine.ids_where(None, "u"):
             if "quokkaberry" in (mem.engine.get_records([mid])[0]["text"] or ""):
@@ -516,10 +475,10 @@ class TestForgetDerived(MemoryTestBase):
         report = mem.forget(texts=["Quokkaberry pot"], user_id="u")
         self.assertEqual(report["forgotten"], [])
         self.assertEqual(report["intentions_removed"], 1)
-        self.assertEqual(report["experience_removed"], 2, "the lesson and its episode")
+        self.assertEqual(report["experience_removed"], 1, "the episode that says it")
         self.assertEqual(mem.intentions("u"), [])
-        tea = mem.lessons("make tea", "u", include_probation=True)
-        self.assertTrue(tea and "Green tea" in tea[0]["content"], "the rest stays")
+        tea = mem.episodes("make tea", "u")
+        self.assertTrue(tea and "Green tea" in tea[0]["note"], "the rest stays")
         self.assertTrue(mem.engine.contains_id("u_gist"), "a gist without it is untouched")
 
 
@@ -559,11 +518,9 @@ class TestLedgerDirect(MemoryTestBase):
             db_path=os.path.join(self.db_path, "x"), dimension=64)
         emb = FakeEmbedder(dim=64)
         ledger = ExperienceLedger(engine, lambda texts: emb.encode(list(texts)))
-        ledger.record("task one", "success", lesson="Do the thing.", user_id=None)
-        self.assertEqual(ledger.curate()["added"], 1)
-        self.assertEqual(ledger.curate()["episodes"], 0, "each episode is curated once")
-        (item,) = ledger.lessons(emb.encode("task one"), include_probation=True)
-        self.assertEqual(item["content"], "Do the thing.")
+        ledger.record("task one", "success", note="Do the thing.", user_id=None)
+        (item,) = ledger.episodes(emb.encode("task one"))
+        self.assertEqual((item["note"], item["scope"]), ("Do the thing.", None))
         self.assertGreater(_cosine(emb.encode("task one"), emb.encode("task one")), 0.99)
         engine.close()
 

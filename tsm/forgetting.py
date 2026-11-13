@@ -2,7 +2,7 @@
 
 ``Memory.forget`` deletes memories outright. What it cannot delete outright
 is text that was made from them and holds other things too: a gist that
-folded a forgotten fact in with twenty others, a cached extraction, a lesson
+folded a forgotten fact in with twenty others, a cached extraction, an episode
 that quotes it. Deleting those whole would lose what they hold besides;
 keeping them would serve the forgotten content again. So a piece of text is
 judged sentence by sentence:
