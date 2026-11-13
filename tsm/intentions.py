@@ -511,10 +511,6 @@ def _eq(field: str, value) -> Dict:
 PENDING = (_eq("kind", "intention"), _eq("status", "pending"))
 
 
-def _day(value) -> Optional[date]:
-    return date.fromordinal(int(value)) if isinstance(value, int) else None
-
-
 class IntentionLedger:
     """The intentions engine and its lifecycle. ``embed`` maps texts to
     document vectors (the Memory's embedder); every write is under the

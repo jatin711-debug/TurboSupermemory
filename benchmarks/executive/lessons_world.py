@@ -935,10 +935,6 @@ def stream(split: str, seed, per_family: int = 12) -> list[dict]:
     return out
 
 
-def rule_for(task: dict) -> str:
-    return _BY_NAME[task["family"]].rule_text(task.get("phase", 0))
-
-
 def rules_text(split: str = "all", phase: int = 0) -> str:
     """Every rule of the split, stated plainly (drift rules at ``phase``)."""
     lines = [f"- {f.rule_text(phase)}" for f in families(split) if f.kind != "control"]

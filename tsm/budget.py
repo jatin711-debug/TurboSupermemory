@@ -145,18 +145,6 @@ def select_under_budget(
 # --- packing ----------------------------------------------------------------
 
 
-def truncate_to_budget(texts: Sequence[str], token_budget: int) -> List[str]:
-    """Greedily pack texts in input order, skipping entries that do not fit."""
-    selected = []
-    used = 0
-    for text in texts:
-        tokens = estimate_tokens(text)
-        if tokens and used + tokens <= token_budget:
-            selected.append(text)
-            used += tokens
-    return selected
-
-
 def pack_recent(texts: Sequence[str], token_budget: int) -> Tuple[List[str], List[str]]:
     """Keep the most-recent entries that fit and return `(kept, overflow)` in input order."""
     selected_indexes = _pack_indexes(texts, token_budget, range(len(texts) - 1, -1, -1))
@@ -200,18 +188,6 @@ def pack_role_priority_recent(texts, roles, token_budget):
     kept = [text for index, text in enumerate(texts) if index in selected_indexes]
     overflow = [text for index, text in enumerate(texts) if index not in selected_indexes]
     return kept, overflow
-
-
-def fit_text_to_budget(text: str, token_budget: int) -> str:
-    """Bound one generated text using the same approximation as storage accounting."""
-    if not text or token_budget <= 0:
-        return ""
-    if estimate_tokens(text) <= token_budget:
-        return text.strip()
-    clipped = text[: token_budget * 4].strip()
-    if " " in clipped:
-        clipped = clipped.rsplit(" ", 1)[0].rstrip(" ,;:")
-    return clipped
 
 
 def fit_complete_facts_to_budget(text: str, token_budget: int) -> str:
